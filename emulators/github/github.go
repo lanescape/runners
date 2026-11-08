@@ -119,6 +119,18 @@ type Run struct {
 	SHA     string
 	BaseRef string
 	HeadRef string
+
+	// EventPull is what the event's payload says of its pull request, as
+	// github.event.pull_request carries it, for pull_request and
+	// pull_request_target runs: fixed when the run is made.
+	EventPull *EventPull
+}
+
+// EventPull is a run's event's pull request.
+type EventPull struct {
+	Number           int
+	HeadRepositoryID int64
+	HeadSHA          string
 }
 
 // Option configures an Emulator.
@@ -353,22 +365,35 @@ func (e *Emulator) PullRequestRun(p *Pull) *Run {
 	defer e.mu.Unlock()
 	r := &Run{Repo: p.Base, Event: "pull_request", HeadBranch: p.HeadRef, HeadSHA: p.HeadSHA, HeadRepo: p.Head,
 		Ref: fmt.Sprintf("refs/pull/%d/merge", p.Number), RefType: "branch", SHA: e.mergeCommit(p),
-		BaseRef: p.BaseRef, HeadRef: p.HeadRef, Actor: p.Author}
+		BaseRef: p.BaseRef, HeadRef: p.HeadRef, Actor: p.Author, EventPull: eventPull(p)}
 	if p.Head == p.Base {
 		r.Pulls = []*Pull{p}
 	}
 	return e.addRun(r)
 }
 
+func eventPull(p *Pull) *EventPull {
+	ep := &EventPull{Number: p.Number, HeadSHA: p.HeadSHA}
+	if p.Head != nil {
+		ep.HeadRepositoryID = p.Head.ID
+	}
+	return ep
+}
+
 // PullRequestTargetRun is a pull_request_target run for p's current head,
 // which runs the default branch's workflow at the default branch's commit.
+// As GitHub records it, the run's head is the base branch's: its head_sha
+// and head_repository are the base's, as GITHUB_SHA is, and only the event's
+// payload names the pull request's head.
 func (e *Emulator) PullRequestTargetRun(p *Pull) *Run {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	def := p.Base.DefaultBranch
-	r := &Run{Repo: p.Base, Event: "pull_request_target", HeadBranch: p.HeadRef, HeadSHA: p.HeadSHA, HeadRepo: p.Head,
-		Ref: "refs/heads/" + def, RefType: "branch", SHA: p.Base.branches[def],
-		BaseRef: p.BaseRef, HeadRef: p.HeadRef, Actor: p.Author, Path: ".github/workflows/contribution.yml"}
+	sha := p.Base.branches[def]
+	r := &Run{Repo: p.Base, Event: "pull_request_target", HeadBranch: def, HeadSHA: sha, HeadRepo: p.Base,
+		Ref: "refs/heads/" + def, RefType: "branch", SHA: sha,
+		BaseRef: p.BaseRef, HeadRef: p.HeadRef, Actor: p.Author, Path: ".github/workflows/contribution.yml",
+		EventPull: eventPull(p)}
 	if p.Head == p.Base {
 		r.Pulls = []*Pull{p}
 	}

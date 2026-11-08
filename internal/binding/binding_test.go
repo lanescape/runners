@@ -117,6 +117,19 @@ var noJob = ghemu.Job{}
 
 func boot() ghemu.Job { return ghemu.Job{WorkflowRef: bootstrap} }
 
+// event is what the bootstrap workflow sends: what its run's event says of
+// the pull request.
+func event(run *ghemu.Run) binding.Request {
+	return binding.Request{PullRequest: run.EventPull.Number, HeadRepositoryID: run.EventPull.HeadRepositoryID, HeadSHA: run.EventPull.HeadSHA}
+}
+
+// naming is the run's event's request, naming another pull request.
+func naming(run *ghemu.Run, n int) binding.Request {
+	r := event(run)
+	r.PullRequest = n
+	return r
+}
+
 // A contributor's pull request from the fork.
 func (e *env) contribution() *ghemu.Pull {
 	e.fork.Commit("feature", map[string]string{"src.go": "package app"})
@@ -268,12 +281,31 @@ func TestPullRequestTarget(t *testing.T) {
 	t.Run("the bootstrap names its pull request", func(t *testing.T) {
 		e := setup(t)
 		p := e.contribution()
-		e.want(e.gh.PullRequestTargetRun(p), boot(), binding.Request{PullRequest: p.Number}, nil, scope.PullRequest(p.Number))
+		run := e.gh.PullRequestTargetRun(p)
+		e.want(run, boot(), event(run), nil, scope.PullRequest(p.Number))
+		bd, _, _ := e.binder.Lookup(context.Background(), run.Repo.ID, run.ID)
+		if bd.HeadRepositoryID != e.fork.ID {
+			t.Fatalf("binding's head repository = %d, want the fork's", bd.HeadRepositoryID)
+		}
+	})
+	t.Run("GitHub's run record is the base's", func(t *testing.T) {
+		e := setup(t)
+		p := e.contribution()
+		run := e.gh.PullRequestTargetRun(p)
+		if run.HeadSHA != e.repo.Head("main") || run.HeadRepo != e.repo || run.SHA != e.repo.Head("main") {
+			t.Fatal("the emulator's pull_request_target run doesn't record the base's head")
+		}
+		e.want(run, boot(), event(run), nil, scope.PullRequest(p.Number))
 	})
 	t.Run("a same-repository pull request", func(t *testing.T) {
 		e := setup(t)
 		p := e.samePull("feature")
-		e.want(e.gh.PullRequestTargetRun(p), boot(), binding.Request{PullRequest: p.Number}, nil, scope.PullRequest(p.Number))
+		run := e.gh.PullRequestTargetRun(p)
+		e.want(run, boot(), event(run), nil, scope.PullRequest(p.Number))
+		bd, _, _ := e.binder.Lookup(context.Background(), run.Repo.ID, run.ID)
+		if bd.HeadRepositoryID != e.repo.ID {
+			t.Fatalf("binding's head repository = %d, want the repository's", bd.HeadRepositoryID)
+		}
 	})
 	t.Run("the pull request has moved on since the run", func(t *testing.T) {
 		e := setup(t)
@@ -281,36 +313,41 @@ func TestPullRequestTarget(t *testing.T) {
 		run := e.gh.PullRequestTargetRun(p)
 		e.fork.Commit("feature", map[string]string{"more": "1"})
 		e.gh.Sync(p)
-		e.want(run, boot(), binding.Request{PullRequest: p.Number}, nil, scope.PullRequest(p.Number))
+		e.want(run, boot(), event(run), nil, scope.PullRequest(p.Number))
 	})
 	t.Run("a contributor's job claims to be the bootstrap", func(t *testing.T) {
 		e := setup(t)
 		p := e.contribution()
+		run := e.gh.PullRequestTargetRun(p)
 		// A job of the calling workflow has the caller's job_workflow_ref.
-		e.want(e.gh.PullRequestTargetRun(p), noJob, binding.Request{PullRequest: p.Number}, nil, scope.Read)
+		e.want(run, noJob, event(run), nil, scope.Read)
 	})
 	t.Run("a token without job_workflow_ref", func(t *testing.T) {
 		e := setup(t)
 		p := e.contribution()
-		e.want(e.gh.PullRequestTargetRun(p), noJob, binding.Request{PullRequest: p.Number}, map[string]any{"job_workflow_ref": nil, "job_workflow_sha": nil}, scope.Read)
+		run := e.gh.PullRequestTargetRun(p)
+		e.want(run, noJob, event(run), map[string]any{"job_workflow_ref": nil, "job_workflow_sha": nil}, scope.Read)
 	})
 	t.Run("another reusable workflow", func(t *testing.T) {
 		e := setup(t)
 		p := e.contribution()
+		run := e.gh.PullRequestTargetRun(p)
 		job := ghemu.Job{WorkflowRef: "lanescape/app/.github/workflows/build.yml@refs/heads/main"}
-		e.want(e.gh.PullRequestTargetRun(p), job, binding.Request{PullRequest: p.Number}, nil, scope.Read)
+		e.want(run, job, event(run), nil, scope.Read)
 	})
 	t.Run("the bootstrap at another ref", func(t *testing.T) {
 		e := setup(t)
 		p := e.contribution()
+		run := e.gh.PullRequestTargetRun(p)
 		job := ghemu.Job{WorkflowRef: "lanescape/app/.github/workflows/bootstrap.yml@refs/heads/feature"}
-		e.want(e.gh.PullRequestTargetRun(p), job, binding.Request{PullRequest: p.Number}, nil, scope.Read)
+		e.want(run, job, event(run), nil, scope.Read)
 	})
 	t.Run("the bootstrap names another pull request", func(t *testing.T) {
 		e := setup(t)
 		p := e.contribution()
 		other := e.samePull("other")
-		e.want(e.gh.PullRequestTargetRun(p), boot(), binding.Request{PullRequest: other.Number}, nil, scope.Read)
+		run := e.gh.PullRequestTargetRun(p)
+		e.want(run, boot(), naming(run, other.Number), nil, scope.Read)
 	})
 	t.Run("the bootstrap names the fork's other pull request", func(t *testing.T) {
 		e := setup(t)
@@ -318,24 +355,61 @@ func TestPullRequestTarget(t *testing.T) {
 		e.fork.Branch("second", e.fork.Head("main"))
 		e.fork.Commit("second", map[string]string{"s": "1"})
 		other := e.gh.PullRequest(e.repo, "main", e.fork, "second", e.contributor)
-		e.want(e.gh.PullRequestTargetRun(p), boot(), binding.Request{PullRequest: other.Number}, nil, scope.Read)
+		run := e.gh.PullRequestTargetRun(p)
+		e.want(run, boot(), naming(run, other.Number), nil, scope.Read)
 	})
-	t.Run("the bootstrap names no pull request", func(t *testing.T) {
+	t.Run("the bootstrap names another head repository", func(t *testing.T) {
 		e := setup(t)
 		p := e.contribution()
-		e.want(e.gh.PullRequestTargetRun(p), boot(), binding.Request{}, nil, scope.Read)
+		run := e.gh.PullRequestTargetRun(p)
+		req := event(run)
+		req.HeadRepositoryID = e.repo.ID
+		e.want(run, boot(), req, nil, scope.Read)
 	})
+	t.Run("the bootstrap names the base's commit", func(t *testing.T) {
+		e := setup(t)
+		p := e.contribution()
+		run := e.gh.PullRequestTargetRun(p)
+		req := event(run)
+		req.HeadSHA = run.HeadSHA
+		e.want(run, boot(), req, nil, scope.Read)
+	})
+	t.Run("the bootstrap names a commit of another branch", func(t *testing.T) {
+		e := setup(t)
+		p := e.contribution()
+		run := e.gh.PullRequestTargetRun(p)
+		req := event(run)
+		req.HeadSHA = e.fork.Commit("unrelated", map[string]string{"u": "1"})
+		e.want(run, boot(), req, nil, scope.Read)
+	})
+	for name, req := range map[string]func(binding.Request) binding.Request{
+		"no pull request":      func(r binding.Request) binding.Request { r.PullRequest = 0; return r },
+		"no head repository":   func(r binding.Request) binding.Request { r.HeadRepositoryID = 0; return r },
+		"no head commit":       func(r binding.Request) binding.Request { r.HeadSHA = ""; return r },
+		"a short head commit":  func(r binding.Request) binding.Request { r.HeadSHA = r.HeadSHA[:12]; return r },
+		"an uppercase commit":  func(r binding.Request) binding.Request { r.HeadSHA = strings.ToUpper(r.HeadSHA); return r },
+		"nothing from the run": func(binding.Request) binding.Request { return binding.Request{} },
+	} {
+		t.Run("the bootstrap sends "+name, func(t *testing.T) {
+			e := setup(t)
+			p := e.contribution()
+			run := e.gh.PullRequestTargetRun(p)
+			e.want(run, boot(), req(event(run)), nil, scope.Read)
+		})
+	}
 	t.Run("a pull request that doesn't exist", func(t *testing.T) {
 		e := setup(t)
 		p := e.contribution()
-		e.want(e.gh.PullRequestTargetRun(p), boot(), binding.Request{PullRequest: 99}, nil, scope.Read)
+		run := e.gh.PullRequestTargetRun(p)
+		e.want(run, boot(), naming(run, 99), nil, scope.Read)
 	})
 	t.Run("the head of two open pull requests", func(t *testing.T) {
 		e := setup(t)
 		p := e.contribution()
 		e.fork.Branch("copy", e.fork.Head("feature"))
 		e.gh.PullRequest(e.repo, "main", e.fork, "copy", e.contributor)
-		e.want(e.gh.PullRequestTargetRun(p), boot(), binding.Request{PullRequest: p.Number}, nil, scope.Read)
+		run := e.gh.PullRequestTargetRun(p)
+		e.want(run, boot(), event(run), nil, scope.Read)
 	})
 	t.Run("no bootstrap on the default branch", func(t *testing.T) {
 		e := setup(t)
@@ -343,13 +417,15 @@ func TestPullRequestTarget(t *testing.T) {
 		// The contributor's branch adds one, which mustn't count.
 		e.fork.Commit("feature", map[string]string{binding.RunnersFile: `{"bootstrap": "` + bootstrap + `"}`})
 		p := e.gh.PullRequest(e.repo, "main", e.fork, "feature", e.contributor)
-		e.want(e.gh.PullRequestTargetRun(p), boot(), binding.Request{PullRequest: p.Number}, nil, scope.Read)
+		run := e.gh.PullRequestTargetRun(p)
+		e.want(run, boot(), event(run), nil, scope.Read)
 	})
 	t.Run("no runners file", func(t *testing.T) {
 		e := setup(t)
 		e.repo.Commit("main", map[string]string{binding.RunnersFile: ""})
 		p := e.contribution()
-		e.want(e.gh.PullRequestTargetRun(p), boot(), binding.Request{PullRequest: p.Number}, nil, scope.Read)
+		run := e.gh.PullRequestTargetRun(p)
+		e.want(run, boot(), event(run), nil, scope.Read)
 	})
 	for name, file := range map[string]string{
 		"not JSON":                  `{`,
@@ -365,7 +441,8 @@ func TestPullRequestTarget(t *testing.T) {
 			var b struct{ Bootstrap any }
 			_ = json.Unmarshal([]byte(file), &b)
 			ref, _ := b.Bootstrap.(string)
-			e.want(e.gh.PullRequestTargetRun(p), ghemu.Job{WorkflowRef: ref}, binding.Request{PullRequest: p.Number}, nil, scope.Read)
+			run := e.gh.PullRequestTargetRun(p)
+			e.want(run, ghemu.Job{WorkflowRef: ref}, event(run), nil, scope.Read)
 		})
 	}
 	t.Run("a tag named like the default branch", func(t *testing.T) {
@@ -373,9 +450,11 @@ func TestPullRequestTarget(t *testing.T) {
 		evil := "lanescape/app/.github/workflows/evil.yml@refs/heads/main"
 		e.repo.Tag("main", e.repo.Commit("evil", map[string]string{binding.RunnersFile: `{"bootstrap": "` + evil + `"}`}))
 		p := e.contribution()
-		e.want(e.gh.PullRequestTargetRun(p), ghemu.Job{WorkflowRef: evil}, binding.Request{PullRequest: p.Number}, nil, scope.Read)
+		run := e.gh.PullRequestTargetRun(p)
+		e.want(run, ghemu.Job{WorkflowRef: evil}, event(run), nil, scope.Read)
 		// The default branch's own bootstrap still works.
-		e.want(e.gh.PullRequestTargetRun(p), boot(), binding.Request{PullRequest: p.Number}, nil, scope.PullRequest(p.Number))
+		run = e.gh.PullRequestTargetRun(p)
+		e.want(run, boot(), event(run), nil, scope.PullRequest(p.Number))
 	})
 	t.Run("more commits than GitHub lists", func(t *testing.T) {
 		e := setup(t)
@@ -384,24 +463,35 @@ func TestPullRequestTarget(t *testing.T) {
 			shas = append(shas, e.fork.Commit("long", map[string]string{"n": fmt.Sprint(i)}))
 		}
 		p := e.gh.PullRequest(e.repo, "main", e.fork, "long", e.contributor)
-		e.want(e.gh.PullRequestTargetRun(p), boot(), binding.Request{PullRequest: p.Number}, nil, scope.PullRequest(p.Number))
+		run := e.gh.PullRequestTargetRun(p)
+		e.want(run, boot(), event(run), nil, scope.PullRequest(p.Number))
 
 		// A run for the 255th commit, after which the pull request moved on.
 		older := e.gh.PullRequestTargetRun(p)
-		older.HeadSHA = shas[254]
-		e.want(older, boot(), binding.Request{PullRequest: p.Number}, nil, scope.PullRequest(p.Number))
+		req := event(older)
+		req.HeadSHA = shas[254]
+		e.want(older, boot(), req, nil, scope.PullRequest(p.Number))
 
-		// A run whose head is the base's, not the pull request's.
+		// A run whose event names the base's commit, not the pull request's.
 		base := e.gh.PullRequestTargetRun(p)
-		base.HeadSHA = e.repo.Head("main")
-		e.want(base, boot(), binding.Request{PullRequest: p.Number}, nil, scope.Read)
+		req = event(base)
+		req.HeadSHA = e.repo.Head("main")
+		e.want(base, boot(), req, nil, scope.Read)
 	})
 	t.Run("the head repository has been deleted", func(t *testing.T) {
 		e := setup(t)
 		p := e.contribution()
 		run := e.gh.PullRequestTargetRun(p)
 		p.Head = nil
-		e.want(run, boot(), binding.Request{PullRequest: p.Number}, nil, scope.Read)
+		e.want(run, boot(), event(run), nil, scope.Read)
+	})
+	t.Run("the bootstrap's word in a pull_request run", func(t *testing.T) {
+		e := setup(t)
+		p := e.samePull("feature")
+		other := e.samePull("other")
+		run := e.gh.PullRequestRun(p)
+		req := binding.Request{PullRequest: other.Number, HeadRepositoryID: e.repo.ID, HeadSHA: other.HeadSHA}
+		e.want(run, boot(), req, nil, scope.PullRequest(p.Number))
 	})
 }
 
@@ -410,8 +500,8 @@ func TestABindingIsMadeOnce(t *testing.T) {
 	p := e.contribution()
 	run := e.gh.PullRequestTargetRun(p)
 	// The first call isn't the bootstrap's, so the run is read for good.
-	e.want(run, noJob, binding.Request{PullRequest: p.Number}, nil, scope.Read)
-	e.want(run, boot(), binding.Request{PullRequest: p.Number}, nil, scope.Read)
+	e.want(run, noJob, event(run), nil, scope.Read)
+	e.want(run, boot(), event(run), nil, scope.Read)
 
 	e2 := setup(t)
 	main := e2.gh.PushRun(e2.repo, "main")
@@ -509,7 +599,7 @@ func TestTransientFailuresLeaveNoBinding(t *testing.T) {
 				// The pull request moves on, so its commits are listed.
 				e.fork.Commit("feature", map[string]string{"more": "1"})
 				e.gh.Sync(p)
-				return run, boot(), binding.Request{PullRequest: p.Number}
+				return run, boot(), event(run)
 			},
 			calls: []string{"/repos/lanescape/app/git/ref/", "/repos/lanescape/app/contents/", "/repos/lanescape/app/pulls/1/commits", "/repos/lanescape/app/pulls"},
 		},
@@ -552,11 +642,11 @@ func TestTransientFailuresLeaveNoBinding(t *testing.T) {
 		e.fork.Commit("feature", map[string]string{"more": "1"})
 		e.gh.Sync(p)
 		e.gh.RateLimit("/repos/lanescape/app/pulls/1/commits", 1, time.Second)
-		if _, err := e.bind(run, boot(), binding.Request{PullRequest: p.Number}, nil); !errors.Is(err, binding.ErrRetry) {
+		if _, err := e.bind(run, boot(), event(run), nil); !errors.Is(err, binding.ErrRetry) {
 			t.Fatalf("error = %v, want ErrRetry", err)
 		}
 		time.Sleep(1100 * time.Millisecond)
-		e.want(run, boot(), binding.Request{PullRequest: p.Number}, nil, scope.PullRequest(p.Number))
+		e.want(run, boot(), event(run), nil, scope.PullRequest(p.Number))
 	})
 	t.Run("a slow GitHub", func(t *testing.T) {
 		e := setup(t)

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -353,7 +354,8 @@ func TestBind(t *testing.T) {
 	prt := e.gh.PullRequestTargetRun(p)
 	boot := e.gh.ActionsToken(prt, ghemu.Job{Audience: audience, WorkflowRef: bootstrap}, nil)
 
-	code, body := e.post(server.BindPath, boot, `{"pull_request": 1}`)
+	ev := fmt.Sprintf(`{"pull_request": 1, "head_repository_id": %d, "head_sha": %q}`, fork.ID, prt.EventPull.HeadSHA)
+	code, body := e.post(server.BindPath, boot, ev)
 	if code != http.StatusOK || body["scope"] != "pr1" {
 		t.Fatalf("bootstrap: %d %v", code, body)
 	}
