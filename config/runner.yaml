@@ -1,0 +1,6 @@
+# The GitHub runner the base images install, checked against the SHA-256
+# GitHub publishes with each release (specs/0003-disks.md, Base images).
+version: 2.338.2
+sha256:
+  amd64: baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c40
+  arm64: 670adb2f268fe21dcbb58b3db0e0aa9d5b3bddfe2c651481336e561ff86de945

@@ -1,0 +1,26 @@
+# Machine shapes (specs/0002-machines.md, Selectors). A shape's name gives its
+# vCPUs and architecture; each lists the machine types that satisfy it, in
+# order of preference, the memory it promises and the size of its work disk.
+zones:
+  - northamerica-northeast1-a
+  - northamerica-northeast1-b
+
+# Every machine's boot disk, and the performance of both its disks.
+boot_disk_gb: 100
+disk_iops: 3000
+disk_throughput_mibps: 400
+
+# The work disk sizes are starting points, to be tuned once real jobs run.
+shapes:
+  lanescape-2vcpu-linux-amd64:
+    machine_types: [n4-highcpu-2, c4-highcpu-2]
+    memory_gb: 4
+    work_disk_gb: 50
+  lanescape-80vcpu-linux-amd64:
+    machine_types: [n4-highcpu-80, c4-highcpu-96]
+    memory_gb: 160
+    work_disk_gb: 500
+  lanescape-16vcpu-linux-arm64:
+    machine_types: [c4a-highcpu-16]
+    memory_gb: 32
+    work_disk_gb: 200
