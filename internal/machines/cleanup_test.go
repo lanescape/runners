@@ -9,6 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lanescape/runners/config"
+	"github.com/lanescape/runners/emulators/fault"
+	gcsemu "github.com/lanescape/runners/emulators/storage"
 	"github.com/lanescape/runners/internal/machines"
 )
 
@@ -265,5 +268,72 @@ func TestOfflineRunnerRegistrations(t *testing.T) {
 	}
 	if !names[live.Name] || !names["someone-elses"] || names["lsr-5001-gonegone"] {
 		t.Fatalf("runners = %v; want the gone machine's removed and the rest kept", names)
+	}
+}
+
+func TestCleanupWithoutTheRecords(t *testing.T) {
+	e := setup(t)
+	m, _ := e.admitted(sel2)
+	e.clock.Advance(machines.IdleLimit + time.Minute)
+	// A refusal the storage client doesn't retry, so the pass goes on
+	// without the machines' records.
+	e.gcs.Faults().Add(fault.Rule{Method: http.MethodGet, Times: 1, Match: func(r *http.Request) bool { return r.URL.Query().Get("prefix") == "machines/" },
+		Respond: gcsemu.JSONError(http.StatusForbidden, "forbidden", "Forbidden")})
+	e.pass()
+	if !e.exists(m.in.Name) {
+		t.Fatal("an admitted machine was deleted when its admission couldn't be read")
+	}
+	// Only the age limit holds without the records.
+	e.clock.Advance(machines.MaxAge)
+	e.gcs.Faults().Add(fault.Rule{Method: http.MethodGet, Times: 1, Match: func(r *http.Request) bool { return r.URL.Query().Get("prefix") == "machines/" },
+		Respond: gcsemu.JSONError(http.StatusForbidden, "forbidden", "Forbidden")})
+	e.pass()
+	if e.exists(m.in.Name) {
+		t.Fatal("a machine past 5 hours was kept")
+	}
+}
+
+func TestCleanupClaimsAMachineBeforeACheckCan(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	j := e.queue(run, sel2)
+	e.pass()
+	m := e.boot(e.one())
+	m.taken(j)
+	// Cleanup claims the idle machine, and the deletion fails.
+	e.gce.ServerError(http.MethodDelete, "/instances/"+m.in.Name, http.StatusInternalServerError, 0)
+	e.clock.Advance(machines.IdleLimit)
+	e.pass()
+	if !e.exists(m.in.Name) {
+		t.Fatal("the machine should still be there")
+	}
+	// The hook asks after the claim: the machine is no longer for any job.
+	if code := m.started(run.ID); code != http.StatusForbidden {
+		t.Fatalf("a check after cleanup's claim: %d, want 403", code)
+	}
+}
+
+func TestAMachineThatMayHaveBeenMadeCountsAgainstTheLimit(t *testing.T) {
+	e := setup(t)
+	e.cfg.Limits.Repositories = map[int64]config.Override{repoID: {Machines: ptr(1)}}
+	run := e.mainRun()
+	e.queue(run, sel2)
+	e.queue(run, "lanescape-16vcpu-linux-arm64-main")
+	// Every answer to making the first is lost, after it's made.
+	e.gce.LoseResponse(http.MethodPost, "/instances", 4)
+	e.pass()
+	e.wantMachines(1)
+}
+
+func TestNoCapacityDoesntStartTheJobsHour(t *testing.T) {
+	e := setup(t)
+	j := e.queue(e.mainRun(), sel2)
+	for _, z := range []string{zoneA, zoneB} {
+		e.gce.Stockout(z, "n4-highcpu-2", false)
+		e.gce.Stockout(z, "c4-highcpu-2", false)
+	}
+	e.pass()
+	if _, ok := e.record("jobs/5001/" + strconv.FormatInt(j.ID, 10) + ".json"); ok {
+		t.Fatal("a job with no machine has its first machine recorded")
 	}
 }

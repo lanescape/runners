@@ -180,13 +180,15 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 	binder := &binding.Binder{GitHub: gh, Objects: objects, OrganizationID: cfg.Organization.ID, Clock: clock, Logger: log}
 	svc := &machines.Service{Config: cfg, Project: s.Project, ServiceURL: s.Audience, MachineAccount: account,
 		GitHub: gh, Compute: gce, Objects: objects, Binder: binder, Machines: machineTokens, Clock: clock, Logger: log}
+	passes := &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log}
+	svc.Kick = kicker(ctx, passes, svc, log)
 	h, err := server.New(server.Config{
 		Logger:           log,
 		OrganizationID:   cfg.Organization.ID,
 		WebhookSecret:    webhookSecret,
 		Publisher:        noPublisher{},
 		ReconcileCallers: callers,
-		Passes:           &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log},
+		Passes:           passes,
 		Reconciler:       svc,
 		Actions:          actions,
 		Binder:           binder,
@@ -214,6 +216,31 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return srv.Shutdown(sctx)
+}
+
+// kicker runs a pass soon after a machine reports, so its cleanup starts at
+// once. A pass that finds the lease held tries again a few times, since the
+// pass holding it may have read the records before the report arrived; the
+// sweep catches whatever this misses.
+func kicker(ctx context.Context, passes *pass.Runner, svc *machines.Service, log *slog.Logger) func() {
+	return func() {
+		go func() {
+			for wait := 15 * time.Second; wait <= 2*time.Minute; wait *= 2 {
+				err := passes.Run(ctx, svc.Pass)
+				if !errors.Is(err, pass.ErrHeld) {
+					if err != nil {
+						log.Warn("pass after a report", "err", err)
+					}
+					return
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(wait):
+				}
+			}
+		}()
+	}
 }
 
 // noPublisher stands in until the service publishes to Pub/Sub: a delivery

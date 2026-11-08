@@ -169,10 +169,14 @@ func newWorld(t *testing.T) *world {
 	binder := &binding.Binder{GitHub: ghc, Objects: objects, OrganizationID: orgID, Clock: clock, Logger: log}
 	svc := &machines.Service{Config: cfg, Project: gcp.Project, ServiceURL: audience, MachineAccount: account,
 		GitHub: ghc, Compute: gcec, Objects: objects, Binder: binder, Machines: tokens, Clock: clock, Logger: log}
+	passes := &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log}
+	var kicks sync.WaitGroup
+	t.Cleanup(kicks.Wait)
+	svc.Kick = func() { kicks.Go(func() { _ = passes.Run(context.Background(), svc.Pass) }) }
 	handler, err = server.New(server.Config{
 		Logger: log, OrganizationID: orgID, WebhookSecret: []byte("secret"), Publisher: nopPublisher{},
 		ReconcileCallers: callers,
-		Passes:           &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log},
+		Passes:           passes,
 		Reconciler:       svc, Actions: actions, Binder: binder,
 		JobStarted: svc.JobStarted(), JobFinished: svc.JobFinished(),
 	})
@@ -363,23 +367,20 @@ func TestAJobRunsOnItsMachine(t *testing.T) {
 	if !strings.Contains(string(rep), `"save":true`) {
 		t.Fatalf("report = %s", rep)
 	}
-	w.eventually("the machine powers off", 30*time.Second, func() bool {
-		in, ok := w.gce.Instance(m.Zone, m.Name)
-		return ok && in.Status == "TERMINATED"
+	// The report starts a pass at once, which deletes the machine.
+	w.eventually("the reported machine is deleted", 30*time.Second, func() bool {
+		_, ok := w.gce.Instance(m.Zone, m.Name)
+		return !ok
 	})
 	sudo, _ := os.ReadFile(filepath.Join(w.guest(m.Name).dir, "sudo.log"))
 	if !strings.Contains(string(sudo), "mkfs.ext4") || !strings.Contains(string(sudo), "mount -o discard,noatime") {
 		t.Fatalf("the hook did %q", sudo)
 	}
-	w.pass()
-	if _, ok := w.gce.Instance(m.Zone, m.Name); ok {
-		t.Fatal("the reported machine wasn't deleted")
-	}
 	if n := len(w.gce.Disks()); n != 0 {
 		t.Fatalf("%d disks left", n)
 	}
 	log, _, ok := w.gcs.Object("state", "logs/"+m.Name+"-"+m.Labels[machines.LabelCreated]+".txt")
-	if !ok || !strings.Contains(string(log), "reported, save true") || !strings.Contains(string(log), "Running job: build") {
+	if !ok || !strings.Contains(string(log), "the runner exited") || !strings.Contains(string(log), "Running job: build") {
 		t.Fatalf("boot log = %q", log)
 	}
 	if !strings.Contains(w.logs.String(), "saving isn't built yet") {

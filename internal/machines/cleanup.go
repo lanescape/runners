@@ -45,7 +45,8 @@ func (inv *inventory) gone(name string) bool {
 	return inv.deleted[name] || (!listed && !inv.attempted[name])
 }
 
-// tidy applies the table to one machine.
+// tidy applies the table to one machine. Only the age limit holds without
+// the records; every other row depends on them.
 func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 	age := s.now().Sub(m.CreatedAt)
 	a, admitted := inv.admissions[m.Name]
@@ -53,6 +54,8 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 	switch {
 	case age >= MaxAge:
 		s.finish(ctx, inv, m, "past "+MaxAge.String()+", deleted even mid-job, saving nothing", nil)
+	case !inv.recordsComplete:
+		return
 	case reported:
 		s.finish(ctx, inv, m, "its supervisor reported", &rep)
 	case admitted && !a.Allowed:
@@ -73,10 +76,28 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 			s.finish(ctx, inv, m, "its job finished "+ReportWait.String()+" ago with no report; going on as if it asked for no save", &Report{Machine: m.Name})
 		}
 	case m.Stopped():
-		s.finish(ctx, inv, m, "it stopped before its job started", nil)
+		if s.retire(ctx, m, "it stopped before its job started") {
+			s.finish(ctx, inv, m, "it stopped before its job started", nil)
+		}
 	case age >= IdleLimit:
-		s.finish(ctx, inv, m, "it hasn't picked up a job after "+IdleLimit.String(), nil)
+		if s.retire(ctx, m, "it hasn't picked up a job after "+IdleLimit.String()) {
+			s.finish(ctx, inv, m, "it hasn't picked up a job after "+IdleLimit.String(), nil)
+		}
 	}
+}
+
+// retire claims an unadmitted machine for cleanup through its admission
+// record, created only if absent, as the job-started check's decision is: a
+// check that decides first keeps the machine, and one that comes later finds
+// it refused. It reports whether the machine may be deleted.
+func (s *Service) retire(ctx context.Context, m Machine, why string) bool {
+	a, _, err := createOnce(ctx, s.Objects, admissionKey(m.Name), Admission{Machine: m.Name, Zone: m.Zone,
+		RepositoryID: m.RepositoryID, Selector: m.Selector.String(), Reason: "retired: " + why, At: s.now()})
+	if err != nil {
+		s.log().Warn("retiring a machine", "machine", m.Name, "err", err.Error())
+		return false
+	}
+	return !a.Allowed
 }
 
 // stoppedSpot deals with a Spot machine that stopped with its job admitted:

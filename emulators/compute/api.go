@@ -886,6 +886,10 @@ func (e *Emulator) insertDisk(r *http.Request, zone string) (*operation, *apiErr
 		return nil, invalid("Invalid value for field 'resource.sizeGb': '%d'.", d.sizeGB)
 	}
 	op := e.newOp(zone, "insert", e.diskURL(d), d.id)
+	if e.diskShort[zone] {
+		return op.fail(http.StatusServiceUnavailable, "ZONE_RESOURCE_POOL_EXHAUSTED",
+			fmt.Sprintf("The zone 'projects/%s/zones/%s' does not have enough resources available to fulfill the request.", e.Project, zone)), nil
+	}
 	e.disks[zone+"/"+d.name] = d
 	return op, nil
 }

@@ -402,3 +402,54 @@ func TestAPassRecordsARefusalTheCheckDidnt(t *testing.T) {
 		t.Fatalf("fork's run: %s %s", st, c)
 	}
 }
+
+func TestAWorkDiskThatCouldntBeMadeIsTriedAgain(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	j := e.queue(run, sel2)
+	e.pass()
+	m := e.boot(e.one())
+	m.taken(j)
+	e.gce.StockoutDisks(m.in.Zone, true)
+	if code := m.started(run.ID); code != http.StatusServiceUnavailable {
+		t.Fatalf("with no disk capacity: %d, want a retryable 503", code)
+	}
+	// Compute Engine answers a request ID it has seen with its first
+	// outcome, so the next try needs another.
+	e.gce.StockoutDisks(m.in.Zone, false)
+	if code := m.started(run.ID); code != http.StatusOK {
+		t.Fatalf("once there's capacity: %d", code)
+	}
+}
+
+func TestAMachineThatIsntRunningGetsNoJob(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	j := e.queue(run, sel2)
+	e.pass()
+	m := e.boot(e.one())
+	m.taken(j)
+	tok := e.token(m.in)
+	e.gce.Shutdown(m.in.Zone, m.in.Name)
+	if code, _ := e.post("/v1/jobs/started", tok, machines.StartedRequest{RunID: run.ID}); code != http.StatusForbidden {
+		t.Fatalf("a stopped machine's token: %d, want 403", code)
+	}
+	if _, ok := e.record("machines/" + m.in.Name + "/admission.json"); ok {
+		t.Fatal("a decision was recorded for a machine that isn't running")
+	}
+}
+
+func TestAReportStartsAPass(t *testing.T) {
+	e := setup(t)
+	kicked := make(chan struct{}, 1)
+	e.svc.Kick = func() { kicked <- struct{}{} }
+	m, _ := e.admitted(sel2)
+	m.release(true)
+	m.finished()
+	m.report(false)
+	select {
+	case <-kicked:
+	default:
+		t.Fatal("a report didn't start a pass")
+	}
+}

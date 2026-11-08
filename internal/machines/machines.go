@@ -140,6 +140,11 @@ type Service struct {
 	Clock    clockwork.Clock
 	Logger   *slog.Logger
 
+	// Kick starts a pass soon, without waiting for it: the service acts on
+	// a report at once, rather than at the next sweep. Unset, reports wait
+	// for the next pass.
+	Kick func()
+
 	// AssignmentWait and AssignmentRetry are how long, and how often, the
 	// job-started check asks GitHub which job is on a machine's runner
 	// before it answers that the hook should ask again.
@@ -263,15 +268,18 @@ const (
 // deletes one that's being made or waiting to be attached while its machine
 // is there.
 type DiskRecord struct {
-	Disk         string    `json:"disk"`
-	Machine      string    `json:"machine"`
-	Zone         string    `json:"zone"`
-	RepositoryID int64     `json:"repository_id"`
-	JobID        int64     `json:"job_id"`
-	State        string    `json:"state"`
-	SizeGB       int64     `json:"size_gb"`
-	SourceImage  string    `json:"source_image,omitempty"`
-	At           time.Time `json:"at"`
+	Disk         string `json:"disk"`
+	Machine      string `json:"machine"`
+	Zone         string `json:"zone"`
+	RepositoryID int64  `json:"repository_id"`
+	JobID        int64  `json:"job_id"`
+	State        string `json:"state"`
+	SizeGB       int64  `json:"size_gb"`
+	SourceImage  string `json:"source_image,omitempty"`
+	// Attempt counts the confirmed failures to make or attach it, and
+	// names the request ID of the next try.
+	Attempt int       `json:"attempt,omitempty"`
+	At      time.Time `json:"at"`
 }
 
 // Refusal is a run whose job was refused for coming from a fork or claiming

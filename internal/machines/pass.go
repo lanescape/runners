@@ -552,7 +552,11 @@ func (s *Service) giveConsumer(ctx context.Context, inv *inventory, q *queue) {
 			}
 			if err := s.make(ctx, inv, repo, d.sel, jobs[i], d.contribution); err != nil {
 				s.log().Warn("no machine made", "repository_id", repo.ID, "job_id", jobs[i].ID, "selector", d.sel.String(), "err", err.Error())
-				continue
+				// One that may have been made counts against the limit
+				// until a pass sees whether it was.
+				if !compute.IsUnavailable(err) {
+					continue
+				}
 			}
 			if d.contribution {
 				liveContributions++
@@ -662,11 +666,18 @@ func (s *Service) make(ctx context.Context, inv *inventory, repo github.Reposito
 		return fmt.Errorf("registering a runner: %w", err)
 	}
 	created := s.now()
-	// The job's first machine is recorded once it's made, or may have
-	// been: another is made while it's queued for up to an hour from then.
-	noteJob := func() {
-		if _, _, err := createOnce(ctx, s.Objects, jobKey(repo.ID, job.ID), JobRecord{RepositoryID: repo.ID, JobID: job.ID, FirstMachineAt: created}); err != nil {
-			s.log().Warn("recording a job's first machine", "job_id", job.ID, "err", err.Error())
+	// The job's first machine is recorded before it's made: another is made
+	// while the job is queued for up to an hour from then. If no machine
+	// was made, the record this attempt made is taken back.
+	jkey := jobKey(repo.ID, job.ID)
+	jgen, err := createJSON(ctx, s.Objects, jkey, JobRecord{RepositoryID: repo.ID, JobID: job.ID, FirstMachineAt: created})
+	if err != nil && !errors.Is(err, store.ErrPrecondition) {
+		_ = s.GitHub.DeleteRunner(ctx, runner.ID)
+		return fmt.Errorf("recording the job's first machine: %w", err)
+	}
+	takeBack := func() {
+		if jgen != 0 {
+			_ = s.Objects.Delete(ctx, jkey, jgen)
 		}
 	}
 	spec := compute.InstanceSpec{
@@ -687,7 +698,6 @@ func (s *Service) make(ctx context.Context, inv *inventory, repo github.Reposito
 		spec.MachineType, spec.Spot = pl.MachineType, pl.Spot
 		err := s.Compute.CreateInstance(ctx, pl.Zone, spec, compute.RequestID("create", name, pl.Zone, pl.MachineType, strconv.FormatBool(pl.Spot)))
 		if err == nil {
-			noteJob()
 			s.log().Info("machine made", "machine", name, "repository_id", repo.ID, "job_id", job.ID, "selector", sel.String(),
 				"zone", pl.Zone, "machine_type", pl.MachineType, "spot", pl.Spot, "contribution", contribution)
 			return nil
@@ -699,13 +709,13 @@ func (s *Service) make(ctx context.Context, inv *inventory, repo github.Reposito
 		}
 		if compute.IsUnavailable(err) {
 			// It may have been made: cleanup deals with it either way.
-			noteJob()
 			return err
 		}
 		last = err
 		break
 	}
 	// Nothing was made: the runner's registration goes too.
+	takeBack()
 	if err := s.GitHub.DeleteRunner(ctx, runner.ID); err != nil && !errors.Is(err, github.ErrNotFound) {
 		s.log().Warn("removing an unused runner registration", "runner", name, "err", err.Error())
 	}

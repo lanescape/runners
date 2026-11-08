@@ -57,6 +57,7 @@ type Emulator struct {
 	ops       map[string]*operation
 	requests  map[string]*operation // by requestId
 	stockouts map[capacityKey]bool
+	diskShort map[string]bool
 	quotas    map[string]int64 // by region/metric
 	opDelay   time.Duration
 	onBoot    func(Machine)
@@ -163,7 +164,7 @@ func New(opts ...Option) *Emulator {
 		zones:     []string{"northamerica-northeast1-a", "northamerica-northeast1-b"},
 		instances: map[string]*instance{}, disks: map[string]*disk{}, images: map[string]*image{},
 		ops: map[string]*operation{}, requests: map[string]*operation{},
-		stockouts: map[capacityKey]bool{}, quotas: map[string]int64{}, booted: map[uint64]bool{},
+		stockouts: map[capacityKey]bool{}, diskShort: map[string]bool{}, quotas: map[string]int64{}, booted: map[uint64]bool{},
 	}
 	for _, o := range opts {
 		o(e)
@@ -242,6 +243,14 @@ func (e *Emulator) Stockout(zone, machineType string, spot bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.stockouts[capacityKey{zone, machineType, spot}] = true
+}
+
+// StockoutDisks makes a zone have no capacity for new disks, or gives it
+// back.
+func (e *Emulator) StockoutDisks(zone string, short bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.diskShort[zone] = short
 }
 
 // ClearStockout gives capacity back.

@@ -48,6 +48,9 @@ type FinishedRequest struct {
 // errNotOurs means the caller isn't a machine the service made.
 var errNotOurs = errors.New("not one of the service's machines")
 
+// errNotRunning means a machine asked to admit a job while not running.
+var errNotRunning = errors.New("the machine isn't running")
+
 // errRetry means the check got no confirmed answer, and the hook should ask
 // again.
 var errRetry = errors.New("no confirmed answer yet")
@@ -155,6 +158,9 @@ func (s *Service) jobStarted(w http.ResponseWriter, r *http.Request) {
 	}
 	a, err := s.admit(ctx, m, req.RunID)
 	switch {
+	case errors.Is(err, errNotRunning):
+		s.log().Warn("job-started check from a machine that isn't running", "machine", m.Name, "status", m.Status)
+		forbidden(w)
 	case err != nil:
 		s.log().Warn("job-started check not answered", "machine", m.Name, "err", err.Error())
 		retryLater(w, "the job-started check got no confirmed answer; ask again")
@@ -175,6 +181,11 @@ func (s *Service) admit(ctx context.Context, m Machine, hint int64) (Admission, 
 		return Admission{}, err
 	}
 	if !found {
+		if m.Status != "RUNNING" {
+			// A token outlives its machine's guest: a machine that isn't
+			// running has no job to admit.
+			return Admission{}, errNotRunning
+		}
 		repo, err := s.GitHub.RepositoryByID(ctx, m.RepositoryID)
 		if err != nil {
 			// A confirmed answer that the repository is gone leaves the
@@ -373,25 +384,22 @@ func (s *Service) decide(ctx context.Context, repo github.Repository, m Machine,
 	return a, nil
 }
 
-// refuse carries out a refusal: the run of a job refused for coming from a
-// fork or claiming a scope is recorded, the machine stops at once, and the
-// run is cancelled. Anything left undone here, a pass does.
+// refuse carries out a refusal: the machine stops at once, and the run of a
+// job refused for coming from a fork or claiming a scope is recorded and
+// cancelled. Anything left undone here, a pass does, from the admission.
 func (s *Service) refuse(ctx context.Context, m Machine, a Admission) {
-	var rf Refusal
-	var gen int64
-	recorded := false
-	if a.Cancel {
-		var err error
-		if rf, gen, err = s.recordRefusal(ctx, a); err != nil {
-			s.log().Error("recording a refused run", "run_id", a.RunID, "err", err.Error())
-		} else {
-			recorded = true
-		}
-	}
 	if err := s.Compute.StopInstance(ctx, m.Zone, m.Name, compute.RequestID("stop", m.Name)); err != nil && !errors.Is(err, compute.ErrNotFound) {
 		s.log().Error("stopping a refused machine", "machine", m.Name, "err", err.Error())
 	}
-	if recorded && rf.CancelledAt.IsZero() && rf.FinishedAt.IsZero() {
+	if !a.Cancel {
+		return
+	}
+	rf, gen, err := s.recordRefusal(ctx, a)
+	if err != nil {
+		s.log().Error("recording a refused run", "run_id", a.RunID, "err", err.Error())
+		return
+	}
+	if rf.CancelledAt.IsZero() && rf.FinishedAt.IsZero() {
 		if repo, err := s.GitHub.RepositoryByID(ctx, a.RepositoryID); err == nil {
 			s.cancel(ctx, repo, rf, gen)
 		}
@@ -495,22 +503,36 @@ func (s *Service) workDisk(ctx context.Context, m Machine, a Admission) error {
 		gen = g
 		return nil
 	}
+	attempt := strconv.Itoa(rec.Attempt)
+	// A confirmed failure is tried again under a new request ID, since
+	// Compute Engine answers a request ID it has seen with its first
+	// outcome.
+	failed := func(err error) error {
+		if compute.IsUnavailable(err) {
+			return err
+		}
+		rec.Attempt++
+		if g, rerr := replaceJSON(ctx, s.Objects, key, rec, gen); rerr == nil {
+			gen = g
+		}
+		return err
+	}
 	if rec.State == DiskMaking {
 		err := s.Compute.CreateDisk(ctx, m.Zone, compute.DiskSpec{
 			Name: name, SizeGB: rec.SizeGB, DiskType: DiskType, SourceImage: rec.SourceImage,
 			ProvisionedIOPS: int64(s.Config.Shapes.DiskIOPS), ProvisionedThroughput: int64(s.Config.Shapes.DiskThroughputMiBps),
 			Labels: map[string]string{LabelRepository: strconv.FormatInt(m.RepositoryID, 10), LabelMachine: m.Name,
 				LabelJob: strconv.FormatInt(a.JobID, 10), LabelCreated: strconv.FormatInt(s.now().Unix(), 10)},
-		}, compute.RequestID("work disk", name, strconv.FormatInt(a.JobID, 10)))
+		}, compute.RequestID("work disk", name, strconv.FormatInt(a.JobID, 10), attempt))
 		if err != nil && !errors.Is(err, compute.ErrExists) {
-			return err
+			return failed(err)
 		}
 		if err := step(DiskMade); err != nil {
 			return err
 		}
 	}
 	if rec.State == DiskMade {
-		err := s.Compute.AttachDisk(ctx, m.Zone, m.Name, name, WorkDevice, compute.RequestID("attach", name, m.Name))
+		err := s.Compute.AttachDisk(ctx, m.Zone, m.Name, name, WorkDevice, compute.RequestID("attach", name, m.Name, attempt))
 		if errors.Is(err, compute.ErrInUse) || (err != nil && !compute.IsUnavailable(err)) {
 			// Perhaps our own earlier attachment, whose answer was lost.
 			if in, ierr := s.Compute.Instance(ctx, m.Zone, m.Name); ierr == nil &&
@@ -519,7 +541,7 @@ func (s *Service) workDisk(ctx context.Context, m Machine, a Admission) error {
 			}
 		}
 		if err != nil {
-			return err
+			return failed(err)
 		}
 		if err := step(DiskAttached); err != nil {
 			return err
@@ -544,4 +566,7 @@ func (s *Service) jobFinished(w http.ResponseWriter, r *http.Request) {
 	}
 	s.log().Info("machine reported", "machine", m.Name, "save", rep.Save)
 	w.WriteHeader(http.StatusNoContent)
+	if s.Kick != nil {
+		s.Kick()
+	}
 }
