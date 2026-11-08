@@ -9,10 +9,9 @@ resource "google_cloud_scheduler_job" "reconcile" {
   time_zone        = "Etc/UTC"
   attempt_deadline = "600s"
 
-  # The next call is in 5 minutes anyway.
-  retry_config {
-    retry_count = 0
-  }
+  # No retry_config: the default is no retries, and the next call is in 5
+  # minutes anyway. Google doesn't store a retry count of zero, so a
+  # retry_config saying so would show as a change in every plan.
 
   http_target {
     http_method = "POST"
