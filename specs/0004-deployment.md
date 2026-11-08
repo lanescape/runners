@@ -2,33 +2,44 @@
 
 ## Code
 
-Go, at the latest stable release, pinned by `go.mod`'s `toolchain` line. One module:
+Go, at the latest stable release, pinned by `go.mod`'s `toolchain` line, using Google's and GitHub's own Go SDKs for their APIs. One module:
 
 - `cmd/runners/`: the service.
-- `internal/`: the reconciler, and GitHub and Compute Engine clients behind interfaces small enough to fake.
-- `config/`: consumers, shapes and the runner version (specs/0001-architecture.md, specs/0002-machines.md).
-- `machine/`: the startup script, the job-started hook and the builder script, embedded into the service's binary, so nothing in a consumer's repository can change what a machine does before its job starts.
+- `cmd/proxy/`, `cmd/proxy-git/` and `cmd/forwarder/`: the proxy's HTTP service, its git server and the local forwarder (specs/0006-proxy.md).
+- `actions/<name>/`: each action's `action.yml` and its program (specs/0005-actions.md).
+- `internal/`: the reconciler, and the clients for GitHub, Compute Engine, Cloud Storage and Pub/Sub, behind interfaces the emulators also serve.
+- `emulators/`: the emulators (below).
+- `config/`: the organization's ID, shapes, limits and the runner version.
+- `machine/`: the supervisor and the job-started hook, embedded into the service's binary, so nothing in a consumer's repository can change what a machine does before its job starts or after it ends.
 - `infra/`: the Terraform for everything the service runs on.
 - `bootstrap/`: the Terraform that lets `infra/` be applied at all (below).
 
-Never log credentials, JIT runner configurations, OIDC tokens or the App's installation tokens.
+Never log credentials, JIT runner configurations, OIDC tokens, identity tokens or the App's installation tokens.
 
 ## Tests
 
-Every reconcile behaviour in these specs has a test, against fakes of GitHub and Compute Engine that keep state and fail as the real ones do: quota and stockout errors, preemption mid-job, lost and duplicated events, a runner that never registers, a job handed to a different machine for the same labels, and a pass that dies part way. The images API is tested with tokens signed by a test key, including each claim being wrong in turn. `terraform validate` and `terraform fmt -check` run on every change to `infra/` and `bootstrap/`.
+Tests run against emulators this repository builds and maintains itself, in Go, in `emulators/`. No test depends on an emulator, container or fake from anyone else. Each emulator serves the real API over HTTP, as the SDKs call it, so the service's real clients run against it unchanged, and each keeps state and fails as the real service does:
+
+- **GitHub:** the REST endpoints the service and the actions use, signed webhook deliveries, runner groups and just-in-time registration, environments and their approvals, and an OIDC issuer with its own signing keys and published key set, so tests can mint tokens with each claim wrong in turn. A runner stand-in registers, takes jobs as GitHub would hand them out, including to a machine made for another job, and calls the job-started hook as the real runner does, with a job's environment able to set what a real job can.
+- **Compute Engine:** instances, disks, images and zone operations; Spot preemption mid-job; stockouts, quota errors and responses lost after the work was done; `requestId` deduplication; guest attributes; and identity tokens in the full format, signed by the emulator's own keys.
+- **Cloud Storage:** objects with generation preconditions, for the lease and the records, and the proxy's temporary and stored objects.
+- **Pub/Sub and the scheduler:** signed pushes, redelivery and duplicates.
+- **Upstreams for the proxy:** HTTP servers whose responses carry every caching header the proxy honours, that change content, go down and send truncated bodies, and git servers.
+
+Every behaviour in these specs has a test. End-to-end tests run the real service, proxy and actions against the emulators together: a pull request's run through to its saves, a job handed to the wrong machine, a Spot machine preempted mid-job and its run resumed, a fork's job refused, an approved contribution accepted. The actions' tests run natively on Blacksmith's Linux amd64, Linux arm64 and macOS arm64 machines, since paths, shells, signals and file locking differ between them; CI builds every program for every platform it targets. `terraform validate` and `terraform fmt -check` run on every change to `infra/` and `bootstrap/`.
 
 ## CI and CD
 
-Workflows here run on Blacksmith, never on this service's own machines, so a broken deploy can always be fixed by the next one. A pull request from a fork runs on GitHub's runners instead, by the expression in specs/0001-architecture.md; it needs no credentials, since nothing in CI does.
+Workflows here run on Blacksmith, never on this service's own machines, so a broken deploy can always be fixed by the next one. A pull request from a fork runs on GitHub's runners instead; it needs no credentials, since nothing in CI does.
 
 - **`ci.yml`, on pull requests:** `go vet`, `gofmt`, the tests, and the Terraform checks.
-- **`cd.yml`, on pushes to main:** the same, then it builds the service's image with `ko`, pushes it to Artifact Registry, and asks Infrastructure Manager to apply `infra/` at that commit, with the image's digest as an input. One apply changes the infrastructure and deploys the service together. The job prints the apply's preview and result, and fails if the apply does.
+- **`cd.yml`, on pushes to main:** the same, then it builds the service's and the proxy's images with `ko`, pushes them to Artifact Registry, and asks Infrastructure Manager to apply `infra/` at that commit, with the images' digests as inputs. One apply changes the infrastructure and deploys both together. A deploy that changes the base images' key leads the service to make new ones (specs/0003-disks.md). Last, once everything has deployed, it moves the `v1` tag to the commit (specs/0005-actions.md). The job prints the apply's preview and result, and fails if anything does.
 
 CD signs in with GitHub's token through the workload identity pool `lanescape-runners-github`, whose provider accepts only a push to main from `cd.yml` in this repository. That identity, `lanescape-runners-deployer`, can push to the service's Artifact Registry repository and start applies of the `lanescape-runners` Infrastructure Manager deployment, and nothing else. The apply runs inside Google Cloud as `lanescape-runners-infra`.
 
 That doesn't make CD less powerful than the infra identity: whoever controls the Terraform that CD applies, which is whoever can merge to main, can make the infra identity do anything it may do, provisioners included. So the infra identity's authority is CD's, and it's kept to what `infra/` manages:
 
-- the service's own resources, by their names: its Cloud Run service, topics, subscriptions, scheduler job, bucket, network and secrets' metadata, and the access to each of those, set on the resource itself. That access can still let a merged change give someone more of those resources, such as reading the bucket; it can't reach anything else;
+- the service's own resources, by their names: its Cloud Run services, the proxy's git machine, topics, subscriptions, scheduler job, buckets, network and its one firewall rule, and secrets' metadata, and the access to each of those, set on the resource itself. That access can still let a merged change give someone more of those resources, such as reading the bucket; it can't reach anything else;
 - no project-level IAM administration, no service account creation or key management, no role definitions, and no log sinks. The service's accounts, its custom roles, every project-level grant, and the log sink with its fixed filter for the service's own machines are in `bootstrap/`, which only a maintainer applies, so a merged change can't widen what the service's accounts hold in the project, nor send the project's other logs to the service.
 
 Infrastructure Manager's Terraform runs no provisioners or external programs here: `ci.yml` refuses `provisioner`, `local-exec` and `external` data sources in `infra/`. That keeps a careless change from running code as the infra identity; a deliberate one would be a merged pull request, which its author answers for.
@@ -37,4 +48,4 @@ Whoever merges to main deploys. No agent reviews, approves or merges a pull requ
 
 ## Bootstrap
 
-`bootstrap/` makes what `infra/` can't make for itself: the APIs, the Terraform state bucket, the Artifact Registry repository, every service account (the service's, the machines', the scheduler's, the deployer's and the infra identity), the service's custom roles and every project-level grant, the log sink for Compute Engine's events about the service's machines, and the CD pool. A maintainer applies it by hand, with their own credentials, and again whenever it changes. Its own state is kept in the same state bucket.
+`bootstrap/` makes what `infra/` can't make for itself: the APIs, the Terraform state bucket, the Artifact Registry repository, every service account (the service's, the machines', the proxy's, the git machine's, the scheduler's, the deployer's and the infra identity), the service's custom roles and every project-level grant, the log sink for Compute Engine's events about the service's machines, the CD pool, the release App's key in Secret Manager with only the deployer able to read it, and the tag ruleset that lets only the release App create, move or delete `v*` tags. A maintainer applies it by hand, with their own credentials, and again whenever it changes. Its own state is kept in the same state bucket.

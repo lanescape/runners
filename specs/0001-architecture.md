@@ -1,30 +1,49 @@
 # Architecture
 
-Lanescape Runners is a GitHub Actions runner service for the `lanescape` organization's repositories, on Google Cloud. A job asks for a machine by label, as it would ask Blacksmith or GitHub: `runs-on: lanescape-80vcpu-linux-amd64`. The service creates a Compute Engine machine for a job, registers a one-job runner on it, and deletes it afterwards. Nothing runs and nothing is billed while no job is queued, apart from storage. Repositories that use it are **consumers**.
+Lanescape Runners is a GitHub Actions runner service for the repositories of the `lanescape` GitHub organization, and for no one else, on Google Cloud. A job asks for a machine by label, as it would ask Blacksmith or GitHub: `runs-on: lanescape-80vcpu-linux-amd64`. The service creates a Compute Engine machine for that job, registers a one-job runner on it, and deletes it afterwards. A job's work disk can be saved when it finishes, and later jobs start from it (specs/0003-disks.md). Jobs read upstream sources through a caching proxy (specs/0006-proxy.md). Nothing runs while no job is queued, apart from the proxy's git mirror and storage. Repositories that use it are **consumers**: any repository of the organization.
 
-The service provides compute. It never decides what a job may do in a consumer's cloud resources, and a job's machine has no identity that can reach them: its account has no role anywhere (specs/0002-machines.md). Its one exception is an image builder, which runs a consumer's own default-branch code with an account the consumer chose for it (specs/0003-images.md). Machine shapes, the images machines boot from, and recovering from Spot preemption are what it abstracts (specs/0002-machines.md).
+The service provides compute, saved disks and the proxy. It never decides what a job may do in a consumer's own cloud resources, and a job's machine has no identity that can reach them: its account has no role anywhere (specs/0002-machines.md). A job that needs a consumer's resources signs in with GitHub's OIDC token through that consumer's own workload identity federation.
+
+## Only the `lanescape` organization
+
+The code is public under the MIT License, so anyone may read or copy it. Only the `lanescape` organization may use the service, and it's built so that no one else can:
+
+1. **The GitHub App is private to the organization.** It's set to install only on its owner's account, so no other organization or person can install it, and the service registers runners nowhere else.
+2. **Every check is by ID.** The organization's ID is in the service's configuration; a repository is a consumer if its owner ID is that, whatever its name. Every endpoint checks the owner ID GitHub reports, so a renamed or look-alike organization never matches.
+3. **Runners register only in the organization's runner groups,** one per repository, made by the service (below).
+4. **Machines, saved disks and images are private to the project.** Compute Engine images are visible only within their project unless shared, and the service never shares one. The service's buckets enforce public access prevention, and the proxy serves only callers it has authenticated (specs/0006-proxy.md). Nothing the service stores can be read from outside the organization, so no one else's reads cost it anything.
+5. **Forks get nothing of the service's** (below), and the actions do nothing of the service's outside the organization (specs/0005-actions.md). Anyone can reference a public action; it falls back to GitHub's runners and plain reads from upstream, and the service and the proxy refuse it anyway.
+
+A consumer's own buckets and identities are the consumer's to keep private: public access prevention on, and no sign-in for a fork's job or for a `pull_request_target` run.
 
 ## Components
 
 All of it runs in project `lanescape-dev`, region `northamerica-northeast1`, and is defined in this repository's Terraform (specs/0004-deployment.md).
 
-- **The service,** one Go program on Cloud Run, with four endpoints: GitHub's webhook, the reconcile endpoint, the job-started check and the images API.
-- **A GitHub App,** "Lanescape Runners", installed on each consumer. It registers just-in-time runners in an organization runner group per consumer, lists jobs and reruns them, and reads a consumer's files for image definitions. Its webhook delivers `workflow_job` and `workflow_run` events.
-- **Pub/Sub.** The webhook endpoint checks the delivery's signature and publishes it to a topic, and a push subscription delivers it to the reconcile endpoint. A log sink publishes Compute Engine's preemption and guest-shutdown events for the service's machines to another topic, pushed to the same endpoint. Either way the service reacts at once instead of on its next sweep.
+- **The service,** one Go program on Cloud Run, with five endpoints: GitHub's webhook, the reconcile endpoint, the run binding, the job-started check and the job-finished report.
+- **The proxy** (specs/0006-proxy.md): a Go program on Cloud Run for HTTP reads, and one small Compute Engine machine for git mirrors.
+- **A GitHub App,** "Lanescape Runners", installed on the organization. It creates and manages a runner group per consumer, registers just-in-time runners in them, lists jobs and reruns runs, and reads consumers' default-branch files. Its webhook delivers `workflow_job` and `workflow_run` events.
+- **Pub/Sub.** The webhook endpoint checks the delivery's signature and publishes it to a topic, and a push subscription delivers it to the reconcile endpoint. A log sink publishes Compute Engine's preemption and guest-shutdown events for the service's machines to another topic, pushed to the same endpoint, which records each preemption in the bucket before acknowledging it.
 - **Cloud Scheduler** calls the reconcile endpoint every 5 minutes. Events can be lost, delayed or duplicated, so a pass works from what GitHub and Compute Engine report when it runs, never from the event that started it, and the sweep catches anything an event missed.
-- **A bucket,** `lanescape-runners`, for the service's own state: the lease, image build records and machines' boot logs. Consumers get no access to it.
+- **Buckets:** `lanescape-runners` for the service's state (the lease, records of preemptions, saves and resumes, and boot logs), and `lanescape-runners-proxy` for the proxy's stored responses.
 - **Secret Manager** holds the App's private key and webhook secret. Their values are added by hand, once.
 
-What machines, disks and images exist, and what they're for, is in their names and labels; what jobs want is in GitHub; what can't be read back from either, such as image build attempts and kept disks' jobs, is in the bucket.
+What machines, disks and images exist, and what they're for, is in their names and labels; what jobs want is in GitHub; what can't be read back from either is in the bucket.
+
+## Runner groups
+
+GitHub gives a job any runner, in a group its repository may use, whose labels include all of the job's. A group per repository keeps one repository's job off a machine made for another's. The first time a consumer queues a job, the service creates its group, `lanescape-runners-<repository ID>`, limited to that repository, and registers that consumer's runners only there. A consumer's limits are the organization-wide defaults in `config/limits.yaml`, unless that file overrides them for the consumer by repository ID.
 
 ## Endpoints
 
 The service is reachable from the internet, so every endpoint authenticates its caller itself:
 
-- **The webhook** checks GitHub's HMAC signature over the body before reading it as JSON, with a size limit on the body.
+- **The webhook** checks GitHub's HMAC signature over the body before reading it as JSON, with a size limit on the body, and ignores deliveries for any other organization.
 - **The reconcile endpoint** accepts only Google-signed OIDC tokens whose audience is the service, and whose account is the scheduler's or the push subscriptions', verified as such.
-- **The job-started check** accepts only a machine's Compute Engine identity token (specs/0002-machines.md).
-- **The images API** accepts only GitHub OIDC tokens whose audience is the service, signed by GitHub's published keys, whose repository and owner IDs are a consumer's, and whose `job_workflow_ref` is a workflow the consumer allows, on its default branch, such as `<owner>/<repo>/.github/workflows/images.yml@refs/heads/main`. A reusable workflow called that way has that `job_workflow_ref` whatever workflow calls it, so a consumer's pull request can ask for an image without being able to change what the request runs. The service also refuses a token whose run, looked up by its `run_id`, is from a fork's pull request, whatever the consumer's settings for fork tokens. The consumer is taken from the token alone, and every image, build and log the API names or returns must be that consumer's; another's reads as not found.
+- **The run binding** accepts only GitHub OIDC tokens whose audience is the service, signed by GitHub's published keys, whose repository's owner ID is the organization's, and whose run is in progress; everything it's told is checked against GitHub before it binds the run's scope (specs/0002-machines.md).
+- **The job-started check and the job-finished report** accept only a machine's Compute Engine identity token in the full format, whose audience is the service and whose project, zone and instance ID are a machine the service made (specs/0002-machines.md).
+
+The endpoints are versioned, `/v1/...`. Machines and their hooks come from the service's own base images, so they speak the version of the service that made them; a change that breaks `/v1/` comes as `/v2/` beside it, and `/v1/` goes once no machine or action uses it. The proxy's interface is versioned the same way (specs/0006-proxy.md).
 
 ## Passes
 
@@ -32,34 +51,26 @@ One pass runs at a time, under a lease in the bucket: an object taken with a gen
 
 A pass:
 
-1. Lists the queued jobs of every consumer's runs, the service's machines, disks and images, and its build records.
-2. Gives queued jobs machines, within each consumer's limit (specs/0002-machines.md).
-3. Advances image builds (specs/0003-images.md).
-4. Keeps the work disks of preempted machines, and reruns jobs lost to preemption once their run has finished.
-5. Deletes what's finished, too old or orphaned, and removes offline runner registrations named after its machines.
+1. Lists the queued jobs of every consumer's runs, the service's machines, disks and images, and its records.
+2. Gives queued jobs machines, within each consumer's limits (specs/0002-machines.md).
+3. Saves the work disks of jobs that asked, and makes resume images for preempted Spot jobs (specs/0003-disks.md).
+4. Reruns runs that lost a Spot job to preemption, once they've finished.
+5. Deletes what's finished, too old, expired or orphaned, and removes offline runner registrations named after its machines.
 
-A failure on one machine, job or image doesn't stop the rest of a pass. If the service itself fails, Compute Engine still stops every machine at its maximum run duration, leaving only its disks to pay for.
+A failure on one machine, job or disk doesn't stop the rest of a pass. If the service itself fails, Compute Engine still stops every machine at its maximum run duration, leaving only its disks to pay for.
 
-## Consumers
+## Forks and contributions
 
-A consumer is listed in `config/consumers.yaml`, reviewed like any other change here:
+A job from a pull request whose head is in another repository never runs on the service's machines, except for an approved contribution, below. The service makes no machine for any other such job, and if one takes a machine made for another job, the job-started check refuses it before its first step (specs/0002-machines.md). In a fork, or for a fork's pull request, the actions resolve every runner to its fallback, normally one of GitHub's, and read sources straight from upstream (specs/0005-actions.md). A fork's pull request runs there, at GitHub's expense, whatever needs nothing of ours.
 
-- its repository and its runner group, which is limited to that repository;
-- its namespace, a short name that prefixes its machines, disks and images, such as `app`;
-- the labels it may use, how many machines its jobs may have at once, and how many image builders;
-- the workflow allowed to request images, and where its image definitions are (specs/0003-images.md);
-- the accounts, its own, that the service may attach to its image builders, and only to those.
+**Approved contributions.** A consumer may also run a contributor's pull request on the service's machines, through a `pull_request_target` workflow whose jobs name the environment `contribution`. The environment's required reviewers are the consumer's maintainers, and each push to the pull request makes a new run that waits for approval again. The service accepts a job from such a run only if GitHub records an approval of the `contribution` environment for that run, and counts it against the consumer's separate limit for contributions. Every other check still applies.
 
-A consumer's own cloud resources, such as its buckets, caches and the identities its jobs sign in as, are the consumer's, defined in its own repository. A job signs in to them with GitHub's OIDC token through the consumer's workload identity federation, which decides what a token from a given repository, workflow, branch and event may do.
+A `pull_request_target` run runs the default branch's workflow file with the base repository's privileges, so its jobs' tokens name default-branch code even when a job runs the contributor's. So:
 
-## Forks
+- a job that runs the contributor's code checks out exactly `github.event.pull_request.head.sha`, the commit the approved run was made for, never the branch, without credentials, so the head repository must be readable without them: contributions come from public forks of public repositories (specs/0005-actions.md);
+- it has `permissions: {}`, no secrets and no `id-token`;
+- it saves work disks only in that pull request's own scope (specs/0003-disks.md);
+- nothing that trusts a token's `job_workflow_ref` may trust it for a `pull_request_target` run: the proxy doesn't, and a consumer's own workload identity federation must refuse those tokens by `event_name`. The service makes one narrow exception: the run binding accepts the consumer's bootstrap workflow, a reusable workflow that does nothing but run the `runners` action and that no job running a contributor's code is part of (specs/0002-machines.md);
+- a workflow on the default branch never restores from GitHub's Actions cache, which a `pull_request_target` job's runtime token can write to as if it were the default branch.
 
-A job from a pull request whose head is in another repository never runs on the service's machines: the service makes none for it, and if it takes a machine made for another job, the job-started check refuses it before its first step (specs/0002-machines.md). It's left queued, or fails with its machine. A consumer may later opt into fork machines, with their own limits.
-
-Forks run on GitHub's runners instead, through labels chosen by expression:
-
-```yaml
-runs-on: ${{ (github.event.pull_request.head.repo.full_name || github.repository) == github.repository && vars.RUNNER_LARGE_LINUX || 'ubuntu-24.04' }}
-```
-
-The organization sets `RUNNER_LARGE_LINUX` and its siblings. A fork's own pushes read the fork's variables instead, so a fork picks its own runners or gets GitHub's. The images API refuses runs from a fork's pull request whether or not GitHub gives them an OIDC token, which depends on a repository's settings and the event.
+Whether a contribution's results count as the pull request's required checks is the consumer's to arrange; a trusted final job can post each result as a commit status on the pull request's head commit.
