@@ -340,3 +340,18 @@ func TestATokenRefusalIsNotANotFound(t *testing.T) {
 		}
 	}
 }
+
+func TestInstallationFoundOnALaterPage(t *testing.T) {
+	emu := ghemu.New()
+	defer emu.Close()
+	app := emu.NewApp(77)
+	for i := range 150 {
+		emu.Install(app, emu.Org(int64(10+i), fmt.Sprintf("org%d", i)))
+	}
+	org := emu.Org(orgID, "lanescape")
+	emu.Install(app, org)
+	emu.Repo(org, 5001, "app")
+	if _, err := client(t, emu, app).RepositoryByID(context.Background(), 5001); err != nil {
+		t.Fatalf("installation past the first page: %v", err)
+	}
+}

@@ -1,6 +1,7 @@
 package github
 
 import (
+	"cmp"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -8,6 +9,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -108,17 +110,22 @@ func (e *Emulator) listInstallations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	e.mu.Lock()
-	var out []map[string]any
+	var ins []*Installation
 	for _, in := range e.installations {
 		if in.App == app {
-			out = append(out, map[string]any{
-				"id":                   in.ID,
-				"app_id":               app.ID,
-				"account":              accountJSON(in.Account),
-				"target_type":          in.Account.Type,
-				"repository_selection": "all",
-			})
+			ins = append(ins, in)
 		}
+	}
+	slices.SortFunc(ins, func(a, b *Installation) int { return cmp.Compare(a.ID, b.ID) })
+	out := []map[string]any{}
+	for _, in := range page(w, r, ins, e.URL) {
+		out = append(out, map[string]any{
+			"id":                   in.ID,
+			"app_id":               app.ID,
+			"account":              accountJSON(in.Account),
+			"target_type":          in.Account.Type,
+			"repository_selection": "all",
+		})
 	}
 	e.mu.Unlock()
 	writeJSON(w, http.StatusOK, out)
