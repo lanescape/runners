@@ -289,6 +289,11 @@ func TestPullRequestTarget(t *testing.T) {
 		// A job of the calling workflow has the caller's job_workflow_ref.
 		e.want(e.gh.PullRequestTargetRun(p), noJob, binding.Request{PullRequest: p.Number}, nil, scope.Read)
 	})
+	t.Run("a token without job_workflow_ref", func(t *testing.T) {
+		e := setup(t)
+		p := e.contribution()
+		e.want(e.gh.PullRequestTargetRun(p), noJob, binding.Request{PullRequest: p.Number}, map[string]any{"job_workflow_ref": nil, "job_workflow_sha": nil}, scope.Read)
+	})
 	t.Run("another reusable workflow", func(t *testing.T) {
 		e := setup(t)
 		p := e.contribution()
@@ -371,6 +376,25 @@ func TestPullRequestTarget(t *testing.T) {
 		e.want(e.gh.PullRequestTargetRun(p), ghemu.Job{WorkflowRef: evil}, binding.Request{PullRequest: p.Number}, nil, scope.Read)
 		// The default branch's own bootstrap still works.
 		e.want(e.gh.PullRequestTargetRun(p), boot(), binding.Request{PullRequest: p.Number}, nil, scope.PullRequest(p.Number))
+	})
+	t.Run("more commits than GitHub lists", func(t *testing.T) {
+		e := setup(t)
+		var shas []string
+		for i := range 260 {
+			shas = append(shas, e.fork.Commit("long", map[string]string{"n": fmt.Sprint(i)}))
+		}
+		p := e.gh.PullRequest(e.repo, "main", e.fork, "long", e.contributor)
+		e.want(e.gh.PullRequestTargetRun(p), boot(), binding.Request{PullRequest: p.Number}, nil, scope.PullRequest(p.Number))
+
+		// A run for the 255th commit, after which the pull request moved on.
+		older := e.gh.PullRequestTargetRun(p)
+		older.HeadSHA = shas[254]
+		e.want(older, boot(), binding.Request{PullRequest: p.Number}, nil, scope.PullRequest(p.Number))
+
+		// A run whose head is the base's, not the pull request's.
+		base := e.gh.PullRequestTargetRun(p)
+		base.HeadSHA = e.repo.Head("main")
+		e.want(base, boot(), binding.Request{PullRequest: p.Number}, nil, scope.Read)
 	})
 	t.Run("the head repository has been deleted", func(t *testing.T) {
 		e := setup(t)
@@ -481,7 +505,11 @@ func TestTransientFailuresLeaveNoBinding(t *testing.T) {
 			name: "pull_request_target",
 			run: func(e *env) (*ghemu.Run, ghemu.Job, binding.Request) {
 				p := e.contribution()
-				return e.gh.PullRequestTargetRun(p), boot(), binding.Request{PullRequest: p.Number}
+				run := e.gh.PullRequestTargetRun(p)
+				// The pull request moves on, so its commits are listed.
+				e.fork.Commit("feature", map[string]string{"more": "1"})
+				e.gh.Sync(p)
+				return run, boot(), binding.Request{PullRequest: p.Number}
 			},
 			calls: []string{"/repos/lanescape/app/git/ref/", "/repos/lanescape/app/contents/", "/repos/lanescape/app/pulls/1/commits", "/repos/lanescape/app/pulls"},
 		},
@@ -521,6 +549,8 @@ func TestTransientFailuresLeaveNoBinding(t *testing.T) {
 		e := setup(t)
 		p := e.contribution()
 		run := e.gh.PullRequestTargetRun(p)
+		e.fork.Commit("feature", map[string]string{"more": "1"})
+		e.gh.Sync(p)
 		e.gh.RateLimit("/repos/lanescape/app/pulls/1/commits", 1, time.Second)
 		if _, err := e.bind(run, boot(), binding.Request{PullRequest: p.Number}, nil); !errors.Is(err, binding.ErrRetry) {
 			t.Fatalf("error = %v, want ErrRetry", err)

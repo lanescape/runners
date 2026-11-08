@@ -98,7 +98,7 @@ func TestPullRequests(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := github.PullRequest{Number: p.Number, State: "open", BaseRepositoryID: 5001, HeadRepositoryID: 7001, HeadSHA: shas[2], Commits: 3}
+	want := github.PullRequest{Number: p.Number, State: "open", BaseRepositoryID: 5001, HeadRepositoryID: 7001, HeadSHA: shas[2], BaseSHA: e.repo.Head("main"), Commits: 3}
 	if got != want {
 		t.Fatalf("pull request = %+v, want %+v", got, want)
 	}
@@ -281,5 +281,46 @@ func TestWrongKeyIsRefused(t *testing.T) {
 	_, err := client(t, e.emu, impostor).RepositoryByID(context.Background(), 5001)
 	if !github.IsUnavailable(err) {
 		t.Fatalf("error = %v, want Unavailable", err)
+	}
+}
+
+func TestCallsWaitingForATokenKeepTheirDeadlines(t *testing.T) {
+	ctx := context.Background()
+	e := setup(t)
+	// Making the installation token hangs.
+	e.emu.Faults().Add(fault.Rule{PathPrefix: "/app/installations/", Delay: time.Minute})
+	first, cancelFirst := context.WithCancel(ctx)
+	defer cancelFirst()
+	go e.c.RepositoryByID(first, 5001)
+	time.Sleep(100 * time.Millisecond)
+
+	second, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := e.c.RepositoryByID(second, 5001); !github.IsUnavailable(err) {
+		t.Fatalf("error = %v, want Unavailable", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("a call waiting for another's token took %v, past its deadline", d)
+	}
+	cancelFirst()
+	e.emu.Faults().Reset()
+	if _, err := e.c.RepositoryByID(ctx, 5001); err != nil {
+		t.Fatalf("after the slow token: %v", err)
+	}
+}
+
+func TestTokensAreReused(t *testing.T) {
+	ctx := context.Background()
+	e := setup(t)
+	for range 3 {
+		if _, err := e.c.RepositoryByID(ctx, 5001); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Were a token made for each call, this would fail the next one.
+	e.emu.ServerError("/app/installations/", 500, 0)
+	if _, err := e.c.RepositoryByID(ctx, 5001); err != nil {
+		t.Fatalf("call with a cached token: %v", err)
 	}
 }

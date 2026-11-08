@@ -4,6 +4,8 @@
 package fault
 
 import (
+	"bytes"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -90,6 +92,13 @@ func (in *Injector) Wrap(next http.Handler) http.Handler {
 			return
 		}
 		if ru.Delay > 0 {
+			// Go's server notices a caller hanging up only once the body
+			// has been read, so read it first and hand it on.
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
 			t := time.NewTimer(ru.Delay)
 			select {
 			case <-t.C:

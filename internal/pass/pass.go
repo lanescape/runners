@@ -155,6 +155,11 @@ func (r *Runner) Run(ctx context.Context, body Body) error {
 	if lost {
 		return errors.Join(context.Cause(pctx), berr)
 	}
+	if err := dctx.Err(); err != nil {
+		// The pass was cut short, by its deadline or its caller, whatever
+		// the body made of it: it didn't finish.
+		return errors.Join(fmt.Errorf("pass stopped: %w", err), berr)
+	}
 	return berr
 }
 

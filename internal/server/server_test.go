@@ -106,7 +106,10 @@ func (l lockedWriter) Write(b []byte) (int, error) {
 	return l.w.Write(b)
 }
 
-func setup(t *testing.T) *env {
+func setup(t *testing.T) *env { return setupPass(t, 0) }
+
+// setupPass sets the passes' deadline; 0 is the spec's.
+func setupPass(t *testing.T, deadline time.Duration) *env {
 	t.Helper()
 	ctx := context.Background()
 	gh := ghemu.New()
@@ -152,7 +155,7 @@ func setup(t *testing.T) *env {
 		WebhookSecret:    secret,
 		Publisher:        pub,
 		ReconcileCallers: callers,
-		Passes:           &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log},
+		Passes:           &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log, Deadline: deadline},
 		Reconciler:       rec,
 		Actions:          actions,
 		Binder:           &binding.Binder{GitHub: client, Objects: objects, OrganizationID: orgID, Clock: clock, Logger: log},
@@ -411,4 +414,16 @@ func TestBind(t *testing.T) {
 		}
 	})
 	e.noSecrets(boot, contributor, tok)
+}
+
+func TestAPassCutShortIsRetried(t *testing.T) {
+	e := setupPass(t, 200*time.Millisecond)
+	e.rec.block = make(chan struct{}) // never closed: the pass runs to its deadline
+	code, body := e.post(server.ReconcilePath, e.gg.Token(pusher, audience), "{}")
+	if code != http.StatusServiceUnavailable || body["retryable"] != true {
+		t.Fatalf("pass cut short: %d %v, want a retryable 503", code, body)
+	}
+	if _, _, ok := e.gcs.Object("state", pass.LeaseName); ok {
+		t.Fatal("lease not released after the deadline")
+	}
 }

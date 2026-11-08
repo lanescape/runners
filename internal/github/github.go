@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
+	"time"
 
 	"github.com/bradleyfalzon/ghinstallation/v2"
 	gh "github.com/google/go-github/v93/github"
@@ -62,6 +62,7 @@ type PullRequest struct {
 	BaseRepositoryID int64
 	HeadRepositoryID int64
 	HeadSHA          string
+	BaseSHA          string
 	Commits          int
 }
 
@@ -115,7 +116,11 @@ func NewAppClient(o Options) (*Client, error) {
 	}
 	base := strings.TrimRight(o.BaseURL, "/")
 	apps.BaseURL = base
-	it := &installationTransport{apps: apps, base: base, orgID: o.OrganizationID}
+	appClient, err := newClient(&http.Client{Transport: apps}, base)
+	if err != nil {
+		return nil, err
+	}
+	it := &installationTransport{app: appClient.gh, base: tr, orgID: o.OrganizationID, sem: make(chan struct{}, 1)}
 	return newClient(&http.Client{Transport: it}, base)
 }
 
@@ -129,49 +134,78 @@ func newClient(hc *http.Client, base string) (*Client, error) {
 }
 
 // installationTransport finds the App's installation on the organization,
-// by the account's ID, then authenticates as it.
+// by the account's ID, and authenticates as it with an installation token
+// that it refreshes before it expires. Callers wait for a refresh only as
+// long as their own contexts allow, so a slow GitHub can't hold a call past
+// its deadline.
 type installationTransport struct {
-	apps  *ghinstallation.AppsTransport
-	base  string
+	app   *gh.Client
+	base  http.RoundTripper
 	orgID int64
 
-	mu    sync.Mutex
-	inner *ghinstallation.Transport
+	// sem guards the fields below; it's a channel so that waiting for it
+	// can give up with the caller's context.
+	sem            chan struct{}
+	installationID int64
+	token          string
+	expires        time.Time
 }
+
+// refreshBefore is how long before a token expires it's replaced.
+const refreshBefore = 5 * time.Minute
 
 func (t *installationTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	inner, err := t.installation(req.Context())
+	tok, err := t.currentToken(req.Context())
 	if err != nil {
 		return nil, err
 	}
-	return inner.RoundTrip(req)
+	r := req.Clone(req.Context())
+	r.Header.Set("Authorization", "token "+tok)
+	return t.base.RoundTrip(r)
 }
 
-func (t *installationTransport) installation(ctx context.Context) (*ghinstallation.Transport, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.inner != nil {
-		return t.inner, nil
+func (t *installationTransport) currentToken(ctx context.Context) (string, error) {
+	select {
+	case t.sem <- struct{}{}:
+	case <-ctx.Done():
+		return "", context.Cause(ctx)
 	}
-	c, err := newClient(&http.Client{Transport: t.apps}, t.base)
+	defer func() { <-t.sem }()
+	if t.token != "" && time.Until(t.expires) > refreshBefore {
+		return t.token, nil
+	}
+	if t.installationID == 0 {
+		id, err := t.find(ctx)
+		if err != nil {
+			return "", err
+		}
+		t.installationID = id
+	}
+	tok, _, err := t.app.Apps.CreateInstallationToken(ctx, t.installationID, nil)
 	if err != nil {
-		return nil, err
+		return "", fmt.Errorf("making an installation token: %w", err)
 	}
+	if tok.GetToken() == "" {
+		return "", errors.New("making an installation token: empty answer")
+	}
+	t.token, t.expires = tok.GetToken(), tok.GetExpiresAt().Time
+	return t.token, nil
+}
+
+func (t *installationTransport) find(ctx context.Context) (int64, error) {
 	opts := &gh.ListOptions{PerPage: 100}
 	for {
-		ins, resp, err := c.gh.Apps.ListInstallations(ctx, opts)
+		ins, resp, err := t.app.Apps.ListInstallations(ctx, opts)
 		if err != nil {
-			return nil, fmt.Errorf("listing the app's installations: %w", err)
+			return 0, fmt.Errorf("listing the app's installations: %w", err)
 		}
 		for _, in := range ins {
 			if in.GetAccount().GetID() == t.orgID {
-				t.inner = ghinstallation.NewFromAppsTransport(t.apps, in.GetID())
-				t.inner.BaseURL = t.base
-				return t.inner, nil
+				return in.GetID(), nil
 			}
 		}
 		if resp.NextPage == 0 {
-			return nil, fmt.Errorf("the app isn't installed on organization %d", t.orgID)
+			return 0, fmt.Errorf("the app isn't installed on organization %d", t.orgID)
 		}
 		opts.Page = resp.NextPage
 	}
@@ -236,6 +270,7 @@ func pullOf(p *gh.PullRequest) PullRequest {
 		BaseRepositoryID: p.GetBase().GetRepo().GetID(),
 		HeadRepositoryID: p.GetHead().GetRepo().GetID(),
 		HeadSHA:          p.GetHead().GetSHA(),
+		BaseSHA:          p.GetBase().GetSHA(),
 		Commits:          p.GetCommits(),
 	}
 }

@@ -398,6 +398,10 @@ type Job struct {
 	// workflow at the run's ref. A job of a reusable workflow has that
 	// workflow's.
 	WorkflowRef string
+	// WorkflowSHA is the job_workflow_sha of a reusable workflow's job; by
+	// default the run's commit, as for a workflow in the same repository
+	// at the run's ref.
+	WorkflowSHA string
 	Audience    string
 	Environment string
 }
@@ -408,9 +412,12 @@ func (e *Emulator) ActionsClaims(r *Run, j Job) map[string]any {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	workflowRef := r.Repo.FullName() + "/" + r.Path + "@" + r.Ref
-	jobRef := j.WorkflowRef
+	jobRef, jobSHA := j.WorkflowRef, j.WorkflowSHA
 	if jobRef == "" {
 		jobRef = workflowRef
+	}
+	if jobSHA == "" {
+		jobSHA = r.SHA
 	}
 	aud := j.Audience
 	if aud == "" {
@@ -446,7 +453,7 @@ func (e *Emulator) ActionsClaims(r *Run, j Job) map[string]any {
 		"workflow_ref":          workflowRef,
 		"workflow_sha":          r.SHA,
 		"job_workflow_ref":      jobRef,
-		"job_workflow_sha":      r.SHA,
+		"job_workflow_sha":      jobSHA,
 		"event_name":            r.Event,
 		"ref_type":              r.RefType,
 		"ref_protected":         "false",

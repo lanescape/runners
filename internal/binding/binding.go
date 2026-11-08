@@ -320,12 +320,45 @@ func (b *Binder) pullRequestTarget(ctx context.Context, c *auth.ActionsClaims, r
 	if pr.HeadRepositoryID == 0 || pr.HeadRepositoryID != run.HeadRepositoryID {
 		return scope.Read, "the pull request's head repository isn't the run's", nil
 	}
-	commits, err := b.GitHub.PullRequestCommits(ctx, repo, req.PullRequest)
+	ok, err := b.isPullCommit(ctx, repo, pr, run.HeadSHA)
 	if err != nil {
-		return scope.Read, "listing the pull request's commits", err
+		return scope.Read, "checking the pull request's commits", err
 	}
-	if !slices.Contains(commits, run.HeadSHA) {
+	if !ok {
 		return scope.Read, "the run's head commit isn't one of the pull request's", nil
 	}
 	return scope.PullRequest(req.PullRequest), "pull_request_target run, named by the bootstrap workflow", nil
+}
+
+// isPullCommit reports whether sha is one of a pull request's commits: its
+// head, one GitHub lists, or, past the 250 GitHub lists, one that its head
+// descends from and its base doesn't.
+func (b *Binder) isPullCommit(ctx context.Context, repo github.Repository, pr github.PullRequest, sha string) (bool, error) {
+	if sha == "" {
+		return false, nil
+	}
+	if sha == pr.HeadSHA {
+		return true, nil
+	}
+	commits, err := b.GitHub.PullRequestCommits(ctx, repo, pr.Number)
+	if err != nil {
+		return false, err
+	}
+	if slices.Contains(commits, sha) {
+		return true, nil
+	}
+	if len(commits) >= pr.Commits || pr.BaseSHA == "" {
+		return false, nil
+	}
+	// The head descends from sha if sha is behind it or the same.
+	toHead, err := b.GitHub.Compare(ctx, repo, pr.HeadSHA, sha)
+	if err != nil || (toHead != "behind" && toHead != "identical") {
+		return false, err
+	}
+	// The base doesn't contain sha if sha is ahead of it or diverged.
+	fromBase, err := b.GitHub.Compare(ctx, repo, pr.BaseSHA, sha)
+	if err != nil {
+		return false, err
+	}
+	return fromBase == "ahead" || fromBase == "diverged", nil
 }

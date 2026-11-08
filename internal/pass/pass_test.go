@@ -236,3 +236,21 @@ func TestWithinIsCappedByTheDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestPassPastItsDeadlineFailsWhateverItsBodySays(t *testing.T) {
+	e := setup(t)
+	result := make(chan error, 1)
+	go func() {
+		result <- e.runner.Run(context.Background(), func(p *pass.Pass) error {
+			<-p.Context().Done()
+			return nil
+		})
+	}()
+	if err := e.clock.BlockUntilContext(context.Background(), 2); err != nil {
+		t.Fatal(err)
+	}
+	e.clock.Advance(pass.Deadline)
+	if err := <-result; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("pass cut short by its deadline returned %v, want a deadline error", err)
+	}
+}
