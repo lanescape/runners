@@ -18,7 +18,7 @@ A selector's `-disk-<family>-<key>` asks for a work disk made from a saved one. 
 
 Families are kept apart by architecture: a family's disks saved from `amd64` machines are never restored on `arm64` ones, or the other way round. The newest disk of a family is how a job whose key has changed, such as a pull request that moves a dependency, still starts from the state nearest to its own and rebuilds only what changed; a consumer's job must check what it restored and rebuild what's out of date, since a key miss restores older state. Every job of a run that uses the same selector starts from the same choice: the service picks once per run and selector, the first time it admits a job with it, and records the exact image version in the bucket. Picking and recording a choice, and marking an image for deletion, each happen under a short lease of their own in the bucket, apart from the pass's, held only for that step, so no image is chosen as it's being marked, nor marked once chosen. An image is deleted only after it's marked, and an image marked for deletion is never chosen. Labels on images and records hold hashes of selectors, families and job names wherever a value could be longer or freer than a Compute Engine label allows; the bucket holds the values themselves.
 
-A job asks to save its work disk with the `save` action (specs/0005-actions.md). When the job has finished, the service saves it only if:
+A job asks to save its work disk, through the `save` action (specs/0005-interface.md). When the job has finished, the service saves it only if:
 
 - the job succeeded, by GitHub's conclusion for it;
 - the run's scope saves: main's for a push to the default branch, a pull request's for that pull request's runs, never `read`;

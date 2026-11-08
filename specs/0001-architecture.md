@@ -12,7 +12,7 @@ The code is public under the MIT License, so anyone may read or copy it. Only th
 2. **Every check is by ID.** The organization's ID is in the service's configuration; a repository is a consumer if its owner ID is that, whatever its name. Every endpoint checks the owner ID GitHub reports, so a renamed or look-alike organization never matches.
 3. **Runners register only in the organization's runner groups,** one per repository, made by the service (below).
 4. **Machines, saved disks and images are private to the project.** Compute Engine images are visible only within their project unless shared, and the service never shares one. The service's buckets enforce public access prevention, and the proxy serves only callers it has authenticated (specs/0006-proxy.md). Nothing the service stores can be read from outside the organization, so no one else's reads cost it anything.
-5. **Forks get nothing of the service's** (below), and the actions do nothing of the service's outside the organization (specs/0005-actions.md). Anyone can reference a public action; it falls back to GitHub's runners and plain reads from upstream, and the service and the proxy refuse it anyway.
+5. **Forks get nothing of the service's** (below), and the actions in `lanescape/actions` do nothing of the service's outside the organization. Anyone can reference a public action; it falls back to GitHub's runners and plain reads from upstream, and the service and the proxy refuse it anyway.
 
 A consumer's own buckets and identities are the consumer's to keep private: public access prevention on, and no sign-in for a fork's job or for a `pull_request_target` run.
 
@@ -61,13 +61,13 @@ A failure on one machine, job or disk doesn't stop the rest of a pass. If the se
 
 ## Forks and contributions
 
-A job from a pull request whose head is in another repository never runs on the service's machines, except for an approved contribution, below. The service makes no machine for any other such job, and if one takes a machine made for another job, the job-started check refuses it before its first step (specs/0002-machines.md). In a fork, or for a fork's pull request, the actions resolve every runner to its fallback, normally one of GitHub's, and read sources straight from upstream (specs/0005-actions.md). A fork's pull request runs there, at GitHub's expense, whatever needs nothing of ours.
+A job from a pull request whose head is in another repository never runs on the service's machines, except for an approved contribution, below. The service makes no machine for any other such job, and if one takes a machine made for another job, the job-started check refuses it before its first step (specs/0002-machines.md). In a fork, or for a fork's pull request, the actions resolve every runner to its fallback, normally one of GitHub's, and read sources straight from upstream. A fork's pull request runs there, at GitHub's expense, whatever needs nothing of ours.
 
 **Approved contributions.** A consumer may also run a contributor's pull request on the service's machines, through a `pull_request_target` workflow whose jobs name the environment `contribution`. The environment's required reviewers are the consumer's maintainers, and each push to the pull request makes a new run that waits for approval again. The service accepts a job from such a run only if GitHub records an approval of the `contribution` environment for that run, and counts it against the consumer's separate limit for contributions. Every other check still applies.
 
 A `pull_request_target` run runs the default branch's workflow file with the base repository's privileges, so its jobs' tokens name default-branch code even when a job runs the contributor's. So:
 
-- a job that runs the contributor's code checks out exactly `github.event.pull_request.head.sha`, the commit the approved run was made for, never the branch, without credentials, so the head repository must be readable without them: contributions come from public forks of public repositories (specs/0005-actions.md);
+- a job that runs the contributor's code checks out exactly `github.event.pull_request.head.sha`, the commit the approved run was made for, never the branch, without credentials, so the head repository must be readable without them: contributions come from public forks of public repositories;
 - it has `permissions: {}`, no secrets and no `id-token`;
 - it saves work disks only in that pull request's own scope (specs/0003-disks.md);
 - nothing that trusts a token's `job_workflow_ref` may trust it for a `pull_request_target` run: the proxy doesn't, and a consumer's own workload identity federation must refuse those tokens by `event_name`. The service makes one narrow exception: the run binding accepts the consumer's bootstrap workflow, a reusable workflow that does nothing but run the `runners` action and that no job running a contributor's code is part of (specs/0002-machines.md);

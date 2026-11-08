@@ -6,7 +6,6 @@ Go, at the latest stable release, pinned by `go.mod`'s `toolchain` line, using G
 
 - `cmd/runners/`: the service.
 - `cmd/proxy/`, `cmd/proxy-git/` and `cmd/forwarder/`: the proxy's HTTP service, its git server and the local forwarder (specs/0006-proxy.md).
-- `actions/<name>/`: each action's `action.yml` and its program (specs/0005-actions.md).
 - `internal/`: the reconciler, and the clients for GitHub, Compute Engine, Cloud Storage and Pub/Sub, behind interfaces the emulators also serve.
 - `emulators/`: the emulators (below).
 - `config/`: the organization's ID, shapes, limits and the runner version.
@@ -26,14 +25,14 @@ Tests run against emulators this repository builds and maintains itself, in Go, 
 - **Pub/Sub and the scheduler:** signed pushes, redelivery and duplicates.
 - **Upstreams for the proxy:** HTTP servers whose responses carry every caching header the proxy honours, that change content, go down and send truncated bodies, and git servers.
 
-Every behaviour in these specs has a test. End-to-end tests run the real service, proxy and actions against the emulators together: a pull request's run through to its saves, a job handed to the wrong machine, a Spot machine preempted mid-job and its run resumed, a fork's job refused, an approved contribution accepted. The actions' tests run natively on Blacksmith's Linux amd64, Linux arm64 and macOS arm64 machines, since paths, shells, signals and file locking differ between them; CI builds every program for every platform it targets. `terraform validate` and `terraform fmt -check` run on every change to `infra/` and `bootstrap/`.
+Every behaviour in these specs has a test. End-to-end tests run the real service and proxy against the emulators together, with a client that speaks the interface for actions (specs/0005-interface.md) as the actions do: a pull request's run through to its saves, a job handed to the wrong machine, a Spot machine preempted mid-job and its run resumed, a fork's job refused, an approved contribution accepted. Those interface tests are the service's promise to the actions: a change that breaks one breaks `/v1/`. The actions themselves are tested in `lanescape/actions`, against this repository's service and emulators at the version they name. The forwarder is tested natively on Blacksmith's Linux amd64, Linux arm64 and macOS arm64 machines, and CI builds it for every platform runners use. `terraform validate` and `terraform fmt -check` run on every change to `infra/` and `bootstrap/`.
 
 ## CI and CD
 
 Workflows here run on Blacksmith, never on this service's own machines, so a broken deploy can always be fixed by the next one. A pull request from a fork runs on GitHub's runners instead; it needs no credentials, since nothing in CI does.
 
 - **`ci.yml`, on pull requests:** `go vet`, `gofmt`, the tests, and the Terraform checks.
-- **`cd.yml`, on pushes to main:** the same, then it builds the service's and the proxy's images with `ko`, pushes them to Artifact Registry, and asks Infrastructure Manager to apply `infra/` at that commit, with the images' digests as inputs. One apply changes the infrastructure and deploys both together. A deploy that changes the base images' key leads the service to make new ones (specs/0003-disks.md). Last, once everything has deployed, it moves the `v1` tag to the commit (specs/0005-actions.md). The job prints the apply's preview and result, and fails if anything does.
+- **`cd.yml`, on pushes to main:** the same, then it builds the service's and the proxy's images with `ko`, pushes them to Artifact Registry, and asks Infrastructure Manager to apply `infra/` at that commit, with the images' digests as inputs. One apply changes the infrastructure and deploys both together. A deploy that changes the base images' key leads the service to make new ones (specs/0003-disks.md). The job prints the apply's preview and result, and fails if anything does.
 
 CD signs in with GitHub's token through the workload identity pool `lanescape-runners-github`, whose provider accepts only a push to main from `cd.yml` in this repository. That identity, `lanescape-runners-deployer`, can push to the service's Artifact Registry repository and start applies of the `lanescape-runners` Infrastructure Manager deployment, and nothing else. The apply runs inside Google Cloud as `lanescape-runners-infra`.
 
@@ -48,4 +47,4 @@ Whoever merges to main deploys. No agent reviews, approves or merges a pull requ
 
 ## Bootstrap
 
-`bootstrap/` makes what `infra/` can't make for itself: the APIs, the Terraform state bucket, the Artifact Registry repository, every service account (the service's, the machines', the proxy's, the git machine's, the scheduler's, the deployer's and the infra identity), the service's custom roles and every project-level grant, the log sink for Compute Engine's events about the service's machines, the CD pool, the release App's key in Secret Manager with only the deployer able to read it, and the tag ruleset that lets only the release App create, move or delete `v*` tags. A maintainer applies it by hand, with their own credentials, and again whenever it changes. Its own state is kept in the same state bucket.
+`bootstrap/` makes what `infra/` can't make for itself: the APIs, the Terraform state bucket, the Artifact Registry repository, every service account (the service's, the machines', the proxy's, the git machine's, the scheduler's, the deployer's and the infra identity), the service's custom roles and every project-level grant, the log sink for Compute Engine's events about the service's machines, and the CD pool. A maintainer applies it by hand, with their own credentials, and again whenever it changes. Its own state is kept in the same state bucket.
