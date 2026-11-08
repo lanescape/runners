@@ -447,3 +447,25 @@ func TestAFirstMachineThatCantBeConfirmed(t *testing.T) {
 		t.Fatal("the first machine went before its record was confirmed")
 	}
 }
+
+func TestTheAgeLimitWinsOverConfirmation(t *testing.T) {
+	e := setup(t)
+	e.queue(e.mainRun(), sel2)
+	writes := 0
+	e.gcs.Faults().Add(fault.Rule{Method: http.MethodPost,
+		Match: func(r *http.Request) bool {
+			if !strings.Contains(r.URL.RawQuery, "jobs") {
+				return false
+			}
+			writes++
+			return writes >= 2
+		},
+		Respond: gcsemu.JSONError(http.StatusForbidden, "forbidden", "Forbidden")})
+	e.pass()
+	m := e.one()
+	e.clock.Advance(machines.MaxAge)
+	e.pass()
+	if e.exists(m.Name) {
+		t.Fatal("a machine past its age limit was kept for its job's record")
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/lanescape/runners/internal/compute"
@@ -61,7 +62,12 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 	case admitted && !a.Allowed:
 		if inv.unrecorded(m.Name) {
 			// Its admission is the only record that its run must be
-			// cancelled; the stopped machine waits for the refusal.
+			// cancelled: the machine waits for the refusal, stopped.
+			if !m.Stopped() {
+				if err := s.Compute.StopInstance(ctx, m.Zone, m.Name, compute.RequestID("stop", m.Name, strconv.FormatInt(s.now().Unix(), 10))); err != nil {
+					s.log().Error("stopping a refused machine", "machine", m.Name, "err", err.Error())
+				}
+			}
 			return
 		}
 		s.finish(ctx, inv, m, "its job was refused", nil)
@@ -166,11 +172,15 @@ func (s *Service) finish(ctx context.Context, inv *inventory, m Machine, why str
 	if r, ok := inv.jobRecords[key]; ok && r.v.Tentative && r.v.Machine == m.Name {
 		r.v.Tentative = false
 		gen, err := replaceJSON(ctx, s.Objects, key, r.v, r.gen)
-		if err != nil {
+		switch {
+		case err == nil:
+			inv.jobRecords[key] = record[JobRecord]{r.v, gen}
+		case s.now().Sub(m.CreatedAt) < MaxAge:
 			log.Warn("confirming a job's first machine; the machine waits for it", "err", err.Error())
 			return
+		default:
+			log.Warn("confirming a job's first machine; the machine is past its age limit and goes without it", "err", err.Error())
 		}
-		inv.jobRecords[key] = record[JobRecord]{r.v, gen}
 	}
 	if err := s.Compute.DeleteInstance(ctx, m.Zone, m.Name, compute.RequestID("delete", m.Name)); err != nil && !errors.Is(err, compute.ErrNotFound) {
 		log.Error("deleting a machine", "err", err.Error())

@@ -647,3 +647,29 @@ func TestARefusedAttemptDoesntCancelARerun(t *testing.T) {
 		t.Fatalf("refusal = %v; the earlier attempt is over", rec)
 	}
 }
+
+func TestARefusedMachineThatWontStop(t *testing.T) {
+	e := setup(t)
+	main := e.mainRun()
+	meant := e.queue(main, sel2)
+	e.pass()
+	fork := e.forkPull()
+	stray := e.queue(fork, sel2)
+	e.gh.CompleteJob(meant, "success")
+	// Neither the stop nor the refusal's record gets through.
+	e.gce.ServerError(http.MethodPost, "/stop", http.StatusInternalServerError, 0)
+	e.gcs.Faults().Add(fault.Rule{Method: http.MethodPost,
+		Match:   func(r *http.Request) bool { return strings.Contains(r.URL.RawQuery, "refusals") },
+		Respond: gcsemu.JSONError(http.StatusForbidden, "forbidden", "Forbidden")})
+	m := e.boot(e.one())
+	m.taken(stray)
+	if code := m.started(fork.ID); code != http.StatusForbidden {
+		t.Fatalf("job-started check: %d, want 403", code)
+	}
+	// Compute Engine recovers; storage doesn't.
+	e.gce.Faults().Reset()
+	e.pass()
+	if in, _ := e.gce.Instance(m.in.Zone, m.in.Name); in.Status != "TERMINATED" {
+		t.Fatalf("a refused machine is %s once Compute Engine is back", in.Status)
+	}
+}
