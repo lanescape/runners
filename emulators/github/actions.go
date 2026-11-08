@@ -267,6 +267,17 @@ func (e *Emulator) settle(r *Run) {
 	r.Status, r.Conclusion = "completed", conclusion
 }
 
+// SetGroupRepositories changes which repositories may use a runner group,
+// as an organization owner can.
+func (e *Emulator) SetGroupRepositories(groupID int64, ids []int64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if g := e.groups[groupID]; g != nil {
+		g.Repositories = slices.Clone(ids)
+	}
+	e.notify()
+}
+
 // HideAssignment makes the next n reads of a job that's been assigned a
 // runner show it without one, as GitHub can for a moment after handing it
 // out.

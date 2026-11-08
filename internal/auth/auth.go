@@ -1,7 +1,8 @@
 // Package auth authenticates the service's callers (specs/0001-architecture.md,
 // Endpoints): GitHub's webhook deliveries by their HMAC signature, Google's
-// signed calls from the scheduler and push subscriptions, and GitHub Actions
-// jobs by their OIDC tokens.
+// signed calls from the scheduler and push subscriptions, GitHub Actions
+// jobs by their OIDC tokens, and the service's machines by their Compute
+// Engine identity tokens.
 //
 // Errors say why a caller was refused, never with the token itself.
 package auth
@@ -247,4 +248,70 @@ func (a *Actions) Verify(ctx context.Context, raw string) (*ActionsClaims, error
 		return nil, fmt.Errorf("%w: event_name, ref and repository are required", ErrUnauthenticated)
 	}
 	return out, nil
+}
+
+// MachineClaims identify a machine, from its Compute Engine identity token
+// in the full format.
+type MachineClaims struct {
+	Email        string
+	ProjectID    string
+	Zone         string
+	InstanceID   uint64
+	InstanceName string
+}
+
+// Machines verifies the identity tokens of the service's machines: signed
+// by Google, for the service, in the full format, whose account is the
+// machines' and whose project is the service's. Which machine it is, the
+// caller checks against Compute Engine.
+type Machines struct {
+	v                *oidc.IDTokenVerifier
+	project, account string
+}
+
+// NewMachines returns a verifier of project's machines' tokens, issued for
+// account.
+func NewMachines(o Options, project, account string) (*Machines, error) {
+	if project == "" || account == "" {
+		return nil, errors.New("auth: the machines' project and account are required")
+	}
+	v, err := o.verifier()
+	if err != nil {
+		return nil, err
+	}
+	return &Machines{v: v, project: project, account: account}, nil
+}
+
+// Verify checks a machine's token.
+func (m *Machines) Verify(ctx context.Context, raw string) (*MachineClaims, error) {
+	var c struct {
+		Email         string `json:"email"`
+		EmailVerified *bool  `json:"email_verified"`
+		Google        *struct {
+			ComputeEngine *struct {
+				ProjectID    string `json:"project_id"`
+				Zone         string `json:"zone"`
+				InstanceID   string `json:"instance_id"`
+				InstanceName string `json:"instance_name"`
+			} `json:"compute_engine"`
+		} `json:"google"`
+	}
+	if err := verify(ctx, m.v, raw, &c); err != nil {
+		return nil, err
+	}
+	if c.Google == nil || c.Google.ComputeEngine == nil {
+		return nil, fmt.Errorf("%w: not a Compute Engine identity token in the full format", ErrUnauthenticated)
+	}
+	ce := c.Google.ComputeEngine
+	if c.EmailVerified == nil || !*c.EmailVerified || c.Email != m.account {
+		return nil, fmt.Errorf("%w: the token's account isn't the machines'", ErrForbidden)
+	}
+	if ce.ProjectID != m.project {
+		return nil, fmt.Errorf("%w: the token's project isn't the service's", ErrForbidden)
+	}
+	n, err := strconv.ParseUint(ce.InstanceID, 10, 64)
+	if err != nil || n == 0 || strconv.FormatUint(n, 10) != ce.InstanceID || ce.Zone == "" || ce.InstanceName == "" {
+		return nil, fmt.Errorf("%w: the token names no instance", ErrUnauthenticated)
+	}
+	return &MachineClaims{Email: c.Email, ProjectID: ce.ProjectID, Zone: ce.Zone, InstanceID: n, InstanceName: ce.InstanceName}, nil
 }

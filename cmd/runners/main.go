@@ -5,6 +5,7 @@
 //
 //	PORT                         where to listen; Cloud Run sets it
 //	RUNNERS_AUDIENCE             the audience callers' tokens must name: the service's URL
+//	RUNNERS_PROJECT              the project the service's machines are in
 //	RUNNERS_BUCKET               the service's state bucket
 //	RUNNERS_GITHUB_APP_ID        the GitHub App's ID
 //	RUNNERS_GITHUB_APP_KEY_FILE  the App's private key, mounted from Secret Manager
@@ -12,7 +13,8 @@
 //	RUNNERS_RECONCILE_ACCOUNTS   the scheduler's and push subscriptions' accounts, comma-separated
 //
 // The issuers it trusts are Google's and GitHub's own, and aren't
-// configurable.
+// configurable. It refuses to start unless the organization requires
+// approval for every outside contributor's fork workflows.
 package main
 
 import (
@@ -33,8 +35,10 @@ import (
 	"github.com/lanescape/runners/config"
 	"github.com/lanescape/runners/internal/auth"
 	"github.com/lanescape/runners/internal/binding"
+	"github.com/lanescape/runners/internal/compute"
 	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/lease"
+	"github.com/lanescape/runners/internal/machines"
 	"github.com/lanescape/runners/internal/pass"
 	"github.com/lanescape/runners/internal/server"
 	"github.com/lanescape/runners/internal/store"
@@ -57,6 +61,7 @@ func main() {
 type settings struct {
 	Port              string
 	Audience          string
+	Project           string
 	Bucket            string
 	AppID             int64
 	AppKeyFile        string
@@ -68,6 +73,7 @@ func loadSettings(getenv func(string) string) (settings, error) {
 	s := settings{
 		Port:              getenv("PORT"),
 		Audience:          getenv("RUNNERS_AUDIENCE"),
+		Project:           getenv("RUNNERS_PROJECT"),
 		Bucket:            getenv("RUNNERS_BUCKET"),
 		AppKeyFile:        getenv("RUNNERS_GITHUB_APP_KEY_FILE"),
 		WebhookSecretFile: getenv("RUNNERS_WEBHOOK_SECRET_FILE"),
@@ -78,6 +84,7 @@ func loadSettings(getenv func(string) string) (settings, error) {
 	var errs []error
 	for name, v := range map[string]string{
 		"RUNNERS_AUDIENCE":            s.Audience,
+		"RUNNERS_PROJECT":             s.Project,
 		"RUNNERS_BUCKET":              s.Bucket,
 		"RUNNERS_GITHUB_APP_KEY_FILE": s.AppKeyFile,
 		"RUNNERS_WEBHOOK_SECRET_FILE": s.WebhookSecretFile,
@@ -154,7 +161,25 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 	if err != nil {
 		return err
 	}
+	account := machines.MachineAccountOf(s.Project)
+	machineTokens, err := auth.NewMachines(auth.Options{Issuer: auth.GoogleIssuer, Audience: s.Audience}, s.Project, account)
+	if err != nil {
+		return err
+	}
+	gce, err := compute.New(ctx, s.Project)
+	if err != nil {
+		return err
+	}
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	err = machines.CheckForkApproval(cctx, gh)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("refusing to run: %w", err)
+	}
 	clock := clockwork.NewRealClock()
+	binder := &binding.Binder{GitHub: gh, Objects: objects, OrganizationID: cfg.Organization.ID, Clock: clock, Logger: log}
+	svc := &machines.Service{Config: cfg, Project: s.Project, ServiceURL: s.Audience, MachineAccount: account,
+		GitHub: gh, Compute: gce, Objects: objects, Binder: binder, Machines: machineTokens, Clock: clock, Logger: log}
 	h, err := server.New(server.Config{
 		Logger:           log,
 		OrganizationID:   cfg.Organization.ID,
@@ -162,9 +187,11 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 		Publisher:        noPublisher{},
 		ReconcileCallers: callers,
 		Passes:           &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log},
-		Reconciler:       noReconciler{},
+		Reconciler:       svc,
 		Actions:          actions,
-		Binder:           &binding.Binder{GitHub: gh, Objects: objects, OrganizationID: cfg.Organization.ID, Clock: clock, Logger: log},
+		Binder:           binder,
+		JobStarted:       svc.JobStarted(),
+		JobFinished:      svc.JobFinished(),
 	})
 	if err != nil {
 		return err
@@ -197,9 +224,3 @@ type noPublisher struct{}
 func (noPublisher) Publish(context.Context, server.Delivery) error {
 	return errors.New("publishing to Pub/Sub isn't built yet")
 }
-
-// noReconciler stands in until passes do anything: each takes and releases
-// the lease, and changes nothing.
-type noReconciler struct{}
-
-func (noReconciler) Pass(*pass.Pass) error { return nil }

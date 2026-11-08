@@ -13,6 +13,7 @@ func env(m map[string]string) func(string) string {
 func good() map[string]string {
 	return map[string]string{
 		"RUNNERS_AUDIENCE":            "https://runners.example.test",
+		"RUNNERS_PROJECT":             "lanescape-dev",
 		"RUNNERS_BUCKET":              "lanescape-runners",
 		"RUNNERS_GITHUB_APP_ID":       "12345",
 		"RUNNERS_GITHUB_APP_KEY_FILE": "/secrets/app-key",
@@ -37,6 +38,7 @@ func TestBadSettings(t *testing.T) {
 		"no audience":     {"RUNNERS_AUDIENCE", "", "RUNNERS_AUDIENCE is required"},
 		"http audience":   {"RUNNERS_AUDIENCE", "http://runners", "https URL"},
 		"no bucket":       {"RUNNERS_BUCKET", "", "RUNNERS_BUCKET is required"},
+		"no project":      {"RUNNERS_PROJECT", "", "RUNNERS_PROJECT is required"},
 		"app by name":     {"RUNNERS_GITHUB_APP_ID", "lanescape-runners", "numeric ID"},
 		"no accounts":     {"RUNNERS_RECONCILE_ACCOUNTS", " , ", "RUNNERS_RECONCILE_ACCOUNTS is required"},
 		"a person":        {"RUNNERS_RECONCILE_ACCOUNTS", "someone@example.com", "isn't a service account"},
