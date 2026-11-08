@@ -2,10 +2,11 @@ package machines
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"slices"
-	"strconv"
 	"strings"
 
 	"github.com/lanescape/runners/internal/compute"
@@ -60,14 +61,15 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 	case reported:
 		s.finish(ctx, inv, m, "its supervisor reported", &rep)
 	case admitted && !a.Allowed:
+		// A refused machine is stopped first, whatever else it waits for.
+		if !m.Stopped() {
+			if err := s.Compute.StopInstance(ctx, m.Zone, m.Name, s.requestID("stop", m.Name)); err != nil {
+				s.log().Error("stopping a refused machine", "machine", m.Name, "err", err.Error())
+			}
+		}
 		if inv.unrecorded(m.Name) {
 			// Its admission is the only record that its run must be
-			// cancelled: the machine waits for the refusal, stopped.
-			if !m.Stopped() {
-				if err := s.Compute.StopInstance(ctx, m.Zone, m.Name, compute.RequestID("stop", m.Name, strconv.FormatInt(s.now().Unix(), 10))); err != nil {
-					s.log().Error("stopping a refused machine", "machine", m.Name, "err", err.Error())
-				}
-			}
+			// cancelled: the machine waits for the refusal.
 			return
 		}
 		s.finish(ctx, inv, m, "its job was refused", nil)
@@ -95,6 +97,16 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 			s.finish(ctx, inv, m, "it hasn't picked up a job after "+IdleLimit.String(), nil)
 		}
 	}
+}
+
+// requestID is a request ID for a change a pass makes, new each time it's
+// tried: Compute Engine answers an ID it has seen with its first outcome,
+// and a deletion or stop is safe to ask for again. Within one call, a
+// retry with no answer keeps the ID.
+func (s *Service) requestID(parts ...string) string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return compute.RequestID(append(parts, hex.EncodeToString(b[:]))...)
 }
 
 // retire claims an unadmitted machine for cleanup through its admission
@@ -182,14 +194,14 @@ func (s *Service) finish(ctx context.Context, inv *inventory, m Machine, why str
 			log.Warn("confirming a job's first machine; the machine is past its age limit and goes without it", "err", err.Error())
 		}
 	}
-	if err := s.Compute.DeleteInstance(ctx, m.Zone, m.Name, compute.RequestID("delete", m.Name)); err != nil && !errors.Is(err, compute.ErrNotFound) {
+	if err := s.Compute.DeleteInstance(ctx, m.Zone, m.Name, s.requestID("delete", m.Name)); err != nil && !errors.Is(err, compute.ErrNotFound) {
 		log.Error("deleting a machine", "err", err.Error())
 		return
 	}
 	inv.deleted[m.Name] = true
 	// Its work disk goes with it; one that's somehow left is deleted here.
 	disk := WorkDisk(m.Name)
-	if err := s.Compute.DeleteDisk(ctx, m.Zone, disk, compute.RequestID("delete", disk)); err != nil &&
+	if err := s.Compute.DeleteDisk(ctx, m.Zone, disk, s.requestID("delete", disk)); err != nil &&
 		!errors.Is(err, compute.ErrNotFound) {
 		log.Warn("deleting a work disk", "disk", disk, "err", err.Error())
 	}
@@ -265,7 +277,7 @@ func (s *Service) tidyDisks(ctx context.Context, inv *inventory) {
 		if recorded && (r.v.State == DiskMaking || r.v.State == DiskMade) && !inv.gone(r.v.Machine) {
 			continue
 		}
-		err := s.Compute.DeleteDisk(ctx, d.Zone, d.Name, compute.RequestID("delete", d.Name))
+		err := s.Compute.DeleteDisk(ctx, d.Zone, d.Name, s.requestID("delete", d.Name))
 		if errors.Is(err, compute.ErrInUse) {
 			// Attached since it was listed.
 			continue

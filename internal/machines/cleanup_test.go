@@ -469,3 +469,45 @@ func TestTheAgeLimitWinsOverConfirmation(t *testing.T) {
 		t.Fatal("a machine past its age limit was kept for its job's record")
 	}
 }
+
+func TestTheAgeLimitKeepsTheJobsHour(t *testing.T) {
+	e := setup(t)
+	e.queue(e.mainRun(), sel2)
+	writes := 0
+	rule := fault.Rule{Method: http.MethodPost,
+		Match: func(r *http.Request) bool {
+			if !strings.Contains(r.URL.RawQuery, "jobs") {
+				return false
+			}
+			writes++
+			return writes >= 2
+		},
+		Respond: gcsemu.JSONError(http.StatusForbidden, "forbidden", "Forbidden")}
+	e.gcs.Faults().Add(rule)
+	e.pass()
+	e.clock.Advance(machines.MaxAge)
+	e.pass()
+	e.wantMachines(0)
+	// Storage recovers; the job is still queued, and its first machine was
+	// made five hours ago.
+	e.gcs.Faults().Reset()
+	e.pass()
+	e.wantMachines(0)
+}
+
+func TestADeletionThatFailedIsAskedForAgain(t *testing.T) {
+	e := setup(t)
+	m, _ := e.admitted(sel2)
+	m.release(true)
+	m.finished()
+	m.report(false)
+	e.gce.FailNextOperation("instances.delete", "RESOURCE_NOT_READY")
+	e.pass()
+	if !e.exists(m.in.Name) {
+		t.Fatal("the failed deletion deleted it")
+	}
+	e.pass()
+	if e.exists(m.in.Name) {
+		t.Fatal("a deletion whose operation failed wasn't asked for again")
+	}
+}

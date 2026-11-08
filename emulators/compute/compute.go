@@ -59,6 +59,7 @@ type Emulator struct {
 	stockouts map[capacityKey]bool
 	refusing  map[capacityKey]bool
 	diskShort map[string]bool
+	failNext  map[string]string
 	quotas    map[string]int64 // by region/metric
 	opDelay   time.Duration
 	onBoot    func(Machine)
@@ -165,7 +166,7 @@ func New(opts ...Option) *Emulator {
 		zones:     []string{"northamerica-northeast1-a", "northamerica-northeast1-b"},
 		instances: map[string]*instance{}, disks: map[string]*disk{}, images: map[string]*image{},
 		ops: map[string]*operation{}, requests: map[string]*operation{},
-		stockouts: map[capacityKey]bool{}, refusing: map[capacityKey]bool{}, diskShort: map[string]bool{}, quotas: map[string]int64{}, booted: map[uint64]bool{},
+		stockouts: map[capacityKey]bool{}, refusing: map[capacityKey]bool{}, diskShort: map[string]bool{}, failNext: map[string]string{}, quotas: map[string]int64{}, booted: map[uint64]bool{},
 	}
 	for _, o := range opts {
 		o(e)
@@ -253,6 +254,23 @@ func (e *Emulator) RefuseForCapacity(zone, machineType string, spot bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.refusing[capacityKey{zone, machineType, spot}] = true
+}
+
+// FailNextOperation makes the next operation of a kind, "instances.delete"
+// or "disks.insert", finish with an error of code, such as INTERNAL_ERROR or
+// RESOURCE_NOT_READY, having done nothing, as Compute Engine sometimes does
+// after accepting a request.
+func (e *Emulator) FailNextOperation(kind, code string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.failNext[kind] = code
+}
+
+// failing reports, once, whether the next operation of a kind fails.
+func (e *Emulator) failing(kind string) (string, bool) {
+	code, ok := e.failNext[kind]
+	delete(e.failNext, kind)
+	return code, ok
 }
 
 // StockoutDisks makes a zone have no capacity for new disks, or gives it

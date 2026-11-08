@@ -673,3 +673,44 @@ func TestARefusedMachineThatWontStop(t *testing.T) {
 		t.Fatalf("a refused machine is %s once Compute Engine is back", in.Status)
 	}
 }
+
+func TestARecordedRefusalsMachineIsStoppedAgain(t *testing.T) {
+	e := setup(t)
+	main := e.mainRun()
+	meant := e.queue(main, sel2)
+	e.pass()
+	fork := e.forkPull()
+	stray := e.queue(fork, sel2)
+	e.gh.CompleteJob(meant, "success")
+	// The stop fails; the refusal is recorded; the boot log can't be saved.
+	e.gce.ServerError(http.MethodPost, "/stop", http.StatusInternalServerError, 0)
+	e.gcs.Faults().Add(fault.Rule{Method: http.MethodPost,
+		Match:   func(r *http.Request) bool { return strings.Contains(r.URL.RawQuery, "logs") },
+		Respond: gcsemu.JSONError(http.StatusForbidden, "forbidden", "Forbidden")})
+	m := e.boot(e.one())
+	m.taken(stray)
+	if code := m.started(fork.ID); code != http.StatusForbidden {
+		t.Fatalf("job-started check: %d, want 403", code)
+	}
+	e.gce.Faults().Reset()
+	e.pass()
+	if in, ok := e.gce.Instance(m.in.Zone, m.in.Name); !ok || in.Status != "TERMINATED" {
+		t.Fatalf("a refused machine waiting for its boot log is %s", in.Status)
+	}
+}
+
+func TestAWorkDiskWhoseOperationFailed(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	j := e.queue(run, sel2)
+	e.pass()
+	m := e.boot(e.one())
+	m.taken(j)
+	e.gce.FailNextOperation("disks.insert", "INTERNAL_ERROR")
+	if code := m.started(run.ID); code != http.StatusServiceUnavailable {
+		t.Fatalf("job-started check: %d, want a retryable 503", code)
+	}
+	if code := m.started(run.ID); code != http.StatusOK {
+		t.Fatalf("asked again: %d; a finished operation's failure needs a new request", code)
+	}
+}

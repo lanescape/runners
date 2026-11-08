@@ -398,7 +398,7 @@ func (s *Service) decide(ctx context.Context, repo github.Repository, m Machine,
 // job refused for coming from a fork or claiming a scope is recorded and
 // cancelled. Anything left undone here, a pass does, from the admission.
 func (s *Service) refuse(ctx context.Context, m Machine, a Admission) {
-	if err := s.Compute.StopInstance(ctx, m.Zone, m.Name, compute.RequestID("stop", m.Name)); err != nil && !errors.Is(err, compute.ErrNotFound) {
+	if err := s.Compute.StopInstance(ctx, m.Zone, m.Name, s.requestID("stop", m.Name)); err != nil && !errors.Is(err, compute.ErrNotFound) {
 		s.log().Error("stopping a refused machine", "machine", m.Name, "err", err.Error())
 	}
 	if !a.Cancel {

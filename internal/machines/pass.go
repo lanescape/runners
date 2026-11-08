@@ -601,8 +601,17 @@ func (s *Service) jobRecord(ctx context.Context, inv *inventory, repoID, jobID i
 	if !r.v.Tentative {
 		return r.v, true
 	}
-	if m, listed := inv.machines[r.v.Machine]; !listed || m.Labels[LabelJob] != strconv.FormatInt(jobID, 10) {
+	m, listed := inv.machines[r.v.Machine]
+	if listed && m.Labels[LabelJob] != strconv.FormatInt(jobID, 10) {
 		return JobRecord{}, false
+	}
+	if !listed {
+		// A machine that's gone was made if its boot log was saved, as it
+		// is before every deletion.
+		_, _, err := s.Objects.Get(ctx, bootLogKey(Machine{Instance: compute.Instance{Name: r.v.Machine}, CreatedAt: r.v.FirstMachineAt}))
+		if err != nil {
+			return JobRecord{}, false
+		}
 	}
 	// The machine shows the record's time was its first, whether or not
 	// its confirmation is written now; one that isn't is tried again, and

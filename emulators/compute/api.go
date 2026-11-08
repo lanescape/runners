@@ -638,6 +638,9 @@ func (e *Emulator) deleteInstance(r *http.Request, zone string) (*operation, *ap
 		return nil, notFound("projects/" + e.Project + "/zones/" + zone + "/instances/" + r.PathValue("name"))
 	}
 	op := e.newOp(zone, "delete", e.instanceURL(in), in.id)
+	if code, ok := e.failing("instances.delete"); ok {
+		return op.fail(http.StatusInternalServerError, code, "The operation failed."), nil
+	}
 	e.remove(in)
 	return op, nil
 }
@@ -890,6 +893,9 @@ func (e *Emulator) insertDisk(r *http.Request, zone string) (*operation, *apiErr
 		return nil, invalid("Invalid value for field 'resource.sizeGb': '%d'.", d.sizeGB)
 	}
 	op := e.newOp(zone, "insert", e.diskURL(d), d.id)
+	if code, ok := e.failing("disks.insert"); ok {
+		return op.fail(http.StatusInternalServerError, code, "The operation failed."), nil
+	}
 	if e.diskShort[zone] {
 		return op.fail(http.StatusServiceUnavailable, "ZONE_RESOURCE_POOL_EXHAUSTED",
 			fmt.Sprintf("The zone 'projects/%s/zones/%s' does not have enough resources available to fulfill the request.", e.Project, zone)), nil

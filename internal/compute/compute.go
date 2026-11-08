@@ -273,9 +273,10 @@ func opError(op *gce.Operation) error {
 		return fmt.Errorf("%w: %s", ErrNotFound, e.Message)
 	case e.Code == "RESOURCE_IN_USE_BY_ANOTHER_RESOURCE":
 		return fmt.Errorf("%w: %s", ErrInUse, e.Message)
-	case op.HttpErrorStatusCode >= 500:
-		return &Unavailable{Err: fmt.Errorf("%s: %s", e.Code, e.Message)}
 	}
+	// A finished operation's error is its outcome, even a passing one such
+	// as an internal error: the request ID has had its answer, and another
+	// try needs another ID.
 	return &Failed{Err: fmt.Errorf("%s: %s", e.Code, e.Message)}
 }
 
