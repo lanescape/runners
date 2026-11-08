@@ -1,0 +1,337 @@
+// Package github is the service's view of GitHub: what it reads, as the
+// organization's GitHub App installation, with every answer classed as
+// confirmed or not. Only GitHub's confirmed answers may decide anything
+// (specs/0002-machines.md, Scope).
+package github
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+
+	"github.com/bradleyfalzon/ghinstallation/v2"
+	gh "github.com/google/go-github/v93/github"
+)
+
+// ErrNotFound is GitHub's confirmed answer that something doesn't exist.
+// Any error that isn't Unavailable is a confirmed answer of some kind.
+var ErrNotFound = errors.New("not found on GitHub")
+
+// Unavailable wraps every other failure: GitHub couldn't be reached, timed
+// out, limited the service's requests, or answered in a way that confirms
+// nothing. A caller must not decide anything from it.
+type Unavailable struct{ Err error }
+
+func (u *Unavailable) Error() string { return "GitHub unavailable: " + u.Err.Error() }
+func (u *Unavailable) Unwrap() error { return u.Err }
+
+// IsUnavailable reports whether err is an Unavailable.
+func IsUnavailable(err error) bool {
+	var u *Unavailable
+	return errors.As(err, &u)
+}
+
+// Repository is a repository, as GitHub reports it.
+type Repository struct {
+	ID            int64
+	OwnerID       int64
+	Owner         string
+	Name          string
+	DefaultBranch string
+}
+
+// WorkflowRun is a workflow run, as GitHub records it.
+type WorkflowRun struct {
+	ID               int64
+	RepositoryID     int64
+	Event            string
+	Status           string
+	HeadBranch       string
+	HeadSHA          string
+	HeadRepositoryID int64
+}
+
+// PullRequest is a pull request. HeadRepositoryID is 0 once the head
+// repository is deleted.
+type PullRequest struct {
+	Number           int
+	State            string
+	BaseRepositoryID int64
+	HeadRepositoryID int64
+	HeadSHA          string
+	Commits          int
+}
+
+// API is what the service reads from GitHub.
+type API interface {
+	RepositoryByID(ctx context.Context, id int64) (Repository, error)
+	WorkflowRun(ctx context.Context, repo Repository, id int64) (WorkflowRun, error)
+	PullRequest(ctx context.Context, repo Repository, number int) (PullRequest, error)
+	OpenPullRequests(ctx context.Context, repo Repository) ([]PullRequest, error)
+	// PullRequestCommits lists a pull request's commits; GitHub lists at
+	// most 250.
+	PullRequestCommits(ctx context.Context, repo Repository, number int) ([]string, error)
+	// BranchHead is a branch's commit, by its full ref, so a tag of the
+	// same name can't stand in for it.
+	BranchHead(ctx context.Context, repo Repository, branch string) (string, error)
+	// Compare is GitHub's comparison of two commits: identical, ahead,
+	// behind or diverged.
+	Compare(ctx context.Context, repo Repository, base, head string) (string, error)
+	// File reads a file at a commit.
+	File(ctx context.Context, repo Repository, path, commit string) ([]byte, error)
+}
+
+// Client is API over GitHub's REST API.
+type Client struct {
+	gh *gh.Client
+}
+
+// Options say how to reach GitHub as the App.
+type Options struct {
+	// BaseURL is GitHub's API, https://api.github.com in production.
+	BaseURL string
+	AppID   int64
+	// PrivateKey is the App's PEM private key.
+	PrivateKey []byte
+	// OrganizationID is the account the App is installed on.
+	OrganizationID int64
+	// Transport is the underlying transport; nil means the default.
+	Transport http.RoundTripper
+}
+
+// NewAppClient returns a client that acts as the App's installation on the
+// organization, found by the organization's ID when first needed.
+func NewAppClient(o Options) (*Client, error) {
+	tr := o.Transport
+	if tr == nil {
+		tr = http.DefaultTransport
+	}
+	apps, err := ghinstallation.NewAppsTransport(tr, o.AppID, o.PrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("github app key: %w", err)
+	}
+	base := strings.TrimRight(o.BaseURL, "/")
+	apps.BaseURL = base
+	it := &installationTransport{apps: apps, base: base, orgID: o.OrganizationID}
+	return newClient(&http.Client{Transport: it}, base)
+}
+
+func newClient(hc *http.Client, base string) (*Client, error) {
+	u := base + "/"
+	c, err := gh.NewClient(gh.WithHTTPClient(hc), gh.WithURLs(&u, &u))
+	if err != nil {
+		return nil, err
+	}
+	return &Client{gh: c}, nil
+}
+
+// installationTransport finds the App's installation on the organization,
+// by the account's ID, then authenticates as it.
+type installationTransport struct {
+	apps  *ghinstallation.AppsTransport
+	base  string
+	orgID int64
+
+	mu    sync.Mutex
+	inner *ghinstallation.Transport
+}
+
+func (t *installationTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	inner, err := t.installation(req.Context())
+	if err != nil {
+		return nil, err
+	}
+	return inner.RoundTrip(req)
+}
+
+func (t *installationTransport) installation(ctx context.Context) (*ghinstallation.Transport, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.inner != nil {
+		return t.inner, nil
+	}
+	c, err := newClient(&http.Client{Transport: t.apps}, t.base)
+	if err != nil {
+		return nil, err
+	}
+	opts := &gh.ListOptions{PerPage: 100}
+	for {
+		ins, resp, err := c.gh.Apps.ListInstallations(ctx, opts)
+		if err != nil {
+			return nil, fmt.Errorf("listing the app's installations: %w", err)
+		}
+		for _, in := range ins {
+			if in.GetAccount().GetID() == t.orgID {
+				t.inner = ghinstallation.NewFromAppsTransport(t.apps, in.GetID())
+				t.inner.BaseURL = t.base
+				return t.inner, nil
+			}
+		}
+		if resp.NextPage == 0 {
+			return nil, fmt.Errorf("the app isn't installed on organization %d", t.orgID)
+		}
+		opts.Page = resp.NextPage
+	}
+}
+
+// classify makes every error either ErrNotFound or Unavailable.
+func classify(err error) error {
+	if err == nil {
+		return nil
+	}
+	var er *gh.ErrorResponse
+	if errors.As(err, &er) && er.Response != nil && er.Response.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("%w: %s", ErrNotFound, er.Message)
+	}
+	return &Unavailable{Err: err}
+}
+
+func repoOf(r *gh.Repository) Repository {
+	return Repository{
+		ID:            r.GetID(),
+		OwnerID:       r.GetOwner().GetID(),
+		Owner:         r.GetOwner().GetLogin(),
+		Name:          r.GetName(),
+		DefaultBranch: r.GetDefaultBranch(),
+	}
+}
+
+// RepositoryByID implements API.
+func (c *Client) RepositoryByID(ctx context.Context, id int64) (Repository, error) {
+	r, _, err := c.gh.Repositories.GetByID(ctx, id)
+	if err != nil {
+		return Repository{}, classify(err)
+	}
+	repo := repoOf(r)
+	if repo.ID != id || repo.OwnerID == 0 || repo.DefaultBranch == "" {
+		return Repository{}, &Unavailable{Err: fmt.Errorf("repository %d: incomplete answer", id)}
+	}
+	return repo, nil
+}
+
+// WorkflowRun implements API.
+func (c *Client) WorkflowRun(ctx context.Context, repo Repository, id int64) (WorkflowRun, error) {
+	r, _, err := c.gh.Actions.GetWorkflowRunByID(ctx, repo.Owner, repo.Name, id)
+	if err != nil {
+		return WorkflowRun{}, classify(err)
+	}
+	return WorkflowRun{
+		ID:               r.GetID(),
+		RepositoryID:     r.GetRepository().GetID(),
+		Event:            r.GetEvent(),
+		Status:           r.GetStatus(),
+		HeadBranch:       r.GetHeadBranch(),
+		HeadSHA:          r.GetHeadSHA(),
+		HeadRepositoryID: r.GetHeadRepository().GetID(),
+	}, nil
+}
+
+func pullOf(p *gh.PullRequest) PullRequest {
+	return PullRequest{
+		Number:           p.GetNumber(),
+		State:            p.GetState(),
+		BaseRepositoryID: p.GetBase().GetRepo().GetID(),
+		HeadRepositoryID: p.GetHead().GetRepo().GetID(),
+		HeadSHA:          p.GetHead().GetSHA(),
+		Commits:          p.GetCommits(),
+	}
+}
+
+// PullRequest implements API.
+func (c *Client) PullRequest(ctx context.Context, repo Repository, number int) (PullRequest, error) {
+	p, _, err := c.gh.PullRequests.Get(ctx, repo.Owner, repo.Name, number)
+	if err != nil {
+		return PullRequest{}, classify(err)
+	}
+	return pullOf(p), nil
+}
+
+// OpenPullRequests implements API.
+func (c *Client) OpenPullRequests(ctx context.Context, repo Repository) ([]PullRequest, error) {
+	opts := &gh.PullRequestListOptions{State: "open", ListOptions: gh.ListOptions{PerPage: 100}}
+	var out []PullRequest
+	for {
+		ps, resp, err := c.gh.PullRequests.List(ctx, repo.Owner, repo.Name, opts)
+		if err != nil {
+			return nil, classify(err)
+		}
+		for _, p := range ps {
+			out = append(out, pullOf(p))
+		}
+		if resp.NextPage == 0 {
+			return out, nil
+		}
+		opts.Page = resp.NextPage
+	}
+}
+
+// PullRequestCommits implements API.
+func (c *Client) PullRequestCommits(ctx context.Context, repo Repository, number int) ([]string, error) {
+	opts := &gh.ListOptions{PerPage: 100}
+	var out []string
+	for {
+		cs, resp, err := c.gh.PullRequests.ListCommits(ctx, repo.Owner, repo.Name, number, opts)
+		if err != nil {
+			return nil, classify(err)
+		}
+		for _, cm := range cs {
+			out = append(out, cm.GetSHA())
+		}
+		if resp.NextPage == 0 {
+			return out, nil
+		}
+		opts.Page = resp.NextPage
+	}
+}
+
+// BranchHead implements API.
+func (c *Client) BranchHead(ctx context.Context, repo Repository, branch string) (string, error) {
+	ref, _, err := c.gh.Git.GetRef(ctx, repo.Owner, repo.Name, "heads/"+branch)
+	if err != nil {
+		return "", classify(err)
+	}
+	if ref.GetRef() != "refs/heads/"+branch || ref.GetObject().GetSHA() == "" {
+		return "", &Unavailable{Err: fmt.Errorf("ref %s: unexpected answer %s", branch, ref.GetRef())}
+	}
+	return ref.GetObject().GetSHA(), nil
+}
+
+// Compare implements API.
+func (c *Client) Compare(ctx context.Context, repo Repository, base, head string) (string, error) {
+	cmp, _, err := c.gh.Repositories.CompareCommits(ctx, repo.Owner, repo.Name, base, head, &gh.ListOptions{PerPage: 1})
+	if err != nil {
+		return "", classify(err)
+	}
+	switch s := cmp.GetStatus(); s {
+	case "identical", "ahead", "behind", "diverged":
+		return s, nil
+	default:
+		return "", &Unavailable{Err: fmt.Errorf("comparison status %q", s)}
+	}
+}
+
+// maxFile bounds what File reads; configuration files are small.
+const maxFile = 64 << 10
+
+// File implements API.
+func (c *Client) File(ctx context.Context, repo Repository, path, commit string) ([]byte, error) {
+	f, _, _, err := c.gh.Repositories.GetContents(ctx, repo.Owner, repo.Name, path, &gh.RepositoryContentGetOptions{Ref: commit})
+	if err != nil {
+		return nil, classify(err)
+	}
+	if f == nil {
+		// A directory: there's no such file.
+		return nil, fmt.Errorf("%w: %s is a directory", ErrNotFound, path)
+	}
+	if f.GetSize() > maxFile {
+		return nil, fmt.Errorf("%s is larger than %d bytes", path, maxFile)
+	}
+	s, err := f.GetContent()
+	if err != nil {
+		return nil, &Unavailable{Err: err}
+	}
+	return []byte(s), nil
+}
