@@ -387,3 +387,33 @@ func TestABootLogThatCouldntBeSaved(t *testing.T) {
 		t.Fatal("no boot log")
 	}
 }
+
+func TestAFirstMachineIsConfirmedBeforeItGoes(t *testing.T) {
+	e := setup(t)
+	j := e.queue(e.mainRun(), sel2)
+	// The record is written, but its confirmation once the machine is made
+	// fails.
+	writes := 0
+	e.gcs.Faults().Add(fault.Rule{Method: http.MethodPost, Times: 1,
+		Match: func(r *http.Request) bool {
+			if !strings.Contains(r.URL.RawQuery, "jobs") {
+				return false
+			}
+			writes++
+			return writes == 2
+		},
+		Respond: gcsemu.JSONError(http.StatusForbidden, "forbidden", "Forbidden")})
+	e.pass()
+	key := "jobs/5001/" + strconv.FormatInt(j.ID, 10) + ".json"
+	if rec, _ := e.record(key); rec["tentative"] != true {
+		t.Fatalf("job record = %v; want it left tentative", rec)
+	}
+	// GitHub's queue can't be read when the idle machine goes.
+	e.clock.Advance(machines.IdleLimit)
+	e.gh.ServerError("/repos/lanescape/app/actions/runs", http.StatusBadGateway, 0)
+	e.pass()
+	e.wantMachines(0)
+	if rec, _ := e.record(key); rec["tentative"] != nil {
+		t.Fatalf("job record = %v; the machine should have confirmed it before going", rec)
+	}
+}

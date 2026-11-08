@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/lanescape/runners/config"
+	gceemu "github.com/lanescape/runners/emulators/compute"
 	"github.com/lanescape/runners/emulators/fault"
 	ghemu "github.com/lanescape/runners/emulators/github"
 	gcsemu "github.com/lanescape/runners/emulators/storage"
@@ -250,7 +251,7 @@ func TestRefusals(t *testing.T) {
 		m := e.boot(e.one())
 		m.taken(claim)
 		m.refused(pr.ID)
-		if _, ok := e.record("refusals/5001/" + strconv.FormatInt(pr.ID, 10) + ".json"); !ok {
+		if _, ok := e.record("refusals/5001/" + strconv.FormatInt(pr.ID, 10) + "-1.json"); !ok {
 			t.Fatal("the refusal wasn't recorded")
 		}
 		e.forceCancelled(pr)
@@ -269,7 +270,7 @@ func TestRefusals(t *testing.T) {
 		m := e.boot(e.one())
 		m.taken(first)
 		m.refused(fork.ID)
-		rec, _ := e.record("refusals/5001/" + strconv.FormatInt(fork.ID, 10) + ".json")
+		rec, _ := e.record("refusals/5001/" + strconv.FormatInt(fork.ID, 10) + "-1.json")
 		if rec["cancelled_at"] == nil {
 			t.Fatalf("refusal = %v; the run wasn't cancelled", rec)
 		}
@@ -348,7 +349,7 @@ func (e *env) forceCancelled(run *ghemu.Run) {
 		e.t.Fatalf("after %s: %s %s; want it force-cancelled", machines.ForceCancel, st, c)
 	}
 	e.pass()
-	rec, _ := e.record("refusals/5001/" + strconv.FormatInt(run.ID, 10) + ".json")
+	rec, _ := e.record("refusals/5001/" + strconv.FormatInt(run.ID, 10) + "-1.json")
 	if rec["finished_at"] == nil {
 		e.t.Fatalf("refusal = %v; want it finished", rec)
 	}
@@ -392,12 +393,12 @@ func TestAPassRecordsARefusalTheCheckDidnt(t *testing.T) {
 	e.queue(e.mainRun(), sel2)
 	e.pass()
 	m := e.one()
-	adm := machines.Admission{Machine: m.Name, Zone: m.Zone, RepositoryID: repoID, JobID: j.ID, RunID: fork.ID, Selector: sel2,
+	adm := machines.Admission{Machine: m.Name, Zone: m.Zone, RepositoryID: repoID, JobID: j.ID, RunID: fork.ID, RunAttempt: 1, Selector: sel2,
 		Reason: "the run is a fork's pull request's", Cancel: true}
 	b, _ := json.Marshal(adm)
 	e.gcs.Put("state", "machines/"+m.Name+"/admission.json", b)
 	e.pass()
-	if _, ok := e.record("refusals/5001/" + strconv.FormatInt(fork.ID, 10) + ".json"); !ok {
+	if _, ok := e.record("refusals/5001/" + strconv.FormatInt(fork.ID, 10) + "-1.json"); !ok {
 		t.Fatal("the pass didn't record the refused run")
 	}
 	if st, c := e.gh.RunState(fork); st != "completed" || c != "cancelled" {
@@ -470,7 +471,7 @@ func TestACancellationConflictIsntAFinish(t *testing.T) {
 	m := e.boot(e.one())
 	m.taken(stray)
 	m.refused(fork.ID)
-	rec, _ := e.record("refusals/5001/" + strconv.FormatInt(fork.ID, 10) + ".json")
+	rec, _ := e.record("refusals/5001/" + strconv.FormatInt(fork.ID, 10) + "-1.json")
 	if rec["finished_at"] != nil {
 		t.Fatalf("refusal = %v; a conflict isn't GitHub showing the run finished", rec)
 	}
@@ -497,6 +498,108 @@ func TestAContributionOnAnOrdinaryMachine(t *testing.T) {
 	m.taken(stray)
 	m.refused(crun.ID)
 	if adm, _ := e.record("machines/" + m.in.Name + "/admission.json"); !strings.Contains(adm["reason"].(string), "not made for contributions") {
+		t.Fatalf("admission = %v", adm)
+	}
+}
+
+// refuseFork has a fork's job take a machine made for main's, and returns
+// the fork's run once its job is refused.
+func (e *env) refuseFork() (*ghemu.Run, *machine) {
+	e.t.Helper()
+	main := e.mainRun()
+	meant := e.queue(main, sel2)
+	e.pass()
+	fork := e.forkPull()
+	stray := e.queue(fork, sel2)
+	e.gh.CompleteJob(meant, "success")
+	m := e.boot(e.one())
+	m.taken(stray)
+	m.refused(fork.ID)
+	return fork, m
+}
+
+func TestARefusalThatCantBeRecorded(t *testing.T) {
+	e := setup(t)
+	refusals := fault.Rule{Method: http.MethodPost,
+		Match:   func(r *http.Request) bool { return strings.Contains(r.URL.RawQuery, "refusals") },
+		Respond: gcsemu.JSONError(http.StatusForbidden, "forbidden", "Forbidden")}
+	e.gcs.Faults().Add(refusals)
+	fork, m := e.refuseFork()
+	// The machine and its admission stay, and its selector is blocked,
+	// until the refusal is recorded.
+	e.queue(e.mainRun(), sel2)
+	e.pass()
+	e.pass()
+	if !e.exists(m.in.Name) {
+		t.Fatal("a refused machine went before its run's refusal was recorded")
+	}
+	e.wantMachines(1)
+	if _, ok := e.record("machines/" + m.in.Name + "/admission.json"); !ok {
+		t.Fatal("the only record of the refusal was removed")
+	}
+	e.gcs.Faults().Reset()
+	e.pass()
+	if _, ok := e.record("refusals/5001/" + strconv.FormatInt(fork.ID, 10) + "-1.json"); !ok {
+		t.Fatal("the refusal wasn't recorded once it could be")
+	}
+	if e.exists(m.in.Name) {
+		t.Fatal("the refused machine wasn't deleted once its refusal was recorded")
+	}
+}
+
+func TestARerunIsRefusedAfresh(t *testing.T) {
+	e := setup(t)
+	fork, _ := e.refuseFork()
+	e.forceCancelled(fork)
+	// A maintainer reruns it, and its job takes another machine.
+	e.gh.Rerun(fork)
+	meant := e.queue(e.mainRun(), sel2)
+	e.pass()
+	stray := e.queue(fork, sel2)
+	e.gh.CompleteJob(meant, "success")
+	var in = e.ours()[len(e.ours())-1]
+	m := e.boot(in)
+	m.taken(stray)
+	m.refused(fork.ID)
+	rec, ok := e.record("refusals/5001/" + strconv.FormatInt(fork.ID, 10) + "-2.json")
+	if !ok || rec["cancelled_at"] == nil || rec["finished_at"] != nil {
+		t.Fatalf("the rerun's refusal = %v, %v; want it recorded and cancelled, not finished", rec, ok)
+	}
+	// The refused machine goes, and no other is made for its selector.
+	e.queue(e.mainRun(), sel2)
+	e.pass()
+	e.wantMachines(0)
+}
+
+func TestAnOrdinaryJobOnAContributionMachine(t *testing.T) {
+	e := setup(t)
+	e.cfg.Limits.Repositories = map[int64]config.Override{repoID: {Machines: ptr(1), ContributionMachines: ptr(1)}}
+	read := "lanescape-2vcpu-linux-amd64-read"
+	other := e.gh.EventRun(e.repo, "workflow_dispatch", "main")
+	e.bind(other, ghemu.Job{}, bindingRequest())
+	// The consumer's own job is older, and its machine is made first; the
+	// contribution's comes next.
+	ordinary := e.queue(other, read)
+	e.fork.Commit("feature", map[string]string{"src.go": "package app"})
+	p := e.gh.PullRequest(e.repo, "main", e.fork, "feature", e.contributor)
+	crun := e.gh.PullRequestTargetRun(p)
+	e.bind(crun, ghemu.Job{}, bindingRequest())
+	e.gh.Approve(crun, machines.ContributionEnvironment, e.maintainer)
+	e.gh.Queue(crun, ghemu.JobSpec{Labels: []string{read}, Environment: machines.ContributionEnvironment})
+	e.pass()
+	ms := e.wantMachines(2)
+	var contribution gceemu.InstanceState
+	for _, in := range ms {
+		if in.Labels[machines.LabelContribution] == "true" {
+			contribution = in
+		}
+	}
+	// Only the contribution's machine boots: GitHub hands it the older,
+	// ordinary job.
+	m := e.boot(contribution)
+	m.taken(ordinary)
+	m.refused(other.ID)
+	if adm, _ := e.record("machines/" + m.in.Name + "/admission.json"); !strings.Contains(adm["reason"].(string), "made for one") {
 		t.Fatalf("admission = %v", adm)
 	}
 }

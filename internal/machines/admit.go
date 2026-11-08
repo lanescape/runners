@@ -367,11 +367,14 @@ func (s *Service) decide(ctx context.Context, repo github.Repository, m Machine,
 			return refuse("the contribution's run has no approval of the "+ContributionEnvironment+" environment", true)
 		}
 		a.Contribution = true
-		// A contribution counts against its own limit, which only the
-		// machines made for contributions do.
-		if !m.Contribution {
+	}
+	// Contributions and the consumer's own jobs count against limits of
+	// their own, by the machines made for each: neither takes the other's.
+	if a.Contribution != m.Contribution {
+		if a.Contribution {
 			return refuse("a contribution's job on a machine not made for contributions", false)
 		}
+		return refuse("a job that isn't a contribution on a machine made for one", false)
 	}
 	// Its labels hold exactly one selector, the machine's, with nothing
 	// else but GitHub's own labels that the runner has.
@@ -414,8 +417,8 @@ func (s *Service) refuse(ctx context.Context, m Machine, a Admission) {
 // recordRefusal records a refused run, once, with the refused job's
 // selector among those no machine is made for.
 func (s *Service) recordRefusal(ctx context.Context, a Admission) (Refusal, int64, error) {
-	key := refusalKey(a.RepositoryID, a.RunID)
-	rf := Refusal{RepositoryID: a.RepositoryID, RunID: a.RunID, Reason: a.Reason, Selectors: []string{a.Selector}, RefusedAt: s.now()}
+	key := refusalKey(a.RepositoryID, a.RunID, a.RunAttempt)
+	rf := Refusal{RepositoryID: a.RepositoryID, RunID: a.RunID, RunAttempt: a.RunAttempt, Reason: a.Reason, Selectors: []string{a.Selector}, RefusedAt: s.now()}
 	got, gen, err := createOnce(ctx, s.Objects, key, rf)
 	if err != nil {
 		return Refusal{}, 0, err
@@ -437,7 +440,7 @@ func (s *Service) recordRefusal(ctx context.Context, a Admission) (Refusal, int6
 // the run goes on.
 func (s *Service) cancel(ctx context.Context, repo github.Repository, rf Refusal, gen int64) {
 	now := s.now()
-	key := refusalKey(rf.RepositoryID, rf.RunID)
+	key := refusalKey(rf.RepositoryID, rf.RunID, rf.RunAttempt)
 	var err error
 	switch {
 	case now.Sub(rf.RefusedAt) >= ForceCancel:
@@ -461,7 +464,7 @@ func (s *Service) cancel(ctx context.Context, repo github.Repository, rf Refusal
 	if errors.Is(err, github.ErrConflict) {
 		run, rerr := s.GitHub.WorkflowRun(ctx, repo, rf.RunID)
 		switch {
-		case rerr == nil && run.Status == "completed", errors.Is(rerr, github.ErrNotFound):
+		case rerr == nil && attemptOver(run, rf), errors.Is(rerr, github.ErrNotFound):
 			rf.FinishedAt = now
 			err = nil
 		case rerr == nil:
@@ -477,6 +480,13 @@ func (s *Service) cancel(ctx context.Context, repo github.Repository, rf Refusal
 	if _, err := replaceJSON(ctx, s.Objects, key, rf, gen); err != nil {
 		s.log().Warn("recording a refused run's cancellation", "run_id", rf.RunID, "err", err.Error())
 	}
+}
+
+// attemptOver reports whether GitHub shows a refused run attempt finished:
+// the run is completed, or a later attempt has begun, which GitHub starts
+// only once the last is done.
+func attemptOver(run github.WorkflowRun, rf Refusal) bool {
+	return run.Status == "completed" || run.Attempt > rf.RunAttempt
 }
 
 // workDisk gives an admitted job its work disk: recorded before it's made,

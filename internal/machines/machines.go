@@ -12,7 +12,7 @@
 //	machines/<machine>/admission.json  the job a machine's runner took, and the check's decision
 //	machines/<machine>/report.json     the supervisor's report
 //	disks/<disk>.json                  a work disk, recorded before it's made
-//	refusals/<repository>/<run>.json   a run refused for a fork's job or a claimed scope, until it's cancelled
+//	refusals/<repository>/<run>-<attempt>.json  a run attempt refused for a fork's job or a claimed scope, until it's cancelled
 //	jobs/<repository>/<job>.json       when a queued job's first machine was made
 //	logs/<machine>-<created>.txt       a deleted machine's boot log
 package machines
@@ -282,12 +282,14 @@ type DiskRecord struct {
 	At      time.Time `json:"at"`
 }
 
-// Refusal is a run whose job was refused for coming from a fork or claiming
-// a scope that isn't its run's: it's cancelled, and no machine is made for
-// its selectors, until GitHub shows it finished.
+// Refusal is a run attempt whose job was refused for coming from a fork or
+// claiming a scope that isn't its run's: it's cancelled, and no machine is
+// made for its selectors, until GitHub shows it finished. A rerun is another
+// attempt, refused afresh.
 type Refusal struct {
 	RepositoryID int64     `json:"repository_id"`
 	RunID        int64     `json:"run_id"`
+	RunAttempt   int       `json:"run_attempt"`
 	Reason       string    `json:"reason"`
 	Selectors    []string  `json:"selectors"`
 	RefusedAt    time.Time `json:"refused_at"`
@@ -312,8 +314,10 @@ type JobRecord struct {
 func admissionKey(machine string) string { return "machines/" + machine + "/admission.json" }
 func reportKey(machine string) string    { return "machines/" + machine + "/report.json" }
 func diskKey(disk string) string         { return "disks/" + disk + ".json" }
-func refusalKey(repo, run int64) string  { return fmt.Sprintf("refusals/%d/%d.json", repo, run) }
-func jobKey(repo, job int64) string      { return fmt.Sprintf("jobs/%d/%d.json", repo, job) }
+func refusalKey(repo, run int64, attempt int) string {
+	return fmt.Sprintf("refusals/%d/%d-%d.json", repo, run, attempt)
+}
+func jobKey(repo, job int64) string { return fmt.Sprintf("jobs/%d/%d.json", repo, job) }
 func bootLogKey(m Machine) string {
 	return fmt.Sprintf("logs/%s-%d.txt", m.Name, m.CreatedAt.Unix())
 }

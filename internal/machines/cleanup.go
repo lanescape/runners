@@ -59,6 +59,11 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 	case reported:
 		s.finish(ctx, inv, m, "its supervisor reported", &rep)
 	case admitted && !a.Allowed:
+		if inv.unrecorded(m.Name) {
+			// Its admission is the only record that its run must be
+			// cancelled; the stopped machine waits for the refusal.
+			return
+		}
 		s.finish(ctx, inv, m, "its job was refused", nil)
 	case admitted && m.Stopped() && m.Spot:
 		s.stoppedSpot(ctx, inv, m, a)
@@ -155,6 +160,18 @@ func (s *Service) finish(ctx context.Context, inv *inventory, m Machine, why str
 		}
 		log.Warn("saving a boot log; the machine is past its age limit and goes without it", "err", err.Error())
 	}
+	// A tentative first-machine record naming this machine is confirmed
+	// while the machine is there to show it was made.
+	key := jobKey(m.RepositoryID, m.MadeFor)
+	if r, ok := inv.jobRecords[key]; ok && r.v.Tentative && r.v.Machine == m.Name {
+		r.v.Tentative = false
+		gen, err := replaceJSON(ctx, s.Objects, key, r.v, r.gen)
+		if err != nil {
+			log.Warn("confirming a job's first machine; the machine waits for it", "err", err.Error())
+			return
+		}
+		inv.jobRecords[key] = record[JobRecord]{r.v, gen}
+	}
 	if err := s.Compute.DeleteInstance(ctx, m.Zone, m.Name, compute.RequestID("delete", m.Name)); err != nil && !errors.Is(err, compute.ErrNotFound) {
 		log.Error("deleting a machine", "err", err.Error())
 		return
@@ -204,9 +221,14 @@ func (s *Service) saves(ctx context.Context, inv *inventory, m Machine) (bool, e
 	return job.Status == "completed" && job.Conclusion == "success", nil
 }
 
-// dropRecords removes a deleted machine's records, and its work disk's.
+// dropRecords removes a deleted machine's records, and its work disk's,
+// except a refused admission whose run's refusal isn't yet recorded.
 func (s *Service) dropRecords(ctx context.Context, inv *inventory, machine string) {
+	keep := inv.unrecorded(machine)
 	for _, o := range inv.machineKeys[machine] {
+		if keep && o.Name == admissionKey(machine) {
+			continue
+		}
 		if err := s.Objects.Delete(ctx, o.Name, o.Generation); err != nil && !errors.Is(err, store.ErrNotFound) {
 			s.log().Warn("removing a machine's record", "record", o.Name, "err", err.Error())
 		}

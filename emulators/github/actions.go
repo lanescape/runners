@@ -216,6 +216,16 @@ func (e *Emulator) review(r *Run, env string, reviewer *Account, state string) {
 	e.notify()
 }
 
+// Rerun starts a finished run's next attempt, as rerunning it does; jobs
+// queued after it are the new attempt's.
+func (e *Emulator) Rerun(r *Run) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	r.Attempt++
+	r.Status, r.Conclusion = "in_progress", ""
+	e.notify()
+}
+
 // CompleteJob finishes a job with a conclusion, as if its runner reported
 // it.
 func (e *Emulator) CompleteJob(j *WorkflowJob, conclusion string) {

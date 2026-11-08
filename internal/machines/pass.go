@@ -284,10 +284,31 @@ func (inv *inventory) activeRefusals(repoID int64) []Refusal {
 	return out
 }
 
+// refusalRecorded reports whether a refused admission that cancels its run
+// has its run's refusal recorded, with its selector.
+func (inv *inventory) refusalRecorded(a Admission) bool {
+	r, ok := inv.refusals[refusalKey(a.RepositoryID, a.RunID, a.RunAttempt)]
+	return ok && slices.Contains(r.v.Selectors, a.Selector)
+}
+
+// unrecorded reports whether a machine's refused admission is the only
+// record that its run must be cancelled: it, and its machine, are kept
+// until the refusal is recorded.
+func (inv *inventory) unrecorded(machine string) bool {
+	a, ok := inv.admissions[machine]
+	return ok && !a.Allowed && a.Cancel && !inv.refusalRecorded(a)
+}
+
 // blocked are the selectors no machine is made for: those of a consumer's
-// refused runs, recorded and still queued, until each run is shown finished.
+// refused runs, recorded and still queued, until each run is shown finished,
+// and of refusals not yet recorded.
 func (inv *inventory) blocked(q *queue) map[string]bool {
 	out := map[string]bool{}
+	for _, a := range inv.admissions {
+		if a.RepositoryID == q.repo.ID && inv.unrecorded(a.Machine) {
+			out[a.Selector] = true
+		}
+	}
 	for _, rf := range inv.activeRefusals(q.repo.ID) {
 		for _, sel := range rf.Selectors {
 			out[sel] = true
@@ -310,8 +331,7 @@ func (s *Service) followRefusals(ctx context.Context, inv *inventory) {
 		if a.Allowed || !a.Cancel {
 			continue
 		}
-		key := refusalKey(a.RepositoryID, a.RunID)
-		if r, ok := inv.refusals[key]; ok && slices.Contains(r.v.Selectors, a.Selector) {
+		if inv.refusalRecorded(a) {
 			continue
 		}
 		rf, gen, err := s.recordRefusal(ctx, a)
@@ -319,7 +339,7 @@ func (s *Service) followRefusals(ctx context.Context, inv *inventory) {
 			s.log().Warn("recording a refused run", "run_id", a.RunID, "err", err.Error())
 			continue
 		}
-		inv.refusals[key] = record[Refusal]{rf, gen}
+		inv.refusals[refusalKey(a.RepositoryID, a.RunID, a.RunAttempt)] = record[Refusal]{rf, gen}
 	}
 	keys := make([]string, 0, len(inv.refusals))
 	for k := range inv.refusals {
@@ -336,7 +356,7 @@ func (s *Service) followRefusals(ctx context.Context, inv *inventory) {
 			continue
 		}
 		run, err := s.GitHub.WorkflowRun(ctx, repo, r.v.RunID)
-		if errors.Is(err, github.ErrNotFound) || (err == nil && run.Status == "completed") {
+		if errors.Is(err, github.ErrNotFound) || (err == nil && attemptOver(run, r.v)) {
 			r.v.FinishedAt = s.now()
 			if gen, err := replaceJSON(ctx, s.Objects, k, r.v, r.gen); err == nil {
 				inv.refusals[k] = record[Refusal]{r.v, gen}
@@ -444,7 +464,8 @@ func (s *Service) giveConsumer(ctx context.Context, inv *inventory, q *queue) {
 			live++
 		}
 		if _, admitted := inv.admissions[m.Name]; !admitted {
-			idle[m.Selector.String()] = append(idle[m.Selector.String()], m)
+			k := m.Selector.String() + "/" + strconv.FormatBool(m.Contribution)
+			idle[k] = append(idle[k], m)
 		}
 	}
 	blocked := inv.blocked(q)
@@ -527,7 +548,7 @@ func (s *Service) giveConsumer(ctx context.Context, inv *inventory, q *queue) {
 	slices.Sort(keys)
 	for _, k := range keys {
 		d := wants[k]
-		have := idle[d.sel.String()]
+		have := idle[k]
 		n := len(d.jobs) - len(have)
 		room := lim.Machines - live
 		if d.contribution {
