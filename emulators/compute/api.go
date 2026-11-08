@@ -599,6 +599,10 @@ func (e *Emulator) insertInstance(r *http.Request, zone string) (*operation, *ap
 				fmt.Sprintf("Quota '%s' exceeded.  Limit: %d.0 in region %s.", metric, limit, region(zone))}
 		}
 	}
+	if e.refusing[capacityKey{zone, mt, prov == "SPOT"}] {
+		return nil, &apiError{http.StatusServiceUnavailable, "insufficientCapacity",
+			fmt.Sprintf("The zone 'projects/%s/zones/%s' does not have enough resources available to fulfill the request.", e.Project, zone)}
+	}
 	op := e.newOp(zone, "insert", e.zoneURL(zone)+"/instances/"+body.Name, 0)
 	if e.stockouts[capacityKey{zone, mt, prov == "SPOT"}] {
 		return op.fail(http.StatusServiceUnavailable, "ZONE_RESOURCE_POOL_EXHAUSTED",

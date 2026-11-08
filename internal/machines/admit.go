@@ -367,6 +367,11 @@ func (s *Service) decide(ctx context.Context, repo github.Repository, m Machine,
 			return refuse("the contribution's run has no approval of the "+ContributionEnvironment+" environment", true)
 		}
 		a.Contribution = true
+		// A contribution counts against its own limit, which only the
+		// machines made for contributions do.
+		if !m.Contribution {
+			return refuse("a contribution's job on a machine not made for contributions", false)
+		}
 	}
 	// Its labels hold exactly one selector, the machine's, with nothing
 	// else but GitHub's own labels that the runner has.
@@ -424,15 +429,18 @@ func (s *Service) recordRefusal(ctx context.Context, a Admission) (Refusal, int6
 	return got, gen, nil
 }
 
-// cancel asks GitHub to cancel a refused run, or to force it once an
-// ordinary cancellation hasn't finished it in time, and records what it
-// asked. A run that's finished needs nothing more.
+// cancel asks GitHub to cancel a refused run, or to force it once it's been
+// refused for longer than an ordinary cancellation should take, counted
+// from the refusal's record, which is written before any cancellation; and
+// records what it asked. Only GitHub's record of the run as completed
+// finishes a refusal: GitHub can answer a cancellation with a conflict while
+// the run goes on.
 func (s *Service) cancel(ctx context.Context, repo github.Repository, rf Refusal, gen int64) {
 	now := s.now()
 	key := refusalKey(rf.RepositoryID, rf.RunID)
 	var err error
 	switch {
-	case !rf.CancelledAt.IsZero() && now.Sub(rf.CancelledAt) >= ForceCancel:
+	case now.Sub(rf.RefusedAt) >= ForceCancel:
 		err = s.GitHub.ForceCancelRun(ctx, repo, rf.RunID)
 		if err == nil {
 			rf.ForcedAt = now
@@ -451,9 +459,16 @@ func (s *Service) cancel(ctx context.Context, repo github.Repository, rf Refusal
 		return
 	}
 	if errors.Is(err, github.ErrConflict) {
-		// GitHub shows it finished.
-		rf.FinishedAt = now
-		err = nil
+		run, rerr := s.GitHub.WorkflowRun(ctx, repo, rf.RunID)
+		switch {
+		case rerr == nil && run.Status == "completed", errors.Is(rerr, github.ErrNotFound):
+			rf.FinishedAt = now
+			err = nil
+		case rerr == nil:
+			err = fmt.Errorf("GitHub refused the cancellation of a run that's %s: %w", run.Status, err)
+		default:
+			err = rerr
+		}
 	}
 	if err != nil {
 		s.log().Warn("cancelling a refused run", "run_id", rf.RunID, "err", err.Error())

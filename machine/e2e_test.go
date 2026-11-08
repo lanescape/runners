@@ -359,14 +359,11 @@ func TestAJobRunsOnItsMachine(t *testing.T) {
 	if got := w.gh.Job(j.ID); got.Conclusion != "success" {
 		t.Fatalf("job %s; the hook should have let it run, with /work", got.Conclusion)
 	}
+	// The report starts a pass at once, which deletes its record with the
+	// machine, so what it said is read from the service's log.
 	w.eventually("the supervisor reports", 30*time.Second, func() bool {
-		_, _, ok := w.gcs.Object("state", "machines/"+m.Name+"/report.json")
-		return ok
+		return strings.Contains(w.logs.String(), `msg="machine reported" machine=`+m.Name+" save=true")
 	})
-	rep, _, _ := w.gcs.Object("state", "machines/"+m.Name+"/report.json")
-	if !strings.Contains(string(rep), `"save":true`) {
-		t.Fatalf("report = %s", rep)
-	}
 	// The report starts a pass at once, which deletes the machine.
 	w.eventually("the reported machine is deleted", 30*time.Second, func() bool {
 		_, ok := w.gce.Instance(m.Zone, m.Name)

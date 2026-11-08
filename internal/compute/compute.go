@@ -233,6 +233,10 @@ func classify(err error) error {
 		return fmt.Errorf("%w: %s", ErrExists, ge.Message)
 	case reason == "quotaExceeded" || reason == "QUOTA_EXCEEDED":
 		return &CapacityError{Message: ge.Message}
+	case stockout(reason):
+		// Compute Engine can refuse a request for want of capacity at
+		// once, as well as in its operation.
+		return &CapacityError{Stockout: true, Message: ge.Message}
 	case reason == "resourceInUseByAnotherResource":
 		return fmt.Errorf("%w: %s", ErrInUse, ge.Message)
 	case ge.Code == http.StatusTooManyRequests || ge.Code >= 500 || reason == "rateLimitExceeded" || reason == "resourceNotReady":
@@ -243,6 +247,14 @@ func classify(err error) error {
 	return &Unavailable{Err: err}
 }
 
+// stockout reports whether an error's reason or code says the zone has no
+// capacity for what was asked.
+func stockout(code string) bool {
+	return strings.HasPrefix(code, "ZONE_RESOURCE_POOL_EXHAUSTED") || code == "RESOURCE_POOL_EXHAUSTED" ||
+		code == "RESOURCE_EXHAUSTED" || code == "STOCKOUT" || code == "resourcePoolExhausted" ||
+		code == "insufficientCapacity" || code == "zoneResourcePoolExhausted"
+}
+
 // opError classes an operation's error, as Compute Engine reports what it
 // couldn't do after accepting a request.
 func opError(op *gce.Operation) error {
@@ -251,8 +263,7 @@ func opError(op *gce.Operation) error {
 	}
 	e := op.Error.Errors[0]
 	switch {
-	case strings.HasPrefix(e.Code, "ZONE_RESOURCE_POOL_EXHAUSTED") || e.Code == "RESOURCE_POOL_EXHAUSTED" ||
-		e.Code == "RESOURCE_EXHAUSTED" || e.Code == "STOCKOUT":
+	case stockout(e.Code):
 		return &CapacityError{Stockout: true, Message: e.Message}
 	case e.Code == "QUOTA_EXCEEDED":
 		return &CapacityError{Message: e.Message}

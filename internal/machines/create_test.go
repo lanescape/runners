@@ -169,6 +169,7 @@ func TestPlacement(t *testing.T) {
 			e.gce.Stockout(zoneA, "n4-highcpu-80", false)
 			e.gce.Stockout(zoneB, "n4-highcpu-80", false)
 		}, zoneA, "c4-highcpu-96", false, false},
+		{"a capacity refusal in the first zone", big, func(e *env) { e.gce.RefuseForCapacity(zoneA, "n4-highcpu-80", false) }, zoneB, "n4-highcpu-80", false, false},
 		{"no N4 quota", big, func(e *env) { e.gce.SetQuota("northamerica-northeast1", "N4_CPUS", 24) }, zoneA, "c4-highcpu-96", false, false},
 		{"no capacity anywhere", big, func(e *env) {
 			for _, z := range []string{zoneA, zoneB} {

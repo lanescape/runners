@@ -145,12 +145,15 @@ func (s *Service) finish(ctx context.Context, inv *inventory, m Machine, why str
 			}
 		}
 	}
-	if out, err := s.Compute.SerialOutput(ctx, m.Zone, m.Name, bootLogLimit); err == nil {
-		if _, err := s.Objects.Create(ctx, bootLogKey(m), []byte(out)); err != nil && !errors.Is(err, store.ErrPrecondition) {
-			log.Warn("saving a boot log", "err", err.Error())
+	// The boot log is saved before the machine, its only copy, goes; a
+	// machine whose log can't be saved waits for a later pass, unless it's
+	// past its age limit.
+	if err := s.saveBootLog(ctx, m); err != nil {
+		if s.now().Sub(m.CreatedAt) < MaxAge {
+			log.Warn("saving a boot log; the machine waits for it", "err", err.Error())
+			return
 		}
-	} else if !errors.Is(err, compute.ErrNotFound) {
-		log.Warn("reading a boot log", "err", err.Error())
+		log.Warn("saving a boot log; the machine is past its age limit and goes without it", "err", err.Error())
 	}
 	if err := s.Compute.DeleteInstance(ctx, m.Zone, m.Name, compute.RequestID("delete", m.Name)); err != nil && !errors.Is(err, compute.ErrNotFound) {
 		log.Error("deleting a machine", "err", err.Error())
@@ -165,6 +168,21 @@ func (s *Service) finish(ctx context.Context, inv *inventory, m Machine, why str
 	}
 	s.dropRecords(ctx, inv, m.Name)
 	log.Info("machine deleted", "reason", why)
+}
+
+// saveBootLog saves a machine's serial console output to the bucket, once.
+func (s *Service) saveBootLog(ctx context.Context, m Machine) error {
+	out, err := s.Compute.SerialOutput(ctx, m.Zone, m.Name, bootLogLimit)
+	if errors.Is(err, compute.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := s.Objects.Create(ctx, bootLogKey(m), []byte(out)); err != nil && !errors.Is(err, store.ErrPrecondition) {
+		return err
+	}
+	return nil
 }
 
 // saves reports whether a finished job's work disk is to be saved: the job

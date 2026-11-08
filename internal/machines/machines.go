@@ -298,11 +298,15 @@ type Refusal struct {
 }
 
 // JobRecord is when a queued job's first machine was made: another is made
-// while it's still queued, for up to RetryLimit from then.
+// while it's still queued, for up to RetryLimit from then. It's written
+// before the machine is made, tentative until the machine is known to have
+// been: a tentative record doesn't start the hour.
 type JobRecord struct {
 	RepositoryID   int64     `json:"repository_id"`
 	JobID          int64     `json:"job_id"`
 	FirstMachineAt time.Time `json:"first_machine_at"`
+	Machine        string    `json:"machine"`
+	Tentative      bool      `json:"tentative,omitempty"`
 }
 
 func admissionKey(machine string) string { return "machines/" + machine + "/admission.json" }

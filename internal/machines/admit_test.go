@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 
+	"github.com/lanescape/runners/config"
 	"github.com/lanescape/runners/emulators/fault"
 	ghemu "github.com/lanescape/runners/emulators/github"
 	gcsemu "github.com/lanescape/runners/emulators/storage"
@@ -451,5 +453,50 @@ func TestAReportStartsAPass(t *testing.T) {
 	case <-kicked:
 	default:
 		t.Fatal("a report didn't start a pass")
+	}
+}
+
+func TestACancellationConflictIsntAFinish(t *testing.T) {
+	e := setup(t)
+	main := e.mainRun()
+	meant := e.queue(main, sel2)
+	e.pass()
+	fork := e.forkPull()
+	stray := e.queue(fork, sel2)
+	e.gh.CompleteJob(meant, "success")
+	// GitHub answers the first cancellation with a conflict, though the
+	// run goes on.
+	e.gh.ServerError("/repos/lanescape/app/actions/runs/"+strconv.FormatInt(fork.ID, 10)+"/cancel", http.StatusConflict, 1)
+	m := e.boot(e.one())
+	m.taken(stray)
+	m.refused(fork.ID)
+	rec, _ := e.record("refusals/5001/" + strconv.FormatInt(fork.ID, 10) + ".json")
+	if rec["finished_at"] != nil {
+		t.Fatalf("refusal = %v; a conflict isn't GitHub showing the run finished", rec)
+	}
+	e.forceCancelled(fork)
+}
+
+func TestAContributionOnAnOrdinaryMachine(t *testing.T) {
+	e := setup(t)
+	e.cfg.Limits.Repositories = map[int64]config.Override{repoID: {ContributionMachines: ptr(0)}}
+	// A contribution whose bootstrap didn't run binds read, and is
+	// approved.
+	e.fork.Commit("feature", map[string]string{"src.go": "package app"})
+	p := e.gh.PullRequest(e.repo, "main", e.fork, "feature", e.contributor)
+	crun := e.gh.PullRequestTargetRun(p)
+	e.bind(crun, ghemu.Job{}, bindingRequest())
+	e.gh.Approve(crun, machines.ContributionEnvironment, e.maintainer)
+	read := "lanescape-2vcpu-linux-amd64-read"
+	stray := e.gh.Queue(crun, ghemu.JobSpec{Labels: []string{read}, Environment: machines.ContributionEnvironment})
+	other := e.gh.EventRun(e.repo, "workflow_dispatch", "main")
+	e.bind(other, ghemu.Job{}, bindingRequest())
+	e.queue(other, read)
+	e.pass()
+	m := e.boot(e.one())
+	m.taken(stray)
+	m.refused(crun.ID)
+	if adm, _ := e.record("machines/" + m.in.Name + "/admission.json"); !strings.Contains(adm["reason"].(string), "not made for contributions") {
+		t.Fatalf("admission = %v", adm)
 	}
 }

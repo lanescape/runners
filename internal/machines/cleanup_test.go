@@ -337,3 +337,53 @@ func TestNoCapacityDoesntStartTheJobsHour(t *testing.T) {
 		t.Fatal("a job with no machine has its first machine recorded")
 	}
 }
+
+func TestAFirstMachineThatWasntMade(t *testing.T) {
+	e := setup(t)
+	j := e.queue(e.mainRun(), sel2)
+	for _, z := range []string{zoneA, zoneB} {
+		e.gce.Stockout(z, "n4-highcpu-2", false)
+		e.gce.Stockout(z, "c4-highcpu-2", false)
+	}
+	// The tentative record can't be taken back.
+	e.gcs.Faults().Add(fault.Rule{Method: http.MethodDelete, Times: 1,
+		Match:   func(r *http.Request) bool { return strings.Contains(r.URL.Path, "jobs") },
+		Respond: gcsemu.JSONError(http.StatusForbidden, "forbidden", "Forbidden")})
+	e.pass()
+	if rec, ok := e.record("jobs/5001/" + strconv.FormatInt(j.ID, 10) + ".json"); !ok || rec["tentative"] != true {
+		t.Fatalf("job record = %v, %v", rec, ok)
+	}
+	e.clock.Advance(machines.RetryLimit + time.Minute)
+	for _, z := range []string{zoneA, zoneB} {
+		e.gce.ClearStockout(z, "n4-highcpu-2", false)
+	}
+	e.pass()
+	e.wantMachines(1)
+	if rec, _ := e.record("jobs/5001/" + strconv.FormatInt(j.ID, 10) + ".json"); rec["tentative"] != nil {
+		t.Fatalf("job record = %v; a made machine confirms it", rec)
+	}
+}
+
+func TestABootLogThatCouldntBeSaved(t *testing.T) {
+	e := setup(t)
+	m, _ := e.admitted(sel2)
+	m.release(true)
+	m.finished()
+	m.report(false)
+	e.gcs.Faults().Add(fault.Rule{Method: http.MethodPost, Times: 1,
+		Match: func(r *http.Request) bool {
+			return strings.Contains(r.URL.RawQuery, "logs") || strings.Contains(r.URL.Path, "logs")
+		},
+		Respond: gcsemu.JSONError(http.StatusForbidden, "forbidden", "Forbidden")})
+	e.pass()
+	if !e.exists(m.in.Name) {
+		t.Fatal("a machine was deleted though its boot log couldn't be saved")
+	}
+	e.pass()
+	if e.exists(m.in.Name) {
+		t.Fatal("not deleted once its boot log was saved")
+	}
+	if _, _, ok := e.gcs.Object("state", "logs/"+m.in.Name+"-"+m.in.Labels[machines.LabelCreated]+".txt"); !ok {
+		t.Fatal("no boot log")
+	}
+}

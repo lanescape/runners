@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/compute"
@@ -506,8 +507,8 @@ func (s *Service) giveConsumer(ctx context.Context, inv *inventory, q *queue) {
 			}
 			contribution = true
 		}
-		if jr, ok := inv.jobRecords[jobKey(repo.ID, job.ID)]; ok && s.now().Sub(jr.v.FirstMachineAt) >= RetryLimit {
-			log.Warn("leaving a job queued: its first machine was made over an hour ago", "first_machine_at", jr.v.FirstMachineAt)
+		if jr, ok := s.jobRecord(ctx, inv, repo.ID, job.ID); ok && s.now().Sub(jr.FirstMachineAt) >= RetryLimit {
+			log.Warn("leaving a job queued: its first machine was made over an hour ago", "first_machine_at", jr.FirstMachineAt)
 			continue
 		}
 		key := sel.String() + "/" + strconv.FormatBool(contribution)
@@ -565,6 +566,63 @@ func (s *Service) giveConsumer(ctx context.Context, inv *inventory, q *queue) {
 			}
 		}
 	}
+}
+
+// jobRecord is a job's confirmed first machine. A tentative record is
+// confirmed once a machine made for the job is seen; otherwise no machine is
+// known to have been made, and it doesn't count.
+func (s *Service) jobRecord(ctx context.Context, inv *inventory, repoID, jobID int64) (JobRecord, bool) {
+	key := jobKey(repoID, jobID)
+	r, ok := inv.jobRecords[key]
+	if !ok {
+		return JobRecord{}, false
+	}
+	if !r.v.Tentative {
+		return r.v, true
+	}
+	if m, listed := inv.machines[r.v.Machine]; !listed || m.Labels[LabelJob] != strconv.FormatInt(jobID, 10) {
+		return JobRecord{}, false
+	}
+	r.v.Tentative = false
+	if gen, err := replaceJSON(ctx, s.Objects, key, r.v, r.gen); err == nil {
+		inv.jobRecords[key] = record[JobRecord]{r.v, gen}
+	}
+	return r.v, true
+}
+
+// noteJob records, before a job's machine is made, when its first machine
+// is: tentatively, unless one is already confirmed. It returns the record's
+// generation if this attempt wrote it, or 0.
+func (s *Service) noteJob(ctx context.Context, inv *inventory, repoID, jobID int64, machine string, at time.Time) (int64, error) {
+	key := jobKey(repoID, jobID)
+	rec := JobRecord{RepositoryID: repoID, JobID: jobID, FirstMachineAt: at, Machine: machine, Tentative: true}
+	if r, ok := inv.jobRecords[key]; ok {
+		if !r.v.Tentative {
+			return 0, nil
+		}
+		gen, err := replaceJSON(ctx, s.Objects, key, rec, r.gen)
+		if err != nil {
+			return 0, err
+		}
+		inv.jobRecords[key] = record[JobRecord]{rec, gen}
+		return gen, nil
+	}
+	gen, err := createJSON(ctx, s.Objects, key, rec)
+	if errors.Is(err, store.ErrPrecondition) {
+		// Written already, perhaps by our own write whose answer was lost.
+		if v, g, ok, rerr := getJSON[JobRecord](ctx, s.Objects, key); rerr == nil && ok {
+			inv.jobRecords[key] = record[JobRecord]{v, g}
+			if v.Tentative && v.Machine == machine {
+				return g, nil
+			}
+		}
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	inv.jobRecords[key] = record[JobRecord]{rec, gen}
+	return gen, nil
 }
 
 func boolInt(b bool) int {
@@ -670,14 +728,25 @@ func (s *Service) make(ctx context.Context, inv *inventory, repo github.Reposito
 	// while the job is queued for up to an hour from then. If no machine
 	// was made, the record this attempt made is taken back.
 	jkey := jobKey(repo.ID, job.ID)
-	jgen, err := createJSON(ctx, s.Objects, jkey, JobRecord{RepositoryID: repo.ID, JobID: job.ID, FirstMachineAt: created})
-	if err != nil && !errors.Is(err, store.ErrPrecondition) {
+	jgen, err := s.noteJob(ctx, inv, repo.ID, job.ID, name, created)
+	if err != nil {
 		_ = s.GitHub.DeleteRunner(ctx, runner.ID)
 		return fmt.Errorf("recording the job's first machine: %w", err)
 	}
+	confirm := func() {
+		if jgen == 0 {
+			return
+		}
+		rec := JobRecord{RepositoryID: repo.ID, JobID: job.ID, FirstMachineAt: created, Machine: name}
+		if gen, err := replaceJSON(ctx, s.Objects, jkey, rec, jgen); err == nil {
+			inv.jobRecords[jkey] = record[JobRecord]{rec, gen}
+		}
+	}
+	// A tentative record whose machine was never made is ignored, so a
+	// failure to take it back only leaves it to be replaced.
 	takeBack := func() {
-		if jgen != 0 {
-			_ = s.Objects.Delete(ctx, jkey, jgen)
+		if jgen != 0 && s.Objects.Delete(ctx, jkey, jgen) == nil {
+			delete(inv.jobRecords, jkey)
 		}
 	}
 	spec := compute.InstanceSpec{
@@ -698,6 +767,7 @@ func (s *Service) make(ctx context.Context, inv *inventory, repo github.Reposito
 		spec.MachineType, spec.Spot = pl.MachineType, pl.Spot
 		err := s.Compute.CreateInstance(ctx, pl.Zone, spec, compute.RequestID("create", name, pl.Zone, pl.MachineType, strconv.FormatBool(pl.Spot)))
 		if err == nil {
+			confirm()
 			s.log().Info("machine made", "machine", name, "repository_id", repo.ID, "job_id", job.ID, "selector", sel.String(),
 				"zone", pl.Zone, "machine_type", pl.MachineType, "spot", pl.Spot, "contribution", contribution)
 			return nil

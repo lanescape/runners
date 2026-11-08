@@ -181,7 +181,7 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 	svc := &machines.Service{Config: cfg, Project: s.Project, ServiceURL: s.Audience, MachineAccount: account,
 		GitHub: gh, Compute: gce, Objects: objects, Binder: binder, Machines: machineTokens, Clock: clock, Logger: log}
 	passes := &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log}
-	svc.Kick = kicker(ctx, passes, svc, log)
+	svc.Kick = kicker(ctx, passes, svc.Pass, 15*time.Second, log)
 	h, err := server.New(server.Config{
 		Logger:           log,
 		OrganizationID:   cfg.Organization.ID,
@@ -219,27 +219,45 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 }
 
 // kicker runs a pass soon after a machine reports, so its cleanup starts at
-// once. A pass that finds the lease held tries again a few times, since the
-// pass holding it may have read the records before the report arrived; the
-// sweep catches whatever this misses.
-func kicker(ctx context.Context, passes *pass.Runner, svc *machines.Service, log *slog.Logger) func() {
-	return func() {
-		go func() {
-			for wait := 15 * time.Second; wait <= 2*time.Minute; wait *= 2 {
-				err := passes.Run(ctx, svc.Pass)
+// once. Reports that arrive before a pass is tried share it. A report is
+// pending until a pass that began after it has run: one that finds the
+// lease held tries again, since the pass holding it may have read the
+// records before the report arrived, until the lease has had time to
+// expire. The sweep catches whatever this misses.
+func kicker(ctx context.Context, passes *pass.Runner, body pass.Body, every time.Duration, log *slog.Logger) func() {
+	pending := make(chan struct{}, 1)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-pending:
+			}
+			for end := time.Now().Add(pass.Validity + pass.Deadline); ; {
+				err := passes.Run(ctx, body)
 				if !errors.Is(err, pass.ErrHeld) {
 					if err != nil {
 						log.Warn("pass after a report", "err", err)
 					}
-					return
+					break
+				}
+				if time.Now().After(end) {
+					log.Warn("no pass after a report; the sweep will catch it")
+					break
 				}
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(wait):
+				case <-time.After(every):
 				}
 			}
-		}()
+		}
+	}()
+	return func() {
+		select {
+		case pending <- struct{}{}:
+		default:
+		}
 	}
 }
 
