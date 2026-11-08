@@ -53,6 +53,13 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 	age := s.now().Sub(m.CreatedAt)
 	a, admitted := inv.admissions[m.Name]
 	rep, reported := inv.reports[m.Name]
+	// A refused machine that's running is stopped before anything else,
+	// whatever the rest of the records or its boot log hold up.
+	if admitted && !a.Allowed && !m.Stopped() {
+		if err := s.Compute.StopInstance(ctx, m.Zone, m.Name, s.requestID("stop", m.Name)); err != nil {
+			s.log().Error("stopping a refused machine", "machine", m.Name, "err", err.Error())
+		}
+	}
 	switch {
 	case age >= MaxAge:
 		s.finish(ctx, inv, m, "past "+MaxAge.String()+", deleted even mid-job, saving nothing", nil)
@@ -61,12 +68,6 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 	case reported:
 		s.finish(ctx, inv, m, "its supervisor reported", &rep)
 	case admitted && !a.Allowed:
-		// A refused machine is stopped first, whatever else it waits for.
-		if !m.Stopped() {
-			if err := s.Compute.StopInstance(ctx, m.Zone, m.Name, s.requestID("stop", m.Name)); err != nil {
-				s.log().Error("stopping a refused machine", "machine", m.Name, "err", err.Error())
-			}
-		}
 		if inv.unrecorded(m.Name) {
 			// Its admission is the only record that its run must be
 			// cancelled: the machine waits for the refusal.
@@ -191,6 +192,10 @@ func (s *Service) finish(ctx context.Context, inv *inventory, m Machine, why str
 			log.Warn("confirming a job's first machine; the machine waits for it", "err", err.Error())
 			return
 		default:
+			// The age limit comes first. If the bucket takes neither this
+			// nor the boot log, nothing is left to show the machine was
+			// made, and its job may get machines for another hour: the cost
+			// of a bucket that's down, bounded by that hour.
 			log.Warn("confirming a job's first machine; the machine is past its age limit and goes without it", "err", err.Error())
 		}
 	}

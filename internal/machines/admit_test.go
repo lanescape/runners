@@ -714,3 +714,27 @@ func TestAWorkDiskWhoseOperationFailed(t *testing.T) {
 		t.Fatalf("asked again: %d; a finished operation's failure needs a new request", code)
 	}
 }
+
+func TestARefusedMachineIsStoppedWhateverElseWaits(t *testing.T) {
+	e := setup(t)
+	main := e.mainRun()
+	meant := e.queue(main, sel2)
+	e.pass()
+	fork := e.forkPull()
+	stray := e.queue(fork, sel2)
+	e.gh.CompleteJob(meant, "success")
+	e.gce.ServerError(http.MethodPost, "/stop", http.StatusInternalServerError, 0)
+	m := e.boot(e.one())
+	m.taken(stray)
+	if code := m.started(fork.ID); code != http.StatusForbidden {
+		t.Fatalf("job-started check: %d, want 403", code)
+	}
+	// Compute Engine recovers, but the disks' records can't be listed.
+	e.gce.Faults().Reset()
+	e.gcs.Faults().Add(fault.Rule{Method: http.MethodGet, Times: 1, Match: func(r *http.Request) bool { return r.URL.Query().Get("prefix") == "disks/" },
+		Respond: gcsemu.JSONError(http.StatusForbidden, "forbidden", "Forbidden")})
+	e.pass()
+	if in, _ := e.gce.Instance(m.in.Zone, m.in.Name); in.Status != "TERMINATED" {
+		t.Fatalf("a refused machine is %s while other records couldn't be read", in.Status)
+	}
+}
