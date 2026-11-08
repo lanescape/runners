@@ -423,7 +423,7 @@ func TestAPassCutShortIsRetried(t *testing.T) {
 	if code != http.StatusServiceUnavailable || body["retryable"] != true {
 		t.Fatalf("pass cut short: %d %v, want a retryable 503", code, body)
 	}
-	if _, _, ok := e.gcs.Object("state", pass.LeaseName); ok {
-		t.Fatal("lease not released after the deadline")
+	if _, _, ok := e.gcs.Object("state", pass.LeaseName); !ok {
+		t.Fatal("lease released past the deadline; it should be left to expire")
 	}
 }

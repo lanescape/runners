@@ -169,3 +169,14 @@ func TestMissingBucket(t *testing.T) {
 		t.Fatalf("attrs of missing bucket: %v", err)
 	}
 }
+
+func TestNotMatchNeedsALiveObject(t *testing.T) {
+	_, b := client(t, false)
+	w := b.Object("new").If(storage.Conditions{GenerationNotMatch: 1}).NewWriter(context.Background())
+	io.WriteString(w, "x")
+	if err := w.Close(); code(err) != http.StatusPreconditionFailed {
+		t.Fatalf("create with a not-match condition: %v, want 412", err)
+	}
+	a := put(t, b.Object("old"), "1")
+	put(t, b.Object("old").If(storage.Conditions{GenerationNotMatch: a.Generation + 1}), "2")
+}

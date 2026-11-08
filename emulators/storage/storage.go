@@ -435,13 +435,15 @@ func (c conds) checkWrite(o *object) error {
 	if c.ifGenerationMatch != nil && *c.ifGenerationMatch != gen {
 		return errPrecondition
 	}
-	if c.ifGenerationNotMatch != nil && *c.ifGenerationNotMatch == gen {
+	// The "not match" conditions, and metageneration ones, fail when there's
+	// no live object, as Cloud Storage's do.
+	if c.ifGenerationNotMatch != nil && (o == nil || *c.ifGenerationNotMatch == gen) {
 		return errPrecondition
 	}
 	if c.ifMetagenerationMatch != nil && (o == nil || *c.ifMetagenerationMatch != metagen) {
 		return errPrecondition
 	}
-	if c.ifMetagenerationNotMat != nil && o != nil && *c.ifMetagenerationNotMat == metagen {
+	if c.ifMetagenerationNotMat != nil && (o == nil || *c.ifMetagenerationNotMat == metagen) {
 		return errPrecondition
 	}
 	return nil

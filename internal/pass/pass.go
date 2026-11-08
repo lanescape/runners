@@ -142,11 +142,15 @@ func (r *Runner) Run(ctx context.Context, body Body) error {
 	wg.Wait()
 
 	lost := errors.Is(context.Cause(pctx), ErrLeaseLost)
-	if !lost {
-		// Release even past the deadline: the lease is still ours until it
-		// expires, and releasing lets the next pass start sooner. A pass
-		// whose renewal failed doesn't, since it changes nothing more.
-		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseLimit)
+	// Whether the body was cut short is decided when it returns; the
+	// release after it doesn't change that.
+	cut := dctx.Err()
+	// Release in what's left of the pass, even if the caller has gone: the
+	// release is capped by the deadline like every other call. A pass that
+	// reached its deadline, or whose renewal failed, leaves the lease to
+	// expire.
+	if !lost && r.Clock.Now().Before(end) {
+		rctx, cancel := withDeadline(context.WithoutCancel(ctx), r.Clock, minTime(r.Clock.Now().Add(releaseLimit), end))
 		defer cancel()
 		if err := held.Release(rctx); err != nil {
 			log.Warn("pass lease release failed; it will expire", "err", err)
@@ -155,7 +159,7 @@ func (r *Runner) Run(ctx context.Context, body Body) error {
 	if lost {
 		return errors.Join(context.Cause(pctx), berr)
 	}
-	if err := dctx.Err(); err != nil {
+	if err := cut; err != nil {
 		// The pass was cut short, by its deadline or its caller, whatever
 		// the body made of it: it didn't finish.
 		return errors.Join(fmt.Errorf("pass stopped: %w", err), berr)

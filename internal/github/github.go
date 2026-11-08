@@ -177,16 +177,16 @@ func (t *installationTransport) currentToken(ctx context.Context) (string, error
 	if t.installationID == 0 {
 		id, err := t.find(ctx)
 		if err != nil {
-			return "", err
+			return "", &Unavailable{Err: err}
 		}
 		t.installationID = id
 	}
 	tok, _, err := t.app.Apps.CreateInstallationToken(ctx, t.installationID, nil)
 	if err != nil {
-		return "", fmt.Errorf("making an installation token: %w", err)
+		return "", &Unavailable{Err: fmt.Errorf("making an installation token: %w", err)}
 	}
 	if tok.GetToken() == "" {
-		return "", errors.New("making an installation token: empty answer")
+		return "", &Unavailable{Err: errors.New("making an installation token: empty answer")}
 	}
 	t.token, t.expires = tok.GetToken(), tok.GetExpiresAt().Time
 	return t.token, nil
@@ -215,6 +215,11 @@ func (t *installationTransport) find(ctx context.Context) (int64, error) {
 func classify(err error) error {
 	if err == nil {
 		return nil
+	}
+	// A failure to authenticate says nothing about what was asked for,
+	// whatever GitHub answered the token request with.
+	if IsUnavailable(err) {
+		return err
 	}
 	var er *gh.ErrorResponse
 	if errors.As(err, &er) && er.Response != nil && er.Response.StatusCode == http.StatusNotFound {

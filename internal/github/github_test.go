@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
@@ -322,5 +323,20 @@ func TestTokensAreReused(t *testing.T) {
 	e.emu.ServerError("/app/installations/", 500, 0)
 	if _, err := e.c.RepositoryByID(ctx, 5001); err != nil {
 		t.Fatalf("call with a cached token: %v", err)
+	}
+}
+
+// GitHub answers 404 when it won't make an installation token; that's no
+// answer about what the call asked for.
+func TestATokenRefusalIsNotANotFound(t *testing.T) {
+	ctx := context.Background()
+	for _, path := range []string{"/app/installations/", "/app/installations"} {
+		e := setup(t)
+		e.emu.ServerError(path, http.StatusNotFound, 1)
+		repo := github.Repository{ID: 5001, Owner: "lanescape", Name: "app", DefaultBranch: "main"}
+		_, err := e.c.BranchHead(ctx, repo, "main")
+		if errors.Is(err, github.ErrNotFound) || !github.IsUnavailable(err) {
+			t.Fatalf("%s refused: error = %v, want Unavailable", path, err)
+		}
 	}
 }

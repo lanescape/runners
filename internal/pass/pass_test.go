@@ -144,8 +144,10 @@ func TestPassDeadline(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("pass past its deadline returned %v, want a deadline error", err)
 	}
-	if _, _, ok := e.emu.Object("state", pass.LeaseName); ok {
-		t.Fatal("lease not released after the deadline")
+	// No call outlives the deadline, the release included: the lease is
+	// left to expire.
+	if _, _, ok := e.emu.Object("state", pass.LeaseName); !ok {
+		t.Fatal("lease released after the deadline")
 	}
 }
 
@@ -253,4 +255,23 @@ func TestPassPastItsDeadlineFailsWhateverItsBodySays(t *testing.T) {
 	if err := <-result; !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("pass cut short by its deadline returned %v, want a deadline error", err)
 	}
+}
+
+func TestASlowReleaseStopsAtTheDeadline(t *testing.T) {
+	e := setup(t)
+	e.runner.Deadline = 300 * time.Millisecond
+	e.runner.Clock = clockwork.NewRealClock()
+	e.runner.Lease = lease.New(e.store, pass.LeaseName, pass.Validity, e.runner.Clock)
+	start := time.Now()
+	err := e.runner.Run(context.Background(), func(p *pass.Pass) error {
+		e.emu.Faults().Add(fault.Rule{Method: http.MethodDelete, Delay: time.Minute})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("the pass took %v, past its deadline, to release", d)
+	}
+	e.emu.Faults().Reset()
 }
