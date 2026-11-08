@@ -1,6 +1,7 @@
 package machines_test
 
 import (
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"testing"
@@ -378,5 +379,26 @@ func TestTheHookCanBeTamperedWith(t *testing.T) {
 	e.pass()
 	if _, ok := e.gce.Instance(m.in.Zone, m.in.Name); ok {
 		t.Fatal("the machine wasn't deleted")
+	}
+}
+
+func TestAPassRecordsARefusalTheCheckDidnt(t *testing.T) {
+	e := setup(t)
+	fork := e.forkPull()
+	j := e.queue(fork, sel2)
+	// The check recorded its decision and stopped short of the rest.
+	e.queue(e.mainRun(), sel2)
+	e.pass()
+	m := e.one()
+	adm := machines.Admission{Machine: m.Name, Zone: m.Zone, RepositoryID: repoID, JobID: j.ID, RunID: fork.ID, Selector: sel2,
+		Reason: "the run is a fork's pull request's", Cancel: true}
+	b, _ := json.Marshal(adm)
+	e.gcs.Put("state", "machines/"+m.Name+"/admission.json", b)
+	e.pass()
+	if _, ok := e.record("refusals/5001/" + strconv.FormatInt(fork.ID, 10) + ".json"); !ok {
+		t.Fatal("the pass didn't record the refused run")
+	}
+	if st, c := e.gh.RunState(fork); st != "completed" || c != "cancelled" {
+		t.Fatalf("fork's run: %s %s", st, c)
 	}
 }

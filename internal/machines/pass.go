@@ -302,7 +302,24 @@ func (inv *inventory) blocked(q *queue) map[string]bool {
 
 // followRefusals cancels refused runs until GitHub shows them finished,
 // forcing them once an ordinary cancellation hasn't finished them in time.
+// A refused admission whose run was never recorded, because the check
+// stopped short, is recorded first.
 func (s *Service) followRefusals(ctx context.Context, inv *inventory) {
+	for _, a := range inv.admissions {
+		if a.Allowed || !a.Cancel {
+			continue
+		}
+		key := refusalKey(a.RepositoryID, a.RunID)
+		if r, ok := inv.refusals[key]; ok && slices.Contains(r.v.Selectors, a.Selector) {
+			continue
+		}
+		rf, gen, err := s.recordRefusal(ctx, a)
+		if err != nil {
+			s.log().Warn("recording a refused run", "run_id", a.RunID, "err", err.Error())
+			continue
+		}
+		inv.refusals[key] = record[Refusal]{rf, gen}
+	}
 	keys := make([]string, 0, len(inv.refusals))
 	for k := range inv.refusals {
 		keys = append(keys, k)

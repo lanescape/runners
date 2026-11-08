@@ -143,7 +143,10 @@ func (s *Service) JobStarted() http.Handler { return http.HandlerFunc(s.jobStart
 func (s *Service) JobFinished() http.Handler { return http.HandlerFunc(s.jobFinished) }
 
 func (s *Service) jobStarted(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), startedTimeout)
+	// A check carries on if its caller goes: a refused machine is stopped
+	// mid-request, which ends its hook's connection, and what follows the
+	// stop must still be done.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), startedTimeout)
 	defer cancel()
 	var req StartedRequest
 	m, ok := s.caller(ctx, w, r, &req)
@@ -370,34 +373,47 @@ func (s *Service) decide(ctx context.Context, repo github.Repository, m Machine,
 	return a, nil
 }
 
-// refuse carries out a refusal: the machine stops at once, and the run of a
-// job refused for coming from a fork or claiming a scope is recorded and
-// cancelled. Anything left undone here, a pass does.
+// refuse carries out a refusal: the run of a job refused for coming from a
+// fork or claiming a scope is recorded, the machine stops at once, and the
+// run is cancelled. Anything left undone here, a pass does.
 func (s *Service) refuse(ctx context.Context, m Machine, a Admission) {
+	var rf Refusal
+	var gen int64
+	recorded := false
+	if a.Cancel {
+		var err error
+		if rf, gen, err = s.recordRefusal(ctx, a); err != nil {
+			s.log().Error("recording a refused run", "run_id", a.RunID, "err", err.Error())
+		} else {
+			recorded = true
+		}
+	}
 	if err := s.Compute.StopInstance(ctx, m.Zone, m.Name, compute.RequestID("stop", m.Name)); err != nil && !errors.Is(err, compute.ErrNotFound) {
 		s.log().Error("stopping a refused machine", "machine", m.Name, "err", err.Error())
 	}
-	if !a.Cancel {
-		return
+	if recorded && rf.CancelledAt.IsZero() && rf.FinishedAt.IsZero() {
+		if repo, err := s.GitHub.RepositoryByID(ctx, a.RepositoryID); err == nil {
+			s.cancel(ctx, repo, rf, gen)
+		}
 	}
+}
+
+// recordRefusal records a refused run, once, with the refused job's
+// selector among those no machine is made for.
+func (s *Service) recordRefusal(ctx context.Context, a Admission) (Refusal, int64, error) {
+	key := refusalKey(a.RepositoryID, a.RunID)
 	rf := Refusal{RepositoryID: a.RepositoryID, RunID: a.RunID, Reason: a.Reason, Selectors: []string{a.Selector}, RefusedAt: s.now()}
-	got, gen, err := createOnce(ctx, s.Objects, refusalKey(a.RepositoryID, a.RunID), rf)
+	got, gen, err := createOnce(ctx, s.Objects, key, rf)
 	if err != nil {
-		s.log().Error("recording a refused run", "run_id", a.RunID, "err", err.Error())
-		return
+		return Refusal{}, 0, err
 	}
 	if !slices.Contains(got.Selectors, a.Selector) {
 		got.Selectors = append(got.Selectors, a.Selector)
-		if g, err := replaceJSON(ctx, s.Objects, refusalKey(a.RepositoryID, a.RunID), got, gen); err == nil {
-			gen = g
+		if gen, err = replaceJSON(ctx, s.Objects, key, got, gen); err != nil {
+			return Refusal{}, 0, err
 		}
 	}
-	if got.CancelledAt.IsZero() {
-		repo, err := s.GitHub.RepositoryByID(ctx, a.RepositoryID)
-		if err == nil {
-			s.cancel(ctx, repo, got, gen)
-		}
-	}
+	return got, gen, nil
 }
 
 // cancel asks GitHub to cancel a refused run, or to force it once an
@@ -513,7 +529,7 @@ func (s *Service) workDisk(ctx context.Context, m Machine, a Admission) error {
 }
 
 func (s *Service) jobFinished(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), finishedTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), finishedTimeout)
 	defer cancel()
 	var req FinishedRequest
 	m, ok := s.caller(ctx, w, r, &req)
