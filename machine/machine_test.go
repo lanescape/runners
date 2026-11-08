@@ -357,3 +357,15 @@ func TestTheHookWaitsForItsDisk(t *testing.T) {
 		t.Fatalf("hook failed waiting for its disk: %v\n%s", err, out)
 	}
 }
+
+func TestTheJobsEnvironmentCantTraceTheToken(t *testing.T) {
+	h := newHookEnv(t)
+	_, done, out := h.run("SHELLOPTS=xtrace", "BASH_XTRACEFD=2", "PS4=+ ")
+	if err := <-done; err != nil {
+		t.Fatalf("hook failed: %v\n%s", err, out)
+	}
+	_, tokens := h.requests()
+	if len(tokens) == 0 || strings.Contains(out.String(), tokens[0]) || strings.Contains(out.String(), "eyJ") {
+		t.Fatalf("the hook traced its token:\n%s", out)
+	}
+}

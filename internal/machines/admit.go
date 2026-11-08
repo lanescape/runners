@@ -368,14 +368,7 @@ func (s *Service) decide(ctx context.Context, repo github.Repository, m Machine,
 		}
 		a.Contribution = true
 	}
-	// Contributions and the consumer's own jobs count against limits of
-	// their own, by the machines made for each: neither takes the other's.
-	if a.Contribution != m.Contribution {
-		if a.Contribution {
-			return refuse("a contribution's job on a machine not made for contributions", false)
-		}
-		return refuse("a job that isn't a contribution on a machine made for one", false)
-	}
+
 	// Its labels hold exactly one selector, the machine's, with nothing
 	// else but GitHub's own labels that the runner has.
 	if err := selector.MatchesMachine(job.Labels, m.Selector); err != nil {
@@ -387,6 +380,15 @@ func (s *Service) decide(ctx context.Context, repo github.Repository, m Machine,
 	}
 	if bd.Scope != m.Selector.Scope {
 		return refuse(fmt.Sprintf("the selector's scope %s isn't the run's binding, %s", m.Selector.Scope, bd.Scope), true)
+	}
+	// Contributions and the consumer's own jobs count against limits of
+	// their own, by the machines made for each: neither takes the other's.
+	// This comes after the conditions whose refusals cancel the run.
+	if a.Contribution != m.Contribution {
+		if a.Contribution {
+			return refuse("a contribution's job on a machine not made for contributions", false)
+		}
+		return refuse("a job that isn't a contribution on a machine made for one", false)
 	}
 	a.Allowed = true
 	return a, nil
@@ -441,7 +443,20 @@ func (s *Service) recordRefusal(ctx context.Context, a Admission) (Refusal, int6
 func (s *Service) cancel(ctx context.Context, repo github.Repository, rf Refusal, gen int64) {
 	now := s.now()
 	key := refusalKey(rf.RepositoryID, rf.RunID, rf.RunAttempt)
-	var err error
+	// GitHub cancels a run by its ID, whatever its attempt: a refused
+	// attempt that's over isn't cancelled, lest a maintainer's rerun be.
+	run, err := s.GitHub.WorkflowRun(ctx, repo, rf.RunID)
+	if err != nil && !errors.Is(err, github.ErrNotFound) {
+		s.log().Warn("reading a refused run", "run_id", rf.RunID, "err", err.Error())
+		return
+	}
+	if err != nil || attemptOver(run, rf) {
+		rf.FinishedAt = now
+		if _, err := replaceJSON(ctx, s.Objects, key, rf, gen); err != nil {
+			s.log().Warn("recording a refused run's end", "run_id", rf.RunID, "err", err.Error())
+		}
+		return
+	}
 	switch {
 	case now.Sub(rf.RefusedAt) >= ForceCancel:
 		err = s.GitHub.ForceCancelRun(ctx, repo, rf.RunID)

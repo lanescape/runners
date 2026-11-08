@@ -604,11 +604,15 @@ func (s *Service) jobRecord(ctx context.Context, inv *inventory, repoID, jobID i
 	if m, listed := inv.machines[r.v.Machine]; !listed || m.Labels[LabelJob] != strconv.FormatInt(jobID, 10) {
 		return JobRecord{}, false
 	}
-	r.v.Tentative = false
-	if gen, err := replaceJSON(ctx, s.Objects, key, r.v, r.gen); err == nil {
-		inv.jobRecords[key] = record[JobRecord]{r.v, gen}
+	// The machine shows the record's time was its first, whether or not
+	// its confirmation is written now; one that isn't is tried again, and
+	// the machine isn't deleted until it is.
+	confirmed := r.v
+	confirmed.Tentative = false
+	if gen, err := replaceJSON(ctx, s.Objects, key, confirmed, r.gen); err == nil {
+		inv.jobRecords[key] = record[JobRecord]{confirmed, gen}
 	}
-	return r.v, true
+	return confirmed, true
 }
 
 // noteJob records, before a job's machine is made, when its first machine
@@ -617,10 +621,10 @@ func (s *Service) jobRecord(ctx context.Context, inv *inventory, repoID, jobID i
 func (s *Service) noteJob(ctx context.Context, inv *inventory, repoID, jobID int64, machine string, at time.Time) (int64, error) {
 	key := jobKey(repoID, jobID)
 	rec := JobRecord{RepositoryID: repoID, JobID: jobID, FirstMachineAt: at, Machine: machine, Tentative: true}
+	if _, ok := s.jobRecord(ctx, inv, repoID, jobID); ok {
+		return 0, nil
+	}
 	if r, ok := inv.jobRecords[key]; ok {
-		if !r.v.Tentative {
-			return 0, nil
-		}
 		gen, err := replaceJSON(ctx, s.Objects, key, rec, r.gen)
 		if err != nil {
 			return 0, err

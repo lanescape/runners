@@ -603,3 +603,47 @@ func TestAnOrdinaryJobOnAContributionMachine(t *testing.T) {
 		t.Fatalf("admission = %v", adm)
 	}
 }
+
+func TestAClaimedScopeOnAContributionMachineCancels(t *testing.T) {
+	e := setup(t)
+	crun, p := e.contribution(true)
+	csel := "lanescape-2vcpu-linux-amd64-pr" + strconv.Itoa(p.Number)
+	meant := e.gh.Queue(crun, ghemu.JobSpec{Labels: []string{csel}, Environment: machines.ContributionEnvironment})
+	e.pass()
+	// A push to main's job claims the pull request's scope, and takes the
+	// contribution's machine.
+	main := e.mainRun()
+	claim := e.queue(main, csel)
+	e.gh.CompleteJob(meant, "success")
+	m := e.boot(e.one())
+	m.taken(claim)
+	m.refused(main.ID)
+	adm, _ := e.record("machines/" + m.in.Name + "/admission.json")
+	if adm["cancel"] != true || !strings.Contains(adm["reason"].(string), "scope") {
+		t.Fatalf("admission = %v; a claimed scope cancels its run", adm)
+	}
+	if _, ok := e.record("refusals/5001/" + strconv.FormatInt(main.ID, 10) + "-1.json"); !ok {
+		t.Fatal("the refusal wasn't recorded")
+	}
+}
+
+func TestARefusedAttemptDoesntCancelARerun(t *testing.T) {
+	e := setup(t)
+	fork := e.forkPull()
+	// Attempt 1 was refused, and finished; a maintainer reran it before
+	// the refusal was followed up.
+	rf := machines.Refusal{RepositoryID: repoID, RunID: fork.ID, RunAttempt: 1, Selectors: []string{sel2}, RefusedAt: e.clock.Now()}
+	b, _ := json.Marshal(rf)
+	e.gcs.Put("state", "refusals/5001/"+strconv.FormatInt(fork.ID, 10)+"-1.json", b)
+	e.gh.SetRunStatus(fork, "completed")
+	e.gh.Rerun(fork)
+	j := e.gh.Queue(fork, ghemu.JobSpec{Labels: []string{"ubuntu-24.04"}})
+	e.pass()
+	if st, _ := e.gh.RunState(fork); st == "completed" || e.gh.Job(j.ID).Status != "queued" {
+		t.Fatal("following up an earlier attempt's refusal cancelled the rerun")
+	}
+	rec, _ := e.record("refusals/5001/" + strconv.FormatInt(fork.ID, 10) + "-1.json")
+	if rec["finished_at"] == nil {
+		t.Fatalf("refusal = %v; the earlier attempt is over", rec)
+	}
+}

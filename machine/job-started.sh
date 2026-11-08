@@ -9,6 +9,11 @@
 #
 # Its settings come from the base image; the only argument, which the runner
 # never passes, is another settings file, for tests.
+#
+# The job's environment can turn on tracing, as SHELLOPTS=xtrace does, which
+# would print the token: it's turned off before anything else. (Unsetting
+# BASH_XTRACEFD would close the descriptor it names, which may be stderr.)
+set +o xtrace +o verbose
 set -u
 
 settings=${1:-/etc/lanescape-runners/job-started.conf}

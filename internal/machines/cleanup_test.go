@@ -417,3 +417,33 @@ func TestAFirstMachineIsConfirmedBeforeItGoes(t *testing.T) {
 		t.Fatalf("job record = %v; the machine should have confirmed it before going", rec)
 	}
 }
+
+func TestAFirstMachineThatCantBeConfirmed(t *testing.T) {
+	e := setup(t)
+	j := e.queue(e.mainRun(), sel2)
+	// Every write to the job's record after the first fails.
+	writes := 0
+	e.gcs.Faults().Add(fault.Rule{Method: http.MethodPost,
+		Match: func(r *http.Request) bool {
+			if !strings.Contains(r.URL.RawQuery, "jobs") {
+				return false
+			}
+			writes++
+			return writes >= 2
+		},
+		Respond: gcsemu.JSONError(http.StatusForbidden, "forbidden", "Forbidden")})
+	e.pass()
+	first := e.one()
+	key := "jobs/5001/" + strconv.FormatInt(j.ID, 10) + ".json"
+	rec, _ := e.record(key)
+	e.clock.Advance(machines.IdleLimit)
+	e.gce.Shutdown(first.Zone, first.Name)
+	e.pass()
+	got, _ := e.record(key)
+	if got["first_machine_at"] != rec["first_machine_at"] || got["machine"] != first.Name {
+		t.Fatalf("job record = %v, was %v; the first machine's time must stand", got, rec)
+	}
+	if !e.exists(first.Name) {
+		t.Fatal("the first machine went before its record was confirmed")
+	}
+}
