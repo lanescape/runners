@@ -60,8 +60,12 @@ func TestRepositoryAndRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := github.WorkflowRun{ID: run.ID, RepositoryID: 5001, Event: "push", Status: "in_progress",
+	want := github.WorkflowRun{ID: run.ID, RepositoryID: 5001, Event: "push", Status: "in_progress", Attempt: 1,
 		HeadBranch: "main", HeadSHA: e.repo.Head("main"), HeadRepositoryID: 5001}
+	if got.CreatedAt.IsZero() {
+		t.Fatal("run has no creation time")
+	}
+	got.CreatedAt = time.Time{}
 	if got != want {
 		t.Fatalf("run = %+v, want %+v", got, want)
 	}

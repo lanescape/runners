@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bradleyfalzon/ghinstallation/v2"
@@ -43,15 +44,19 @@ type Repository struct {
 	DefaultBranch string
 }
 
-// WorkflowRun is a workflow run, as GitHub records it.
+// WorkflowRun is a workflow run, as GitHub records it. For a
+// pull_request_target run, its head is the base branch's.
 type WorkflowRun struct {
 	ID               int64
 	RepositoryID     int64
 	Event            string
 	Status           string
+	Conclusion       string
+	Attempt          int
 	HeadBranch       string
 	HeadSHA          string
 	HeadRepositoryID int64
+	CreatedAt        time.Time
 }
 
 // PullRequest is a pull request. HeadRepositoryID is 0 once the head
@@ -83,11 +88,18 @@ type API interface {
 	Compare(ctx context.Context, repo Repository, base, head string) (string, error)
 	// File reads a file at a commit.
 	File(ctx context.Context, repo Repository, path, commit string) ([]byte, error)
+
+	Actions
 }
 
 // Client is API over GitHub's REST API.
 type Client struct {
-	gh *gh.Client
+	gh    *gh.Client
+	orgID int64
+
+	orgMu    sync.Mutex
+	orgLogin string
+	orgUntil time.Time
 }
 
 // Options say how to reach GitHub as the App.
@@ -121,7 +133,12 @@ func NewAppClient(o Options) (*Client, error) {
 		return nil, err
 	}
 	it := &installationTransport{app: appClient.gh, base: tr, orgID: o.OrganizationID, sem: make(chan struct{}, 1)}
-	return newClient(&http.Client{Transport: it}, base)
+	c, err := newClient(&http.Client{Transport: it}, base)
+	if err != nil {
+		return nil, err
+	}
+	c.orgID = o.OrganizationID
+	return c, nil
 }
 
 func newClient(hc *http.Client, base string) (*Client, error) {
@@ -251,21 +268,28 @@ func (c *Client) RepositoryByID(ctx context.Context, id int64) (Repository, erro
 	return repo, nil
 }
 
+func runOf(r *gh.WorkflowRun) WorkflowRun {
+	return WorkflowRun{
+		ID:               r.GetID(),
+		RepositoryID:     r.GetRepository().GetID(),
+		Event:            r.GetEvent(),
+		Status:           r.GetStatus(),
+		Conclusion:       r.GetConclusion(),
+		Attempt:          r.GetRunAttempt(),
+		HeadBranch:       r.GetHeadBranch(),
+		HeadSHA:          r.GetHeadSHA(),
+		HeadRepositoryID: r.GetHeadRepository().GetID(),
+		CreatedAt:        r.GetCreatedAt().Time,
+	}
+}
+
 // WorkflowRun implements API.
 func (c *Client) WorkflowRun(ctx context.Context, repo Repository, id int64) (WorkflowRun, error) {
 	r, _, err := c.gh.Actions.GetWorkflowRunByID(ctx, repo.Owner, repo.Name, id)
 	if err != nil {
 		return WorkflowRun{}, classify(err)
 	}
-	return WorkflowRun{
-		ID:               r.GetID(),
-		RepositoryID:     r.GetRepository().GetID(),
-		Event:            r.GetEvent(),
-		Status:           r.GetStatus(),
-		HeadBranch:       r.GetHeadBranch(),
-		HeadSHA:          r.GetHeadSHA(),
-		HeadRepositoryID: r.GetHeadRepository().GetID(),
-	}, nil
+	return runOf(r), nil
 }
 
 func pullOf(p *gh.PullRequest) PullRequest {

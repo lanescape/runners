@@ -27,6 +27,7 @@ func (e *Emulator) routes() http.Handler {
 	mux.HandleFunc("GET /repos/{owner}/{repo}/compare/{basehead...}", e.authed(e.repo(e.compare)))
 	mux.HandleFunc("GET /repos/{owner}/{repo}/git/ref/{ref...}", e.authed(e.repo(e.getRef)))
 	mux.HandleFunc("GET /repos/{owner}/{repo}/contents/{path...}", e.authed(e.repo(e.getContents)))
+	e.actionsRoutes(mux)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "Not Found")
 	})
@@ -165,7 +166,7 @@ func (e *Emulator) runJSON(run *Run) map[string]any {
 		"actor":           accountJSON(run.Actor),
 		"repository":      e.repoJSON(run.Repo),
 		"head_repository": e.repoJSON(run.HeadRepo),
-		"created_at":      e.clock.Now().UTC().Format(time.RFC3339),
+		"created_at":      run.Created.UTC().Format(time.RFC3339),
 		"updated_at":      e.clock.Now().UTC().Format(time.RFC3339),
 	}
 }

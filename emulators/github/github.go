@@ -1,8 +1,11 @@
 // Package github emulates the parts of GitHub the service uses: the REST
 // API as go-github calls it, authenticated as a GitHub App installation; an
 // Actions OIDC issuer; and signed webhook deliveries. It keeps repositories,
-// commits, branches, tags, pull requests and workflow runs, and fails as
-// GitHub does, with rate limits and server errors.
+// commits, branches, tags, pull requests, workflow runs and their jobs,
+// environments' approvals, runner groups and just-in-time runners, and hands
+// queued jobs to registered runners as GitHub does. A runner stand-in
+// (StandIn) plays a runner's part. It fails as GitHub does, with rate limits
+// and server errors.
 //
 // Commits live in one store shared by every repository, as a fork network
 // shares its objects, so a fork's commits can be named in its parent.
@@ -46,6 +49,13 @@ type Emulator struct {
 	commits       map[string]*Commit
 	runs          map[int64]*Run
 	nextID        int64
+
+	jobs         map[int64]*WorkflowJob
+	groups       map[int64]*RunnerGroup
+	runners      map[int64]*Runner
+	forkApproval map[int64]string
+	protected    map[string]bool
+	changed      chan struct{}
 }
 
 // Account is a user or organization.
@@ -120,6 +130,10 @@ type Run struct {
 	BaseRef string
 	HeadRef string
 
+	Created   time.Time
+	Jobs      []*WorkflowJob
+	Approvals []Approval
+
 	// EventPull is what the event's payload says of its pull request, as
 	// github.event.pull_request carries it, for pull_request and
 	// pull_request_target runs: fixed when the run is made.
@@ -152,6 +166,7 @@ func New(opts ...Option) *Emulator {
 		runs:          map[int64]*Run{},
 		nextID:        1_000_000,
 	}
+	e.initActions()
 	for _, o := range opts {
 		o(e)
 	}
@@ -175,9 +190,13 @@ func (e *Emulator) id() int64 {
 	return e.nextID
 }
 
-// Org adds an organization.
+// Org adds an organization, with its Default runner group.
 func (e *Emulator) Org(id int64, login string) *Account {
-	return e.account(id, login, "Organization")
+	a := e.account(id, login, "Organization")
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.defaultGroup(a)
+	return a
 }
 
 // User adds a user.
@@ -320,6 +339,7 @@ func (e *Emulator) mergeCommit(p *Pull) string {
 
 func (e *Emulator) addRun(r *Run) *Run {
 	r.ID = e.id()
+	r.Created = e.clock.Now()
 	if r.Status == "" {
 		r.Status = "in_progress"
 	}
@@ -415,6 +435,7 @@ func (e *Emulator) SetRunStatus(r *Run, status string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	r.Status = status
+	e.notify()
 }
 
 // Job is what distinguishes one job's token from another's in a run.
