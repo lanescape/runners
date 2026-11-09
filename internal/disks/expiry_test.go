@@ -7,6 +7,7 @@ import (
 
 	ghemu "github.com/lanescape/runners/emulators/github"
 	"github.com/lanescape/runners/internal/disks"
+	"github.com/lanescape/runners/internal/selector"
 )
 
 func tools(key, scope string) string {
@@ -151,4 +152,52 @@ func (e *env) saveMainLabel(label string) string {
 	before := e.images()
 	e.start(e.mainRun(), ghemu.JobSpec{Name: "build", Labels: []string{label}}).finish(true)
 	return e.saved(before).Name
+}
+
+func TestAFailedDeletionDoesntMakeRoom(t *testing.T) {
+	e := setup(t)
+	e.cfg.Limits.Defaults.MainDisksGB = 100
+	m1 := e.saveMain(key1)
+	e.clock.Advance(time.Minute)
+	m2 := e.saveMain(key2)
+	e.clock.Advance(time.Minute)
+	jb := e.start(e.mainRun(), ghemu.JobSpec{Name: "build", Labels: []string{tools(key1, "main")}})
+	e.gce.FailNextOperation("images.delete", "INTERNAL_ERROR")
+	before := e.images()
+	jb.finish(true)
+	// The disk making room was marked, but its deletion failed: the save
+	// waits, and the pass's sweep of marked images tries the deletion
+	// again. The limit is never passed.
+	for n := range e.images() {
+		if _, ok := before[n]; !ok {
+			t.Fatalf("images %v; a save went ahead of the deletion that made room for it", e.images())
+		}
+	}
+	e.pass()
+	if e.has(m1) || !e.has(m2) || len(e.images()) != 2 {
+		t.Fatalf("images %v; want the old disk deleted, then the save", e.images())
+	}
+}
+
+func TestAPreemptedJobThatSucceededLetsItsRunsChoiceGo(t *testing.T) {
+	e := setup(t)
+	img := e.saveMain(key1)
+	run := e.mainRun()
+	label := "lanescape-2vcpu-linux-amd64-spot-disk-build-" + key1 + "-main"
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{label}})
+	if jb.source() != img {
+		t.Fatal("no restore")
+	}
+	// Preempted after its last step, with GitHub's success recorded.
+	if err := e.gce.Preempt(jb.in.Zone, jb.in.Name); err != nil {
+		t.Fatal(err)
+	}
+	e.gh.CompleteJobByID(jb.j.ID, "success")
+	e.pass()
+	if e.attempt(run) != 1 {
+		t.Fatal("a run whose preempted job succeeded was rerun")
+	}
+	if _, ok := e.record("choices/5001/" + strconv.FormatInt(run.ID, 10) + "/" + selector.Hash(label) + ".json"); ok {
+		t.Fatal("a finished run due no rerun kept its choice")
+	}
 }

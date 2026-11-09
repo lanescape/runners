@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/lanescape/runners/internal/compute"
+	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/machines"
 	"github.com/lanescape/runners/internal/store"
 )
@@ -89,31 +90,25 @@ func (s *Service) Save(ctx context.Context, m machines.Machine, a machines.Admis
 	return err
 }
 
-// settled reports whether GitHub shows a run finished, with no automatic
-// rerun it may yet be due: none of its preempted Spot machines' records is
-// of its latest attempt while it may have another.
+// settled reports whether a run has finished with no automatic rerun it is,
+// or may yet be, due, read afresh from GitHub and the bucket, as a pass
+// reads it: a run or repository GitHub confirms is gone has settled.
 func (s *Service) settled(ctx context.Context, repo, runID int64) (bool, error) {
-	r, err := s.GitHub.RepositoryByID(ctx, repo)
-	if err != nil {
-		return false, err
-	}
-	run, err := s.GitHub.WorkflowRun(ctx, r, runID)
-	if err != nil || run.Status != "completed" {
-		return false, err
-	}
-	if run.Attempt >= MaxAttempts {
-		return true, nil
-	}
 	ps, err := listJSON[Preemption](ctx, s.Objects, preemptionPrefix(repo, runID))
 	if err != nil {
 		return false, err
 	}
-	for _, p := range ps {
-		if p.v.RunAttempt == run.Attempt {
-			return false, nil
-		}
+	st := &state{preemptions: ps, reruns: map[string]record[Rerun]{}, repos: map[int64]*github.Repository{}, runs: map[string]*run{}}
+	if rr, _, ok, err := getJSON[Rerun](ctx, s.Objects, rerunKey(repo, runID)); err != nil {
+		return false, err
+	} else if ok {
+		st.reruns[rerunKey(repo, runID)] = record[Rerun]{v: rr}
 	}
-	return true, nil
+	rs, err := s.runState(ctx, st, repo, runID)
+	if err != nil {
+		return false, err
+	}
+	return rs.finished && !rs.due, nil
 }
 
 // counts reports whether a saved disk of scope counts against the limit of
@@ -158,10 +153,12 @@ func (s *Service) makeRoom(ctx context.Context, repo int64, scope, arch, family 
 	}
 	// Saves happen only in passes, one at a time, so a save that fits
 	// needs no lease; one that must make room marks under it.
+	// A marked image counts until Compute Engine confirms it's deleted:
+	// what's still stored isn't room.
 	total := func(recs map[string]record[Image]) int64 {
 		var n int64
 		for _, r := range recs {
-			if r.v.Kind == KindSaved && r.v.State != ImageMarked && counts(r.v.Scope, scope) {
+			if r.v.Kind == KindSaved && counts(r.v.Scope, scope) {
 				n += r.v.SizeGB
 			}
 		}
@@ -170,6 +167,21 @@ func (s *Service) makeRoom(ctx context.Context, repo int64, scope, arch, family 
 	recs, err := listJSON[Image](ctx, s.Objects, fmt.Sprintf("images/%d/", repo))
 	if err != nil {
 		return false, "", err
+	}
+	// Marked images of the limit's scopes go first.
+	var pending bool
+	for _, r := range recs {
+		if r.v.Kind == KindSaved && r.v.State == ImageMarked && counts(r.v.Scope, scope) {
+			if err := s.deleteMarked(ctx, r.v); err != nil {
+				return false, "", fmt.Errorf("deleting a marked disk before a save: %w", err)
+			}
+			pending = true
+		}
+	}
+	if pending {
+		if recs, err = listJSON[Image](ctx, s.Objects, fmt.Sprintf("images/%d/", repo)); err != nil {
+			return false, "", err
+		}
 	}
 	if total(recs)+sizeGB <= limit {
 		return true, "", nil

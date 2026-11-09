@@ -3,6 +3,8 @@ package machines
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -525,8 +527,10 @@ func (s *Service) workDisk(ctx context.Context, m Machine, a Admission) error {
 				return err
 			}
 		}
+		var nonce [8]byte
+		_, _ = rand.Read(nonce[:])
 		rec = DiskRecord{Disk: name, Machine: m.Name, Zone: m.Zone, RepositoryID: m.RepositoryID, JobID: a.JobID, State: DiskMaking,
-			SizeGB: size, SourceImage: image, At: s.now()}
+			SizeGB: size, SourceImage: image, Nonce: hex.EncodeToString(nonce[:]), At: s.now()}
 		if rec, gen, err = createOnce(ctx, s.Objects, key, rec); err != nil {
 			return err
 		}
@@ -544,6 +548,9 @@ func (s *Service) workDisk(ctx context.Context, m Machine, a Admission) error {
 		return nil
 	}
 	attempt := strconv.Itoa(rec.Attempt)
+	if rec.Nonce != "" {
+		attempt += "/" + rec.Nonce
+	}
 	// A confirmed failure is tried again under a new request ID, since
 	// Compute Engine answers a request ID it has seen with its first
 	// outcome.

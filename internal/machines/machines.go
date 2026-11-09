@@ -280,8 +280,11 @@ type DiskRecord struct {
 	SizeGB       int64  `json:"size_gb"`
 	SourceImage  string `json:"source_image,omitempty"`
 	// Attempt counts the confirmed failures to make or attach it, and
-	// names the request ID of the next try.
+	// names the request ID of the next try. Nonce is new with each record,
+	// so a record made again after its image went, whose attempts count
+	// from 0 again, never reuses an earlier record's request.
 	Attempt int       `json:"attempt,omitempty"`
+	Nonce   string    `json:"nonce,omitempty"`
 	At      time.Time `json:"at"`
 }
 

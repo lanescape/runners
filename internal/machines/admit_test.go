@@ -461,6 +461,34 @@ func TestAWorkDiskWhoseImageWentIsChosenAgain(t *testing.T) {
 	}
 }
 
+// An image that goes after its disk's request was accepted fails the
+// request's operation, which Compute Engine keeps under its request ID: the
+// next try, chosen again, is a new request.
+func TestAWorkDiskWhoseImageWentInItsOperationIsChosenAgain(t *testing.T) {
+	e := setup(t)
+	e.svc.Disks = baseImage{}
+	run := e.mainRun()
+	j := e.queue(run, sel2)
+	e.pass()
+	m := e.boot(e.one())
+	m.taken(j)
+	e.gce.FailNextOperation("disks.insert", "RESOURCE_NOT_FOUND")
+	if code := m.started(run.ID); code != http.StatusServiceUnavailable {
+		t.Fatalf("with its image gone: %d, want a retryable 503", code)
+	}
+	if code := m.started(run.ID); code != http.StatusOK {
+		t.Fatalf("the next try, which chose the same image again: %d", code)
+	}
+}
+
+// baseImage starts every work disk from a base image, as if it were a
+// saved disk.
+type baseImage struct{}
+
+func (baseImage) Choose(_ context.Context, _ machines.Machine, _ machines.Admission, size int64) (string, int64, error) {
+	return "lsr-base-amd64-new", size, nil
+}
+
 func TestAMachineThatIsntRunningGetsNoJob(t *testing.T) {
 	e := setup(t)
 	run := e.mainRun()
