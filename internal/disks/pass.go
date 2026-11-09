@@ -262,7 +262,15 @@ func (s *Service) follow(ctx context.Context, st *state) {
 	}
 }
 
+// rerun asks GitHub to rerun a run's failed jobs, under the disks' lease,
+// which every reading of a restore choice takes: whether the attempt it
+// begins is the service's is settled before any of that attempt's jobs
+// reads its run's choices.
 func (s *Service) rerun(ctx context.Context, st *state, repoID, runID int64, rs *run) error {
+	return s.step(ctx, repoID, func(ctx context.Context) error { return s.rerunLocked(ctx, st, repoID, runID, rs) })
+}
+
+func (s *Service) rerunLocked(ctx context.Context, st *state, repoID, runID int64, rs *run) error {
 	key := rerunKey(repoID, runID)
 	rec, gen, err := createOnce(ctx, s.Objects, key, Rerun{RepositoryID: repoID, RunID: runID, At: s.now()})
 	if err != nil {

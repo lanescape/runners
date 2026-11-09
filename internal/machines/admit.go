@@ -82,6 +82,12 @@ func (s *Service) caller(ctx context.Context, w http.ResponseWriter, r *http.Req
 	if err == nil {
 		c, err = s.Machines.Verify(ctx, tok)
 	}
+	if errors.Is(err, auth.ErrUnavailable) {
+		// The hook holds on a refusal; this isn't one.
+		s.log().Warn("machine not checked: Google's keys couldn't be read", "path", r.URL.Path, "err", err.Error())
+		retryLater(w, "the machine couldn't be checked; try again")
+		return Machine{}, false
+	}
 	if err != nil {
 		code := http.StatusUnauthorized
 		if errors.Is(err, auth.ErrForbidden) {

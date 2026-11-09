@@ -31,6 +31,10 @@ var ErrUnauthenticated = errors.New("unauthenticated")
 // ErrForbidden means the caller proved who it is, and isn't allowed.
 var ErrForbidden = errors.New("forbidden")
 
+// ErrUnavailable means a token couldn't be checked, because its issuer's
+// published keys couldn't be read: the caller should try again.
+var ErrUnavailable = errors.New("the issuer's keys couldn't be read")
+
 // ErrTooLarge means a body was larger than its limit.
 var ErrTooLarge = errors.New("body too large")
 
@@ -104,7 +108,7 @@ func (o Options) verifier() (*oidc.IDTokenVerifier, error) {
 	if hc == nil {
 		hc = &http.Client{Timeout: 10 * time.Second}
 	}
-	keys := oidc.NewRemoteKeySet(oidc.ClientContext(context.Background(), hc), o.Issuer.JWKSURL)
+	keys := keySet{oidc.NewRemoteKeySet(oidc.ClientContext(context.Background(), hc), o.Issuer.JWKSURL)}
 	return oidc.NewVerifier(o.Issuer.URL, keys, &oidc.Config{
 		ClientID:             o.Audience,
 		SupportedSigningAlgs: []string{oidc.RS256},
@@ -112,8 +116,25 @@ func (o Options) verifier() (*oidc.IDTokenVerifier, error) {
 	}), nil
 }
 
+// keySet is an issuer's published keys, whose failures to be read are
+// ErrUnavailable rather than a token that doesn't verify.
+type keySet struct{ *oidc.RemoteKeySet }
+
+func (k keySet) VerifySignature(ctx context.Context, jwt string) ([]byte, error) {
+	payload, err := k.RemoteKeySet.VerifySignature(ctx, jwt)
+	if err != nil && strings.Contains(err.Error(), "fetching keys") {
+		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
+	}
+	return payload, err
+}
+
 func verify(ctx context.Context, v *oidc.IDTokenVerifier, raw string, claims any) error {
 	tok, err := v.Verify(ctx, raw)
+	// go-oidc formats its key set's error rather than wrapping it, so the
+	// key set's own words are what say its keys couldn't be read.
+	if err != nil && strings.Contains(err.Error(), ErrUnavailable.Error()) {
+		return fmt.Errorf("%w: %v", ErrUnavailable, err)
+	}
 	if err != nil {
 		// go-oidc's errors name what failed, never the token itself.
 		return fmt.Errorf("%w: %v", ErrUnauthenticated, err)

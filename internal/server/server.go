@@ -139,6 +139,11 @@ func retryLater(w http.ResponseWriter, msg string) {
 // refuse answers an authentication failure. The caller learns only the
 // status; the log says why, without the credential.
 func (s *server) refuse(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, auth.ErrUnavailable) {
+		s.log.Warn("caller not checked: the issuer's keys couldn't be read", "path", r.URL.Path, "err", err.Error())
+		retryLater(w, "the caller couldn't be checked; try again")
+		return
+	}
 	code := http.StatusUnauthorized
 	if errors.Is(err, auth.ErrForbidden) {
 		code = http.StatusForbidden
@@ -270,6 +275,11 @@ func (s *server) bind(w http.ResponseWriter, r *http.Request) {
 	var claims *auth.ActionsClaims
 	if err == nil {
 		claims, err = s.Actions.Verify(ctx, tok)
+	}
+	if errors.Is(err, auth.ErrUnavailable) {
+		s.log.Warn("run binding not made: GitHub's keys couldn't be read", "err", err.Error())
+		retryLater(w, "GitHub's keys couldn't be read; try again")
+		return
 	}
 	if err != nil {
 		refuse("the token isn't one the service binds: " + err.Error())

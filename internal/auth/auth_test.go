@@ -189,3 +189,22 @@ func TestActions(t *testing.T) {
 		t.Fatalf("Google token: %v", err)
 	}
 }
+
+// A token whose issuer's keys can't be read isn't refused: it can't be
+// checked yet, and the caller should try again.
+func TestKeysThatCantBeRead(t *testing.T) {
+	emu := ghemu.New()
+	defer emu.Close()
+	org := emu.Org(orgID, "lanescape")
+	run := emu.PushRun(emu.Repo(org, 5001, "app"), "main")
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusBadGateway) }))
+	defer down.Close()
+	v, err := auth.NewActions(auth.Options{Issuer: auth.Issuer{URL: emu.Actions.URL, JWKSURL: down.URL}, Audience: audience}, orgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = v.Verify(context.Background(), emu.ActionsToken(run, ghemu.Job{Audience: audience}, nil))
+	if !errors.Is(err, auth.ErrUnavailable) || errors.Is(err, auth.ErrUnauthenticated) {
+		t.Fatalf("keys that can't be read: %v, want ErrUnavailable", err)
+	}
+}

@@ -11,7 +11,7 @@ The service's address and the proxy's are constants of this module's package `gi
 `POST /v1/bind` at `endpoints.Service`, with the job's GitHub OIDC token, audience `endpoints.Service`, binds the run's scope (specs/0002-machines.md), or returns the binding the run already has. A run's first job calls it.
 
 - **The body** is empty, except from a consumer's bootstrap workflow in a `pull_request_target` run, where it's what the job's own event says: `{"pull_request": <number>, "head_repository_id": <id>, "head_sha": "<commit>"}`.
-- **The answer** is `200` with `{"scope": "main" | "pr<number>" | "read"}`; `403` with `{"reason": "<why>"}` when the token or its run isn't one the service binds, or the body isn't a binding request; or `503` with `{"retryable": true}` and a `Retry-After`, when GitHub couldn't confirm an answer, which the caller retries with backoff. Answers may carry other fields, which callers ignore; nothing else is answered.
+- **The answer** is `200` with `{"scope": "main" | "pr<number>" | "read"}`; `403` with `{"reason": "<why>"}` when the token or its run isn't one the service binds, or the body isn't a binding request; or `503` with `{"retryable": true}` and a `Retry-After`, when GitHub couldn't confirm an answer, or its signing keys couldn't be read, which the caller retries with backoff. Answers may carry other fields, which callers ignore; nothing else is answered.
 
 ## Selectors
 
