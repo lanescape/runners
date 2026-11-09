@@ -8,7 +8,7 @@ Go, at the latest stable release, pinned by `go.mod`'s `toolchain` line, using G
 - `internal/`: the reconciler, and the clients for GitHub, Compute Engine, Cloud Storage and Pub/Sub, behind interfaces the emulators also serve.
 - `emulators/`: the emulators (below), and `emulators/service`, the emulator of the interface for actions that consumers test against (specs/0005-interface.md).
 - `conformance/`: the interface's test suite, which holds the emulator and the service to the same answers.
-- `config/`: the organization's ID, shapes, limits and the runner version.
+- `config/`: the organization's ID, shapes and the runner version.
 - `machine/`: the supervisor and the job-started hook, embedded into the service's binary, so nothing in a consumer's repository can change what a machine does before its job starts or after it ends.
 - `infra/`: the Terraform for everything the service runs on.
 - `bootstrap/`: the Terraform that lets `infra/` be applied at all (below).

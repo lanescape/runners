@@ -1,5 +1,5 @@
 // Package config is the service's configuration: the organization's ID,
-// shapes, limits and the runner version. The YAML files beside this one are
+// shapes and the runner version. The YAML files beside this one are
 // embedded into the service's binary, and validated when it starts.
 package config
 
@@ -12,7 +12,6 @@ import (
 	"io/fs"
 	"regexp"
 	"strconv"
-	"strings"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -24,7 +23,6 @@ var files embed.FS
 type Config struct {
 	Organization Organization
 	Shapes       Shapes
-	Limits       Limits
 	Runner       Runner
 }
 
@@ -52,42 +50,6 @@ type Shape struct {
 	WorkDiskGB   int      `yaml:"work_disk_gb"`
 }
 
-// Limit is one consumer's limits.
-type Limit struct {
-	Machines             int `yaml:"machines"`
-	ContributionMachines int `yaml:"contribution_machines"`
-}
-
-// Override changes some of a consumer's limits; absent fields keep the
-// defaults.
-type Override struct {
-	Machines             *int `yaml:"machines"`
-	ContributionMachines *int `yaml:"contribution_machines"`
-}
-
-// Limits are the defaults and the overrides by repository ID.
-type Limits struct {
-	Defaults     Limit              `yaml:"defaults"`
-	Repositories map[int64]Override `yaml:"repositories"`
-}
-
-// For returns a consumer's limits.
-func (l Limits) For(repositoryID int64) Limit {
-	lim := l.Defaults
-	o, ok := l.Repositories[repositoryID]
-	if !ok {
-		return lim
-	}
-	set := func(dst *int, src *int) {
-		if src != nil {
-			*dst = *src
-		}
-	}
-	set(&lim.Machines, o.Machines)
-	set(&lim.ContributionMachines, o.ContributionMachines)
-	return lim
-}
-
 // Runner is the GitHub runner release the base images install.
 type Runner struct {
 	Version string            `yaml:"version"`
@@ -109,7 +71,6 @@ func Load(fsys fs.FS) (*Config, error) {
 	}{
 		{"organization.yaml", &c.Organization},
 		{"shapes.yaml", &c.Shapes},
-		{"limits.yaml", &c.Limits},
 		{"runner.yaml", &c.Runner},
 	} {
 		if err := decode(fsys, f.name, f.v); err != nil {
@@ -217,23 +178,6 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if err := c.Limits.Defaults.validate(); err != nil {
-		bad("limits.yaml: defaults: %v", err)
-	}
-	for id, o := range c.Limits.Repositories {
-		if id <= 0 {
-			bad("limits.yaml: %d isn't a repository ID", id)
-			continue
-		}
-		if o == (Override{}) {
-			bad("limits.yaml: override for %d changes nothing", id)
-			continue
-		}
-		if err := c.Limits.For(id).validate(); err != nil {
-			bad("limits.yaml: repository %d: %v", id, err)
-		}
-	}
-
 	if !version.MatchString(c.Runner.Version) {
 		bad("runner.yaml: version %q isn't a release version such as 2.330.0", c.Runner.Version)
 	}
@@ -255,18 +199,4 @@ func archOf(family string) string {
 		return "arm64"
 	}
 	return "amd64"
-}
-
-func (l Limit) validate() error {
-	var bad []string
-	if l.Machines <= 0 {
-		bad = append(bad, "machines must be at least 1")
-	}
-	if l.ContributionMachines < 0 {
-		bad = append(bad, "contribution_machines can't be negative")
-	}
-	if len(bad) == 0 {
-		return nil
-	}
-	return errors.New(strings.Join(bad, "; "))
 }

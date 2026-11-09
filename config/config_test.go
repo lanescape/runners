@@ -43,7 +43,7 @@ func TestDefaultConfig(t *testing.T) {
 // files is a valid configuration that tests change one file of.
 func files() fstest.MapFS {
 	fsys := fstest.MapFS{}
-	for _, name := range []string{"organization.yaml", "shapes.yaml", "limits.yaml", "runner.yaml"} {
+	for _, name := range []string{"organization.yaml", "shapes.yaml", "runner.yaml"} {
 		data, err := os.ReadFile(name)
 		if err != nil {
 			panic(err)
@@ -59,36 +59,7 @@ func with(name, data string) fstest.MapFS {
 	return fsys
 }
 
-func TestOverridesByRepositoryID(t *testing.T) {
-	c, err := config.Load(with("limits.yaml", `
-defaults:
-  machines: 10
-  contribution_machines: 2
-repositories:
-  123456:
-    machines: 30
-    contribution_machines: 0
-`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := c.Limits.For(123456)
-	if got.Machines != 30 || got.ContributionMachines != 0 {
-		t.Errorf("overridden limits = %+v", got)
-	}
-	if other := c.Limits.For(654321); other != c.Limits.Defaults {
-		t.Errorf("limits without an override = %+v, want the defaults", other)
-	}
-}
-
 func TestInvalidConfigs(t *testing.T) {
-	limits := func(extra string) string {
-		return `
-defaults:
-  machines: 10
-  contribution_machines: 2
-` + extra
-	}
 	shapes := func(shape string) string {
 		return `
 zones: [northamerica-northeast1-a]
@@ -112,11 +83,6 @@ shapes:
 		{"no work disk", "shapes.yaml", shapes("  lanescape-16vcpu-linux-arm64: {machine_types: [c4a-highcpu-16], memory_gb: 32}"), "must be positive"},
 		{"duplicate type", "shapes.yaml", shapes("  lanescape-2vcpu-linux-amd64: {machine_types: [n4-highcpu-2, n4-highcpu-2], memory_gb: 4, work_disk_gb: 1}"), "twice"},
 		{"no zones", "shapes.yaml", "boot_disk_gb: 100\ndisk_iops: 3000\ndisk_throughput_mibps: 400\nshapes: {lanescape-2vcpu-linux-amd64: {machine_types: [n4-highcpu-2], memory_gb: 4, work_disk_gb: 1}}", "no zones"},
-		{"no machines", "limits.yaml", strings.Replace(limits(""), "machines: 10", "machines: 0", 1), "machines must be at least 1"},
-		{"a limit that's gone", "limits.yaml", limits("repositories:\n  42: {main_disks_gb: 100}"), "not found"},
-		{"empty override", "limits.yaml", limits("repositories:\n  42: {}"), "changes nothing"},
-		{"bad override", "limits.yaml", limits("repositories:\n  42: {contribution_machines: -1}"), "repository 42"},
-		{"override by name", "limits.yaml", limits("repositories:\n  app: {machines: 2}"), "limits.yaml"},
 		{"bad runner version", "runner.yaml", "version: v2.338\nsha256: {amd64: " + strings.Repeat("a", 64) + ", arm64: " + strings.Repeat("a", 64) + "}", "isn't a release version"},
 		{"missing checksum", "runner.yaml", "version: 2.338.2\nsha256: {amd64: " + strings.Repeat("a", 64) + "}", "sha256 for arm64"},
 	} {
@@ -129,9 +95,9 @@ shapes:
 	}
 	t.Run("missing file", func(t *testing.T) {
 		fsys := files()
-		delete(fsys, "limits.yaml")
+		delete(fsys, "runner.yaml")
 		if _, err := config.Load(fsys); err == nil {
-			t.Fatal("loaded without limits.yaml")
+			t.Fatal("loaded without runner.yaml")
 		}
 	})
 }

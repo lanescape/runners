@@ -31,7 +31,7 @@ What machines, disks and images exist, and what they're for, is in their names a
 
 ## Runner groups
 
-GitHub gives a job any runner, in a group its repository may use, whose labels include all of the job's. A group per repository keeps one repository's job off a machine made for another's. The first time a consumer queues a job, the service creates its group, `lanescape-runners-<repository ID>`, limited to that repository, and registers that consumer's runners only there. A consumer's limits are the organization-wide defaults in `config/limits.yaml`, unless that file overrides them for the consumer by repository ID.
+GitHub gives a job any runner, in a group its repository may use, whose labels include all of the job's. A group per repository keeps one repository's job off a machine made for another's. The first time a consumer queues a job, the service creates its group, `lanescape-runners-<repository ID>`, limited to that repository, and registers that consumer's runners only there.
 
 ## Endpoints
 
@@ -52,7 +52,7 @@ One pass runs at a time, under a lease in the bucket: an object taken with a gen
 A pass:
 
 1. Lists the queued jobs of every consumer's runs, the service's machines, disks and images, and its records.
-2. Gives queued jobs machines, within each consumer's limits (specs/0002-machines.md).
+2. Gives queued jobs machines, oldest first, from one pool for every consumer (specs/0002-machines.md, One pool).
 3. Saves the work disks of jobs that asked, and makes resume images for preempted Spot jobs (specs/0003-disks.md).
 4. Reruns runs that lost a Spot job to preemption, once they've finished.
 5. Deletes what's finished, too old, expired or orphaned, and removes offline runner registrations named after its machines.
@@ -63,7 +63,7 @@ A failure on one machine, job or disk doesn't stop the rest of a pass. If the se
 
 A job from a pull request whose head is in another repository never runs on the service's machines, except for an approved contribution, below. The service makes no machine for any other such job, and if one takes a machine made for another job, the job-started check refuses it before its first step (specs/0002-machines.md). In a fork, or for a fork's pull request, the actions resolve every runner to its fallback, normally one of GitHub's, and read sources straight from upstream. A fork's pull request runs there, at GitHub's expense, whatever needs nothing of ours.
 
-**Approved contributions.** A consumer may also run a contributor's pull request on the service's machines, through a `pull_request_target` workflow whose jobs name the environment `contribution`. The environment's required reviewers are the consumer's maintainers, and each push to the pull request makes a new run that waits for approval again. The service accepts a job from such a run only if GitHub records an approval of the `contribution` environment for that run, and counts it against the consumer's separate limit for contributions. Every other check still applies.
+**Approved contributions.** A consumer may also run a contributor's pull request on the service's machines, through a `pull_request_target` workflow whose jobs name the environment `contribution`. The environment's required reviewers are the consumer's maintainers, and each push to the pull request makes a new run that waits for approval again. The service accepts a job from such a run only if GitHub records an approval of the `contribution` environment for that run. Every other check still applies.
 
 A `pull_request_target` run runs the default branch's workflow file with the base repository's privileges, so its jobs' tokens name default-branch code even when a job runs the contributor's. So:
 

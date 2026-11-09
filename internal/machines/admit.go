@@ -404,15 +404,6 @@ func (s *Service) decide(ctx context.Context, repo github.Repository, m Machine,
 	if bd.Scope != m.Selector.Scope {
 		return refuse(fmt.Sprintf("the selector's scope %s isn't the run's binding, %s", m.Selector.Scope, bd.Scope), true)
 	}
-	// Contributions and the consumer's own jobs count against limits of
-	// their own, by the machines made for each: neither takes the other's.
-	// This comes after the conditions whose refusals cancel the run.
-	if a.Contribution != m.Contribution {
-		if a.Contribution {
-			return refuse("a contribution's job on a machine not made for contributions", false)
-		}
-		return refuse("a job that isn't a contribution on a machine made for one", false)
-	}
 	a.Allowed = true
 	return a, nil
 }

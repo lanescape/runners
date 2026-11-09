@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lanescape/runners/config"
 	"github.com/lanescape/runners/emulators/fault"
 	gcsemu "github.com/lanescape/runners/emulators/storage"
 	"github.com/lanescape/runners/internal/machines"
@@ -313,14 +312,15 @@ func TestCleanupClaimsAMachineBeforeACheckCan(t *testing.T) {
 	}
 }
 
-func TestAMachineThatMayHaveBeenMadeCountsAgainstTheLimit(t *testing.T) {
+func TestAMachineThatMayHaveBeenMadeIsntMadeAgain(t *testing.T) {
 	e := setup(t)
-	e.cfg.Limits.Repositories = map[int64]config.Override{repoID: {Machines: ptr(1)}}
 	run := e.mainRun()
 	e.queue(run, sel2)
-	e.queue(run, "lanescape-16vcpu-linux-arm64-main")
-	// Every answer to making the first is lost, after it's made.
+	// Every answer to making it is lost, after it's made.
 	e.gce.LoseResponse(http.MethodPost, "/instances", 4)
+	e.pass()
+	e.wantMachines(1)
+	// The next pass finds it, idle, for the job.
 	e.pass()
 	e.wantMachines(1)
 }

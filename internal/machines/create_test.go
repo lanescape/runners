@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lanescape/runners/config"
 	ghemu "github.com/lanescape/runners/emulators/github"
+	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/machines"
 	"github.com/lanescape/runners/internal/selector"
 )
@@ -121,11 +121,10 @@ func TestForkApprovalSetting(t *testing.T) {
 	e.wantMachines(1)
 }
 
-func ptr(n int) *int { return &n }
-
-func TestLimits(t *testing.T) {
+// Every consumer draws on one pool, and contributions on the same one:
+// nothing but Compute Engine's quota and capacity holds a job back.
+func TestOnePool(t *testing.T) {
 	e := setup(t)
-	e.cfg.Limits.Repositories = map[int64]config.Override{repoID: {Machines: ptr(2), ContributionMachines: ptr(1)}}
 	run := e.mainRun()
 	for range 3 {
 		e.queue(run, sel2)
@@ -135,21 +134,67 @@ func TestLimits(t *testing.T) {
 	for range 2 {
 		e.gh.Queue(crun, ghemu.JobSpec{Labels: []string{csel}, Environment: machines.ContributionEnvironment})
 	}
+	other := e.gh.Repo(e.org, repoID+1, "other")
+	orun := e.gh.PushRun(other, "main")
+	e.bind(orun, ghemu.Job{}, binding.Request{})
+	for range 2 {
+		e.queue(orun, sel2)
+	}
 	e.pass()
-	ms := e.wantMachines(3)
+	ms := e.wantMachines(7)
 	contributions := 0
 	for _, m := range ms {
 		if m.Labels[machines.LabelContribution] == "true" {
 			contributions++
 		}
 	}
-	if contributions != 1 {
-		t.Fatalf("%d contribution machines, want 1", contributions)
+	if contributions != 2 {
+		t.Fatalf("%d contribution machines, want 2", contributions)
 	}
-	// Another selector shares the consumer's limit.
-	e.queue(run, "lanescape-16vcpu-linux-arm64-main")
+}
+
+// Machines go to queued jobs oldest first, across consumers. A job that
+// quota or capacity holds back stays queued, and isn't overtaken by a
+// younger job that could have had its machine; jobs of other machine types
+// go on.
+func TestOldestFirst(t *testing.T) {
+	e := setup(t)
+	// Room for one 2-vCPU machine.
+	e.gce.SetQuota("northamerica-northeast1", "N4_CPUS", 2)
+	e.gce.SetQuota("northamerica-northeast1", "C4_CPUS", 0)
+	other := e.gh.Repo(e.org, repoID+1, "other")
+	orun := e.gh.PushRun(other, "main")
+	e.bind(orun, ghemu.Job{}, binding.Request{})
+	oldest := e.queue(orun, sel2)
+	// GitHub gives jobs' times to the second.
+	time.Sleep(1100 * time.Millisecond)
+	run := e.mainRun()
+	younger := e.queue(run, sel2)
+	youngest := e.queue(run, sel2)
+	arm := e.queue(run, "lanescape-16vcpu-linux-arm64-main")
 	e.pass()
-	e.wantMachines(3)
+	ms := e.wantMachines(2)
+	byJob := map[string]bool{}
+	for _, m := range ms {
+		byJob[m.Labels[machines.LabelJob]] = true
+	}
+	if !byJob[strconv.FormatInt(oldest.ID, 10)] || !byJob[strconv.FormatInt(arm.ID, 10)] {
+		t.Fatalf("machines for jobs %v; want the oldest's and the Arm job's", byJob)
+	}
+	if e.gh.Job(younger.ID).Status != "queued" || e.gh.Job(youngest.ID).Status != "queued" {
+		t.Fatal("a job held back by quota isn't queued")
+	}
+	// Once there's room, the next oldest gets its machine.
+	e.gce.SetQuota("northamerica-northeast1", "N4_CPUS", 4)
+	e.pass()
+	ms = e.wantMachines(3)
+	byJob = map[string]bool{}
+	for _, m := range ms {
+		byJob[m.Labels[machines.LabelJob]] = true
+	}
+	if !byJob[strconv.FormatInt(younger.ID, 10)] || byJob[strconv.FormatInt(youngest.ID, 10)] {
+		t.Fatalf("machines for jobs %v; want the younger's before the youngest's", byJob)
+	}
 }
 
 func TestPlacement(t *testing.T) {

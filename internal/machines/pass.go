@@ -266,7 +266,7 @@ func (inv *inventory) reported(m string) bool {
 	return ok
 }
 
-// live reports whether a machine counts against its consumer's limits: it
+// live reports whether a machine is being made, idle or running a job: it
 // hasn't stopped, been refused or reported.
 func (inv *inventory) live(m Machine) bool {
 	return !m.Stopped() && !inv.refused(m.Name) && !inv.reported(m.Name)
@@ -421,17 +421,23 @@ func CheckForkApproval(ctx context.Context, gh github.API) error {
 	return nil
 }
 
-// demand is the queued jobs of one consumer that may have a machine of one
-// selector.
-type demand struct {
+// wanted is a queued job that may have a machine of its selector, and is
+// still without one.
+type wanted struct {
+	repo         github.Repository
 	sel          selector.Selector
 	contribution bool
-	jobs         []github.Job
+	job          github.Job
 }
 
 // give makes a machine for each queued job that may have one, unless as
-// many are already being made or idle for its consumer and selector, within
-// the consumer's limits.
+// many are already being made or idle for its consumer and selector. Every
+// consumer draws on one pool, whose only ceiling is the project's Compute
+// Engine quota: machines go to queued jobs oldest first, across all
+// consumers, so no consumer or run starves another (specs/0002-machines.md,
+// One pool). A job whose machine can't be made for want of quota or
+// capacity stays queued, and is tried again by later passes; meanwhile no
+// younger job gets a machine of a type it could have had.
 func (s *Service) give(ctx context.Context, inv *inventory) {
 	if !inv.machinesComplete || !inv.recordsComplete {
 		s.log().Warn("making no machines this pass: the machines or records couldn't all be read")
@@ -441,31 +447,54 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 		s.log().Error("making no machines", "err", err.Error())
 		return
 	}
+	var all []wanted
 	for _, q := range inv.queues {
 		if ctx.Err() != nil {
 			return
 		}
-		s.giveConsumer(ctx, inv, q)
+		all = append(all, s.wants(ctx, inv, q)...)
+	}
+	slices.SortStableFunc(all, func(a, b wanted) int {
+		return cmp.Or(a.job.CreatedAt.Compare(b.job.CreatedAt), cmp.Compare(a.repo.ID, b.repo.ID), cmp.Compare(a.job.ID, b.job.ID))
+	})
+	short := map[string]bool{}
+	for _, w := range all {
+		if ctx.Err() != nil {
+			return
+		}
+		types := s.Config.Shapes.Shapes[w.sel.Shape].MachineTypes
+		if slices.ContainsFunc(types, func(t string) bool { return short[t] }) {
+			s.log().Info("a job waits: an older job is waiting for quota or capacity of its machine types", "repository_id", w.repo.ID,
+				"job_id", w.job.ID, "selector", w.sel.String())
+			continue
+		}
+		err := s.make(ctx, inv, w.repo, w.sel, w.job, w.contribution)
+		if err == nil {
+			continue
+		}
+		s.log().Warn("no machine made; the job stays queued", "repository_id", w.repo.ID, "job_id", w.job.ID, "selector", w.sel.String(),
+			"err", err.Error())
+		if compute.IsCapacity(err) {
+			for _, t := range types {
+				short[t] = true
+			}
+		}
 	}
 }
 
-func (s *Service) giveConsumer(ctx context.Context, inv *inventory, q *queue) {
+// wants are a consumer's queued jobs that may have a machine and need a
+// new one: of each selector's jobs, those beyond the machines already
+// being made or idle for it, oldest first among those with no machine made
+// for them.
+func (s *Service) wants(ctx context.Context, inv *inventory, q *queue) []wanted {
 	repo := q.repo
-	lim := s.Config.Limits.For(repo.ID)
-	live, liveContributions := 0, 0
 	idle := map[string][]Machine{}
 	for _, m := range inv.machines {
 		if m.RepositoryID != repo.ID || !inv.live(m) {
 			continue
 		}
-		if m.Contribution {
-			liveContributions++
-		} else {
-			live++
-		}
 		if _, admitted := inv.admissions[m.Name]; !admitted {
-			k := m.Selector.String() + "/" + strconv.FormatBool(m.Contribution)
-			idle[k] = append(idle[k], m)
+			idle[m.Selector.String()] = append(idle[m.Selector.String()], m)
 		}
 	}
 	blocked := inv.blocked(q)
@@ -474,7 +503,7 @@ func (s *Service) giveConsumer(ctx context.Context, inv *inventory, q *queue) {
 		refusedRuns[rf.RunID] = true
 	}
 
-	wants := map[string]*demand{}
+	bySel := map[string][]wanted{}
 	for _, job := range q.jobs {
 		sel, err := selector.OfJob(job.Labels)
 		if errors.Is(err, selector.ErrNoSelector) {
@@ -532,61 +561,24 @@ func (s *Service) giveConsumer(ctx context.Context, inv *inventory, q *queue) {
 			log.Warn("leaving a job queued: its first machine was made over an hour ago", "first_machine_at", jr.FirstMachineAt)
 			continue
 		}
-		key := sel.String() + "/" + strconv.FormatBool(contribution)
-		d := wants[key]
-		if d == nil {
-			d = &demand{sel: sel, contribution: contribution}
-			wants[key] = d
-		}
-		d.jobs = append(d.jobs, job)
+		bySel[sel.String()] = append(bySel[sel.String()], wanted{repo: repo, sel: sel, contribution: contribution, job: job})
 	}
 
-	keys := make([]string, 0, len(wants))
-	for k := range wants {
-		keys = append(keys, k)
-	}
-	slices.Sort(keys)
-	for _, k := range keys {
-		d := wants[k]
+	var out []wanted
+	for k, jobs := range bySel {
 		have := idle[k]
-		n := len(d.jobs) - len(have)
-		room := lim.Machines - live
-		if d.contribution {
-			room = lim.ContributionMachines - liveContributions
-		}
-		if n > room {
-			s.log().Info("jobs wait for room under the consumer's limit", "repository_id", repo.ID, "selector", d.sel.String(),
-				"waiting", n-max(room, 0), "contribution", d.contribution)
-			n = room
-		}
-		// Jobs without a machine made for them come first.
 		madeFor := map[int64]bool{}
 		for _, m := range have {
 			madeFor[m.MadeFor] = true
 		}
-		jobs := slices.Clone(d.jobs)
-		slices.SortStableFunc(jobs, func(a, b github.Job) int {
-			return cmp.Compare(boolInt(madeFor[a.ID]), boolInt(madeFor[b.ID]))
+		// Jobs without a machine made for them come first, oldest first.
+		slices.SortStableFunc(jobs, func(a, b wanted) int {
+			return cmp.Or(cmp.Compare(boolInt(madeFor[a.job.ID]), boolInt(madeFor[b.job.ID])), a.job.CreatedAt.Compare(b.job.CreatedAt))
 		})
-		for i := 0; i < n && i < len(jobs); i++ {
-			if ctx.Err() != nil {
-				return
-			}
-			if err := s.make(ctx, inv, repo, d.sel, jobs[i], d.contribution); err != nil {
-				s.log().Warn("no machine made", "repository_id", repo.ID, "job_id", jobs[i].ID, "selector", d.sel.String(), "err", err.Error())
-				// One that may have been made counts against the limit
-				// until a pass sees whether it was.
-				if !compute.IsUnavailable(err) {
-					continue
-				}
-			}
-			if d.contribution {
-				liveContributions++
-			} else {
-				live++
-			}
-		}
+		n := max(len(jobs)-len(have), 0)
+		out = append(out, jobs[:n]...)
 	}
+	return out
 }
 
 // jobRecord is a job's confirmed first machine. A tentative record is

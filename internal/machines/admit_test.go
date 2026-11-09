@@ -9,7 +9,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/lanescape/runners/config"
 	gceemu "github.com/lanescape/runners/emulators/compute"
 	"github.com/lanescape/runners/emulators/fault"
 	ghemu "github.com/lanescape/runners/emulators/github"
@@ -542,9 +541,10 @@ func TestACancellationConflictIsntAFinish(t *testing.T) {
 	e.forceCancelled(fork)
 }
 
+// Contributions differ from other jobs only in what they must show to
+// run, never in which machines of their selector they may take.
 func TestAContributionOnAnOrdinaryMachine(t *testing.T) {
 	e := setup(t)
-	e.cfg.Limits.Repositories = map[int64]config.Override{repoID: {ContributionMachines: ptr(0)}}
 	// A contribution whose bootstrap didn't run binds read, and is
 	// approved.
 	e.fork.Commit("feature", map[string]string{"src.go": "package app"})
@@ -556,12 +556,20 @@ func TestAContributionOnAnOrdinaryMachine(t *testing.T) {
 	stray := e.gh.Queue(crun, ghemu.JobSpec{Labels: []string{read}, Environment: machines.ContributionEnvironment})
 	other := e.gh.EventRun(e.repo, "workflow_dispatch", "main")
 	e.bind(other, ghemu.Job{}, bindingRequest())
-	e.queue(other, read)
+	ordinary := e.queue(other, read)
 	e.pass()
-	m := e.boot(e.one())
+	var made gceemu.InstanceState
+	for _, in := range e.wantMachines(2) {
+		if in.Labels[machines.LabelJob] == strconv.FormatInt(ordinary.ID, 10) {
+			made = in
+		}
+	}
+	m := e.boot(made)
 	m.taken(stray)
-	m.refused(crun.ID)
-	if adm, _ := e.record("machines/" + m.in.Name + "/admission.json"); !strings.Contains(adm["reason"].(string), "not made for contributions") {
+	if code := m.started(crun.ID); code != http.StatusOK {
+		t.Fatalf("a contribution on an ordinary machine of its selector: %d", code)
+	}
+	if adm, _ := e.record("machines/" + m.in.Name + "/admission.json"); adm["allowed"] != true || adm["contribution"] != true {
 		t.Fatalf("admission = %v", adm)
 	}
 }
@@ -637,7 +645,6 @@ func TestARerunIsRefusedAfresh(t *testing.T) {
 
 func TestAnOrdinaryJobOnAContributionMachine(t *testing.T) {
 	e := setup(t)
-	e.cfg.Limits.Repositories = map[int64]config.Override{repoID: {Machines: ptr(1), ContributionMachines: ptr(1)}}
 	read := "lanescape-2vcpu-linux-amd64-read"
 	other := e.gh.EventRun(e.repo, "workflow_dispatch", "main")
 	e.bind(other, ghemu.Job{}, bindingRequest())
@@ -662,8 +669,10 @@ func TestAnOrdinaryJobOnAContributionMachine(t *testing.T) {
 	// ordinary job.
 	m := e.boot(contribution)
 	m.taken(ordinary)
-	m.refused(other.ID)
-	if adm, _ := e.record("machines/" + m.in.Name + "/admission.json"); !strings.Contains(adm["reason"].(string), "made for one") {
+	if code := m.started(other.ID); code != http.StatusOK {
+		t.Fatalf("an ordinary job on a contribution's machine of its selector: %d", code)
+	}
+	if adm, _ := e.record("machines/" + m.in.Name + "/admission.json"); adm["allowed"] != true || adm["contribution"] == true {
 		t.Fatalf("admission = %v", adm)
 	}
 }

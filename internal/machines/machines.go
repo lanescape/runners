@@ -1,6 +1,7 @@
 // Package machines gives queued jobs machines and ends their lives
 // (specs/0002-machines.md, A machine's life): a pass makes a machine for each
-// job that may have one, within its consumer's limits, and deletes what's
+// job that may have one, from one pool for every consumer, oldest job
+// first, and deletes what's
 // finished; the job-started check decides, from GitHub's records, whether
 // the job a machine's runner took may run there, and gives it its work disk;
 // and the supervisor's report says the job is done.
