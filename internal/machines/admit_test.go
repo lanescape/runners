@@ -1,10 +1,12 @@
 package machines_test
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/lanescape/runners/config"
@@ -422,6 +424,40 @@ func TestAWorkDiskThatCouldntBeMadeIsTriedAgain(t *testing.T) {
 	e.gce.StockoutDisks(m.in.Zone, false)
 	if code := m.started(run.ID); code != http.StatusOK {
 		t.Fatalf("once there's capacity: %d", code)
+	}
+}
+
+// vanishing chooses an image that isn't there the first time, as one
+// deleted just after it was chosen would be, and none after that.
+type vanishing struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (v *vanishing) Choose(_ context.Context, _ machines.Machine, _ machines.Admission, size int64) (string, int64, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.calls++
+	if v.calls == 1 {
+		return "lsr-5001-0123456789abcdef0123-1-gonegone", size, nil
+	}
+	return "", size, nil
+}
+
+func TestAWorkDiskWhoseImageWentIsChosenAgain(t *testing.T) {
+	e := setup(t)
+	v := &vanishing{}
+	e.svc.Disks = v
+	run := e.mainRun()
+	j := e.queue(run, sel2)
+	e.pass()
+	m := e.boot(e.one())
+	m.taken(j)
+	if code := m.started(run.ID); code != http.StatusServiceUnavailable {
+		t.Fatalf("with its image gone: %d, want a retryable 503", code)
+	}
+	if code := m.started(run.ID); code != http.StatusOK || v.calls != 2 {
+		t.Fatalf("the next try: %d, %d choices; want it to choose again", code, v.calls)
 	}
 }
 

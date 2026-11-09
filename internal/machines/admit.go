@@ -564,6 +564,15 @@ func (s *Service) workDisk(ctx context.Context, m Machine, a Admission) error {
 			Labels: map[string]string{LabelRepository: strconv.FormatInt(m.RepositoryID, 10), LabelMachine: m.Name,
 				LabelJob: strconv.FormatInt(a.JobID, 10), LabelCreated: strconv.FormatInt(s.now().Unix(), 10)},
 		}, compute.RequestID("work disk", name, strconv.FormatInt(a.JobID, 10), attempt))
+		if err != nil && rec.SourceImage != "" && errors.Is(err, compute.ErrNotFound) {
+			// The image it was to start from went after it was chosen:
+			// the record goes, and the next try chooses again.
+			s.log().Warn("a work disk's image is gone; choosing again", "machine", m.Name, "image", rec.SourceImage)
+			if derr := s.Objects.Delete(ctx, key, gen); derr != nil {
+				return errors.Join(err, derr)
+			}
+			return err
+		}
 		if err != nil && !errors.Is(err, compute.ErrExists) {
 			return failed(err)
 		}
