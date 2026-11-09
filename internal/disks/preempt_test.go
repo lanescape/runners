@@ -611,3 +611,36 @@ func TestARefusedRerunWithNoReadBack(t *testing.T) {
 		t.Fatalf("a maintainer's rerun started from %q, want the newest %s", src, newer)
 	}
 }
+
+// A rerun GitHub refuses because a maintainer's has begun isn't the
+// service's.
+func TestARefusalWhileAMaintainersRerunBegins(t *testing.T) {
+	e := setup(t)
+	old := e.saveMain(key1)
+	run := e.mainRun()
+	label := "lanescape-2vcpu-linux-amd64-spot-disk-build-" + key1 + "-main"
+	lost := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{label}})
+	if lost.source() != old {
+		t.Fatal("no restore")
+	}
+	e.clock.Advance(time.Minute)
+	newer := e.saveMain(key1)
+	lost.preempt()
+	// The maintainer reruns it just as the service asks.
+	path := "/repos/lanescape/app/actions/runs/" + strconv.FormatInt(run.ID, 10) + "/rerun-failed-jobs"
+	e.gh.Faults().Add(fault.Rule{Method: http.MethodPost, Times: 1,
+		Match: func(r *http.Request) bool { return r.URL.Path == path },
+		Respond: func(w http.ResponseWriter, _ *http.Request) {
+			e.gh.Rerun(run)
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message": "This workflow is already running"}`))
+		}})
+	e.pass()
+	rr, _ := e.record("reruns/5001/" + strconv.FormatInt(run.ID, 10) + ".json")
+	if started, _ := rr["started"].([]any); len(started) != 0 {
+		t.Fatalf("rerun record = %v; a refused rerun is recorded as the service's", rr)
+	}
+	if src := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{label}}).source(); src != newer {
+		t.Fatalf("the maintainer's rerun started from %q, want the newest %s", src, newer)
+	}
+}

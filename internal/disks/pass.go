@@ -289,15 +289,18 @@ func (s *Service) rerun(ctx context.Context, st *state, repoID, runID int64, rs 
 	repo := st.repos[repoID]
 	err = s.GitHub.RerunFailedJobs(ctx, *repo, runID)
 	wr, rerr := s.GitHub.WorkflowRun(ctx, *repo, runID)
+	refused := err != nil && !github.IsUnavailable(err)
 	switch {
-	case rerr == nil && wr.Attempt > rs.attempt:
+	case !refused && rerr == nil && wr.Attempt > rs.attempt:
 		// Begun, whatever the answer said: an answer lost after GitHub
-		// began the next attempt is a rerun all the same.
+		// began the next attempt is a rerun all the same. A confirmed
+		// refusal never is, even if another attempt has begun, which
+		// then is someone else's.
 		err = nil
 	case rerr == nil && err == nil:
 		err = fmt.Errorf("GitHub accepted the rerun but still shows attempt %d", wr.Attempt)
 		fallthrough
-	case rerr == nil, err != nil && !github.IsUnavailable(err):
+	case rerr == nil, refused:
 		// GitHub's attempt didn't move on, or GitHub confirmed its
 		// refusal: not a rerun of the service's.
 		rec.Started = slices.DeleteFunc(rec.Started, func(a int) bool { return a == rs.attempt })
@@ -615,9 +618,30 @@ func (s *Service) tidy(ctx context.Context, st *state) {
 	}
 	for repo, names := range orphans {
 		slices.Sort(names)
+		// A claim keeps an orphaned resume image only while it would keep
+		// one with a record: until its job has finished, and for a day
+		// after its machine stopped, by its preemption record, or failing
+		// that its claim.
+		expired := map[int64]bool{}
+		for _, name := range names {
+			c, claimed := st.claims[claimKey(repo, name)]
+			if !claimed || !resumeName.MatchString(name) {
+				continue
+			}
+			stopped := c.v.At
+			for _, p := range st.preemptions {
+				if p.v.RepositoryID == repo && p.v.ResumeImage == name {
+					stopped = p.v.StoppedAt
+				}
+			}
+			done, err := s.finishedJob(ctx, st, repo, c.v.JobID)
+			if (err == nil && done) || s.now().Sub(stopped) >= ResumeKept {
+				expired[c.v.JobID] = true
+			}
+		}
 		var marked []Image
 		err := s.step(ctx, repo, func(ctx context.Context) error {
-			named, err := s.named(ctx, repo, nil)
+			named, err := s.named(ctx, repo, expired)
 			if err != nil {
 				return err
 			}

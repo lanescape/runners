@@ -329,3 +329,23 @@ func TestAClaimedOrphanKeepsItsClaim(t *testing.T) {
 		t.Fatal("the claim keeping an image was removed")
 	}
 }
+
+// A claimed orphan goes once its claiming job has finished.
+func TestAClaimedOrphanGoesWithItsJob(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{"lanescape-2vcpu-linux-amd64-spot-main"}})
+	jb.preempt()
+	e.pass()
+	resume := disks.ResumeName(repoID, jb.in.ID)
+	again := e.admit(run, e.rerunJob(run, 2, "build"))
+	key := "images/5001/" + resume + ".json"
+	if err := e.objects.Delete(context.Background(), key, mustGen(t, e, key)); err != nil {
+		t.Fatal(err)
+	}
+	again.finish(false)
+	e.pass()
+	if e.has(resume) {
+		t.Fatal("a claimed orphan outlived its job")
+	}
+}
