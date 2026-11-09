@@ -10,6 +10,7 @@ import (
 
 	"github.com/lanescape/runners/internal/compute"
 	"github.com/lanescape/runners/internal/machines"
+	"github.com/lanescape/runners/internal/scope"
 )
 
 // Stopped records a Spot machine that stopped with its job admitted,
@@ -148,11 +149,16 @@ func (s *Service) ParseEvent(data []byte) (Event, bool) {
 	return Event{InstanceID: id, Zone: m[2], Machine: m[3], Method: preemptedMethod, At: e.Timestamp.UTC()}, true
 }
 
-// RecordEvent records a Compute Engine event in the bucket by instance ID,
-// if it's a preemption of one of the service's machines, before the
-// reconcile endpoint acknowledges it: Google keeps the zone operation that
-// also shows it for as little as an hour.
-func (s *Service) RecordEvent(ctx context.Context, data []byte) error {
+// RecordEvent records what a pushed message says that a pass can't read
+// back later, before the reconcile endpoint acknowledges it: a Compute
+// Engine event by instance ID, if it's a preemption of one of the service's
+// machines, since Google keeps the zone operation that also shows it for as
+// little as an hour; and a pull request's closing, since GitHub no longer
+// shows it once the pull request is reopened.
+func (s *Service) RecordEvent(ctx context.Context, attributes map[string]string, data []byte) error {
+	if attributes["event"] == "pull_request" {
+		return s.recordClosing(ctx, data)
+	}
 	ev, ok := s.ParseEvent(data)
 	if !ok {
 		return nil
@@ -163,4 +169,76 @@ func (s *Service) RecordEvent(ctx context.Context, data []byte) error {
 	}
 	s.log().Info("preemption event recorded", "instance_id", ev.InstanceID, "machine", ev.Machine, "zone", ev.Zone)
 	return nil
+}
+
+// closing is what the service reads of GitHub's pull_request delivery.
+type closing struct {
+	Action      string `json:"action"`
+	PullRequest *struct {
+		Number   int       `json:"number"`
+		ClosedAt time.Time `json:"closed_at"`
+	} `json:"pull_request"`
+	Repository *struct {
+		ID    int64 `json:"id"`
+		Owner *struct {
+			ID int64 `json:"id"`
+		} `json:"owner"`
+	} `json:"repository"`
+}
+
+// recordClosing records a pull request's closing, from GitHub's signed
+// delivery, as the last time it was seen closed: the second after GitHub's
+// closed_at, which it gives to the second, so a run bound in that second
+// counts as bound before. A pass may see the pull request open again by the
+// time it runs; its disks saved by runs bound before are retired all the
+// same.
+func (s *Service) recordClosing(ctx context.Context, data []byte) error {
+	var c closing
+	if json.Unmarshal(data, &c) != nil || c.Action != "closed" || c.PullRequest == nil || c.PullRequest.Number <= 0 ||
+		c.PullRequest.ClosedAt.IsZero() || c.Repository == nil || c.Repository.Owner == nil ||
+		c.Repository.Owner.ID != s.Config.Organization.ID || c.Repository.ID <= 0 {
+		return nil
+	}
+	sc := scope.PullRequest(c.PullRequest.Number).String()
+	seen := c.PullRequest.ClosedAt.UTC().Truncate(time.Second).Add(time.Second)
+	if _, err := s.closeScope(ctx, c.Repository.ID, sc, seen, c.PullRequest.ClosedAt.UTC()); err != nil {
+		return err
+	}
+	s.log().Info("pull request closing recorded", "repository_id", c.Repository.ID, "scope", sc)
+	return nil
+}
+
+// closeScope records that a pull request scope's pull request was seen
+// closed at seen, under the disks' lease, which every choice and mark takes,
+// keeping whichever time is later, the one recorded or this, and returns
+// what's recorded. The delivery and the passes both write it this way, so
+// neither can move it back, nor change it while a step reads it.
+func (s *Service) closeScope(ctx context.Context, repo int64, sc string, seen, closedAt time.Time) (Closure, error) {
+	key := closureKey(repo, sc)
+	var out Closure
+	err := s.step(ctx, repo, func(ctx context.Context) error {
+		cur, gen, found, err := getJSON[Closure](ctx, s.Objects, key)
+		if err != nil {
+			return err
+		}
+		if found && !cur.SeenAt.Before(seen) {
+			out = cur
+			return nil
+		}
+		rec := Closure{RepositoryID: repo, Scope: sc, ClosedAt: closedAt, SeenAt: seen}
+		if found && closedAt.IsZero() {
+			rec.ClosedAt = cur.ClosedAt
+		}
+		if found {
+			_, err = replaceJSON(ctx, s.Objects, key, rec, gen)
+		} else {
+			_, _, err = createOnce(ctx, s.Objects, key, rec)
+		}
+		if err != nil {
+			return err
+		}
+		out = rec
+		return nil
+	})
+	return out, err
 }

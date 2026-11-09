@@ -5,7 +5,7 @@ variable "project_id" {
 }
 
 variable "region" {
-  description = "The region of the service, its machines and the proxy."
+  description = "The region of the service, its machines and its buckets."
   type        = string
   default     = "northamerica-northeast1"
 }
@@ -21,12 +21,6 @@ variable "zones" {
     condition     = length(var.zones) >= 1 && length(var.zones) <= 8
     error_message = "zones must list between 1 and 8 zones."
   }
-}
-
-variable "proxy_git_zone" {
-  description = "The zone of the proxy's git machine, lsr-proxy-git."
-  type        = string
-  default     = "northamerica-northeast1-a"
 }
 
 variable "github_owner_id" {
@@ -45,10 +39,4 @@ variable "machines_cidr" {
   description = "The range of the subnetwork the service's machines join."
   type        = string
   default     = "10.64.0.0/20"
-}
-
-variable "proxy_git_cidr" {
-  description = "The range of the subnetwork that holds only the proxy's git machine, so its address is never another machine's."
-  type        = string
-  default     = "10.64.16.0/29"
 }

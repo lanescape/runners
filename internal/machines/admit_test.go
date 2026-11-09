@@ -163,7 +163,7 @@ func TestIdentity(t *testing.T) {
 	}{
 		"no token":                 {"", http.StatusUnauthorized},
 		"the standard format":      {e.gce.Identity.Mint(e.gce.IdentityClaims(in.Zone, in.Name, audience, false)), http.StatusUnauthorized},
-		"another audience":         {e.gce.Identity.Mint(e.gce.IdentityClaims(in.Zone, in.Name, "https://proxy.example.test", true)), http.StatusUnauthorized},
+		"another audience":         {e.gce.Identity.Mint(e.gce.IdentityClaims(in.Zone, in.Name, "https://other.example.test", true)), http.StatusUnauthorized},
 		"another instance's ID":    {wrongID, http.StatusForbidden},
 		"a GitHub token":           {e.gh.ActionsToken(run, ghemu.Job{Audience: audience}, nil), http.StatusUnauthorized},
 		"a machine it didn't make": {e.otherMachineToken(), http.StatusForbidden},
@@ -194,7 +194,7 @@ func (e *env) otherMachineToken() string {
 	var in = e.ours()[len(e.ours())-1]
 	c := e.gce.IdentityClaims(in.Zone, in.Name, audience, true)
 	ce := c["google"].(map[string]any)["compute_engine"].(map[string]any)
-	ce["instance_name"] = "lsr-proxy-git"
+	ce["instance_name"] = "lsr-shared"
 	return e.gce.Identity.Mint(c)
 }
 

@@ -3,12 +3,15 @@ package disks
 import (
 	"context"
 	"errors"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/lanescape/runners/internal/compute"
 	"github.com/lanescape/runners/internal/github"
+	"github.com/lanescape/runners/internal/machines"
 	"github.com/lanescape/runners/internal/pass"
 	"github.com/lanescape/runners/internal/scope"
 	"github.com/lanescape/runners/internal/store"
@@ -21,6 +24,10 @@ type state struct {
 	images      map[string]compute.Image
 	imagesRead  bool
 	records     map[string]record[Image]
+	recents     map[string]record[Recent]
+	families    map[string]record[Family]
+	closures    map[string]record[Closure]
+	workDisks   map[string]record[machines.DiskRecord]
 	choices     map[string]record[Choice]
 	claims      map[string]record[Claim]
 	preemptions map[string]record[Preemption]
@@ -33,6 +40,9 @@ type state struct {
 	pulls     map[string]*github.PullRequest
 	jobs      map[int64]*github.Job
 	preempted map[string][]uint64
+	// live are the runs with an admitted machine that hasn't reported,
+	// read once a pass when first needed.
+	live map[int64]bool
 }
 
 // run is what a pass learns of one run.
@@ -103,6 +113,17 @@ func (s *Service) read(ctx context.Context) *state {
 		}
 	}
 	list("images/", func() (err error) { st.records, err = listJSON[Image](ctx, s.Objects, "images/"); return })
+	// After the images' records: a choice writes its pull request's recent
+	// record before it touches the image it chose.
+	list("recent/", func() (err error) { st.recents, err = listJSON[Recent](ctx, s.Objects, "recent/"); return })
+	// After the images' records too: a use marks its family before it
+	// touches the image.
+	list("families/", func() (err error) { st.families, err = listJSON[Family](ctx, s.Objects, "families/"); return })
+	list("closures/", func() (err error) { st.closures, err = listJSON[Closure](ctx, s.Objects, "closures/"); return })
+	list("disks/", func() (err error) {
+		st.workDisks, err = listJSON[machines.DiskRecord](ctx, s.Objects, "disks/")
+		return
+	})
 	list("choices/", func() (err error) { st.choices, err = listJSON[Choice](ctx, s.Objects, "choices/"); return })
 	list("claims/", func() (err error) { st.claims, err = listJSON[Claim](ctx, s.Objects, "claims/"); return })
 	list("preemptions/", func() (err error) { st.preemptions, err = listJSON[Preemption](ctx, s.Objects, "preemptions/"); return })
@@ -398,14 +419,16 @@ func (s *Service) finishedJob(ctx context.Context, st *state, repoID, jobID int6
 	return j == nil || j.Status == "completed", nil
 }
 
-// expire marks and deletes what's superseded or expired (specs/0003-disks.md,
-// Expiry and limits): older versions of a saved disk once a newer one is
-// ready; a pull request's disks 14 days after their last use, or once the
-// pull request has been closed for a day; main's 90 days after their last
-// use, except the newest of each family; and resume images a day after
-// their machine stopped, or once the job that claimed one has finished,
-// though never one claimed by a job that hasn't. Marking leaves alone any
-// image an unfinished run's choice names.
+// expire marks and deletes what no longer needs keeping, as early as the
+// rules allow (specs/0003-disks.md, Expiry): older versions of a saved disk
+// once a newer one is ready; in a pull request's scope, its other disks of
+// a family once it saves one, all of them once it has closed, and any
+// unused for 14 days; in main's, every key of a family but the two newest
+// and any an open pull request's most recent choice names, and all of a
+// family unused for 90 days; and resume images once their job has started
+// from one, or has finished, or their run has finished with no rerun left.
+// Marking leaves alone any image an unfinished run's choice names, and a
+// resume image a job has claimed and not yet started from.
 func (s *Service) expire(ctx context.Context, st *state) {
 	byRepo := map[int64]map[string]record[Image]{}
 	for _, r := range st.records {
@@ -414,11 +437,26 @@ func (s *Service) expire(ctx context.Context, st *state) {
 		}
 		byRepo[r.v.RepositoryID][r.v.Image] = r
 	}
+	// A consumer with pull requests' recent choices and no images still has
+	// its closed pull requests' choices dropped.
+	for _, r := range st.recents {
+		if byRepo[r.v.RepositoryID] == nil {
+			byRepo[r.v.RepositoryID] = map[string]record[Image]{}
+		}
+	}
 	repos := make([]int64, 0, len(byRepo))
 	for id := range byRepo {
 		repos = append(repos, id)
 	}
 	slices.Sort(repos)
+	// A resume image a job has started from: its work disk is made.
+	started := map[string]int64{}
+	for _, r := range st.workDisks {
+		d := r.v
+		if d.SourceImage != "" && (d.State == machines.DiskMade || d.State == machines.DiskAttached) {
+			started[d.SourceImage] = d.JobID
+		}
+	}
 	for _, repo := range repos {
 		if ctx.Err() != nil {
 			return
@@ -437,24 +475,116 @@ func (s *Service) expire(ctx context.Context, st *state) {
 		finished := map[int64]bool{}
 		var due []record[Image]
 		why := map[string]string{}
+		// The disk that replaces a pull request's, by which a pass decided
+		// it goes: that it isn't itself retired is read again under the
+		// lease, since a closing may be recorded meanwhile.
+		replacedBy := map[string]Image{}
 		add := func(image, reason string) {
 			if _, ok := why[image]; !ok {
 				due = append(due, recs[image])
 				why[image] = reason
 			}
 		}
-		latest := map[string]Image{}
+		// Every pull request whose disks or most recent choices this
+		// consumer holds is read once; one seen closed is recorded as
+		// closed before anything else, so that, reopened, it never chooses
+		// what its earlier runs saved.
+		closed := map[string]bool{}
+		scopes := map[string]bool{}
+		for _, r := range there {
+			if _, pr := isPullRequest(r.v.Scope); pr && r.v.Kind == KindSaved {
+				scopes[r.v.Scope] = true
+			}
+		}
+		for _, r := range st.recents {
+			if r.v.RepositoryID == repo {
+				scopes[r.v.Scope] = true
+			}
+		}
+		unknown := map[string]bool{}
+		for _, sc := range slices.Sorted(maps.Keys(scopes)) {
+			c, err := s.seenClosed(ctx, st, repo, sc)
+			if err != nil {
+				s.log().Warn("reading a scope's pull request", "scope", sc, "err", err.Error())
+				unknown[sc] = true
+				continue
+			}
+			closed[sc] = c
+		}
+		closure := func(sc string) *Closure {
+			if c, ok := st.closures[closureKey(repo, sc)]; ok {
+				return &c.v
+			}
+			return nil
+		}
+		latest, lineage := map[string]Image{}, map[string]Image{}
+		mainKeys := map[string][]Image{}
+		mainUsed := map[string]time.Time{}
+		for _, r := range st.families {
+			if f := r.v; f.RepositoryID == repo {
+				mainUsed[f.Scope+"\x00"+f.Arch+"\x00"+f.Family] = f.LastUsed
+			}
+		}
 		for _, r := range there {
 			v := r.v
 			if v.Kind != KindSaved || v.State != ImageReady {
 				continue
 			}
+			// A retired disk of a pull request's replaces nothing: it goes
+			// itself.
+			if retired(v, closure(v.Scope)) {
+				continue
+			}
 			k := Series(v.Scope, v.Arch, v.Family, v.Key)
-			if b, ok := latest[k]; !ok || v.SavedAt.After(b.SavedAt) {
+			if b, ok := latest[k]; !ok || olderThan(b, v) {
 				latest[k] = v
 			}
+			f := v.Scope + "\x00" + v.Arch + "\x00" + v.Family
+			if b, ok := lineage[f]; !ok || olderThan(b, v) {
+				lineage[f] = v
+			}
+			if v.Scope == "main" && v.LastUsed.After(mainUsed[f]) {
+				mainUsed[f] = v.LastUsed
+			}
 		}
-		top := newest(there)
+		for _, v := range latest {
+			if v.Scope == "main" {
+				f := v.Scope + "\x00" + v.Arch + "\x00" + v.Family
+				mainKeys[f] = append(mainKeys[f], v)
+			}
+		}
+		// Main keeps its two newest keys of each family, by their newest
+		// versions.
+		keep := map[string]bool{}
+		for _, vs := range mainKeys {
+			slices.SortFunc(vs, func(x, y Image) int {
+				if olderThan(y, x) {
+					return -1
+				}
+				return 1
+			})
+			for _, v := range vs[:min(MainKeys, len(vs))] {
+				keep[Series(v.Scope, v.Arch, v.Family, v.Key)] = true
+			}
+		}
+		// And any key an open pull request's most recent choice names. A
+		// closed pull request's recent choices go; one whose state can't
+		// be read keeps what it names.
+		for key, r := range st.recents {
+			c := r.v
+			if c.RepositoryID != repo {
+				continue
+			}
+			if closed[c.Scope] {
+				if err := s.Objects.Delete(ctx, key, r.gen); err == nil || errors.Is(err, store.ErrNotFound) {
+					delete(st.recents, key)
+				}
+				continue
+			}
+			if c.ImageScope == "main" {
+				keep[Series("main", c.Arch, c.Family, c.Key)] = true
+			}
+		}
 		for _, r := range there {
 			v := r.v
 			if v.State != ImageReady {
@@ -462,42 +592,44 @@ func (s *Service) expire(ctx context.Context, st *state) {
 			}
 			switch v.Kind {
 			case KindSaved:
-				if l := latest[Series(v.Scope, v.Arch, v.Family, v.Key)]; l.Image != v.Image {
+				if l, ok := latest[Series(v.Scope, v.Arch, v.Family, v.Key)]; ok && l.Image != v.Image {
 					add(v.Image, "superseded by "+l.Image)
+					replacedBy[v.Image] = l
 					continue
 				}
-				unused := s.now().Sub(v.LastUsed)
+				f := v.Scope + "\x00" + v.Arch + "\x00" + v.Family
 				if v.Scope == "main" {
-					if unused >= MainUnused && !top[v.Image] {
-						add(v.Image, "unused for 90 days")
+					switch {
+					case s.now().Sub(mainUsed[f]) >= MainUnused:
+						add(v.Image, familyUnused)
+					case !keep[Series(v.Scope, v.Arch, v.Family, v.Key)]:
+						add(v.Image, "not among its family's two newest keys, nor named by an open pull request's most recent choice")
 					}
 					continue
 				}
-				if unused >= PullRequestUnused {
+				if closed[v.Scope] {
+					add(v.Image, "its pull request closed")
+					continue
+				}
+				if retired(v, closure(v.Scope)) {
+					add(v.Image, "saved by a run from before its pull request closed")
+					continue
+				}
+				if l, ok := lineage[f]; ok && l.Image != v.Image {
+					add(v.Image, "its pull request saved "+l.Image+" of the family since")
+					replacedBy[v.Image] = l
+					continue
+				}
+				if s.now().Sub(v.LastUsed) >= PullRequestUnused {
 					add(v.Image, "unused for 14 days")
-					continue
-				}
-				pr, err := s.pull(ctx, st, repo, v.Scope)
-				if err != nil {
-					s.log().Warn("reading a saved disk's pull request", "image", v.Image, "err", err.Error())
-					continue
-				}
-				if pr == nil || (pr.State == "closed" && !pr.ClosedAt.IsZero() && s.now().Sub(pr.ClosedAt) >= PullRequestClosed) {
-					add(v.Image, "its pull request closed a day ago")
 				}
 			case KindResume:
-				c, claimed := st.claims[claimKey(repo, v.Image)]
-				// A day after its machine stopped, it goes whatever its
-				// record or claim says: a claimed job's disk is made by
-				// then, or chooses again.
-				if s.now().Sub(v.SavedAt) >= ResumeKept {
-					if claimed {
+				if c, claimed := st.claims[claimKey(repo, v.Image)]; claimed {
+					if started[v.Image] == c.v.JobID {
 						finished[c.v.JobID] = true
+						add(v.Image, "its job has started from it")
+						continue
 					}
-					add(v.Image, "a day since its machine stopped")
-					continue
-				}
-				if claimed {
 					done, err := s.finishedJob(ctx, st, repo, c.v.JobID)
 					if err != nil {
 						s.log().Warn("reading a resume image's job", "image", v.Image, "err", err.Error())
@@ -506,7 +638,19 @@ func (s *Service) expire(ctx context.Context, st *state) {
 					if done {
 						finished[c.v.JobID] = true
 						add(v.Image, "its job has finished")
+						continue
 					}
+				}
+				ok, err := s.runSettled(ctx, st, repo, v.RunID)
+				if err != nil {
+					s.log().Warn("reading a resume image's run", "image", v.Image, "err", err.Error())
+					continue
+				}
+				if ok {
+					if c, claimed := st.claims[claimKey(repo, v.Image)]; claimed {
+						finished[c.v.JobID] = true
+					}
+					add(v.Image, "its run has finished with no rerun left")
 				}
 			}
 		}
@@ -514,7 +658,30 @@ func (s *Service) expire(ctx context.Context, st *state) {
 		if len(due) > 0 {
 			slices.SortFunc(due, func(x, y record[Image]) int { return strings.Compare(x.v.Image, y.v.Image) })
 			var err error
-			if marked, err = s.mark(ctx, repo, due, finished); err != nil {
+			// A family's retirement rests on its other versions' use too,
+			// which a choice of one of them marks in the family's record:
+			// that's read again under the lease.
+			recheck := func(ctx context.Context, v Image) (bool, error) {
+				if by, ok := replacedBy[v.Image]; ok {
+					if _, pr := isPullRequest(by.Scope); !pr {
+						return true, nil
+					}
+					c, _, found, err := getJSON[Closure](ctx, s.Objects, closureKey(repo, by.Scope))
+					if err != nil || !found {
+						return err == nil, err
+					}
+					return !retired(by, &c), nil
+				}
+				if why[v.Image] != familyUnused {
+					return true, nil
+				}
+				f, _, found, err := getJSON[Family](ctx, s.Objects, familyKey(repo, v.Scope, v.Arch, v.Family))
+				if err != nil || !found {
+					return err == nil, err
+				}
+				return s.now().Sub(f.LastUsed) >= MainUnused, nil
+			}
+			if marked, err = s.mark(ctx, repo, due, finished, recheck); err != nil {
 				s.log().Warn("marking images for deletion", "repository_id", repo, "err", err.Error())
 			}
 		}
@@ -530,7 +697,83 @@ func (s *Service) expire(ctx context.Context, st *state) {
 				}
 			}
 		}
+		s.tidyScopes(ctx, st, repo, unknown)
 	}
+}
+
+// seenClosed reports whether a pull request scope's pull request is closed,
+// or gone, by GitHub's record read once a pass, and if it is, records that
+// it was seen closed now.
+func (s *Service) seenClosed(ctx context.Context, st *state, repo int64, sc string) (bool, error) {
+	pr, err := s.pull(ctx, st, repo, sc)
+	if err != nil {
+		return false, err
+	}
+	if pr != nil && pr.State != "closed" {
+		return false, nil
+	}
+	var closedAt time.Time
+	if pr != nil {
+		closedAt = pr.ClosedAt.UTC()
+	}
+	rec, err := s.closeScope(ctx, repo, sc, s.now(), closedAt)
+	if err != nil {
+		return true, err
+	}
+	st.closures[closureKey(repo, sc)] = record[Closure]{v: rec}
+	return true, nil
+}
+
+// tidyScopes drops a consumer's family records once the family has no
+// images left, and its closures once the scope has none and no run bound
+// before the closure can still be going on.
+func (s *Service) tidyScopes(ctx context.Context, st *state, repo int64, unknown map[string]bool) {
+	have := map[string]bool{}
+	for _, r := range st.records {
+		v := r.v
+		if v.RepositoryID == repo && v.Kind == KindSaved {
+			have[v.Scope] = true
+			have[v.Scope+"\x00"+v.Arch+"\x00"+v.Family] = true
+		}
+	}
+	for key, r := range st.families {
+		f := r.v
+		if f.RepositoryID == repo && !have[f.Scope+"\x00"+f.Arch+"\x00"+f.Family] {
+			_ = s.Objects.Delete(ctx, key, r.gen)
+		}
+	}
+	for key, r := range st.closures {
+		c := r.v
+		if c.RepositoryID == repo && !have[c.Scope] && !unknown[c.Scope] && s.now().Sub(c.SeenAt) >= RunLimit {
+			if err := s.Objects.Delete(ctx, key, r.gen); err == nil {
+				delete(st.closures, key)
+			}
+		}
+	}
+}
+
+// familyUnused is why every disk of a retired family of main's goes.
+const familyUnused = "its family unused for 90 days"
+
+// runSettled reports whether a run has finished with no automatic rerun it
+// is, or may yet be, due, counting a run with an admitted machine that
+// hasn't reported as unfinished.
+func (s *Service) runSettled(ctx context.Context, st *state, repo, runID int64) (bool, error) {
+	if st.live == nil {
+		live, err := s.unreported(ctx, "")
+		if err != nil {
+			return false, err
+		}
+		st.live = live
+	}
+	if st.live[runID] {
+		return false, nil
+	}
+	rs, err := s.runState(ctx, st, repo, runID)
+	if err != nil {
+		return false, err
+	}
+	return rs.finished && !rs.due, nil
 }
 
 // tidy deletes images of the service's names that no record describes,
@@ -605,23 +848,22 @@ func (s *Service) tidy(ctx context.Context, st *state) {
 	for repo, names := range orphans {
 		slices.Sort(names)
 		// A claim keeps an orphaned resume image only while it would keep
-		// one with a record: until its job has finished, and for a day
-		// after its machine stopped, by its preemption record, or failing
-		// that its claim.
+		// one with a record: until its job has started from it, or has
+		// finished.
 		expired := map[int64]bool{}
 		for _, name := range names {
 			c, claimed := st.claims[claimKey(repo, name)]
 			if !claimed || !resumeName.MatchString(name) {
 				continue
 			}
-			stopped := c.v.At
-			for _, p := range st.preemptions {
-				if p.v.RepositoryID == repo && p.v.ResumeImage == name {
-					stopped = p.v.StoppedAt
+			startedFrom := false
+			for _, d := range st.workDisks {
+				if d.v.SourceImage == name && d.v.JobID == c.v.JobID && (d.v.State == machines.DiskMade || d.v.State == machines.DiskAttached) {
+					startedFrom = true
 				}
 			}
 			done, err := s.finishedJob(ctx, st, repo, c.v.JobID)
-			if (err == nil && done) || s.now().Sub(stopped) >= ResumeKept {
+			if startedFrom || (err == nil && done) {
 				expired[c.v.JobID] = true
 			}
 		}

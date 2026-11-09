@@ -1,16 +1,18 @@
 package disks
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
+	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/compute"
 	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/machines"
+	"github.com/lanescape/runners/internal/scope"
 	"github.com/lanescape/runners/internal/store"
 )
 
@@ -18,9 +20,10 @@ import (
 // version of its scope's disk for its selector's family and key
 // (specs/0003-disks.md, Saved disks). The machines' part has checked that
 // the job succeeded, asked, and that its scope saves; this checks the scope
-// and selector again, keeps to the scope's size limit, and deletes the older
-// versions no unfinished run's choice names. It implements machines.Saver,
-// and is called again until it returns nil.
+// and selector again, and deletes what the new disk replaces that no
+// unfinished run's choice names: older versions of its series, and in a
+// pull request's scope, the pull request's other disks of the family. It
+// implements machines.Saver, and is called again until it returns nil.
 func (s *Service) Save(ctx context.Context, m machines.Machine, a machines.Admission) error {
 	sel := m.Selector
 	if !a.Allowed || a.Machine != m.Name || a.Selector != sel.String() || !sel.Scope.Saves() || !sel.HasDisk() {
@@ -64,22 +67,18 @@ func (s *Service) Save(ctx context.Context, m machines.Machine, a machines.Admis
 		return err
 	}
 	if !ok {
-		fits, why, err := s.makeRoom(ctx, m.RepositoryID, m.Name, sel.Scope.String(), sel.Arch, sel.Family, sv.SizeGB)
-		if err != nil {
+		// When the run was bound, so that a pull request's disk saved by a
+		// run from before it closed is never chosen after it's reopened.
+		var bound time.Time
+		if b, _, found, err := getJSON[binding.Binding](ctx, s.Objects, binding.Key(m.RepositoryID, a.RunID)); err != nil {
 			return err
-		}
-		if !fits {
-			// The job has finished, so its own log can't say why; the
-			// service's does, with the job's ID.
-			log.Warn("work disk not saved: it would pass its scope's size limit", "reason", why, "size_gb", sv.SizeGB)
-			sv.Skipped = why
-			_, err := replaceJSON(ctx, s.Objects, saveKey(m.Name), sv, gen)
-			return err
+		} else if found {
+			bound = b.BoundAt
 		}
 		rec = Image{Image: sv.Image, RepositoryID: m.RepositoryID, Kind: KindSaved, State: ImageMaking, Scope: sel.Scope.String(),
 			Arch: sel.Arch, Family: sel.Family, Key: sel.Key, Machine: m.Name, Zone: m.Zone, InstanceID: m.ID, JobID: a.JobID,
 			JobName: a.JobName, RunID: a.RunID, RunAttempt: a.RunAttempt, Selector: a.Selector, SizeGB: sv.SizeGB,
-			SavedAt: sv.At, LastUsed: sv.At}
+			SavedAt: sv.At, LastUsed: sv.At, BoundAt: bound}
 		if rec, rgen, err = createOnce(ctx, s.Objects, key, rec); err != nil {
 			return err
 		}
@@ -161,228 +160,6 @@ func (s *Service) settled(ctx context.Context, repo, runID int64, unreported map
 	return rs.finished && !rs.due, nil
 }
 
-// counts reports whether a saved disk of scope counts against the limit of
-// a save in scope save: main's alone, or all pull requests' together.
-func counts(scope, save string) bool {
-	return (scope == "main") == (save == "main")
-}
-
-// newest are main's newest disk of each family and architecture.
-func newest(recs map[string]record[Image]) map[string]bool {
-	best := map[string]Image{}
-	for _, r := range recs {
-		v := r.v
-		if v.Kind != KindSaved || v.Scope != "main" || v.State != ImageReady {
-			continue
-		}
-		k := v.Arch + "/" + v.Family
-		if b, ok := best[k]; !ok || v.SavedAt.After(b.SavedAt) || (v.SavedAt.Equal(b.SavedAt) && v.Image > b.Image) {
-			best[k] = v
-		}
-	}
-	out := map[string]bool{}
-	for _, v := range best {
-		out[v.Image] = true
-	}
-	return out
-}
-
-// makeRoom keeps a save within its scope's limit (specs/0003-disks.md,
-// Expiry and limits): if the save would pass it, it first deletes that
-// scope's least recently used disks, never another scope's, nor the newest
-// of a main family, other than the one the save replaces as newest, nor any
-// that an unfinished run's choice names. If that wouldn't be enough, it
-// deletes nothing, and says why the save is skipped. The saving job's own
-// run has often just finished, and its choice is still recorded: a run
-// counts as finished only once GitHub shows it, read inside the lease.
-func (s *Service) makeRoom(ctx context.Context, repo int64, saver, scope, arch, family string, sizeGB int64) (bool, string, error) {
-	lim := s.Config.Limits.For(repo)
-	limit := int64(lim.PullRequestDisksGB)
-	if scope == "main" {
-		limit = int64(lim.MainDisksGB)
-	}
-	// Saves happen only in passes, one at a time, so a save that fits
-	// needs no lease; one that must make room marks under it.
-	// A marked image counts until Compute Engine confirms it's deleted:
-	// what's still stored isn't room.
-	total := func(recs map[string]record[Image]) int64 {
-		var n int64
-		for _, r := range recs {
-			if r.v.Kind == KindSaved && counts(r.v.Scope, scope) {
-				n += r.v.SizeGB
-			}
-		}
-		return n
-	}
-	recs, err := listJSON[Image](ctx, s.Objects, fmt.Sprintf("images/%d/", repo))
-	if err != nil {
-		return false, "", err
-	}
-	// A record of a ready image Compute Engine confirms is gone counts
-	// nothing: it goes, before the limit is reckoned.
-	listed, err := s.Compute.Images(ctx)
-	if err != nil {
-		return false, "", err
-	}
-	have := map[string]bool{}
-	for _, im := range listed {
-		have[im.Name] = true
-	}
-	for k, r := range recs {
-		if r.v.State != ImageReady || have[r.v.Image] {
-			continue
-		}
-		if _, err := s.Compute.Image(ctx, r.v.Image); !errors.Is(err, compute.ErrNotFound) {
-			continue
-		}
-		if err := s.Objects.Delete(ctx, k, r.gen); err != nil && !errors.Is(err, store.ErrNotFound) {
-			return false, "", err
-		}
-		delete(recs, k)
-	}
-	// Marked images of the limit's scopes go first.
-	var pending bool
-	for _, r := range recs {
-		if r.v.Kind == KindSaved && r.v.State == ImageMarked && counts(r.v.Scope, scope) {
-			if err := s.deleteMarked(ctx, r.v); err != nil {
-				return false, "", fmt.Errorf("deleting a marked disk before a save: %w", err)
-			}
-			pending = true
-		}
-	}
-	if pending {
-		if recs, err = listJSON[Image](ctx, s.Objects, fmt.Sprintf("images/%d/", repo)); err != nil {
-			return false, "", err
-		}
-	}
-	if total(recs)+sizeGB <= limit {
-		return true, "", nil
-	}
-	var fits bool
-	var why string
-	var marked []Image
-	err = s.step(ctx, repo, func(ctx context.Context) error {
-		recs, err := listJSON[Image](ctx, s.Objects, fmt.Sprintf("images/%d/", repo))
-		if err != nil {
-			return err
-		}
-		total := total(recs)
-		need := total + sizeGB - limit
-		if need <= 0 {
-			fits = true
-			return nil
-		}
-		choices, err := listJSON[Choice](ctx, s.Objects, fmt.Sprintf("choices/%d/", repo))
-		if err != nil {
-			return err
-		}
-		namers := map[string][]string{}
-		for k, c := range choices {
-			if c.v.Image != "" {
-				namers[c.v.Image] = append(namers[c.v.Image], k)
-			}
-		}
-		// A choice protects its image while its run may need it. One of a
-		// run that GitHub shows finished, with no automatic rerun due, is
-		// dropped before its image is marked, so that a maintainer's rerun
-		// picks again, under this lease.
-		settled := map[int64]bool{}
-		var live map[int64]bool
-		free := func(image string) (bool, error) {
-			if live == nil && len(namers[image]) > 0 {
-				if live, err = s.unreported(ctx, saver); err != nil {
-					return false, err
-				}
-			}
-			for _, k := range namers[image] {
-				run := choices[k].v.RunID
-				ok, seen := settled[run]
-				if !seen {
-					if ok, err = s.settled(ctx, repo, run, live); err != nil {
-						return false, err
-					}
-					settled[run] = ok
-				}
-				if !ok {
-					return false, nil
-				}
-			}
-			return true, nil
-		}
-		// Main's newest of each family, among images Compute Engine has.
-		listed, err := s.Compute.Images(ctx)
-		if err != nil {
-			return err
-		}
-		there := map[string]record[Image]{}
-		for _, im := range listed {
-			for n, r := range recs {
-				if r.v.Image == im.Name && im.Status == "READY" && matches(im, r.v) {
-					there[n] = r
-				}
-			}
-		}
-		top := newest(there)
-		var cands []record[Image]
-		for _, r := range recs {
-			v := r.v
-			if v.Kind != KindSaved || v.State != ImageReady || v.Scope != scope {
-				continue
-			}
-			if top[v.Image] && !(v.Arch == arch && v.Family == family) {
-				continue
-			}
-			cands = append(cands, r)
-		}
-		slices.SortFunc(cands, func(x, y record[Image]) int {
-			return cmp.Or(x.v.LastUsed.Compare(y.v.LastUsed), x.v.SavedAt.Compare(y.v.SavedAt), strings.Compare(x.v.Image, y.v.Image))
-		})
-		var freed int64
-		var pick []record[Image]
-		for _, c := range cands {
-			if freed >= need {
-				break
-			}
-			ok, err := free(c.v.Image)
-			if err != nil {
-				return err
-			}
-			if ok {
-				pick, freed = append(pick, c), freed+c.v.SizeGB
-			}
-		}
-		if freed < need {
-			why = fmt.Sprintf("the scope's disks would be %d GB of its %d GB limit, and only %d GB of them may be deleted to make room",
-				total+sizeGB, limit, freed)
-			return nil
-		}
-		for _, c := range pick {
-			for _, k := range namers[c.v.Image] {
-				if err := s.Objects.Delete(ctx, k, choices[k].gen); err != nil && !errors.Is(err, store.ErrNotFound) {
-					return err
-				}
-			}
-			v, err := s.markOne(ctx, c.v, c.gen)
-			if err != nil {
-				return err
-			}
-			marked = append(marked, v)
-		}
-		fits = true
-		return nil
-	})
-	if err != nil {
-		return false, "", err
-	}
-	for _, v := range marked {
-		s.log().Info("saved disk deleted to make room", "image", v.Image, "repository_id", repo, "scope", v.Scope)
-		if err := s.deleteMarked(ctx, v); err != nil {
-			return false, "", err
-		}
-	}
-	return fits, why, nil
-}
-
 // named are the images that any recorded restore choice names, and the
 // resume images any claim holds whose job isn't among finished. A choice
 // is dropped once its run has finished and has no automatic rerun left, so
@@ -426,8 +203,11 @@ func (s *Service) markOne(ctx context.Context, rec Image, gen int64) (Image, err
 // the lease after the candidates were; it returns those it marked. Each is
 // marked only at the generation its candidate was read at, when the
 // decision to delete it was made, so a choice or use of it since then,
-// which rewrites the record, leaves it for a later pass.
-func (s *Service) mark(ctx context.Context, repo int64, cands []record[Image], finished map[int64]bool) ([]Image, error) {
+// which rewrites the record, leaves it for a later pass. recheck, if set,
+// is asked under the lease whether each candidate should still go, for a
+// decision that rests on more than its own record.
+func (s *Service) mark(ctx context.Context, repo int64, cands []record[Image], finished map[int64]bool,
+	recheck func(ctx context.Context, rec Image) (bool, error)) ([]Image, error) {
 	var marked []Image
 	err := s.step(ctx, repo, func(ctx context.Context) error {
 		named, err := s.named(ctx, repo, finished)
@@ -438,6 +218,13 @@ func (s *Service) mark(ctx context.Context, repo int64, cands []record[Image], f
 			rec, gen := c.v, c.gen
 			if named[rec.Image] || rec.State != ImageReady {
 				continue
+			}
+			if recheck != nil {
+				if ok, err := recheck(ctx, rec); err != nil {
+					return err
+				} else if !ok {
+					continue
+				}
 			}
 			v, err := s.markOne(ctx, rec, gen)
 			if errors.Is(err, store.ErrPrecondition) {
@@ -476,9 +263,38 @@ func (s *Service) deleteMarked(ctx context.Context, rec Image) error {
 	return nil
 }
 
-// supersede deletes the older versions of a saved disk once a new one is
-// ready, except those an unfinished run's choice names, which go once it
-// has finished.
+// replaces reports whether a ready saved disk, older than a newly saved one,
+// is one the new one replaces: an older version of its series, or in a pull
+// request's scope, any of the pull request's disks of the family, whatever
+// its key, since a pull request keeps one disk of each family.
+func replaces(newer, v Image) bool {
+	if v.Kind != KindSaved || v.State != ImageReady || v.Image == newer.Image || v.Scope != newer.Scope || v.Arch != newer.Arch ||
+		v.Family != newer.Family || !olderThan(v, newer) {
+		return false
+	}
+	_, pr := isPullRequest(newer.Scope)
+	return pr || v.Key == newer.Key
+}
+
+// olderThan orders saved disks by when they were saved, then by name.
+func olderThan(x, y Image) bool {
+	return x.SavedAt.Before(y.SavedAt) || (x.SavedAt.Equal(y.SavedAt) && x.Image < y.Image)
+}
+
+// isPullRequest reports whether a scope is a pull request's.
+func isPullRequest(sc string) (int, bool) {
+	parsed, err := scope.Parse(sc)
+	if err != nil {
+		return 0, false
+	}
+	return parsed.PullRequestNumber()
+}
+
+// supersede deletes what a newly ready saved disk replaces, except what an
+// unfinished run's choice names, which goes once it has finished. A pull
+// request's disk saved by a run bound before the pull request was last seen
+// closed replaces nothing: it's never chosen, and goes itself. That's read
+// again under the lease, as the closure may be recorded meanwhile.
 func (s *Service) supersede(ctx context.Context, rec Image) error {
 	recs, err := listJSON[Image](ctx, s.Objects, fmt.Sprintf("images/%d/", rec.RepositoryID))
 	if err != nil {
@@ -486,9 +302,7 @@ func (s *Service) supersede(ctx context.Context, rec Image) error {
 	}
 	var older []record[Image]
 	for _, r := range recs {
-		v := r.v
-		if v.Kind == KindSaved && v.State == ImageReady && v.Image != rec.Image && v.Scope == rec.Scope && v.Arch == rec.Arch &&
-			v.Family == rec.Family && v.Key == rec.Key && v.SavedAt.Before(rec.SavedAt) {
+		if replaces(rec, r.v) {
 			older = append(older, r)
 		}
 	}
@@ -496,13 +310,22 @@ func (s *Service) supersede(ctx context.Context, rec Image) error {
 		return nil
 	}
 	slices.SortFunc(older, func(x, y record[Image]) int { return strings.Compare(x.v.Image, y.v.Image) })
-	marked, err := s.mark(ctx, rec.RepositoryID, older, nil)
+	marked, err := s.mark(ctx, rec.RepositoryID, older, nil, func(ctx context.Context, _ Image) (bool, error) {
+		if _, pr := isPullRequest(rec.Scope); !pr {
+			return true, nil
+		}
+		c, _, found, err := getJSON[Closure](ctx, s.Objects, closureKey(rec.RepositoryID, rec.Scope))
+		if err != nil || !found {
+			return err == nil, err
+		}
+		return !retired(rec, &c), nil
+	})
 	if err != nil {
 		return err
 	}
 	var errs []error
 	for _, v := range marked {
-		s.log().Info("older version of a saved disk deleted", "image", v.Image, "newer", rec.Image)
+		s.log().Info("saved disk deleted: a newer one replaces it", "image", v.Image, "newer", rec.Image, "scope", v.Scope)
 		errs = append(errs, s.deleteMarked(ctx, v))
 	}
 	return errors.Join(errs...)

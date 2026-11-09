@@ -123,8 +123,33 @@ func TestTheRestoreOrder(t *testing.T) {
 	e.start(e.pullRun(p), ghemu.JobSpec{Name: "c", Labels: []string{sel(zero, pr)}}).finish(true)
 	prZero := e.saved(before).Name
 	// Its own newest comes before main's for the key.
-	if src := e.start(e.pullRun(p), ghemu.JobSpec{Name: "d", Labels: []string{sel(key1, pr)}}).source(); src != prZero {
+	drun := e.pullRun(p)
+	if src := e.start(drun, ghemu.JobSpec{Name: "d", Labels: []string{sel(key1, pr)}}).source(); src != prZero {
 		t.Fatalf("the pull request's newest: %s, want %s", src, prZero)
+	}
+	// Each choice records the step of the order it came from, with its
+	// family and scope, and the service logs it.
+	for _, c := range []struct {
+		run         *ghemu.Run
+		label, step string
+	}{
+		{run, sel(key1, pr), disks.StepMainExact},
+		{run, sel(zero, pr), disks.StepMainNewest},
+		{drun, sel(key1, pr), disks.StepPullRequestNewest},
+	} {
+		rec, ok := e.record("choices/5001/" + strconv.FormatInt(c.run.ID, 10) + "/" + selector.Hash(c.label) + ".json")
+		if !ok || rec["step"] != c.step || rec["family"] != "build" || rec["scope"] != pr || rec["arch"] != "amd64" {
+			t.Fatalf("choice for %s = %v, want step %s", c.label, rec, c.step)
+		}
+		if !e.logged(`msg="restore choice"`) || !e.logged("step="+c.step) {
+			t.Fatalf("the service didn't log the choice's step %s", c.step)
+		}
+	}
+	// So does a choice of nothing.
+	none := e.mainRun()
+	e.start(none, ghemu.JobSpec{Name: "e", Labels: []string{"lanescape-2vcpu-linux-amd64-disk-other-" + key1 + "-main"}})
+	if rec, _ := e.record("choices/5001/" + strconv.FormatInt(none.ID, 10) + "/" + selector.Hash("lanescape-2vcpu-linux-amd64-disk-other-"+key1+"-main") + ".json"); rec["step"] != disks.StepNone || rec["image"] != nil {
+		t.Fatalf("a choice of nothing = %v", rec)
 	}
 }
 

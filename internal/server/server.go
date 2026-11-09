@@ -29,8 +29,8 @@ const (
 
 // Limits on what the service reads from callers.
 const (
-	// GitHub's workflow_job and workflow_run deliveries are tens of
-	// kilobytes; anything near this is not one of them.
+	// GitHub's workflow_job, workflow_run and pull_request deliveries are
+	// tens of kilobytes; anything near this is not one of them.
 	DefaultWebhookLimit = 1 << 20
 	pushLimit           = 1 << 20
 	bindLimit           = 4 << 10
@@ -55,11 +55,13 @@ type Reconciler interface {
 }
 
 // EventRecorder records what a pushed message says that a pass can't read
-// back later, such as Compute Engine's word that it preempted a machine,
-// which Google keeps elsewhere for as little as an hour. It ignores any
-// other message.
+// back later: Compute Engine's word that it preempted a machine, which
+// Google keeps elsewhere for as little as an hour, and GitHub's that a pull
+// request closed, which it no longer says once the pull request is
+// reopened. A webhook delivery's message has its event's name as its
+// attribute "event". It ignores any other message.
 type EventRecorder interface {
-	RecordEvent(ctx context.Context, data []byte) error
+	RecordEvent(ctx context.Context, attributes map[string]string, data []byte) error
 }
 
 // Config is what the server needs.
@@ -153,8 +155,10 @@ func (s *server) refuse(w http.ResponseWriter, r *http.Request, err error) {
 }
 
 // webhookHeader is what the service reads of a delivery to know whose it
-// is: the repository's owner, and the organization if the event names one.
+// is, the repository's owner and the organization if the event names one,
+// and what it says happened.
 type webhookHeader struct {
+	Action     string `json:"action"`
 	Repository *struct {
 		ID    int64 `json:"id"`
 		Owner *struct {
@@ -166,7 +170,10 @@ type webhookHeader struct {
 	} `json:"organization"`
 }
 
-var webhookEvents = map[string]bool{"workflow_job": true, "workflow_run": true}
+// webhookEvents are the events that start a pass, and for each, the
+// actions that do, or nil for every action: a pull request's closing, merged
+// or not, deletes its scope's disks at once (specs/0003-disks.md, Expiry).
+var webhookEvents = map[string]map[string]bool{"workflow_job": nil, "workflow_run": nil, "pull_request": {"closed": true}}
 
 func (s *server) webhook(w http.ResponseWriter, r *http.Request) {
 	body, err := auth.ReadSigned(r, s.WebhookSecret, s.WebhookLimit)
@@ -180,13 +187,18 @@ func (s *server) webhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	event, id := r.Header.Get("X-GitHub-Event"), r.Header.Get("X-GitHub-Delivery")
-	if !webhookEvents[event] {
+	actions, ok := webhookEvents[event]
+	if !ok {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	var h webhookHeader
 	if err := json.Unmarshal(body, &h); err != nil {
 		writeError(w, http.StatusBadRequest, "delivery isn't JSON")
+		return
+	}
+	if actions != nil && !actions[h.Action] {
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if h.Repository == nil || h.Repository.Owner == nil || h.Repository.Owner.ID != s.OrganizationID ||
@@ -221,8 +233,8 @@ func (s *server) reconcile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "body unreadable or too large")
 		return
 	}
-	if data, ok := pushData(body); ok && s.Events != nil {
-		if err := s.Events.RecordEvent(r.Context(), data); err != nil {
+	if data, attrs, ok := pushData(body); ok && s.Events != nil {
+		if err := s.Events.RecordEvent(r.Context(), attrs, data); err != nil {
 			s.log.Error("recording a pushed event", "err", err)
 			retryLater(w, "event not recorded")
 			return
@@ -248,20 +260,21 @@ func (s *server) reconcile(w http.ResponseWriter, r *http.Request) {
 // push is a Pub/Sub push subscription's request body.
 type push struct {
 	Message *struct {
-		Data      []byte `json:"data"`
-		MessageID string `json:"messageId"`
+		Data       []byte            `json:"data"`
+		Attributes map[string]string `json:"attributes"`
+		MessageID  string            `json:"messageId"`
 	} `json:"message"`
 	Subscription string `json:"subscription"`
 }
 
 // pushData is a pushed message's data, if the body is a push; the
 // scheduler's calls aren't.
-func pushData(body []byte) ([]byte, bool) {
+func pushData(body []byte) ([]byte, map[string]string, bool) {
 	var p push
 	if len(bytes.TrimSpace(body)) == 0 || json.Unmarshal(body, &p) != nil || p.Message == nil || len(p.Message.Data) == 0 {
-		return nil, false
+		return nil, nil, false
 	}
-	return p.Message.Data, true
+	return p.Message.Data, p.Message.Attributes, true
 }
 
 func (s *server) bind(w http.ResponseWriter, r *http.Request) {

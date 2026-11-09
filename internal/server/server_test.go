@@ -84,18 +84,20 @@ func (r *reconciler) Pass(p *pass.Pass) error {
 // events records pushed messages' data, as the service's event recorder
 // does, failing while fail is set.
 type events struct {
-	mu   sync.Mutex
-	got  [][]byte
-	fail bool
+	mu    sync.Mutex
+	got   [][]byte
+	attrs []map[string]string
+	fail  bool
 }
 
-func (ev *events) RecordEvent(_ context.Context, data []byte) error {
+func (ev *events) RecordEvent(_ context.Context, attrs map[string]string, data []byte) error {
 	ev.mu.Lock()
 	defer ev.mu.Unlock()
 	if ev.fail {
 		return errors.New("bucket down")
 	}
 	ev.got = append(ev.got, data)
+	ev.attrs = append(ev.attrs, attrs)
 	return nil
 }
 
@@ -244,6 +246,15 @@ func TestWebhook(t *testing.T) {
 	if got := e.pub.got[0]; got.Event != "workflow_job" || got.ID == "" || !bytes.Contains(got.Body, []byte(`"queued"`)) {
 		t.Fatalf("published %+v", got)
 	}
+	// A pull request's closing starts a pass too, merged or not, so its
+	// scope's disks go at once.
+	closed := map[string]any{"action": "closed", "number": 7, "repository": payload["repository"]}
+	if code := send(ghemu.NewDelivery(e.url+server.WebhookPath, secret, "pull_request", closed)); code != http.StatusAccepted || e.pub.count() != 2 {
+		t.Fatalf("a pull request's closing: %d, %d published", code, e.pub.count())
+	}
+	if got := e.pub.got[1]; got.Event != "pull_request" {
+		t.Fatalf("published %+v", got)
+	}
 
 	for _, tc := range []struct {
 		name   string
@@ -288,6 +299,10 @@ func TestWebhook(t *testing.T) {
 		}, http.StatusNoContent},
 		{"another event", func() *ghemu.Delivery {
 			return ghemu.NewDelivery(e.url+server.WebhookPath, secret, "push", payload)
+		}, http.StatusNoContent},
+		{"a pull request that opens", func() *ghemu.Delivery {
+			return ghemu.NewDelivery(e.url+server.WebhookPath, secret, "pull_request",
+				map[string]any{"action": "opened", "number": 7, "repository": payload["repository"]})
 		}, http.StatusNoContent},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -465,6 +480,12 @@ func TestPushedEventsAreRecordedBeforeTheyreAcknowledged(t *testing.T) {
 	if code, _ := e.post(server.ReconcilePath, tok, body); code != http.StatusNoContent || e.ev.count() != 1 || string(e.ev.got[0]) != string(data) {
 		t.Fatalf("push: %d, recorded %d", code, e.ev.count())
 	}
+	// A webhook delivery's message comes with its event's name.
+	closed := []byte(`{"action": "closed"}`)
+	wbody := string(google.PushWith("lanescape-dev", "lanescape-runners-webhooks-reconcile", "2", closed, map[string]string{"event": "pull_request"}))
+	if code, _ := e.post(server.ReconcilePath, tok, wbody); code != http.StatusNoContent || e.ev.count() != 2 || e.ev.attrs[1]["event"] != "pull_request" {
+		t.Fatalf("webhook push: %d, recorded %d", code, e.ev.count())
+	}
 	// A message that can't be recorded isn't acknowledged, and Pub/Sub
 	// delivers it again; no pass runs for it.
 	e.ev.fail = true
@@ -486,13 +507,13 @@ func TestPushedEventsAreRecordedBeforeTheyreAcknowledged(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if code, _ := e.post(server.ReconcilePath, tok, body); code != http.StatusServiceUnavailable || e.ev.count() != 2 {
+	if code, _ := e.post(server.ReconcilePath, tok, body); code != http.StatusServiceUnavailable || e.ev.count() != 3 {
 		t.Fatalf("push while a pass runs: %d, recorded %d", code, e.ev.count())
 	}
 	close(e.rec.block)
 	<-done
 	// The scheduler's calls carry no message.
-	if code, _ := e.post(server.ReconcilePath, e.gg.Token(scheduler, audience), "{}"); code != http.StatusNoContent || e.ev.count() != 2 {
+	if code, _ := e.post(server.ReconcilePath, e.gg.Token(scheduler, audience), "{}"); code != http.StatusNoContent || e.ev.count() != 3 {
 		t.Fatalf("scheduler: %d, recorded %d", code, e.ev.count())
 	}
 }

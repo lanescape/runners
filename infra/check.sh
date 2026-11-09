@@ -31,21 +31,13 @@ if found=$(find infra bootstrap -name '*.tf.json' -o -name '*.tfvars.json' -o -n
   failed=1
 fi
 
-# The network, its subnetworks and its one firewall rule are bootstrap/'s;
-# the infra identity can't change them, and infra/ may not try.
+# The network and its subnetwork are bootstrap/'s; the infra identity can't
+# change them, and infra/ may not try. The network has no firewall rules at
+# all, so nothing reaches a machine: neither may declare one, nor a policy.
 refuse "infra/ may not manage networks or firewall rules" \
   'resource[[:space:]]+"google_compute_(network|subnetwork|firewall|[a-z_]*firewall_policy[a-z_]*|route|router[a-z_]*)"' infra
-refuse "No firewall policies: the network has exactly one firewall rule" \
-  'resource[[:space:]]+"google_compute_[a-z_]*firewall_policy[a-z_]*"' bootstrap
-rules=$(grep -rEh --include='*.tf' 'resource[[:space:]]+"google_compute_firewall"' bootstrap | wc -l | tr -d ' ')
-if [ "$rules" != 1 ]; then
-  echo "bootstrap/ must declare exactly one firewall rule, and declares $rules"
-  failed=1
-fi
-if awk '/resource "google_compute_firewall"/,/^}/' bootstrap/*.tf | grep -Eq 'for_each|count[[:space:]]*='; then
-  echo "bootstrap/'s firewall rule must be a single rule, without for_each or count"
-  failed=1
-fi
+refuse "The network has no firewall rules or policies" \
+  'resource[[:space:]]+"google_compute_(firewall|[a-z_]*firewall_policy[a-z_]*)"' bootstrap
 
 # Accounts, project-level grants, role definitions and log sinks are
 # bootstrap/'s, so a merged change can't widen any account's access.

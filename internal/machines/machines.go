@@ -42,8 +42,7 @@ import (
 // The spec's names and timings.
 const (
 	// Network is the service's network, which every machine joins, in its
-	// subnetwork of the same name; the proxy's git machine has a
-	// subnetwork of its own.
+	// subnetwork of the same name.
 	Network    = "lanescape-runners"
 	Subnetwork = "lanescape-runners"
 	// AccountID is the machines' account, which has no role anywhere.

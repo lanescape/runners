@@ -17,20 +17,6 @@ resource "google_service_account" "machine" {
   depends_on   = [google_project_service.apis]
 }
 
-resource "google_service_account" "proxy" {
-  account_id   = "lanescape-runners-proxy"
-  display_name = "Lanescape Runners proxy"
-  description  = "The HTTP proxy on Cloud Run: its own bucket, and what it needs to check callers (specs/0006-proxy.md)."
-  depends_on   = [google_project_service.apis]
-}
-
-resource "google_service_account" "proxy_git" {
-  account_id   = "lanescape-runners-proxy-git"
-  display_name = "Lanescape Runners proxy git machine"
-  description  = "The proxy's git machine, lsr-proxy-git: no more than checking callers (specs/0006-proxy.md)."
-  depends_on   = [google_project_service.apis]
-}
-
 resource "google_service_account" "scheduler" {
   account_id   = "lanescape-runners-scheduler"
   display_name = "Lanescape Runners scheduler"
@@ -60,14 +46,12 @@ resource "google_service_account" "infra" {
 }
 
 # Who may act as whom. The service attaches only the machines' account to
-# what it makes; the infra identity deploys as the service, the proxy and the
-# git machine; CD starts applies as the infra identity.
+# what it makes; the infra identity deploys as the service; CD starts applies
+# as the infra identity.
 resource "google_service_account_iam_member" "act_as" {
   for_each = {
     service_as_machine = { account = google_service_account.machine.name, member = google_service_account.service.member }
     infra_as_service   = { account = google_service_account.service.name, member = google_service_account.infra.member }
-    infra_as_proxy     = { account = google_service_account.proxy.name, member = google_service_account.infra.member }
-    infra_as_proxy_git = { account = google_service_account.proxy_git.name, member = google_service_account.infra.member }
     deployer_as_infra  = { account = google_service_account.infra.name, member = google_service_account.deployer.member }
   }
 

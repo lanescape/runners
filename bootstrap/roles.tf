@@ -3,8 +3,8 @@
 # The project holds other teams' resources, so each grant is limited by IAM
 # Conditions to the service's own resources by name wherever IAM can do
 # that: Compute Engine instances, disks and images, Cloud Storage buckets and
-# Secret Manager secrets. The two Cloud Run services' grants are on the
-# services themselves (run.tf). Listing, operations, a few other reads and
+# Secret Manager secrets. The Cloud Run service's grant is on the service
+# itself (run.tf). Listing, operations, a few other reads and
 # Infrastructure Manager can't be limited by name; those grants are apart
 # and say so (README.md, What IAM can't limit). Every grant here adds a
 # member; none replaces a role's or the project's policy.
@@ -17,47 +17,34 @@ locals {
   # projects/<project>/zones/<zone>/instances/<name>.
   in_machine_zones = "(${join(" || ", [for z in var.zones : "resource.name.extract(\"/zones/{zone}/\") == \"${z}\""])})"
 
-  # The service's own instances, disks and images: lsr-, but never the
-  # proxy's lsr-proxy-, which the service doesn't manage.
+  # The service's own instances, disks and images: lsr-.
   service_compute = {
     instances = <<-EOT
       resource.type == "compute.googleapis.com/Instance" &&
       ${local.in_machine_zones} &&
-      resource.name.extract("/instances/{name}").startsWith("lsr-") &&
-      !resource.name.extract("/instances/{name}").startsWith("lsr-proxy-")
+      resource.name.extract("/instances/{name}").startsWith("lsr-")
     EOT
     disks     = <<-EOT
       resource.type == "compute.googleapis.com/Disk" &&
       ${local.in_machine_zones} &&
-      resource.name.extract("/disks/{name}").startsWith("lsr-") &&
-      !resource.name.extract("/disks/{name}").startsWith("lsr-proxy-")
+      resource.name.extract("/disks/{name}").startsWith("lsr-")
     EOT
     images    = <<-EOT
       resource.type == "compute.googleapis.com/Image" &&
-      resource.name.extract("/images/{name}").startsWith("lsr-") &&
-      !resource.name.extract("/images/{name}").startsWith("lsr-proxy-")
+      resource.name.extract("/images/{name}").startsWith("lsr-")
     EOT
   }
 
   # Exactly the resources infra/ manages that IAM can limit by name.
   infra_named = {
-    buckets            = <<-EOT
+    buckets = <<-EOT
       resource.type == "storage.googleapis.com/Bucket" && (
         ${join(" ||\n  ", [for b in local.infra_buckets : "resource.name == \"projects/_/buckets/${b}\""])}
       )
     EOT
-    secrets            = <<-EOT
+    secrets = <<-EOT
       resource.type == "secretmanager.googleapis.com/Secret" && (
         ${join(" ||\n  ", [for x in local.infra_secrets : "resource.name == \"projects/${data.google_project.this.number}/secrets/${x}\""])}
-      )
-    EOT
-    proxy-git-instance = <<-EOT
-      resource.type == "compute.googleapis.com/Instance" &&
-      resource.name.endsWith("/zones/${var.proxy_git_zone}/instances/${local.proxy_git}")
-    EOT
-    proxy-git-disks    = <<-EOT
-      resource.type == "compute.googleapis.com/Disk" && (
-        ${join(" ||\n  ", [for d in local.proxy_git_disks : "resource.name.endsWith(\"/zones/${var.proxy_git_zone}/disks/${d}\")"])}
       )
     EOT
   }
@@ -143,33 +130,22 @@ resource "google_project_iam_member" "service_compute_reader" {
   member  = google_service_account.service.member
 }
 
-# --- The proxy --------------------------------------------------------------
-
-# A caller's token names an instance; the proxy reads that instance to map it
-# to its consumer, as the service does (specs/0006-proxy.md).
-resource "google_project_iam_custom_role" "caller_check" {
-  role_id     = "lanescapeRunnersCallerCheck"
-  title       = "Lanescape Runners caller check"
-  description = "Reads one of the service's machines, to check a caller that signed with its identity. Granted only on lsr- names."
-  permissions = ["compute.instances.get"]
+# The cache hands out V4 signed URLs for one object at a time
+# (specs/0006-cache.md). The service has no key, so it signs with IAM's
+# signBlob, as its own account and only that: this role holds nothing else,
+# and is granted on the service's account alone.
+resource "google_project_iam_custom_role" "signer" {
+  role_id     = "lanescapeRunnersSigner"
+  title       = "Lanescape Runners signer"
+  description = "Signs blobs as an account. Granted only to the service, on its own account, for the cache's signed URLs."
+  permissions = ["iam.serviceAccounts.signBlob"]
   depends_on  = [google_project_service.apis]
 }
 
-resource "google_project_iam_member" "caller_check" {
-  for_each = {
-    proxy     = google_service_account.proxy.member
-    proxy_git = google_service_account.proxy_git.member
-  }
-
-  project = var.project_id
-  role    = google_project_iam_custom_role.caller_check.name
-  member  = each.value
-
-  condition {
-    title       = "lanescape-runners-machines"
-    description = "Only the service's lsr- instances in its zones."
-    expression  = local.service_compute.instances
-  }
+resource "google_service_account_iam_member" "service_signs_as_itself" {
+  service_account_id = google_service_account.service.name
+  role               = google_project_iam_custom_role.signer.name
+  member             = google_service_account.service.member
 }
 
 # --- The infra identity -----------------------------------------------------
@@ -178,36 +154,13 @@ resource "google_project_iam_member" "caller_check" {
 # or keys, no role definitions and no log sinks, so a merged change can't
 # widen what any account holds in the project (specs/0004-deployment.md).
 
-# Exactly the buckets, secrets, git machine and disks infra/ manages, and the
-# access to each, set on the resource itself.
+# Exactly the buckets and secrets infra/ manages, and the access to each,
+# set on the resource itself.
 resource "google_project_iam_custom_role" "infra_named" {
   role_id     = "lanescapeRunnersInfraNamed"
   title       = "Lanescape Runners infrastructure, by name"
-  description = "Manages the service's buckets, secrets' metadata and the proxy's git machine. Granted only on their names."
+  description = "Manages the service's buckets and secrets' metadata. Granted only on their names."
   permissions = [
-    "compute.disks.create",
-    "compute.disks.delete",
-    "compute.disks.get",
-    "compute.disks.resize",
-    "compute.disks.setLabels",
-    "compute.disks.update",
-    "compute.disks.use",
-    "compute.instances.attachDisk",
-    "compute.instances.create",
-    "compute.instances.delete",
-    "compute.instances.detachDisk",
-    "compute.instances.get",
-    "compute.instances.reset",
-    "compute.instances.setDiskAutoDelete",
-    "compute.instances.setLabels",
-    "compute.instances.setMachineType",
-    "compute.instances.setMetadata",
-    "compute.instances.setScheduling",
-    "compute.instances.setServiceAccount",
-    "compute.instances.start",
-    "compute.instances.stop",
-    "compute.instances.update",
-    "compute.instances.updateShieldedVmConfig",
     "secretmanager.secrets.delete",
     "secretmanager.secrets.get",
     "secretmanager.secrets.getIamPolicy",
@@ -237,20 +190,17 @@ resource "google_project_iam_member" "infra_named" {
 }
 
 # What can't be limited by name: making a bucket or a secret (which touches
-# nothing that exists), reading the project, zones, machine types and
-# operations (Terraform polls its own; the identity can't list operations or
-# read logs, so it can't learn another team's operation's name), writing Infrastructure Manager's logs, and the state
-# permissions of Infrastructure Manager's own agent role, without its
-# project-wide Cloud Storage and Cloud Build access.
+# nothing that exists), reading the project and Cloud Run's operations
+# (Terraform polls its own; the identity can't list operations or read logs,
+# so it can't learn another team's operation's name), writing Infrastructure
+# Manager's logs, and the state permissions of Infrastructure Manager's own
+# agent role, without its project-wide Cloud Storage and Cloud Build access.
 resource "google_project_iam_custom_role" "infra_project" {
   role_id     = "lanescapeRunnersInfraProject"
   title       = "Lanescape Runners infrastructure, project"
   description = "Creates the service's resources and runs Infrastructure Manager's applies. Holds nothing that changes an existing resource."
   permissions = [
     "cloudquotas.quotas.get",
-    "compute.machineTypes.get",
-    "compute.zoneOperations.get",
-    "compute.zones.get",
     "config.artifacts.import",
     "config.deployments.deleteState",
     "config.deployments.getLock",
@@ -273,12 +223,12 @@ resource "google_project_iam_member" "infra_project" {
   member  = google_service_account.infra.member
 }
 
-# Deploys the service's two Cloud Run services, granted on each of them
-# alone (run.tf). It can't delete either.
+# Deploys the service on Cloud Run, granted on it alone (run.tf). It can't
+# delete it.
 resource "google_project_iam_custom_role" "infra_run" {
   role_id     = "lanescapeRunnersInfraRun"
   title       = "Lanescape Runners infrastructure, Cloud Run"
-  description = "Deploys one of the service's Cloud Run services. Granted only on lanescape-runners and lanescape-runners-proxy."
+  description = "Deploys the service's Cloud Run service. Granted only on lanescape-runners."
   permissions = [
     "run.services.get",
     "run.services.getIamPolicy",

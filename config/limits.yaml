@@ -1,18 +1,14 @@
-# Each consumer's limits (specs/0002-machines.md, specs/0003-disks.md,
-# specs/0006-proxy.md): the organization-wide defaults, unless overridden for
-# a consumer by its repository ID. An override names only what it changes.
-# The default values are starting points, to be tuned once real jobs run.
+# Each consumer's limits (specs/0002-machines.md): the organization-wide
+# defaults, unless overridden for a consumer by its repository ID. An
+# override names only what it changes. The default values are starting
+# points, to be tuned once real jobs run. Saved disks and cache entries have
+# no size limits: they go as early as their rules allow (specs/0003-disks.md,
+# specs/0006-cache.md).
 defaults:
   # Machines for the consumer's own jobs at once.
   machines: 10
   # Machines for approved contributions at once, counted apart.
   contribution_machines: 2
-  # Total size of saved disks: main's, and all pull requests' together.
-  main_disks_gb: 2000
-  pull_request_disks_gb: 2000
-  # What the proxy stores for the consumer, and the largest object it stores.
-  proxy_storage_gb: 200
-  proxy_object_mb: 4096
 
 # Overrides by repository ID, for example:
 #

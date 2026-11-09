@@ -56,10 +56,6 @@ type Shape struct {
 type Limit struct {
 	Machines             int `yaml:"machines"`
 	ContributionMachines int `yaml:"contribution_machines"`
-	MainDisksGB          int `yaml:"main_disks_gb"`
-	PullRequestDisksGB   int `yaml:"pull_request_disks_gb"`
-	ProxyStorageGB       int `yaml:"proxy_storage_gb"`
-	ProxyObjectMB        int `yaml:"proxy_object_mb"`
 }
 
 // Override changes some of a consumer's limits; absent fields keep the
@@ -67,10 +63,6 @@ type Limit struct {
 type Override struct {
 	Machines             *int `yaml:"machines"`
 	ContributionMachines *int `yaml:"contribution_machines"`
-	MainDisksGB          *int `yaml:"main_disks_gb"`
-	PullRequestDisksGB   *int `yaml:"pull_request_disks_gb"`
-	ProxyStorageGB       *int `yaml:"proxy_storage_gb"`
-	ProxyObjectMB        *int `yaml:"proxy_object_mb"`
 }
 
 // Limits are the defaults and the overrides by repository ID.
@@ -93,10 +85,6 @@ func (l Limits) For(repositoryID int64) Limit {
 	}
 	set(&lim.Machines, o.Machines)
 	set(&lim.ContributionMachines, o.ContributionMachines)
-	set(&lim.MainDisksGB, o.MainDisksGB)
-	set(&lim.PullRequestDisksGB, o.PullRequestDisksGB)
-	set(&lim.ProxyStorageGB, o.ProxyStorageGB)
-	set(&lim.ProxyObjectMB, o.ProxyObjectMB)
 	return lim
 }
 
@@ -276,15 +264,6 @@ func (l Limit) validate() error {
 	}
 	if l.ContributionMachines < 0 {
 		bad = append(bad, "contribution_machines can't be negative")
-	}
-	if l.MainDisksGB <= 0 || l.PullRequestDisksGB <= 0 {
-		bad = append(bad, "main_disks_gb and pull_request_disks_gb must be positive")
-	}
-	if l.ProxyStorageGB <= 0 || l.ProxyObjectMB <= 0 {
-		bad = append(bad, "proxy_storage_gb and proxy_object_mb must be positive")
-	}
-	if l.ProxyObjectMB > 0 && l.ProxyStorageGB > 0 && l.ProxyObjectMB > l.ProxyStorageGB*1024 {
-		bad = append(bad, "proxy_object_mb is larger than proxy_storage_gb")
 	}
 	if len(bad) == 0 {
 		return nil

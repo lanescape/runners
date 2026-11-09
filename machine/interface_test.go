@@ -121,8 +121,8 @@ func (a action) saveStep() string {
 }
 
 func TestTheInterfacesConstants(t *testing.T) {
-	if endpoints.Organization != orgID || !strings.HasPrefix(endpoints.Service, "https://") || !strings.HasPrefix(endpoints.Proxy, "https://") {
-		t.Fatalf("endpoints = %d %s %s", endpoints.Organization, endpoints.Service, endpoints.Proxy)
+	if endpoints.Organization != orgID || !strings.HasPrefix(endpoints.Service, "https://") {
+		t.Fatalf("endpoints = %d %s", endpoints.Organization, endpoints.Service)
 	}
 	if machine.SaveMarker != "/var/lib/lanescape-runners/save" || machine.SaveRequest != `{"save": true}` {
 		t.Fatalf("save request = %s in %s", machine.SaveRequest, machine.SaveMarker)

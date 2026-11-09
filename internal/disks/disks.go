@@ -4,13 +4,17 @@
 // service through the seams machines.Service offers: choosing what a job's
 // work disk starts from, saving a finished job's disk, and recording a
 // stopped Spot machine; and it adds its own part of each pass, which reruns
-// runs that lost a Spot job to preemption, and deletes what's expired.
+// runs that lost a Spot job to preemption, and deletes what's no longer
+// needed, as early as its rules allow.
 //
 // What images exist is in Compute Engine, by their names and labels; what
 // they hold and who chose them is in the bucket:
 //
 //	images/<repository>/<image>.json            a saved disk or resume image, recorded before it's made
 //	choices/<repository>/<run>/<selector hash>.json  a run's restore choice for a selector
+//	recent/<repository>/<scope>/<family hash>.json  a pull request's most recent choice for a family
+//	closures/<repository>/<scope>.json          when a pull request was last seen closed
+//	families/<repository>/<family hash>.json    when a family of main's was last used
 //	claims/<repository>/<image>.json            the job a resume image is claimed for
 //	preemptions/<repository>/<run>/<instance ID>.json  a stopped Spot machine, preempted or perhaps
 //	events/<instance ID>.json                   Compute Engine's event that it preempted an instance
@@ -47,19 +51,25 @@ import (
 	"github.com/lanescape/runners/internal/store"
 )
 
-// The spec's timings and limits.
+// The spec's timings and counts.
 const (
-	// PullRequestUnused and PullRequestClosed are how long a pull
-	// request's disks are kept after their last use, and after the pull
-	// request closed.
+	// PullRequestUnused is how long an open pull request's disks are kept
+	// after their last use, for pull requests that are abandoned but never
+	// closed.
 	PullRequestUnused = 14 * 24 * time.Hour
-	PullRequestClosed = 24 * time.Hour
-	// MainUnused is how long main's disks are kept after their last use,
-	// except the newest of each family.
+	// MainUnused is how long a family of main's may go unused before all
+	// of it goes, newest included: a family that's been retired.
 	MainUnused = 90 * 24 * time.Hour
-	// ResumeKept is how long a resume image is kept after its machine
-	// stopped, and how long the service looks for evidence that it was
-	// preempted.
+	// MainKeys is how many of a main family's keys are kept, the newest
+	// and the one before it, besides any an open pull request's most
+	// recent choice names.
+	MainKeys = 2
+	// RunLimit is the longest GitHub lets a workflow run go on, after which
+	// no run bound before a pull request closed can still save.
+	RunLimit = 35 * 24 * time.Hour
+	// ResumeKept is how long after its machine stopped a resume image may
+	// resume a job, and how long the service looks for evidence that it
+	// was preempted.
 	ResumeKept = 24 * time.Hour
 	// MaxAttempts is how many attempts of a run there may be in all
 	// before the service reruns it no more.
@@ -105,6 +115,17 @@ const (
 	// ImageMarked is an image marked for deletion: it's never chosen, and
 	// it's deleted next.
 	ImageMarked = "marked"
+)
+
+// The steps of the restore order a choice can come from
+// (specs/0003-disks.md, Saved disks), as its record and the service's log
+// name them.
+const (
+	StepPullRequestExact  = "pull_request_exact"
+	StepPullRequestNewest = "pull_request_newest"
+	StepMainExact         = "main_exact"
+	StepMainNewest        = "main_newest"
+	StepNone              = "none"
 )
 
 // The preemption evidence a record holds.
@@ -209,6 +230,10 @@ type Image struct {
 	Attempt  int       `json:"attempt,omitempty"`
 	SavedAt  time.Time `json:"saved_at"`
 	LastUsed time.Time `json:"last_used"`
+	// BoundAt is when a saved disk's run was bound: one of a pull
+	// request's bound before the pull request was last closed is never
+	// chosen again.
+	BoundAt time.Time `json:"bound_at,omitzero"`
 	// TouchedAt is when a job last chose or claimed it: writing it changes
 	// the record's generation, so marking it, which writes the same
 	// record with the generation it read, can't succeed past a choice.
@@ -220,17 +245,70 @@ type Image struct {
 }
 
 // Choice is a run's restore choice for a selector: the exact image version
-// every job of the run with that selector starts from, or none.
+// every job of the run with that selector starts from, or none, and which
+// step of the restore order it came from.
 type Choice struct {
 	RepositoryID int64  `json:"repository_id"`
 	RunID        int64  `json:"run_id"`
 	Selector     string `json:"selector"`
+	Scope        string `json:"scope"`
+	Arch         string `json:"arch"`
+	Family       string `json:"family"`
+	Step         string `json:"step"`
 	Image        string `json:"image,omitempty"`
 	// Attempt is the run attempt it was picked in. It holds for the
 	// attempts the service's automatic reruns started from it; one a
 	// maintainer started picks again, as a new run would.
 	Attempt int       `json:"attempt"`
 	At      time.Time `json:"at"`
+}
+
+// Recent is a pull request's most recent restore choice for a family on an
+// architecture, kept while the pull request is open, after its run's choice
+// has gone: main keeps an older key while one names it.
+type Recent struct {
+	RepositoryID int64  `json:"repository_id"`
+	Scope        string `json:"scope"`
+	Arch         string `json:"arch"`
+	Family       string `json:"family"`
+	Step         string `json:"step"`
+	// The image chosen, and its scope and key; none if the choice was an
+	// empty disk.
+	Image      string    `json:"image,omitempty"`
+	ImageScope string    `json:"image_scope,omitempty"`
+	Key        string    `json:"key,omitempty"`
+	RunID      int64     `json:"run_id"`
+	At         time.Time `json:"at"`
+}
+
+// Closure is a pull request the service has seen closed: its disks saved by
+// runs bound up to the last time it was seen closed are never chosen again,
+// even once it's reopened, and go as soon as no unfinished run's choice
+// names them. SeenAt moves on with every pass that still sees it closed, so
+// that a run bound while it was closed counts too; GitHub's ClosedAt, to
+// the second, is for whoever reads the bucket.
+type Closure struct {
+	RepositoryID int64     `json:"repository_id"`
+	Scope        string    `json:"scope"`
+	ClosedAt     time.Time `json:"closed_at,omitzero"`
+	SeenAt       time.Time `json:"seen_at"`
+}
+
+// retired reports whether a saved disk of a pull request's was saved by a
+// run bound before its pull request was last seen closed.
+func retired(v Image, c *Closure) bool {
+	return c != nil && v.Kind == KindSaved && v.Scope == c.Scope && !v.BoundAt.After(c.SeenAt)
+}
+
+// Family is when a family of main's was last used, kept apart from its
+// images' records so that deleting a version never makes the family look
+// unused for longer than it has been.
+type Family struct {
+	RepositoryID int64     `json:"repository_id"`
+	Scope        string    `json:"scope"`
+	Arch         string    `json:"arch"`
+	Family       string    `json:"family"`
+	LastUsed     time.Time `json:"last_used"`
 }
 
 // Claim is the one job a resume image is for.
@@ -299,6 +377,15 @@ func imageKey(repo int64, image string) string { return fmt.Sprintf("images/%d/%
 func choicePrefix(repo, run int64) string      { return fmt.Sprintf("choices/%d/%d/", repo, run) }
 func choiceKey(repo, run int64, sel selector.Selector) string {
 	return choicePrefix(repo, run) + sel.Hash() + ".json"
+}
+func recentKey(repo int64, scope, arch, family string) string {
+	return fmt.Sprintf("recent/%d/%s/%s.json", repo, scope, selector.Hash(arch+"\x00"+family))
+}
+func closureKey(repo int64, scope string) string {
+	return fmt.Sprintf("closures/%d/%s.json", repo, scope)
+}
+func familyKey(repo int64, scope, arch, family string) string {
+	return fmt.Sprintf("families/%d/%s.json", repo, selector.Hash(scope+"\x00"+arch+"\x00"+family))
 }
 func claimKey(repo int64, image string) string { return fmt.Sprintf("claims/%d/%s.json", repo, image) }
 func preemptionPrefix(repo, run int64) string  { return fmt.Sprintf("preemptions/%d/%d/", repo, run) }
@@ -447,8 +534,17 @@ func (s *Service) touch(ctx context.Context, repo int64, image string) error {
 		}
 		rec.TouchedAt = s.now()
 		// Choosing a saved disk is using it, at most once a day, in the
-		// same write: expiry reads it.
+		// same write: expiry reads it. A family of main's is marked used
+		// first, in its own record, which a pass reads after the images':
+		// a pass that read this image's record before the touch fails to
+		// mark it, and one that read it after reads the family's use.
 		if rec.Kind == KindSaved && day(rec.LastUsed) != day(s.now()) {
+			if rec.Scope == "main" {
+				if err := s.putJSON(ctx, familyKey(repo, rec.Scope, rec.Arch, rec.Family), Family{RepositoryID: repo,
+					Scope: rec.Scope, Arch: rec.Arch, Family: rec.Family, LastUsed: s.now()}); err != nil {
+					return err
+				}
+			}
 			rec.LastUsed = s.now()
 		}
 		if _, err := replaceJSON(ctx, s.Objects, imageKey(repo, image), rec, gen); err == nil {

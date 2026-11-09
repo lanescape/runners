@@ -8,8 +8,6 @@ output "accounts" {
   value = {
     service   = google_service_account.service.email
     machine   = google_service_account.machine.email
-    proxy     = google_service_account.proxy.email
-    proxy_git = google_service_account.proxy_git.email
     scheduler = google_service_account.scheduler.email
     push      = google_service_account.push.email
     deployer  = google_service_account.deployer.email

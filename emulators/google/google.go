@@ -54,10 +54,15 @@ func (i *Issuer) Token(email, audience string) string {
 // message, as Pub/Sub sends it: the message's data, base64-encoded, its ID
 // and the subscription's full name. A redelivery has the same ID.
 func Push(project, subscription, messageID string, data []byte) []byte {
+	return PushWith(project, subscription, messageID, data, map[string]string{})
+}
+
+// PushWith is Push, for a message with attributes.
+func PushWith(project, subscription, messageID string, data []byte, attributes map[string]string) []byte {
 	b, _ := json.Marshal(map[string]any{
 		"message": map[string]any{
 			"data": data, "messageId": messageID, "message_id": messageID,
-			"publishTime": time.Now().UTC().Format(time.RFC3339Nano), "attributes": map[string]string{},
+			"publishTime": time.Now().UTC().Format(time.RFC3339Nano), "attributes": attributes,
 		},
 		"subscription": "projects/" + project + "/subscriptions/" + subscription,
 	})

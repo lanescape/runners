@@ -227,14 +227,14 @@ func TestOrphanedDisks(t *testing.T) {
 	unrecorded := "lsr-5001-yyyyyyyy-work"
 	e.gce.AddDisk(zoneB, unrecorded, 50, map[string]string{machines.LabelRepository: "5001"})
 	// Disks the service didn't make are left alone.
-	e.gce.AddDisk(zoneB, "lsr-proxy-git-mirror", 500, map[string]string{"lsr-repository": "x"})
+	e.gce.AddDisk(zoneB, "lsr-shared-data", 500, map[string]string{"lsr-repository": "x"})
 	e.gce.AddDisk(zoneB, "lsr-5001-xxxxxxxx-work", 50, nil)
 	e.pass()
 	have := map[string]bool{}
 	for _, d := range e.gce.Disks() {
 		have[d.Name] = true
 	}
-	if !have[madeFor] || !have[machines.WorkDisk(m.in.Name)] || !have["lsr-proxy-git-mirror"] || !have["lsr-5001-xxxxxxxx-work"] {
+	if !have[madeFor] || !have[machines.WorkDisk(m.in.Name)] || !have["lsr-shared-data"] || !have["lsr-5001-xxxxxxxx-work"] {
 		t.Fatalf("disks = %v; a disk waiting for its machine, an attached one or one not the service's was deleted", have)
 	}
 	if have[goneFor] || have[unrecorded] {

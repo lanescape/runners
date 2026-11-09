@@ -24,9 +24,9 @@ func TestOrganization(t *testing.T) {
 	}
 }
 
-// The addresses are the ones infra/ deploys to: Cloud Run's deterministic
-// URLs for the services it names, in its region, in the project.
-func TestAddressesAreInfrasOwn(t *testing.T) {
+// The address is the one infra/ deploys to: Cloud Run's deterministic URL
+// for the service it names, in its region, in the project.
+func TestTheAddressIsInfrasOwn(t *testing.T) {
 	main, err := os.ReadFile("../infra/main.tf")
 	if err != nil {
 		t.Fatal(err)
@@ -39,7 +39,7 @@ func TestAddressesAreInfrasOwn(t *testing.T) {
 	if region == nil {
 		t.Fatal("infra/variables.tf has no default region")
 	}
-	for name, want := range map[string]string{"service_url": endpoints.Service, "proxy_url": endpoints.Proxy} {
+	for name, want := range map[string]string{"service_url": endpoints.Service} {
 		m := regexp.MustCompile(name + `\s*=\s*"([^"]+)"`).FindSubmatch(main)
 		if m == nil {
 			t.Fatalf("infra/main.tf has no %s", name)

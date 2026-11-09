@@ -30,12 +30,7 @@ resource "google_secret_manager_secret" "webhook_secret" {
 }
 
 resource "google_secret_manager_secret_iam_member" "app_key" {
-  for_each = toset([
-    local.accounts.service,
-    # The proxy asks GitHub about a caller's run, and reads a consumer's
-    # .github/proxy.json, with the App (specs/0006-proxy.md).
-    local.accounts.proxy,
-  ])
+  for_each = toset([local.accounts.service])
 
   secret_id = google_secret_manager_secret.app_key.id
   role      = "roles/secretmanager.secretAccessor"

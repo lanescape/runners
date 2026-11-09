@@ -64,10 +64,6 @@ func TestOverridesByRepositoryID(t *testing.T) {
 defaults:
   machines: 10
   contribution_machines: 2
-  main_disks_gb: 2000
-  pull_request_disks_gb: 1000
-  proxy_storage_gb: 200
-  proxy_object_mb: 4096
 repositories:
   123456:
     machines: 30
@@ -77,7 +73,7 @@ repositories:
 		t.Fatal(err)
 	}
 	got := c.Limits.For(123456)
-	if got.Machines != 30 || got.ContributionMachines != 0 || got.MainDisksGB != 2000 || got.PullRequestDisksGB != 1000 {
+	if got.Machines != 30 || got.ContributionMachines != 0 {
 		t.Errorf("overridden limits = %+v", got)
 	}
 	if other := c.Limits.For(654321); other != c.Limits.Defaults {
@@ -91,10 +87,6 @@ func TestInvalidConfigs(t *testing.T) {
 defaults:
   machines: 10
   contribution_machines: 2
-  main_disks_gb: 2000
-  pull_request_disks_gb: 2000
-  proxy_storage_gb: 200
-  proxy_object_mb: 4096
 ` + extra
 	}
 	shapes := func(shape string) string {
@@ -121,8 +113,9 @@ shapes:
 		{"duplicate type", "shapes.yaml", shapes("  lanescape-2vcpu-linux-amd64: {machine_types: [n4-highcpu-2, n4-highcpu-2], memory_gb: 4, work_disk_gb: 1}"), "twice"},
 		{"no zones", "shapes.yaml", "boot_disk_gb: 100\ndisk_iops: 3000\ndisk_throughput_mibps: 400\nshapes: {lanescape-2vcpu-linux-amd64: {machine_types: [n4-highcpu-2], memory_gb: 4, work_disk_gb: 1}}", "no zones"},
 		{"no machines", "limits.yaml", strings.Replace(limits(""), "machines: 10", "machines: 0", 1), "machines must be at least 1"},
+		{"a limit that's gone", "limits.yaml", limits("repositories:\n  42: {main_disks_gb: 100}"), "not found"},
 		{"empty override", "limits.yaml", limits("repositories:\n  42: {}"), "changes nothing"},
-		{"bad override", "limits.yaml", limits("repositories:\n  42: {main_disks_gb: -1}"), "repository 42"},
+		{"bad override", "limits.yaml", limits("repositories:\n  42: {contribution_machines: -1}"), "repository 42"},
 		{"override by name", "limits.yaml", limits("repositories:\n  app: {machines: 2}"), "limits.yaml"},
 		{"bad runner version", "runner.yaml", "version: v2.338\nsha256: {amd64: " + strings.Repeat("a", 64) + ", arm64: " + strings.Repeat("a", 64) + "}", "isn't a release version"},
 		{"missing checksum", "runner.yaml", "version: 2.338.2\nsha256: {amd64: " + strings.Repeat("a", 64) + "}", "sha256 for arm64"},

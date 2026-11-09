@@ -169,7 +169,7 @@ func TestActions(t *testing.T) {
 		{"no repository ID", emu.ActionsToken(run, job, map[string]any{"repository_id": "x"}), auth.ErrUnauthenticated},
 		{"no event", emu.ActionsToken(run, job, map[string]any{"event_name": nil}), auth.ErrUnauthenticated},
 		{"default audience", emu.ActionsToken(run, ghemu.Job{}, nil), auth.ErrUnauthenticated},
-		{"wrong audience", emu.ActionsToken(run, ghemu.Job{Audience: "https://proxy.example.test"}, nil), auth.ErrUnauthenticated},
+		{"wrong audience", emu.ActionsToken(run, ghemu.Job{Audience: "https://other.example.test"}, nil), auth.ErrUnauthenticated},
 		{"expired", emu.ActionsToken(run, job, map[string]any{"exp": time.Now().Add(-time.Second).Unix()}), auth.ErrUnauthenticated},
 		{"wrong issuer", emu.ActionsToken(run, job, map[string]any{"iss": "https://token.actions.githubusercontent.com"}), auth.ErrUnauthenticated},
 		{"unpublished key", emu.Actions.MintWith(oidc.NewKey(), emu.ActionsClaims(run, job)), auth.ErrUnauthenticated},

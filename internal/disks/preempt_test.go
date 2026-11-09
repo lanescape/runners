@@ -95,11 +95,13 @@ func TestAPreemptedJobResumes(t *testing.T) {
 	if !ok || claim["job_id"] != float64(j2.ID) {
 		t.Fatalf("claim = %v", claim)
 	}
-	// Once its job has finished, the resume image goes.
-	again.finish(false)
+	// Once its job has started from it, the resume image goes, while the
+	// job runs on.
+	e.pass()
 	if e.has(resume) {
-		t.Fatal("a resume image outlived its job")
+		t.Fatal("a resume image outlived its job's start")
 	}
+	again.finish(false)
 	if a := e.attempt(run); a != 2 {
 		t.Fatalf("a run whose rerun succeeded was rerun again: attempt %d", a)
 	}
@@ -180,7 +182,7 @@ func TestEvidenceFromTheRecordedEvent(t *testing.T) {
 		t.Fatal("no resume image while the evidence is unknown")
 	}
 	// The event arrives late, through the push subscription.
-	if err := e.disks.RecordEvent(context.Background(), entry); err != nil {
+	if err := e.disks.RecordEvent(context.Background(), nil, entry); err != nil {
 		t.Fatal(err)
 	}
 	e.pass()
@@ -337,14 +339,11 @@ func TestADayCountsFromTheStop(t *testing.T) {
 	if img["size_gb"] != float64(50) {
 		t.Fatalf("resume image record = %v; want its disk's size", img)
 	}
-	e.clock.Advance(disks.ResumeKept - time.Hour + time.Minute)
-	e.pass()
-	if e.has(disks.ResumeName(repoID, jb.in.ID)) {
-		t.Fatal("a resume image outlived a day from its machine's stop")
-	}
 }
 
-func TestAClaimedResumeImageGoesAfterADayAllTheSame(t *testing.T) {
+// A resume image resumes a job late in its day, and goes once the job has
+// started from it, while the job runs on.
+func TestAClaimedResumeImageGoesOnceItsJobStarts(t *testing.T) {
 	e := setup(t)
 	run := e.mainRun()
 	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
@@ -357,35 +356,60 @@ func TestAClaimedResumeImageGoesAfterADayAllTheSame(t *testing.T) {
 	if again.source() != resume {
 		t.Fatal("no resume")
 	}
-	e.clock.Advance(2 * time.Hour)
 	e.pass()
 	if e.has(resume) {
-		t.Fatal("a claimed resume image outlived its day")
+		t.Fatal("a claimed resume image outlived its job's start")
 	}
 }
 
-func TestAResumeImageGoesADayAfterItsMachineStopped(t *testing.T) {
+// A resume image no job has started from is kept while its run may still
+// need it, however long that is.
+func TestAResumeImageWaitsForItsRun(t *testing.T) {
 	e := setup(t)
 	run := e.mainRun()
 	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
 	if err := e.gce.Preempt(jb.in.Zone, jb.in.Name); err != nil {
 		t.Fatal(err)
 	}
-	// Its job's run never finishes, so it's never rerun.
+	// Its job's run hasn't finished, so it isn't rerun yet.
 	e.pass()
 	resume := disks.ResumeName(repoID, jb.in.ID)
 	if !e.has(resume) {
 		t.Fatal("no resume image")
 	}
-	e.clock.Advance(disks.ResumeKept - time.Minute)
+	e.clock.Advance(2 * disks.ResumeKept)
 	e.pass()
 	if !e.has(resume) {
-		t.Fatal("a resume image went before a day")
+		t.Fatal("a resume image went while its run was unfinished")
 	}
-	e.clock.Advance(2 * time.Minute)
+}
+
+// A resume image that no job resumes from goes once its run has finished
+// with no rerun left.
+func TestAnUnusedResumeImageGoesWithItsRun(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	a := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{spot}})
+	b := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{spot}})
+	a.preempt()
+	b.finish(false)
+	e.pass()
+	resume := disks.ResumeName(repoID, a.in.ID)
+	if !e.has(resume) || e.attempt(run) != 2 {
+		t.Fatal("no resume image, or no rerun")
+	}
+	again := e.admit(run, e.rerunJob(run, 2, "test"))
+	if again.source() != "" {
+		t.Fatal("a job whose name its matrix shares resumed")
+	}
+	if !e.has(resume) {
+		t.Fatal("a resume image went while its run was due a rerun")
+	}
+	again.finish(false)
+	e.eventually("the run is finished", func() bool { s, _ := e.gh.RunState(run); return s == "completed" })
 	e.pass()
 	if e.has(resume) {
-		t.Fatal("a resume image outlived its day")
+		t.Fatal("a resume image outlived its run")
 	}
 }
 

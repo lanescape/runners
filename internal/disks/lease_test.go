@@ -275,12 +275,13 @@ func TestTheNewestThatsThereIsKept(t *testing.T) {
 	e := setup(t)
 	old := e.saveMain(key1)
 	e.clock.Advance(time.Minute)
-	newer := e.saveMain(key2)
-	e.gce.DeleteImageNow(newer)
-	e.clock.Advance(disks.MainUnused)
+	gone := e.saveMain(key2)
+	e.gce.DeleteImageNow(gone)
+	e.clock.Advance(time.Minute)
+	newest := e.saveMain(key3)
 	e.pass()
-	if !e.has(old) {
-		t.Fatal("the only disk of a family that's there was deleted as not the newest")
+	if !e.has(old) || !e.has(newest) {
+		t.Fatal("a family's two newest disks that are there weren't both kept")
 	}
 }
 
@@ -304,7 +305,7 @@ func TestAnOrphanAChoiceNamesIsKept(t *testing.T) {
 }
 
 // A resume image with no record that a claim holds keeps its claim, and so
-// is kept, pass after pass, until its day is over.
+// is kept, pass after pass, until its job is shown to have started from it.
 func TestAClaimedOrphanKeepsItsClaim(t *testing.T) {
 	e := setup(t)
 	run := e.mainRun()
@@ -318,6 +319,11 @@ func TestAClaimedOrphanKeepsItsClaim(t *testing.T) {
 	}
 	key := "images/5001/" + resume + ".json"
 	if err := e.objects.Delete(context.Background(), key, mustGen(t, e, key)); err != nil {
+		t.Fatal(err)
+	}
+	// Nor is there a record of the work disk made from it.
+	disk := "disks/" + machines.WorkDisk(again.in.Name) + ".json"
+	if err := e.objects.Delete(context.Background(), disk, mustGen(t, e, disk)); err != nil {
 		t.Fatal(err)
 	}
 	e.pass()

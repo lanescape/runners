@@ -3,6 +3,7 @@ package disks
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -12,6 +13,7 @@ import (
 	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/machines"
 	"github.com/lanescape/runners/internal/selector"
+	"github.com/lanescape/runners/internal/store"
 )
 
 // Choose picks what an admitted job's work disk starts from
@@ -220,23 +222,50 @@ func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Ad
 		if err != nil {
 			return err
 		}
+		var closure *Closure
+		if _, isPR := sel.Scope.PullRequestNumber(); isPR {
+			c, _, found, err := getJSON[Closure](ctx, s.Objects, closureKey(repo, sel.Scope.String()))
+			if err != nil {
+				return err
+			}
+			if found {
+				closure = &c
+			}
+		}
 		var pick *Image
-		for _, cand := range candidates(recs, sel) {
-			im, err := s.Compute.Image(ctx, cand.Image)
+		step := StepNone
+		for _, cand := range candidates(recs, sel, closure) {
+			im, err := s.Compute.Image(ctx, cand.Image.Image)
 			if errors.Is(err, compute.ErrNotFound) {
 				continue
 			}
 			if err != nil {
 				return err
 			}
-			if matches(im, cand) {
-				pick = &cand
+			if matches(im, cand.Image) {
+				pick, step = &cand.Image, cand.step
 				break
 			}
 		}
-		choice := Choice{RepositoryID: repo, RunID: a.RunID, Selector: sel.String(), Attempt: a.RunAttempt, At: s.now()}
+		choice := Choice{RepositoryID: repo, RunID: a.RunID, Selector: sel.String(), Scope: sel.Scope.String(), Arch: sel.Arch,
+			Family: sel.Family, Step: step, Attempt: a.RunAttempt, At: s.now()}
 		if pick != nil {
 			choice.Image = pick.Image
+		}
+		// A pull request's most recent choice for the family outlives its
+		// run's, so main keeps the key it names while the pull request is
+		// open. It's written before the image is touched: a pass that read
+		// the image's record before the touch, and would mark it, fails its
+		// precondition, and one that read it after reads this too.
+		if _, isPR := sel.Scope.PullRequestNumber(); isPR {
+			rec := Recent{RepositoryID: repo, Scope: sel.Scope.String(), Arch: sel.Arch, Family: sel.Family, Step: step,
+				RunID: a.RunID, At: s.now()}
+			if pick != nil {
+				rec.Image, rec.ImageScope, rec.Key = pick.Image, pick.Scope, pick.Key
+			}
+			if err := s.putJSON(ctx, recentKey(rec.RepositoryID, rec.Scope, rec.Arch, rec.Family), rec); err != nil {
+				return err
+			}
 		}
 		if ok {
 			_, err = replaceJSON(ctx, s.Objects, key, choice, gen)
@@ -255,10 +284,38 @@ func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Ad
 				return err
 			}
 		}
+		// What each restore found, so the order and what's kept can be
+		// tuned from evidence. Nothing here is a URL, token or payload.
+		s.log().Info("restore choice", "repository_id", repo, "run_id", a.RunID, "selector", a.Selector, "scope", choice.Scope,
+			"arch", choice.Arch, "family", choice.Family, "step", step, "image", choice.Image)
 		out = pick
 		return nil
 	})
 	return out, err
+}
+
+// putJSON writes a record, replacing whatever is there.
+func (s *Service) putJSON(ctx context.Context, key string, rec any) error {
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	for range 3 {
+		_, gen, err := s.Objects.Get(ctx, key)
+		found := err == nil
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return err
+		}
+		if found {
+			_, err = s.Objects.Replace(ctx, key, data, gen)
+		} else {
+			_, err = s.Objects.Create(ctx, key, data)
+		}
+		if !errors.Is(err, store.ErrPrecondition) {
+			return err
+		}
+	}
+	return fmt.Errorf("record %s kept changing", key)
 }
 
 // rerunBySomeoneElse reports whether any attempt of a run after from, up to
@@ -290,31 +347,39 @@ func (s *Service) rerunBySomeoneElse(ctx context.Context, repoID, runID int64, f
 // that pull request's disk for the family and key, then its newest for the
 // family; then main's for the family and key, then main's newest for the
 // family. Only disks of the selector's architecture, ready and unmarked,
-// count; of several versions, the newest comes first.
-func candidates(recs map[string]record[Image], sel selector.Selector) []Image {
+// count, and none of a pull request's saved by a run bound before it was
+// last seen closed; of several versions, the newest comes first.
+func candidates(recs map[string]record[Image], sel selector.Selector, closure *Closure) []candidate {
 	var pool []Image
 	for _, r := range recs {
 		v := r.v
-		if v.Kind == KindSaved && v.State == ImageReady && v.Arch == sel.Arch && v.Family == sel.Family {
+		if v.Kind == KindSaved && v.State == ImageReady && v.Arch == sel.Arch && v.Family == sel.Family && !retired(v, closure) {
 			pool = append(pool, v)
 		}
 	}
 	slices.SortFunc(pool, func(x, y Image) int { return cmp.Or(y.SavedAt.Compare(x.SavedAt), strings.Compare(y.Image, x.Image)) })
-	var out []Image
-	add := func(scope string, exact bool) {
+	var out []candidate
+	add := func(scope string, exact bool, step string) {
 		for _, v := range pool {
-			if v.Scope == scope && (!exact || v.Key == sel.Key) && !slices.ContainsFunc(out, func(o Image) bool { return o.Image == v.Image }) {
-				out = append(out, v)
+			if v.Scope == scope && (!exact || v.Key == sel.Key) && !slices.ContainsFunc(out, func(o candidate) bool { return o.Image.Image == v.Image }) {
+				out = append(out, candidate{v, step})
 			}
 		}
 	}
 	if _, ok := sel.Scope.PullRequestNumber(); ok {
-		add(sel.Scope.String(), true)
-		add(sel.Scope.String(), false)
+		add(sel.Scope.String(), true, StepPullRequestExact)
+		add(sel.Scope.String(), false, StepPullRequestNewest)
 	}
-	add("main", true)
-	add("main", false)
+	add("main", true, StepMainExact)
+	add("main", false, StepMainNewest)
 	return out
+}
+
+// candidate is a saved disk a selector may start from, and the step of the
+// restore order it comes from.
+type candidate struct {
+	Image Image
+	step  string
 }
 
 // used labels a saved disk used, at most once a day. Its record, which

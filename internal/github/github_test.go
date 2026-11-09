@@ -225,7 +225,7 @@ func TestFile(t *testing.T) {
 	if err != nil || string(got) != long {
 		t.Fatalf("file = %q, %v", got, err)
 	}
-	if _, err := e.c.File(ctx, repo, ".github/proxy.json", sha); !errors.Is(err, github.ErrNotFound) {
+	if _, err := e.c.File(ctx, repo, ".github/absent.json", sha); !errors.Is(err, github.ErrNotFound) {
 		t.Fatalf("missing file: %v", err)
 	}
 }

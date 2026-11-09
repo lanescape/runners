@@ -38,6 +38,7 @@ const (
 	audience = "https://runners.example.test"
 	key1     = "0123456789abcdef0123"
 	key2     = "fedcba9876543210fedc"
+	key3     = "00112233445566778899"
 	zero     = "00000000000000000000"
 )
 

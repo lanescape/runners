@@ -25,7 +25,7 @@ func TestMachines(t *testing.T) {
 		t.Fatal(err)
 	}
 	zone := emu.Zones()[0]
-	for name, sa := range map[string]string{"m": machineAccount, "other": "proxy@lanescape-dev.iam.gserviceaccount.com"} {
+	for name, sa := range map[string]string{"m": machineAccount, "other": "other@lanescape-dev.iam.gserviceaccount.com"} {
 		inst := &gce.Instance{Name: name, MachineType: "zones/" + zone + "/machineTypes/n4-highcpu-2",
 			Disks: []*gce.AttachedDisk{{Boot: true, InitializeParams: &gce.AttachedDiskInitializeParams{
 				SourceImage: "global/images/base", DiskType: "zones/" + zone + "/diskTypes/hyperdisk-balanced"}}},
@@ -61,7 +61,7 @@ func TestMachines(t *testing.T) {
 		want  error
 	}{
 		{"standard format", emu.Identity.Mint(emu.IdentityClaims(zone, "m", audience, false)), auth.ErrUnauthenticated},
-		{"another audience", emu.Identity.Mint(emu.IdentityClaims(zone, "m", "https://proxy.example.test", true)), auth.ErrUnauthenticated},
+		{"another audience", emu.Identity.Mint(emu.IdentityClaims(zone, "m", "https://other.example.test", true)), auth.ErrUnauthenticated},
 		{"another account", emu.Identity.Mint(emu.IdentityClaims(zone, "other", audience, true)), auth.ErrForbidden},
 		{"unverified email", full(func(cl map[string]any) { cl["email_verified"] = false }), auth.ErrForbidden},
 		{"another project", full(func(cl map[string]any) { ce(cl)["project_id"] = "elsewhere" }), auth.ErrForbidden},
