@@ -42,14 +42,6 @@ terraform apply bootstrap.tfplan
 
 Read the plan before applying it: it's the only review this configuration's changes get beyond the pull request's. `infra/check.sh`, which CI runs, refuses any firewall rule or policy, and any grant that replaces a policy or a role's members rather than adding one.
 
-## After removing the proxy
-
-The proxy's Cloud Run shell, `lanescape-runners-proxy`, has deletion protection, so the apply that removes the proxy forgets it rather than destroying it (`run.tf`). Delete it by hand once that apply has succeeded:
-
-```sh
-gcloud run services delete lanescape-runners-proxy --project=lanescape-dev --region=northamerica-northeast1
-```
-
 ## After the first apply
 
 1. Give CD what it needs from `terraform output`: the workload identity provider and the deployer's account for signing in, the image repository for `ko`, and the Infrastructure Manager artifacts bucket. `infra/README.md` says how CD starts an apply.

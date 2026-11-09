@@ -35,28 +35,3 @@ resource "google_cloud_run_v2_service_iam_member" "infra" {
   role     = google_project_iam_custom_role.infra_run.name
   member   = google_service_account.infra.member
 }
-
-# There were two shells, the service's and the proxy's, made with for_each.
-# The service's keeps its place in the state under its new address. The
-# proxy's, lanescape-runners-proxy, has deletion protection and ignores every
-# change, so Terraform couldn't destroy it: it's forgotten, and the
-# maintainer deletes it by hand (README.md, After removing the proxy). The
-# infra identity's grant on it is destroyed with it. Once applied, these
-# blocks can go.
-moved {
-  from = google_cloud_run_v2_service.shells["service"]
-  to   = google_cloud_run_v2_service.shell
-}
-
-moved {
-  from = google_cloud_run_v2_service_iam_member.infra["service"]
-  to   = google_cloud_run_v2_service_iam_member.infra
-}
-
-removed {
-  from = google_cloud_run_v2_service.shells
-
-  lifecycle {
-    destroy = false
-  }
-}
