@@ -129,8 +129,8 @@ func (s *Scope) UnmarshalText(b []byte) error {
 // reads, in order. That's its own scope, if it saves, then its base, the
 // scope it falls back to, if it has one: a pull request's base is the one
 // its binding recorded, the listed branch it targets or else main's; a
-// long-lived branch's push falls back to main's (BranchBase); main's has
-// none; and read reads main's alone.
+// long-lived branch's push falls back to main's, so a new branch starts
+// warm; main's has none; and read reads main's alone.
 func Chain(s, base Scope) []Scope {
 	switch {
 	case s.IsMain() || s.IsRead():
@@ -141,22 +141,7 @@ func Chain(s, base Scope) []Scope {
 		}
 		return []Scope{s, Main}
 	case s.branch != "":
-		if b, ok := BranchBase(s); ok {
-			return []Scope{s, b}
-		}
-		return []Scope{s}
+		return []Scope{s, Main}
 	}
 	return []Scope{Main}
-}
-
-// BranchBase is the scope a long-lived branch's own pushes fall back to:
-// main's, so that a new branch starts warm. This fallback awaits the
-// maintainer's confirmation (specs/0002-machines.md, Scope); dropping it
-// is this function answering false, which leaves a branch's chain its own
-// scope alone.
-func BranchBase(s Scope) (Scope, bool) {
-	if s.branch == "" {
-		return Scope{}, false
-	}
-	return Main, true
 }
