@@ -235,3 +235,51 @@ func TestAnAbandonedImageGoes(t *testing.T) {
 		t.Fatal("an abandoned image's record was kept")
 	}
 }
+
+// A repository transferred out of the organization between its job's
+// admission and its work disk gets nothing of the organization's.
+func TestATransferredRepositoryGetsNoDisk(t *testing.T) {
+	e := setup(t)
+	e.saveMain(key1)
+	release := e.hold()
+	run := e.mainRun()
+	jb := e.take(run, e.gh.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}}))
+	if code := jb.started(); code != http.StatusServiceUnavailable {
+		t.Fatalf("while the lease is held: %d", code)
+	}
+	e.gh.Transfer(e.repo, e.gh.Org(1234, "elsewhere"))
+	release()
+	if code := jb.started(); code != http.StatusForbidden {
+		t.Fatalf("a transferred repository's check: %d, want 403", code)
+	}
+	in, _ := e.gce.Instance(jb.in.Zone, jb.in.Name)
+	if in.Status != "TERMINATED" || in.Disks[machines.WorkDevice] != "" {
+		t.Fatalf("machine %s with disks %v; want it stopped, with no work disk", in.Status, in.Disks)
+	}
+}
+
+// Nor does it save.
+func TestATransferredRepositoryDoesntSave(t *testing.T) {
+	e := setup(t)
+	jb := e.start(e.mainRun(), ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}})
+	e.gh.Transfer(e.repo, e.gh.Org(1234, "elsewhere"))
+	jb.finish(true)
+	if len(e.images()) != 0 {
+		t.Fatalf("images %v; a transferred repository saved", e.images())
+	}
+}
+
+// Which disk is a family's newest is read from the images there are: a
+// record of one that's gone doesn't leave the one that's there unprotected.
+func TestTheNewestThatsThereIsKept(t *testing.T) {
+	e := setup(t)
+	old := e.saveMain(key1)
+	e.clock.Advance(time.Minute)
+	newer := e.saveMain(key2)
+	e.gce.DeleteImageNow(newer)
+	e.clock.Advance(disks.MainUnused)
+	e.pass()
+	if !e.has(old) {
+		t.Fatal("the only disk of a family that's there was deleted as not the newest")
+	}
+}

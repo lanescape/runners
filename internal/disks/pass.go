@@ -3,6 +3,7 @@ package disks
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strconv"
 	"strings"
@@ -267,8 +268,19 @@ func (s *Service) rerun(ctx context.Context, st *state, repoID, runID int64, rs 
 	if err != nil {
 		return err
 	}
-	if !slices.Contains(rec.Attempts, rs.attempt) {
-		rec.Attempts, rec.At = append(rec.Attempts, rs.attempt), s.now()
+	// The rerun is recorded, as asked for and as the service's own,
+	// before it's asked for, so a rerun GitHub begins is never one the
+	// bucket doesn't know of; if GitHub's attempt hasn't moved on after
+	// the asking, it's taken back as the service's, and a maintainer's
+	// rerun after it picks its restore choices again.
+	if !slices.Contains(rec.Attempts, rs.attempt) || !slices.Contains(rec.Started, rs.attempt) {
+		if !slices.Contains(rec.Attempts, rs.attempt) {
+			rec.Attempts = append(rec.Attempts, rs.attempt)
+		}
+		if !slices.Contains(rec.Started, rs.attempt) {
+			rec.Started = append(rec.Started, rs.attempt)
+		}
+		rec.At = s.now()
 		if gen, err = replaceJSON(ctx, s.Objects, key, rec, gen); err != nil {
 			return err
 		}
@@ -276,24 +288,29 @@ func (s *Service) rerun(ctx context.Context, st *state, repoID, runID int64, rs 
 	}
 	repo := st.repos[repoID]
 	err = s.GitHub.RerunFailedJobs(ctx, *repo, runID)
-	if err != nil {
-		// An answer lost after GitHub began the next attempt is a rerun
-		// all the same.
-		if wr, rerr := s.GitHub.WorkflowRun(ctx, *repo, runID); rerr == nil && wr.Attempt > rs.attempt {
-			err = nil
+	wr, rerr := s.GitHub.WorkflowRun(ctx, *repo, runID)
+	switch {
+	case rerr == nil && wr.Attempt > rs.attempt:
+		// Begun, whatever the answer said: an answer lost after GitHub
+		// began the next attempt is a rerun all the same.
+		err = nil
+	case rerr == nil && err == nil:
+		err = fmt.Errorf("GitHub accepted the rerun but still shows attempt %d", wr.Attempt)
+		fallthrough
+	case rerr == nil:
+		rec.Started = slices.DeleteFunc(rec.Started, func(a int) bool { return a == rs.attempt })
+		if g, werr := replaceJSON(ctx, s.Objects, key, rec, gen); werr == nil {
+			st.reruns[key] = record[Rerun]{rec, g}
+		} else {
+			s.log().Warn("taking back a rerun that didn't begin", "run_id", runID, "err", werr.Error())
 		}
+	case err == nil:
+		// Accepted, and the run can't be read back: it's taken as begun.
+	default:
+		err = errors.Join(err, rerr)
 	}
 	if err != nil {
 		return err
-	}
-	// Confirmed: a restore choice holds for the attempt it started.
-	if !slices.Contains(rec.Started, rs.attempt) {
-		rec.Started = append(rec.Started, rs.attempt)
-		if g, err := replaceJSON(ctx, s.Objects, key, rec, gen); err == nil {
-			st.reruns[key] = record[Rerun]{rec, g}
-		} else {
-			s.log().Warn("recording a rerun as started; its jobs will pick their restore choices again", "run_id", runID, "err", err.Error())
-		}
 	}
 	rs.finished, rs.rerun = false, false
 	s.log().Info("run rerun: a Spot job was preempted", "repository_id", repoID, "run_id", runID, "attempt", rs.attempt+1)
@@ -416,6 +433,16 @@ func (s *Service) expire(ctx context.Context, st *state) {
 			return
 		}
 		recs := byRepo[repo]
+		// Which version is newest, of a series or of a main family, is
+		// read only from images Compute Engine has, ready: a record of
+		// one that's gone mustn't stand in for it, and leave the one
+		// that's there unprotected.
+		there := map[string]record[Image]{}
+		for n, r := range recs {
+			if im, ok := st.images[r.v.Image]; ok && im.Status == "READY" && matches(im, r.v) {
+				there[n] = r
+			}
+		}
 		finished := map[int64]bool{}
 		var due []record[Image]
 		why := map[string]string{}
@@ -426,7 +453,7 @@ func (s *Service) expire(ctx context.Context, st *state) {
 			}
 		}
 		latest := map[string]Image{}
-		for _, r := range recs {
+		for _, r := range there {
 			v := r.v
 			if v.Kind != KindSaved || v.State != ImageReady {
 				continue
@@ -436,8 +463,8 @@ func (s *Service) expire(ctx context.Context, st *state) {
 				latest[k] = v
 			}
 		}
-		top := newest(recs)
-		for _, r := range recs {
+		top := newest(there)
+		for _, r := range there {
 			v := r.v
 			if v.State != ImageReady {
 				continue
@@ -526,8 +553,20 @@ func (s *Service) tidy(ctx context.Context, st *state) {
 		// An image whose making was abandoned, its machine gone, never
 		// becomes ready: it goes, image and record, and stops counting
 		// against its scope's limit.
-		if v.State == ImageMaking && st.imagesRead && s.now().Sub(v.SavedAt) >= abandoned {
+		if v.State == ImageMaking && st.imagesRead {
 			if _, err := s.Compute.Instance(ctx, v.Zone, v.Machine); errors.Is(err, compute.ErrNotFound) {
+				if v.GoneAt.IsZero() {
+					// The hour counts from when its machine is first
+					// seen gone.
+					v.GoneAt = s.now()
+					if g, err := replaceJSON(ctx, s.Objects, key, v, r.gen); err == nil {
+						st.records[key] = record[Image]{v, g}
+					}
+					continue
+				}
+				if s.now().Sub(v.GoneAt) < abandoned {
+					continue
+				}
 				if err := s.Compute.DeleteImage(ctx, v.Image, freshID("delete image", v.Image)); err != nil && !errors.Is(err, compute.ErrNotFound) {
 					s.log().Warn("deleting an abandoned image", "image", v.Image, "err", err.Error())
 					continue

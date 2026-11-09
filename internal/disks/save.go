@@ -27,6 +27,13 @@ func (s *Service) Save(ctx context.Context, m machines.Machine, a machines.Admis
 		return nil
 	}
 	log := s.log().With("machine", m.Name, "repository_id", m.RepositoryID, "run_id", a.RunID, "job_id", a.JobID, "selector", a.Selector)
+	// Only the organization's consumers save.
+	if repo, err := s.GitHub.RepositoryByID(ctx, m.RepositoryID); err != nil {
+		return err
+	} else if repo.OwnerID != s.Config.Organization.ID {
+		log.Warn("work disk not saved: the repository is no longer the organization's")
+		return nil
+	}
 	sv, gen, found, err := getJSON[Save](ctx, s.Objects, saveKey(m.Name))
 	if err != nil {
 		return err
@@ -280,7 +287,20 @@ func (s *Service) makeRoom(ctx context.Context, repo int64, saver, scope, arch, 
 			}
 			return true, nil
 		}
-		top := newest(recs)
+		// Main's newest of each family, among images Compute Engine has.
+		listed, err := s.Compute.Images(ctx)
+		if err != nil {
+			return err
+		}
+		there := map[string]record[Image]{}
+		for _, im := range listed {
+			for n, r := range recs {
+				if r.v.Image == im.Name && im.Status == "READY" && matches(im, r.v) {
+					there[n] = r
+				}
+			}
+		}
+		top := newest(there)
 		var cands []record[Image]
 		for _, r := range recs {
 			v := r.v

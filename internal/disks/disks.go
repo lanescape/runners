@@ -214,6 +214,9 @@ type Image struct {
 	// record with the generation it read, can't succeed past a choice.
 	TouchedAt time.Time `json:"touched_at,omitzero"`
 	MarkedAt  time.Time `json:"marked_at,omitzero"`
+	// GoneAt is when a pass first found the machine it's made from gone
+	// while it was still being made.
+	GoneAt time.Time `json:"gone_at,omitzero"`
 }
 
 // Choice is a run's restore choice for a selector: the exact image version

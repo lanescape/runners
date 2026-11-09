@@ -503,3 +503,24 @@ func TestATransferredRepositoryIsntRerun(t *testing.T) {
 		t.Fatal("a transferred repository's run was rerun")
 	}
 }
+
+// Without its admission, a stopped Spot machine past its age limit isn't
+// known to have had no job: it waits for the records.
+func TestAPreemptionPastTheAgeLimitWaitsForTheRecords(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+	e.clock.Advance(machines.MaxAge + time.Minute)
+	jb.preempt()
+	e.gcs.Faults().Add(fault.Rule{Method: http.MethodGet, Times: 1,
+		Match:   func(r *http.Request) bool { return r.URL.Query().Get("prefix") == "machines/" },
+		Respond: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusForbidden) }})
+	e.pass()
+	if _, ok := e.gce.Instance(jb.in.Zone, jb.in.Name); !ok {
+		t.Fatal("a stopped Spot machine went while its admission couldn't be read")
+	}
+	e.pass()
+	if e.attempt(run) != 2 {
+		t.Fatal("the run wasn't rerun once the records were read")
+	}
+}

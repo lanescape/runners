@@ -65,10 +65,12 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 		// A stopped Spot machine is recorded all the same, without a
 		// resume image, so its run may be rerun. It's stopped, so it
 		// waits for its record, however old it is.
+		// Without the records, whether it was admitted isn't known, and
+		// a stopped Spot machine waits for them.
+		if m.Stopped() && m.Spot && s.Preemptions != nil && !inv.recordsComplete {
+			return
+		}
 		if admitted && a.Allowed && m.Stopped() && m.Spot && s.Preemptions != nil {
-			if !inv.recordsComplete {
-				return
-			}
 			if err := s.Preemptions.Stopped(ctx, m, a, s.preempted(ctx, m), false); err != nil {
 				s.log().Warn("recording a stopped Spot machine past the age limit; it waits for its record", "machine", m.Name, "err", err.Error())
 				return
@@ -262,6 +264,10 @@ func (s *Service) saves(ctx context.Context, inv *inventory, m Machine) (bool, e
 	repo, err := s.repository(ctx, inv, m.RepositoryID)
 	if err != nil {
 		return false, err
+	}
+	if repo.OwnerID != s.Config.Organization.ID {
+		// Transferred out of the organization: no longer a consumer.
+		return false, nil
 	}
 	job, err := s.GitHub.Job(ctx, repo, a.JobID)
 	if err != nil {

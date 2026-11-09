@@ -77,6 +77,9 @@ func (s *Service) resume(ctx context.Context, m machines.Machine, a machines.Adm
 	if err != nil {
 		return Image{}, false, err
 	}
+	if repo.OwnerID != s.Config.Organization.ID {
+		return Image{}, false, nil
+	}
 	unique := func(attempt int) (bool, error) {
 		jobs, err := s.GitHub.AttemptJobs(ctx, repo, a.RunID, attempt)
 		if err != nil {

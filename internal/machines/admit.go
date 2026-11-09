@@ -218,6 +218,21 @@ func (s *Service) admit(ctx context.Context, m Machine, hint int64) (Admission, 
 		s.refuse(ctx, m, a)
 		return a, nil
 	}
+	if found {
+		// A retried check gives a work disk only to a consumer that's
+		// still the organization's: a repository transferred since its
+		// job was admitted gets nothing of the organization's.
+		repo, err := s.GitHub.RepositoryByID(ctx, m.RepositoryID)
+		if err != nil {
+			return a, retryErr(err)
+		}
+		if repo.OwnerID != s.Config.Organization.ID {
+			if err := s.Compute.StopInstance(ctx, m.Zone, m.Name, s.requestID("stop", m.Name)); err != nil && !errors.Is(err, compute.ErrNotFound) {
+				s.log().Error("stopping a transferred repository's machine", "machine", m.Name, "err", err.Error())
+			}
+			return a, errNotRunning
+		}
+	}
 	if err := s.workDisk(ctx, m, a); err != nil {
 		return a, retryErr(err)
 	}

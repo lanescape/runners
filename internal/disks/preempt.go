@@ -59,6 +59,14 @@ func (s *Service) Stopped(ctx context.Context, m machines.Machine, a machines.Ad
 		log.Info("stopped Spot machine recorded")
 		return nil
 	}
+	// A repository transferred out of the organization gets no resume
+	// image of the organization's.
+	if repo, err := s.GitHub.RepositoryByID(ctx, m.RepositoryID); err != nil {
+		return err
+	} else if repo.OwnerID != s.Config.Organization.ID {
+		log.Warn("no resume image: the repository is no longer the organization's")
+		return nil
+	}
 	if rec.ResumeImage == "" {
 		_, err := s.Compute.Disk(ctx, m.Zone, machines.WorkDisk(m.Name))
 		if errors.Is(err, compute.ErrNotFound) {
