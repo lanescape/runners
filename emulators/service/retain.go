@@ -89,7 +89,9 @@ func (e *Emulator) retain() {
 	}
 	named := map[string]bool{}
 	for k, c := range e.choices {
-		if rn := e.runs[c.run]; rn.due || e.runInProgress(rn) || !github {
+		// A run GitHub no longer shows the organization's, such as one of a
+		// repository transferred away, is no consumer's: its choices go.
+		if rn := e.runs[c.run]; rn != nil && (rn.due || !e.finished(rn)) || !github {
 			if c.entry != "" {
 				named[c.entry] = true
 			}
@@ -234,7 +236,10 @@ func (e *Emulator) delisted(en *entry) bool {
 		return false
 	}
 	rp := e.repos[en.repo]
-	for branch, n := range parseRunners(rp.runners).branches {
+	if rp == nil {
+		return true
+	}
+	for branch, n := range parseRunners(rp.runners, rp.def).branches {
 		if n == name {
 			_, exists := rp.branches[branch]
 			return !exists

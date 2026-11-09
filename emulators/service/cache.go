@@ -107,12 +107,16 @@ func (e *Emulator) serveCache(h func(c *caller, body []byte) (any, error)) http.
 			} else if err != nil {
 				err = refuse("%s", err.Error())
 			} else {
-				e.mu.Lock()
-				var cl *caller
-				if cl, err = e.caller(c); err == nil {
-					out, err = h(cl, body)
-				}
-				e.mu.Unlock()
+				out, err = func() (any, error) {
+					e.mu.Lock()
+					defer e.mu.Unlock()
+					e.observe()
+					cl, err := e.caller(c)
+					if err != nil {
+						return nil, err
+					}
+					return h(cl, body)
+				}()
 			}
 		}
 		var rf *refusal

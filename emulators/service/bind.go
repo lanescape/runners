@@ -142,6 +142,7 @@ func (e *Emulator) bind(w http.ResponseWriter, r *http.Request) {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.observe()
 	if e.unavailable {
 		Unavailable(5*time.Second)(w, r)
 		return
@@ -156,7 +157,7 @@ func (e *Emulator) bind(w http.ResponseWriter, r *http.Request) {
 		refuse("run binding refused: no such run of the repository")
 		return
 	}
-	if !e.runInProgress(rn) {
+	if !e.binds(rn) {
 		refuse("run binding refused: the run isn't in progress")
 		return
 	}
@@ -167,6 +168,22 @@ func (e *Emulator) bind(w http.ResponseWriter, r *http.Request) {
 		e.bindings[rn.id] = b
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"scope": b.scope})
+}
+
+// binds reports whether a run may be bound: GitHub shows it in progress.
+func (e *Emulator) binds(rn *run) bool {
+	if e.gh != nil {
+		return rn.status == "in_progress"
+	}
+	return e.runInProgress(rn)
+}
+
+// finished reports whether a run has finished, so its choices go.
+func (e *Emulator) finished(rn *run) bool {
+	if e.gh != nil {
+		return rn.status == "completed"
+	}
+	return !e.runInProgress(rn)
 }
 
 // runInProgress reports whether any of a run's jobs is still going, or it
@@ -194,7 +211,7 @@ func (e *Emulator) decide(c *claims, req bindRequest, rp *repo, rn *run) *bindin
 	if c.event != rn.event {
 		return read
 	}
-	f := parseRunners(rp.runners)
+	f := parseRunners(rp.runners, rp.def)
 	var b *binding
 	switch rn.event {
 	case "push":
@@ -204,8 +221,8 @@ func (e *Emulator) decide(c *claims, req bindRequest, rp *repo, rn *run) *bindin
 		}
 		// The run's commit must be on the branch now, as GitHub's
 		// comparison of the two shows.
-		if branch == "main" {
-			if !rp.onBranch("main", rn.sha) {
+		if branch == rp.def {
+			if !rp.onBranch(rp.def, rn.sha) {
 				return read
 			}
 			return &binding{scope: "main", event: rn.event, headRepo: rp.id}
@@ -229,7 +246,7 @@ func (e *Emulator) decide(c *claims, req bindRequest, rp *repo, rn *run) *bindin
 		b = &binding{scope: fmt.Sprintf("pr%d", n), base: baseOf(f, p.base), event: rn.event, headRepo: p.headRepo, headSHA: rn.headSHA}
 	case "pull_request_target":
 		prefix := strings.ToLower(c.repository + "/.github/workflows/")
-		if f.bootstrap == "" || !strings.HasPrefix(strings.ToLower(f.bootstrap), prefix) || !strings.HasSuffix(f.bootstrap, "@refs/heads/main") ||
+		if f.bootstrap == "" || !strings.HasPrefix(strings.ToLower(f.bootstrap), prefix) || !strings.HasSuffix(f.bootstrap, "@refs/heads/"+rp.def) ||
 			c.workflow != f.bootstrap || req.PullRequest <= 0 || req.HeadRepositoryID <= 0 || !commitSHA.MatchString(req.HeadSHA) {
 			return read
 		}
@@ -274,7 +291,7 @@ type runners struct {
 // parseRunners reads runners.json as the service does: it ignores a
 // branch's entry for the default branch, one whose name isn't valid, and
 // every entry whose name another shares.
-func parseRunners(file string) runners {
+func parseRunners(file, def string) runners {
 	out := runners{branches: map[string]string{}}
 	var m map[string]json.RawMessage
 	if json.Unmarshal([]byte(file), &m) != nil {
@@ -288,7 +305,7 @@ func parseRunners(file string) runners {
 	byName := map[string][]string{}
 	for branch, raw := range listed {
 		var name string
-		if json.Unmarshal(raw, &name) == nil && branch != "main" && branch != "" && scopeName.MatchString(name) {
+		if json.Unmarshal(raw, &name) == nil && branch != def && branch != "" && scopeName.MatchString(name) {
 			byName[name] = append(byName[name], branch)
 		}
 	}

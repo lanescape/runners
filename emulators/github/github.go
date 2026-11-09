@@ -113,6 +113,8 @@ type Pull struct {
 	Created  time.Time
 	Closed   time.Time
 	mergeSHA string
+	// closings are when it was closed, each time.
+	closings []time.Time
 }
 
 // Run is a workflow run, with what its jobs' environment and tokens carry.
@@ -209,6 +211,21 @@ func (e *Emulator) Faults() *fault.Injector { return &e.faults }
 func (e *Emulator) id() int64 {
 	e.nextID++
 	return e.nextID
+}
+
+// NewID is an ID the emulator hasn't given anything, for a test's own
+// accounts, repositories and forks.
+func (e *Emulator) NewID() int64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.id()
+}
+
+// Account is the account with an ID, or nil.
+func (e *Emulator) Account(id int64) *Account {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.accounts[id]
 }
 
 // Org adds an organization, with its Default runner group.
@@ -358,6 +375,7 @@ func (e *Emulator) ClosePull(p *Pull) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	p.State, p.Closed = "closed", e.clock.Now()
+	p.closings = append(p.closings, p.Closed)
 }
 
 // ReopenPull reopens a closed pull request.

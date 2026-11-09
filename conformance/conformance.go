@@ -72,6 +72,7 @@ func Cases() []Case {
 		both("only a successful job's entries are restored", successGating),
 		both("a pending entry goes after 5 days", pendingFor),
 		both("a closed pull request's run saves nothing it reopens to", closedRun),
+		both("a reopened pull request's earlier runs save nothing", reopened),
 		both("an outage decides nothing of GitHub's", outage),
 		both("a pull request keeps one entry of each family", oneOfEachFamily),
 		both("main keeps its two newest keys", twoNewestKeys),
@@ -1072,6 +1073,26 @@ func closedRun(t T, w *world) {
 	w.ReopenPullRequest(pr)
 	w.FinishJob(j, "success")
 	// Reopened, it starts again from its base.
+	next := w.PullRequestRun(pr)
+	w.bound(next, fmt.Sprintf("pr%d", pr.Number))
+	w.restore(next, linux, key1, "main_exact", main1)
+}
+
+// reopened is a run bound before its pull request was closed and
+// reopened, with nothing held in its scope meanwhile: what it saves once
+// reopened is retired, as the closing was seen.
+func reopened(t T, w *world) {
+	repo := w.Repository("app")
+	main1 := data("main1")
+	w.mainSaves(repo, linux, key1, main1)
+	pr := w.PullRequest(repo, "main", "fix")
+	run := w.PullRequestRun(pr)
+	w.bound(run, fmt.Sprintf("pr%d", pr.Number))
+	w.Advance(2 * time.Second)
+	w.ClosePullRequest(pr)
+	w.ReopenPullRequest(pr)
+	w.Advance(2 * time.Second)
+	w.save(run, linux, "build", key1, data("bound before the closing"), "success")
 	next := w.PullRequestRun(pr)
 	w.bound(next, fmt.Sprintf("pr%d", pr.Number))
 	w.restore(next, linux, key1, "main_exact", main1)

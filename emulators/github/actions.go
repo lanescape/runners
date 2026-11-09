@@ -219,13 +219,19 @@ func (e *Emulator) review(r *Run, env string, reviewer *Account, state string) {
 // Rerun starts a finished run's next attempt, as a maintainer rerunning it
 // does; jobs queued after it are the new attempt's.
 func (e *Emulator) Rerun(r *Run) {
+	e.RerunAs(r, &Account{ID: 42, Login: "maintainer", Type: "User"})
+}
+
+// RerunAs starts a run's next attempt, as Rerun does, triggered by an
+// account, such as an App's bot.
+func (e *Emulator) RerunAs(r *Run, by *Account) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	r.Attempt++
 	if r.Triggers == nil {
 		r.Triggers = map[int]*Account{}
 	}
-	r.Triggers[r.Attempt] = &Account{ID: 42, Login: "maintainer", Type: "User"}
+	r.Triggers[r.Attempt] = by
 	r.Status, r.Conclusion = "in_progress", ""
 	e.notify()
 }

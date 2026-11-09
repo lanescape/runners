@@ -14,7 +14,9 @@
 // runners.json and branches, pull requests, runs and jobs, as GitHub would
 // show them; finish jobs; close pull requests; make GitHub unavailable;
 // and read what was bound, saved and chosen. Faults adds any other failure,
-// with Refuse and Unavailable answering as the service does.
+// with Refuse and Unavailable answering as the service does. A test that
+// runs this module's GitHub emulator hands it over with WithGitHub, and the
+// emulator takes its view of GitHub from that one state.
 package service
 
 import (
@@ -32,6 +34,7 @@ import (
 	"github.com/jonboulle/clockwork"
 
 	"github.com/lanescape/runners/emulators/fault"
+	ghemu "github.com/lanescape/runners/emulators/github"
 	emuoidc "github.com/lanescape/runners/emulators/oidc"
 	"github.com/lanescape/runners/endpoints"
 )
@@ -65,6 +68,17 @@ type Emulator struct {
 	sessions    map[string]*session
 	unavailable bool
 	advanced    time.Duration
+
+	// With WithGitHub: the GitHub emulator the emulator reads, and what
+	// it keeps of its own beside it: the jobs on the service's machines,
+	// the runs due an automatic rerun, the closings it has seen, and the
+	// bot whose reruns are the service's own.
+	gh         *ghemu.Emulator
+	machines   map[int64]bool
+	due        map[int64]bool
+	closings   map[string]int
+	bot        *ghemu.Account
+	maintainer *ghemu.Account
 }
 
 // Option configures an Emulator.
@@ -92,6 +106,13 @@ func New(opts ...Option) *Emulator {
 		closures: map[string]time.Time{}, recents: map[string]recent{}, familyUsed: map[string]time.Time{}, objects: map[string][]byte{}, grants: map[string]*grant{}, sessions: map[string]*session{}}
 	for _, o := range opts {
 		o(e)
+	}
+	if e.gh != nil {
+		if e.issuer != nil && e.issuer != e.gh.Actions {
+			panic("service emulator: WithGitHub verifies the GitHub emulator's own tokens, not another issuer's")
+		}
+		e.issuer = e.gh.Actions
+		e.machines, e.due, e.closings = map[int64]bool{}, map[int64]bool{}, map[string]int{}
 	}
 	if e.issuer == nil {
 		e.issuer = emuoidc.New(emuoidc.WithClock(e.clock))
@@ -169,8 +190,10 @@ func newSHA(seed string, n int64) string {
 // repo is a repository as the emulator models GitHub's: its branches'
 // commits, its default branch's runners.json, and its pull requests.
 type repo struct {
-	id       int64
-	name     string
+	id   int64
+	name string
+	// def is the default branch: main.
+	def      string
 	branches map[string]string
 	// history is each branch's commits: what's reachable from its tip.
 	history  map[string]map[string]bool
@@ -212,6 +235,9 @@ type run struct {
 	// due says a Spot job of its latest attempt was preempted, so it's due
 	// an automatic rerun, which keeps its choices.
 	due bool
+	// status is GitHub's status of the run, with a GitHub emulator; with
+	// none, the run's jobs say whether it's in progress.
+	status string
 }
 
 type job struct {
@@ -234,11 +260,14 @@ func (e *Emulator) repo(r Repository) *repo {
 
 // Repository implements World.
 func (e *Emulator) Repository(name string) Repository {
+	if e.gh != nil {
+		return e.ghRepository(name)
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	id := e.id()
 	full := e.login + "/" + name
-	rp := &repo{id: id, name: full, branches: map[string]string{}, history: map[string]map[string]bool{}, pulls: map[int]*pull{}}
+	rp := &repo{id: id, name: full, def: "main", branches: map[string]string{}, history: map[string]map[string]bool{}, pulls: map[int]*pull{}}
 	rp.commit("main", newSHA(full, id))
 	e.repos[id] = rp
 	return Repository{ID: id, Name: full}
@@ -262,6 +291,10 @@ func (rp *repo) onBranch(branch, sha string) bool { return rp.history[branch][sh
 
 // SetRunners implements World.
 func (e *Emulator) SetRunners(r Repository, file string) {
+	if e.gh != nil {
+		e.GitHubRepo(r).Commit(e.GitHubRepo(r).DefaultBranch, map[string]string{runnersFile: file})
+		return
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	rp := e.repo(r)
@@ -276,6 +309,10 @@ func (e *Emulator) Bootstrap(r Repository) string {
 
 // Branch implements World.
 func (e *Emulator) Branch(r Repository, name string) {
+	if e.gh != nil {
+		e.GitHubRepo(r).Commit(name, map[string]string{"branch": name})
+		return
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	rp := e.repo(r)
@@ -284,6 +321,10 @@ func (e *Emulator) Branch(r Repository, name string) {
 
 // DeleteBranch implements World.
 func (e *Emulator) DeleteBranch(r Repository, name string) {
+	if e.gh != nil {
+		e.GitHubRepo(r).DeleteBranch(name)
+		return
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	rp := e.repo(r)
@@ -293,6 +334,9 @@ func (e *Emulator) DeleteBranch(r Repository, name string) {
 
 // PullRequest implements World.
 func (e *Emulator) PullRequest(r Repository, base, head string) PullRequest {
+	if e.gh != nil {
+		return e.ghPullRequest(r, base, head)
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	rp := e.repo(r)
@@ -304,6 +348,9 @@ func (e *Emulator) PullRequest(r Repository, base, head string) PullRequest {
 
 // ForkPullRequest implements World.
 func (e *Emulator) ForkPullRequest(r Repository, base string) PullRequest {
+	if e.gh != nil {
+		return e.ghForkPullRequest(r, base)
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	rp := e.repo(r)
@@ -330,6 +377,9 @@ func (rp *repo) pullCommit(p *pull, sha string) bool {
 
 // PushPullRequest implements World.
 func (e *Emulator) PushPullRequest(pr PullRequest) PullRequest {
+	if e.gh != nil {
+		return e.ghPushPullRequest(pr)
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	rp, p := e.repo(pr.Repository), e.pull(pr)
@@ -356,6 +406,10 @@ func (e *Emulator) pull(pr PullRequest) *pull {
 // ClosePullRequest implements World: the emulator records the closing as
 // the service records GitHub's delivery of it.
 func (e *Emulator) ClosePullRequest(pr PullRequest) {
+	if e.gh != nil {
+		e.ghClosePullRequest(pr)
+		return
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.pull(pr).open = false
@@ -368,6 +422,10 @@ func (e *Emulator) ClosePullRequest(pr PullRequest) {
 
 // ReopenPullRequest implements World.
 func (e *Emulator) ReopenPullRequest(pr PullRequest) {
+	if e.gh != nil {
+		e.gh.ReopenPull(e.GitHubPull(pr))
+		return
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.pull(pr).open = true
@@ -390,6 +448,9 @@ func (e *Emulator) addRun(rp *repo, r *run) Run {
 
 // Push implements World.
 func (e *Emulator) Push(r Repository, branch string) Run {
+	if e.gh != nil {
+		return e.RunOf(e.gh.PushRun(e.GitHubRepo(r), branch))
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	rp := e.repo(r)
@@ -402,6 +463,9 @@ func (e *Emulator) Push(r Repository, branch string) Run {
 
 // Tag implements World.
 func (e *Emulator) Tag(r Repository, tag string) Run {
+	if e.gh != nil {
+		return e.ghTag(r, tag)
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	rp := e.repo(r)
@@ -410,6 +474,9 @@ func (e *Emulator) Tag(r Repository, tag string) Run {
 
 // Event implements World.
 func (e *Emulator) Event(r Repository, event, branch string) Run {
+	if e.gh != nil {
+		return e.RunOf(e.gh.EventRun(e.GitHubRepo(r), event, branch))
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	rp := e.repo(r)
@@ -418,6 +485,9 @@ func (e *Emulator) Event(r Repository, event, branch string) Run {
 
 // PullRequestRun implements World.
 func (e *Emulator) PullRequestRun(pr PullRequest) Run {
+	if e.gh != nil {
+		return e.RunOf(e.gh.PullRequestRun(e.GitHubPull(pr)))
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	rp, p := e.repo(pr.Repository), e.pull(pr)
@@ -428,6 +498,9 @@ func (e *Emulator) PullRequestRun(pr PullRequest) Run {
 // PullRequestTargetRun implements World. As GitHub records it, the run's
 // head is the base's; only its event names the pull request's.
 func (e *Emulator) PullRequestTargetRun(pr PullRequest) Run {
+	if e.gh != nil {
+		return e.RunOf(e.gh.PullRequestTargetRun(e.GitHubPull(pr)))
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	rp, p := e.repo(pr.Repository), e.pull(pr)
@@ -436,6 +509,10 @@ func (e *Emulator) PullRequestTargetRun(pr PullRequest) Run {
 
 // Approve implements World.
 func (e *Emulator) Approve(r Run) {
+	if e.gh != nil {
+		e.gh.Approve(e.GitHubRun(r), contributionEnvironment, e.ghMaintainer())
+		return
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.runs[r.ID].approved = true
@@ -451,6 +528,9 @@ func (e *Emulator) Rerun(r Run) Run { return e.rerun(r, false) }
 func (e *Emulator) AutomaticRerun(r Run) Run { return e.rerun(r, true) }
 
 func (e *Emulator) rerun(r Run, automatic bool) Run {
+	if e.gh != nil {
+		return e.ghRerun(r, automatic)
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	rn := e.runs[r.ID]
@@ -463,6 +543,9 @@ func (e *Emulator) rerun(r Run, automatic bool) Run {
 
 // StartJob implements World.
 func (e *Emulator) StartJob(r Run, workflowRef string) Job {
+	if e.gh != nil {
+		return e.ghStartJob(r, workflowRef, false)
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	rn := e.runs[r.ID]
@@ -481,6 +564,9 @@ func (e *Emulator) StartJob(r Run, workflowRef string) Job {
 
 // StartMachineJob implements World.
 func (e *Emulator) StartMachineJob(r Run) Job {
+	if e.gh != nil {
+		return e.ghStartJob(r, "", true)
+	}
 	j := e.StartJob(r, "")
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -491,6 +577,9 @@ func (e *Emulator) StartMachineJob(r Run) Job {
 // Claims are a job's token's claims, as GitHub signs them, for the
 // service.
 func (e *Emulator) Claims(j Job) map[string]any {
+	if e.gh != nil {
+		return e.ghClaims(j, nil)
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	jb := e.jobs[j.ID]
@@ -525,6 +614,10 @@ func (e *Emulator) Token(j Job, overrides map[string]any) string {
 // FinishJob implements World: the emulator settles the job's pending
 // entries at once, as the service does on GitHub's delivery.
 func (e *Emulator) FinishJob(j Job, conclusion string) {
+	if e.gh != nil {
+		e.ghFinishJob(j, conclusion, false)
+		return
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	jb := e.jobs[j.ID]
@@ -537,6 +630,10 @@ func (e *Emulator) FinishJob(j Job, conclusion string) {
 // failed, with its run due one of the service's automatic reruns, which
 // keeps the run's restore choices until AutomaticRerun starts it.
 func (e *Emulator) PreemptJob(j Job) {
+	if e.gh != nil {
+		e.ghFinishJob(j, "failure", true)
+		return
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	jb := e.jobs[j.ID]
@@ -558,6 +655,7 @@ func (e *Emulator) Unavailable(on bool) {
 func (e *Emulator) Pass() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.observe()
 	e.retain()
 }
 
@@ -565,6 +663,7 @@ func (e *Emulator) Pass() {
 func (e *Emulator) Binding(r Run) (string, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.observe()
 	b := e.bindings[r.ID]
 	if b == nil {
 		return "", false
@@ -576,6 +675,7 @@ func (e *Emulator) Binding(r Run) (string, bool) {
 func (e *Emulator) Entries(r Repository) []Entry {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.observe()
 	var out []Entry
 	for _, en := range e.entries {
 		if en.repo == r.ID {
@@ -590,6 +690,7 @@ func (e *Emulator) Entries(r Repository) []Entry {
 func (e *Emulator) Choices(r Run) []Choice {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.observe()
 	var out []Choice
 	for _, c := range e.choices {
 		if c.run == r.ID {
@@ -620,6 +721,8 @@ func (e *Emulator) now() time.Time { return e.clock.Now().UTC().Add(e.advanced) 
 func (e *Emulator) Advance(d time.Duration) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	// What GitHub shows so far happened before the time moves on.
+	e.observe()
 	e.advanced += d
 }
 

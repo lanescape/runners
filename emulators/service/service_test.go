@@ -128,6 +128,11 @@ func TestFaults(t *testing.T) {
 
 func TestAnAutomaticRerunKeepsItsRunsChoices(t *testing.T) {
 	e, clock, c, repo := setup(t)
+	automaticRerun(t, e, clock, c, repo)
+}
+
+func automaticRerun(t *testing.T, e *service.Emulator, clock *clockwork.FakeClock, c *conformance.Client, repo service.Repository) {
+	t.Helper()
 	first := saved(t, e, c, repo, []byte("first"))
 	run := e.Push(repo, "main")
 	j := e.StartMachineJob(run)
