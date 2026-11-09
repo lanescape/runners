@@ -64,8 +64,19 @@ const (
 	// /dev/disk/by-id/google-work.
 	WorkDevice = "work"
 
-	MaxAge          = 5 * time.Hour
-	MaxRunDuration  = 6 * time.Hour
+	// MaxAge is the most a machine lives, from its creation: a job on the
+	// service should take under 30 minutes, 60 at worst, and this is the
+	// absolute maximum. A machine past it is deleted, even mid-job, saving
+	// nothing; a Spot machine is stopped and recorded first, with no resume
+	// image (specs/0002-machines.md). It's the one constant that says so.
+	MaxAge = 90 * time.Minute
+	// MaxRunDuration is when Compute Engine itself stops a machine, the
+	// backstop for when the service can't. Its margin over MaxAge covers
+	// the service's own path, so the backstop never races it: a pass runs
+	// within 5 minutes of a machine reaching MaxAge, or waits up to 10 for
+	// a lease an earlier pass holds, then has up to 7 to stop and record a
+	// Spot machine, which takes a minute or two; that's under 25 minutes.
+	MaxRunDuration  = MaxAge + 30*time.Minute
 	IdleLimit       = 20 * time.Minute
 	ReportWait      = 10 * time.Minute
 	RetryLimit      = time.Hour

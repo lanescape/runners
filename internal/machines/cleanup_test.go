@@ -119,7 +119,7 @@ func TestAMachinePastFiveHours(t *testing.T) {
 	e.clock.Advance(time.Second)
 	e.pass()
 	if e.exists(m.in.Name) {
-		t.Fatal("a machine past 5 hours wasn't deleted")
+		t.Fatal("a machine past its age limit wasn't deleted")
 	}
 }
 
@@ -288,7 +288,7 @@ func TestCleanupWithoutTheRecords(t *testing.T) {
 		Respond: gcsemu.JSONError(http.StatusForbidden, "forbidden", "Forbidden")})
 	e.pass()
 	if e.exists(m.in.Name) {
-		t.Fatal("a machine past 5 hours was kept")
+		t.Fatal("a machine past its age limit was kept")
 	}
 }
 
@@ -489,7 +489,7 @@ func TestTheAgeLimitKeepsTheJobsHour(t *testing.T) {
 	e.pass()
 	e.wantMachines(0)
 	// Storage recovers; the job is still queued, and its first machine was
-	// made five hours ago.
+	// made as long ago as the age limit.
 	e.gcs.Faults().Reset()
 	e.pass()
 	e.wantMachines(0)

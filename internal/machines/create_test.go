@@ -30,7 +30,7 @@ func TestAMachineForAQueuedJob(t *testing.T) {
 		t.Fatal("metadata lacks the selector, the service or the runner's configuration")
 	}
 	if m.ServiceAccount != machines.MachineAccountOf(e.gce.Project) || !slices.Equal(m.Scopes, []string{"https://www.googleapis.com/auth/userinfo.email"}) ||
-		m.Network != machines.Network || m.Subnetwork != machines.Subnetwork || !m.ExternalIP || m.MaxRun != 6*time.Hour || m.Provisioning != "STANDARD" ||
+		m.Network != machines.Network || m.Subnetwork != machines.Subnetwork || !m.ExternalIP || m.MaxRun != machines.MaxAge+30*time.Minute || m.Provisioning != "STANDARD" ||
 		m.MachineType != "n4-highcpu-2" || m.Zone != zoneA {
 		t.Fatalf("machine = %+v", m)
 	}
