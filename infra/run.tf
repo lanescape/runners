@@ -67,16 +67,6 @@ resource "google_cloud_run_v2_service" "service" {
         name  = "RUNNERS_BUCKET"
         value = google_storage_bucket.state.name
       }
-      env {
-        name  = "RUNNERS_CACHE_BUCKET"
-        value = google_storage_bucket.cache.name
-      }
-      # The service signs the cache's URLs as itself, through IAM's signBlob,
-      # which bootstrap/ grants it on its own account alone.
-      env {
-        name  = "RUNNERS_SIGNER"
-        value = local.accounts.service
-      }
       # bootstrap/ makes the topic, and grants the service publishing on it.
       env {
         name  = "RUNNERS_WEBHOOK_TOPIC"
@@ -133,7 +123,6 @@ resource "google_cloud_run_v2_service" "service" {
 
   depends_on = [
     google_storage_bucket_iam_member.state_service,
-    google_storage_bucket_iam_member.cache_service,
     google_secret_manager_secret_iam_member.app_key,
     google_secret_manager_secret_iam_member.webhook_secret,
   ]

@@ -195,9 +195,6 @@ type ActionsClaims struct {
 	RefType           string
 	SHA               string
 	JobWorkflowRef    string
-	// CheckRunID is the token's job, as its check run; 0 when the token
-	// names none.
-	CheckRunID int64
 }
 
 // Actions verifies GitHub Actions OIDC tokens for the service, from the
@@ -244,7 +241,6 @@ func (a *Actions) Verify(ctx context.Context, raw string) (*ActionsClaims, error
 		RefType           string `json:"ref_type"`
 		SHA               string `json:"sha"`
 		JobWorkflowRef    string `json:"job_workflow_ref"`
-		CheckRunID        string `json:"check_run_id"`
 	}
 	if err := verify(ctx, a.v, raw, &c); err != nil {
 		return nil, err
@@ -268,11 +264,6 @@ func (a *Actions) Verify(ctx context.Context, raw string) (*ActionsClaims, error
 	}
 	if out.RunAttempt, err = id("run_attempt", c.RunAttempt); err != nil {
 		return nil, err
-	}
-	if c.CheckRunID != "" {
-		if out.CheckRunID, err = id("check_run_id", c.CheckRunID); err != nil {
-			return nil, err
-		}
 	}
 	if c.EventName == "" || c.Ref == "" || c.Repository == "" {
 		return nil, fmt.Errorf("%w: event_name, ref and repository are required", ErrUnauthenticated)

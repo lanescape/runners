@@ -84,19 +84,11 @@ func newDiverging(t *testing.T, m mutation) service.World {
 	return diverging{World: e, url: srv.URL}
 }
 
-func entry(body map[string]any) map[string]any { m, _ := body["entry"].(map[string]any); return m }
-
 // Every deliberate divergence from the service's answers fails the suite:
 // the suite's cases pass against the emulator, and each of these changes to
 // its answers makes at least one fail.
 func TestADivergenceFailsTheSuite(t *testing.T) {
 	mutations := map[string]mutation{
-		"a step misnamed": func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
-			if e := entry(b); e != nil && e["step"] == "main_exact" {
-				e["step"] = "main_newest"
-			}
-			return c, b
-		},
 		"a pull request's run bound read": func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
 			if s, _ := b["scope"].(string); strings.HasPrefix(s, "pr") {
 				b["scope"] = "read"
@@ -109,14 +101,14 @@ func TestADivergenceFailsTheSuite(t *testing.T) {
 			}
 			return c, b
 		},
-		"nothing restored": func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
-			if p == "/v1/cache/restore" && c == http.StatusOK {
-				b["entry"] = nil
+		"a read run bound main": func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
+			if b["scope"] == "read" {
+				b["scope"] = "main"
 			}
 			return c, b
 		},
 		"a refusal answered as retryable": func(p string, c int, b map[string]any, h http.Header) (int, map[string]any) {
-			if c == http.StatusForbidden && strings.HasPrefix(p, "/v1/cache/") {
+			if c == http.StatusForbidden {
 				h.Set("Retry-After", "5")
 				return http.StatusServiceUnavailable, map[string]any{"retryable": true}
 			}
@@ -124,25 +116,6 @@ func TestADivergenceFailsTheSuite(t *testing.T) {
 		},
 		"a 503 without a Retry-After": func(p string, c int, b map[string]any, h http.Header) (int, map[string]any) {
 			h.Del("Retry-After")
-			return c, b
-		},
-		"a refused commit accepted": func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
-			if p == "/v1/cache/commit" && c == http.StatusForbidden {
-				return http.StatusOK, map[string]any{"state": "pending"}
-			}
-			return c, b
-		},
-		"a read run allowed to save": func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
-			if p == "/v1/cache/save" && c == http.StatusForbidden && strings.Contains(fmt.Sprint(b["reason"]), "read") {
-				return http.StatusOK, map[string]any{"id": strings.Repeat("0", 32), "url": "http://127.0.0.1:1/x",
-					"headers": map[string]any{"x-goog-resumable": "start"}, "expires": "2099-01-01T00:00:00Z"}
-			}
-			return c, b
-		},
-		"a lookup handing out a URL": func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
-			if e := entry(b); e != nil && e["url"] == nil {
-				e["url"], e["expires"] = "http://127.0.0.1:1/x", "2099-01-01T00:00:00Z"
-			}
 			return c, b
 		},
 	}

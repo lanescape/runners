@@ -2,15 +2,9 @@ package service
 
 import (
 	"fmt"
-	"strings"
-	"time"
 
 	ghemu "github.com/lanescape/runners/emulators/github"
 )
-
-// contributionEnvironment is the environment whose approval admits an
-// approved contribution's jobs (specs/0001-architecture.md).
-const contributionEnvironment = "contribution"
 
 // runnersFile is the default branch's file the service reads.
 const runnersFile = ".github/runners.json"
@@ -20,25 +14,19 @@ const runnersFile = ".github/runners.json"
 // state serves the test's jobs and the service emulator, as GitHub serves
 // both a job and the service. The emulator reads gh's repositories, their
 // branches, commits and default branch's .github/runners.json, pull
-// requests and their commits, runs, their approvals and who triggered each
-// attempt, and jobs, as they are when each request arrives, and verifies
-// tokens against gh's Actions issuer. A test may change anything in gh
-// directly, such as pushing to a pull request's branch and syncing it, and
-// the emulator sees it at its next request, Pass, Advance, Entries or
-// Choices: a job that finished is then settled, while GitHub is
-// available, and a pull request's closing is recorded from its closed_at,
-// as the service does on GitHub's delivery, so a closing a test reopens
-// before the emulator next looks is still seen. Faults added to gh's API don't reach the emulator, which doesn't
-// call it; Unavailable makes GitHub unavailable to it.
+// requests and their commits, runs and jobs, as they are when each request
+// arrives, and verifies tokens against gh's Actions issuer. A test may
+// change anything in gh directly, such as pushing to a pull request's
+// branch and syncing it, finishing a job or closing a pull request, and the
+// emulator sees it at its next request or Binding. Faults added to gh's API
+// don't reach the emulator, which doesn't call it; Unavailable makes GitHub
+// unavailable to it.
 //
 // World's methods act on gh: Repository makes a repository of the
 // organization there, Push makes gh's push run, StartJob queues and starts
 // a job of gh's run, Token mints gh's token for it, and so on. GitHubRepo,
 // GitHubPull, GitHubRun and GitHubJob give a handle's GitHub object, and
 // RunOf and JobOf the handles of a run or job the test made in gh itself.
-// Only a job started with StartMachineJob runs on one of the service's
-// machines, and only an attempt AutomaticRerun starts is the service's
-// own automatic rerun.
 func WithGitHub(gh *ghemu.Emulator) Option { return func(e *Emulator) { e.gh = gh } }
 
 // GitHub is the GitHub emulator the emulator takes its view of GitHub
@@ -51,19 +39,14 @@ func (e *Emulator) needGitHub(what string) {
 	}
 }
 
-// observe reads GitHub's state from the GitHub emulator, then settles
-// every pending entry whose job GitHub shows finished, and records every
-// closing not yet seen, as the service does on GitHub's deliveries. The
-// caller holds e.mu.
+// observe reads GitHub's state from the GitHub emulator. The caller holds
+// e.mu.
 func (e *Emulator) observe() {
 	if e.gh == nil {
 		return
 	}
 	repos, runs, jobs := map[int64]*repo{}, map[int64]*run{}, map[int64]*job{}
-	closings := map[string][]time.Time{}
-	var ghNow time.Time
 	e.gh.Read(func(s *ghemu.State) {
-		ghNow = s.Now()
 		for _, gr := range s.Repos() {
 			if gr.Owner == nil || gr.Owner.ID != e.org {
 				continue
@@ -84,7 +67,6 @@ func (e *Emulator) observe() {
 					p.commits[c] = true
 				}
 				rp.pulls[p.number] = p
-				closings[closureKey(rp.id, fmt.Sprintf("pr%d", p.number))] = s.Closings(gp)
 			}
 			repos[rp.id] = rp
 		}
@@ -94,52 +76,20 @@ func (e *Emulator) observe() {
 				continue
 			}
 			rn := &run{id: gr.ID, repo: rp, event: gr.Event, ref: gr.Ref, refType: gr.RefType, sha: gr.SHA, headSHA: gr.HeadSHA,
-				attempt: gr.Attempt, automatic: map[int]bool{}, approved: s.Approved(gr, contributionEnvironment),
-				due: e.due[gr.ID], status: gr.Status}
+				attempt: gr.Attempt, status: gr.Status}
 			if gr.HeadRepo != nil {
 				rn.headRepo = gr.HeadRepo.ID
-			}
-			for a, by := range gr.Triggers {
-				rn.automatic[a] = e.bot != nil && by != nil && by.ID == e.bot.ID
 			}
 			if gr.EventPull != nil && (gr.Event == "pull_request" || gr.Event == "pull_request_target") {
 				rn.pull = rp.pulls[gr.EventPull.Number]
 			}
 			runs[rn.id] = rn
 			for _, gj := range gr.Jobs {
-				jobs[gj.ID] = &job{id: gj.ID, run: rn, attempt: gj.Attempt, status: gj.Status, conclusion: gj.Conclusion,
-					onMachine: e.machines[gj.ID]}
+				jobs[gj.ID] = &job{id: gj.ID, run: rn, attempt: gj.Attempt, status: gj.Status}
 			}
 		}
 	})
 	e.repos, e.runs, e.jobs = repos, runs, jobs
-	changed := false
-	// A closing the service hasn't seen is recorded from the second after
-	// its closed_at, as GitHub's delivery of it would be: as long before
-	// the service's time now as GitHub's closed_at is before GitHub's.
-	// Advance looks first, so the service's time moves on only after it.
-	for k, ts := range closings {
-		if len(ts) > e.closings[k] {
-			e.closings[k] = len(ts)
-			repo, scope, _ := strings.Cut(k, "/")
-			var id int64
-			fmt.Sscan(repo, &id)
-			ago := max(ghNow.Sub(ts[len(ts)-1]), 0)
-			e.seen(id, scope, e.now().Add(-ago).Truncate(time.Second).Add(time.Second))
-			changed = true
-		}
-	}
-	// A job's end is decided only while GitHub answers, as the service
-	// reads the job again before it settles its entries.
-	for _, en := range e.entries {
-		if jb := e.jobs[en.job]; !e.unavailable && en.state == "pending" && jb != nil && jb.status == "completed" {
-			e.settle(jb)
-			changed = true
-		}
-	}
-	if changed {
-		e.retain()
-	}
 }
 
 // ghOrg is the organization's account in the GitHub emulator, made if the
@@ -153,8 +103,7 @@ func (e *Emulator) ghOrg() *ghemu.Account {
 	return e.gh.Org(e.org, e.login)
 }
 
-// ghMaintainer is the maintainer who opens pull requests, approves runs
-// and reruns them.
+// ghMaintainer is the maintainer who opens pull requests and reruns runs.
 func (e *Emulator) ghMaintainer() *ghemu.Account {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -305,49 +254,22 @@ func (e *Emulator) ghPushPullRequest(pr PullRequest) PullRequest {
 	return e.PullRequestOf(p)
 }
 
-func (e *Emulator) ghClosePullRequest(pr PullRequest) {
-	e.gh.ClosePull(e.GitHubPull(pr))
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.observe()
-}
-
 func (e *Emulator) ghTag(r Repository, tag string) Run {
 	rp := e.GitHubRepo(r)
 	rp.Tag(tag, rp.Head(rp.DefaultBranch))
 	return e.RunOf(e.gh.TagRun(rp, tag))
 }
 
-func (e *Emulator) ghRerun(r Run, automatic bool) Run {
+func (e *Emulator) ghRerun(r Run) Run {
 	gr := e.GitHubRun(r)
-	by := e.ghMaintainer()
-	if automatic {
-		e.mu.Lock()
-		if e.bot == nil {
-			e.bot = e.gh.NewApp(e.gh.NewID()).Bot
-		}
-		by = e.bot
-		e.due[r.ID] = false
-		e.mu.Unlock()
-	}
-	e.gh.RerunAs(gr, by)
+	e.gh.RerunAs(gr, e.ghMaintainer())
 	return e.RunOf(gr)
 }
 
-func (e *Emulator) ghStartJob(r Run, workflowRef string, machine bool) Job {
-	gr := e.GitHubRun(r)
-	if !machine {
-		wj := e.gh.Queue(gr, ghemu.JobSpec{Labels: []string{"ubuntu-24.04"}})
-		e.gh.RunJob(wj)
-		return e.JobOf(wj, workflowRef)
-	}
-	wj := e.gh.Queue(gr, ghemu.JobSpec{Labels: []string{"self-hosted"}})
-	e.gh.RunJobOn(wj, fmt.Sprintf("lsr-%d-%08x", r.Repository.ID, e.gh.NewID()))
-	j := e.JobOf(wj, workflowRef)
-	e.mu.Lock()
-	e.machines[j.ID] = true
-	e.mu.Unlock()
-	return j
+func (e *Emulator) ghStartJob(r Run, workflowRef string) Job {
+	wj := e.gh.Queue(e.GitHubRun(r), ghemu.JobSpec{Labels: []string{"ubuntu-24.04"}})
+	e.gh.RunJob(wj)
+	return e.JobOf(wj, workflowRef)
 }
 
 func (e *Emulator) ghClaims(j Job, overrides map[string]any) map[string]any {
@@ -361,17 +283,4 @@ func (e *Emulator) ghClaims(j Job, overrides map[string]any) map[string]any {
 		c[k] = v
 	}
 	return c
-}
-
-func (e *Emulator) ghFinishJob(j Job, conclusion string, preempted bool) {
-	if preempted {
-		e.mu.Lock()
-		e.due[j.Run.ID] = true
-		e.mu.Unlock()
-	}
-	e.gh.CompleteJobByID(j.ID, conclusion)
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.observe()
-	e.retain()
 }

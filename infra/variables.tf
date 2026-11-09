@@ -5,7 +5,7 @@ variable "project_id" {
 }
 
 variable "region" {
-  description = "The region of the service and its buckets."
+  description = "The region of the service and its bucket."
   type        = string
   default     = "northamerica-northeast1"
 }

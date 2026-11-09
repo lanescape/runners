@@ -1,14 +1,6 @@
 // Package storage emulates Cloud Storage's JSON and XML APIs, as
 // cloud.google.com/go/storage calls them over HTTP: buckets of objects with
-// generations, preconditions, reads, lists by prefix, copies and deletes.
-//
-// It also serves what a holder of a V4 signed URL does with it, without the
-// SDK: signed URLs are checked as Cloud Storage checks them, against the
-// keys of the accounts the test trusts, with their expiry and signed
-// headers; a signed GET reads an object, ranged or whole; and a signed POST
-// starts a resumable upload, whose session URI takes the bytes in chunks,
-// resumes after an interruption, and expires after a week. A bucket's
-// lifecycle rules delete objects by age when a test runs them.
+// generations, preconditions, reads, lists by prefix and deletes.
 //
 // Versioning isn't emulated: a bucket keeps only each object's live
 // generation, as the service's buckets do.
@@ -17,7 +9,6 @@ package storage
 import (
 	"bytes"
 	"crypto/md5"
-	"crypto/rsa"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -51,18 +42,15 @@ type Emulator struct {
 	faults fault.Injector
 	clock  clockwork.Clock
 
-	mu       sync.Mutex
-	buckets  map[string]*bucket
-	lastGen  int64
-	signers  map[string]*rsa.PublicKey
-	sessions map[string]*session
+	mu      sync.Mutex
+	buckets map[string]*bucket
+	lastGen int64
 }
 
 type bucket struct {
 	name    string
 	created time.Time
 	objects map[string]*object
-	rules   []lifecycleRule
 }
 
 type object struct {
@@ -86,8 +74,7 @@ func WithClock(c clockwork.Clock) Option { return func(e *Emulator) { e.clock = 
 
 // New starts an emulator. Close it when done.
 func New(opts ...Option) *Emulator {
-	e := &Emulator{clock: clockwork.NewRealClock(), buckets: map[string]*bucket{}, signers: map[string]*rsa.PublicKey{},
-		sessions: map[string]*session{}}
+	e := &Emulator{clock: clockwork.NewRealClock(), buckets: map[string]*bucket{}}
 	for _, o := range opts {
 		o(e)
 	}
@@ -311,14 +298,6 @@ func splitObjectPath(rest string) (bucketName, objectName string, hasObjects, ha
 }
 
 func (e *Emulator) serveJSON(w http.ResponseWriter, r *http.Request, rest string) {
-	// An object's name is escaped in its path, slashes and all, so these
-	// literal segments can only be the copy calls'.
-	for _, verb := range []string{"/rewriteTo/b/", "/copyTo/b/"} {
-		if src, dst, ok := strings.Cut(rest, verb); ok && r.Method == http.MethodPost {
-			e.copyObject(w, r, src, dst, verb == "/rewriteTo/b/")
-			return
-		}
-	}
 	bucketName, objectName, hasObjects, hasObject, err := splitObjectPath(rest)
 	if err != nil {
 		writeJSONError(w, &apiError{http.StatusNotFound, "notFound", "NotFound", "Not Found"})
@@ -341,6 +320,10 @@ func (e *Emulator) serveJSON(w http.ResponseWriter, r *http.Request, rest string
 }
 
 func (e *Emulator) serveXML(w http.ResponseWriter, r *http.Request, rest string) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeXMLError(w, r, errNotEmulated("XML "+r.Method))
+		return
+	}
 	bucketEsc, objectEsc, ok := strings.Cut(rest, "/")
 	if !ok || objectEsc == "" {
 		writeXMLError(w, r, errNotEmulated("XML bucket requests"))
@@ -350,33 +333,6 @@ func (e *Emulator) serveXML(w http.ResponseWriter, r *http.Request, rest string)
 	objectName, err2 := url.PathUnescape(objectEsc)
 	if err1 != nil || err2 != nil {
 		writeXMLError(w, r, errInvalid("bad path"))
-		return
-	}
-	q := r.URL.Query()
-	// A session URI needs no signature: its upload ID is the credential.
-	if q.Has("upload_id") {
-		e.serveSession(w, r, bucketName, objectName, q.Get("upload_id"))
-		return
-	}
-	signed := q.Has("X-Goog-Signature") || q.Has("X-Goog-Algorithm") || q.Has("X-Goog-Credential")
-	if signed {
-		if err := e.verifySigned(r, bucketName, objectName); err != nil {
-			writeXMLError(w, r, err)
-			return
-		}
-	}
-	switch {
-	case r.Method == http.MethodGet || r.Method == http.MethodHead:
-	case !signed:
-		// Writes through the XML API need credentials, which only a signed
-		// URL brings here.
-		writeXMLError(w, r, errAccessDenied("Anonymous caller does not have storage.objects.create access to the Google Cloud Storage object."))
-		return
-	case r.Method == http.MethodPost && r.Header.Get("x-goog-resumable") == "start":
-		e.startSession(w, r, bucketName, objectName)
-		return
-	default:
-		writeXMLError(w, r, errNotEmulated("XML "+r.Method))
 		return
 	}
 	c, err := headerConds(r.Header)
@@ -508,19 +464,12 @@ func (e *Emulator) lookup(bucketName, objectName string) (*bucket, *object, erro
 func (e *Emulator) getBucket(w http.ResponseWriter, name string) {
 	e.mu.Lock()
 	b := e.buckets[name]
-	var rules []map[string]any
-	if b != nil {
-		for _, ru := range b.rules {
-			rules = append(rules, map[string]any{"action": map[string]any{"type": "Delete"},
-				"condition": map[string]any{"age": ru.ageDays, "matchesPrefix": []string{ru.prefix}}})
-		}
-	}
 	e.mu.Unlock()
 	if b == nil {
 		writeJSONError(w, errNoBucket(name))
 		return
 	}
-	res := map[string]any{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"kind":                  "storage#bucket",
 		"id":                    b.name,
 		"name":                  b.name,
@@ -534,11 +483,7 @@ func (e *Emulator) getBucket(w http.ResponseWriter, name string) {
 		"projectNumber":         "0",
 		"softDeletePolicy":      map[string]any{"retentionDurationSeconds": "0"},
 		"hierarchicalNamespace": map[string]any{"enabled": false},
-	}
-	if len(rules) > 0 {
-		res["lifecycle"] = map[string]any{"rule": rules}
-	}
-	writeJSON(w, http.StatusOK, res)
+	})
 }
 
 func (e *Emulator) resource(b *bucket, o *object) map[string]any {

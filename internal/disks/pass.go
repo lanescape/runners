@@ -804,9 +804,8 @@ func (s *Service) seenClosed(ctx context.Context, st *state, repo int64, sc stri
 }
 
 // tidyScopes drops a consumer's family records once the family has no
-// images left, and its closures once the scope has no images, nor anything
-// else ScopesHeld names, and no run bound before the closure can still be
-// going on.
+// images left, and its closures once the scope has none and no run bound
+// before the closure can still be going on.
 func (s *Service) tidyScopes(ctx context.Context, st *state, repo int64, unknown map[string]bool) {
 	have := map[string]bool{}
 	for _, r := range st.records {
@@ -820,16 +819,6 @@ func (s *Service) tidyScopes(ctx context.Context, st *state, repo int64, unknown
 		f := r.v
 		if f.RepositoryID == repo && !have[f.Scope+"\x00"+f.Arch+"\x00"+f.Family] {
 			_ = s.Objects.Delete(ctx, key, r.gen)
-		}
-	}
-	if s.ScopesHeld != nil {
-		held, err := s.ScopesHeld(ctx, repo)
-		if err != nil {
-			s.log().Warn("reading what else holds a consumer's scopes; its closures are kept", "repository_id", repo, "err", err.Error())
-			return
-		}
-		for sc := range held {
-			have[sc] = true
 		}
 	}
 	for key, r := range st.closures {

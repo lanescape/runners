@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"time"
 )
 
 // Delivery is a webhook delivery as GitHub sends it. Tests may change its
@@ -77,32 +76,6 @@ func (e *Emulator) WorkflowJobPayload(run *Run, in *Installation, action string,
 		"repository":   e.repoJSON(run.Repo),
 		"organization": accountJSON(run.Repo.Owner),
 		"sender":       accountJSON(run.Actor),
-		"installation": map[string]any{"id": in.ID},
-	}
-}
-
-// PullRequestPayload is a pull_request event of p, such as its closing,
-// with its state as it is now.
-func (e *Emulator) PullRequestPayload(p *Pull, in *Installation, action string) map[string]any {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	var closedAt any
-	if !p.Closed.IsZero() {
-		closedAt = p.Closed.UTC().Format(time.RFC3339)
-	}
-	return map[string]any{
-		"action": action,
-		"number": p.Number,
-		"pull_request": map[string]any{
-			"number":    p.Number,
-			"state":     p.State,
-			"closed_at": closedAt,
-			"base":      map[string]any{"ref": p.BaseRef, "repo": e.repoJSON(p.Base)},
-			"head":      map[string]any{"ref": p.HeadRef, "sha": p.HeadSHA, "repo": e.repoJSON(p.Head)},
-		},
-		"repository":   e.repoJSON(p.Base),
-		"organization": accountJSON(p.Base.Owner),
-		"sender":       accountJSON(p.Author),
 		"installation": map[string]any{"id": in.ID},
 	}
 }

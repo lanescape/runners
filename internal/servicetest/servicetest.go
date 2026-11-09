@@ -1,8 +1,7 @@
-// Package servicetest wires the real service, its run binding, cache,
-// disks and webhook, to this repository's emulators of GitHub, Google's
-// issuers, IAM, Pub/Sub, Compute Engine and Cloud Storage, as a
-// service.World: what the conformance suite and the cache's own tests
-// drive. GitHub's deliveries reach the service as they do in production:
+// Package servicetest wires the real service, its run binding, disks and
+// webhook, to this repository's emulators of GitHub, Google's issuers,
+// Pub/Sub, Compute Engine and Cloud Storage, as a service.World: what the
+// conformance suite drives. GitHub's deliveries reach the service as they do in production:
 // signed to its webhook, published to Pub/Sub, and pushed to its reconcile
 // endpoint, signed as the push account.
 package servicetest
@@ -15,10 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
-	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -34,12 +30,10 @@ import (
 	gcsemu "github.com/lanescape/runners/emulators/storage"
 	"github.com/lanescape/runners/internal/auth"
 	"github.com/lanescape/runners/internal/binding"
-	"github.com/lanescape/runners/internal/cache"
 	"github.com/lanescape/runners/internal/compute"
 	"github.com/lanescape/runners/internal/disks"
 	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/lease"
-	"github.com/lanescape/runners/internal/machines"
 	"github.com/lanescape/runners/internal/pass"
 	"github.com/lanescape/runners/internal/pubsub"
 	"github.com/lanescape/runners/internal/server"
@@ -49,11 +43,9 @@ import (
 const (
 	orgID   = 303994381
 	pusher  = "lanescape-runners-push@lanescape-dev.iam.gserviceaccount.com"
-	signer  = "lanescape-runners-service@lanescape-dev.iam.gserviceaccount.com"
 	topic   = "projects/lanescape-dev/topics/lanescape-runners-webhooks"
 	secret  = "webhook secret"
 	State   = "state"
-	Cache   = "cache"
 	project = "lanescape-dev"
 )
 
@@ -64,12 +56,10 @@ type World struct {
 	Storage *gcsemu.Emulator
 	PubSub  *google.PubSub
 	Google  *google.Issuer
-	IAM     *google.IAM
 	Compute *gceemu.Emulator
 	Org     *ghemu.Account
 	Inst    *ghemu.Installation
 	Objects store.Objects
-	Cache   *cache.Service
 	Disks   *disks.Service
 	Passes  *pass.Runner
 	Body    pass.Body
@@ -77,7 +67,6 @@ type World struct {
 
 	url        string
 	maintainer *ghemu.Account
-	clock      clockwork.Clock
 
 	mu        sync.Mutex
 	nextID    int64
@@ -85,7 +74,6 @@ type World struct {
 	pulls     map[string]*ghemu.Pull
 	runs      map[int64]*ghemu.Run
 	jobs      map[int64]*ghemu.WorkflowJob
-	onMachine map[int64]string
 	published int
 }
 
@@ -108,23 +96,18 @@ func (l *Logs) String() string {
 }
 
 // New starts the service and the emulators, for one test, with clock as
-// the service's clock; nil is real time, which Advance moves on.
+// the service's clock; nil is real time.
 func New(t testing.TB, clock clockwork.Clock) *World {
 	t.Helper()
 	ctx := context.Background()
 	if clock == nil {
-		clock = &offsetClock{Clock: clockwork.NewRealClock()}
+		clock = clockwork.NewRealClock()
 	}
 	gh := ghemu.New()
 	t.Cleanup(gh.Close)
 	gcs := gcsemu.New()
 	t.Cleanup(gcs.Close)
 	gcs.CreateBucket(State)
-	gcs.CreateBucket(Cache)
-	gcs.AddLifecycleRule(Cache, "uploads/", 1)
-	iam := google.NewIAM()
-	t.Cleanup(iam.Close)
-	gcs.TrustSigner(signer, iam.AddAccount(signer))
 	ps := google.NewPubSub()
 	t.Cleanup(ps.Close)
 	ps.CreateTopic(topic)
@@ -149,11 +132,6 @@ func New(t testing.TB, clock clockwork.Clock) *World {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { objects.Close() })
-	blobs, err := store.NewGCS(ctx, Cache, gcs.ClientOptions()...)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { blobs.Close() })
 	gcec, err := compute.New(ctx, gce.Project, gce.ClientOptions()...)
 	if err != nil {
 		t.Fatal(err)
@@ -162,12 +140,6 @@ func New(t testing.TB, clock clockwork.Clock) *World {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sg, err := cache.NewIAMSigner(ctx, Cache, signer, iam.ClientOptions()...)
-	if err != nil {
-		t.Fatal(err)
-	}
-	u, _ := url.Parse(gcs.URL)
-	sg.Hostname, sg.Insecure = u.Host, true
 
 	var handler http.Handler
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handler.ServeHTTP(w, r) }))
@@ -193,23 +165,19 @@ func New(t testing.TB, clock clockwork.Clock) *World {
 	binder := &binding.Binder{GitHub: ghc, Objects: objects, OrganizationID: orgID, Clock: clock, Logger: log}
 	dks := &disks.Service{Config: cfg, Project: project, GitHub: ghc, Compute: gcec, Objects: objects, Clock: clock, Logger: log,
 		StepDeadline: 5 * time.Second}
-	cch := &cache.Service{OrganizationID: orgID, GitHub: ghc, Objects: objects, Bucket: blobs, Signer: sg, Actions: actions,
-		Binder: binder, Disks: dks, Clock: clock, Logger: log}
-	dks.ScopesHeld = cch.ScopesHeld
 	passes := &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log}
-	body := pass.All(dks.Pass, cch.Pass)
+	body := pass.All(dks.Pass)
 	handler, err = server.New(server.Config{
 		Logger: log, OrganizationID: orgID, WebhookSecret: []byte(secret), Publisher: pub, ReconcileCallers: callers,
-		Passes: passes, Reconciler: reconciler(body), Events: server.Recorders{dks, cch}, Actions: actions, Binder: binder,
-		Cache: cch.Handler(),
+		Passes: passes, Reconciler: reconciler(body), Events: dks, Actions: actions, Binder: binder,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &World{T: t, GitHub: gh, Storage: gcs, PubSub: ps, Google: gg, IAM: iam, Compute: gce, Org: org, Inst: inst,
-		Objects: objects, Cache: cch, Disks: dks, Passes: passes, Body: body, Logs: logs, url: audience, clock: clock,
+	return &World{T: t, GitHub: gh, Storage: gcs, PubSub: ps, Google: gg, Compute: gce, Org: org, Inst: inst,
+		Objects: objects, Disks: dks, Passes: passes, Body: body, Logs: logs, url: audience,
 		maintainer: gh.User(42, "maintainer"), nextID: 5000, repos: map[int64]*ghemu.Repo{}, pulls: map[string]*ghemu.Pull{},
-		runs: map[int64]*ghemu.Run{}, jobs: map[int64]*ghemu.WorkflowJob{}, onMachine: map[int64]string{}}
+		runs: map[int64]*ghemu.Run{}, jobs: map[int64]*ghemu.WorkflowJob{}}
 }
 
 type reconciler pass.Body
@@ -311,16 +279,6 @@ func (w *World) PushPullRequest(pr service.PullRequest) service.PullRequest {
 	return pr
 }
 
-// ClosePullRequest implements service.World.
-func (w *World) ClosePullRequest(pr service.PullRequest) {
-	p := w.pull(pr)
-	w.GitHub.ClosePull(p)
-	w.deliver("pull_request", w.GitHub.PullRequestPayload(p, w.Inst, "closed"))
-}
-
-// ReopenPullRequest implements service.World.
-func (w *World) ReopenPullRequest(pr service.PullRequest) { w.GitHub.ReopenPull(w.pull(pr)) }
-
 func (w *World) addRun(r *ghemu.Run, pr *service.PullRequest) service.Run {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -370,11 +328,6 @@ func (w *World) Rerun(r service.Run) service.Run {
 	return r
 }
 
-// Approve implements service.World.
-func (w *World) Approve(r service.Run) {
-	w.GitHub.Approve(w.run(r), machines.ContributionEnvironment, w.maintainer)
-}
-
 // StartJob implements service.World.
 func (w *World) StartJob(r service.Run, workflowRef string) service.Job {
 	wj := w.GitHub.Queue(w.run(r), ghemu.JobSpec{Labels: []string{"ubuntu-24.04"}})
@@ -384,27 +337,6 @@ func (w *World) StartJob(r service.Run, workflowRef string) service.Job {
 	w.mu.Unlock()
 	r.Attempt = wj.Attempt
 	return service.Job{Run: r, ID: wj.ID, WorkflowRef: workflowRef}
-}
-
-// StartMachineJob implements service.World: GitHub shows the job on one
-// of the service's machines, by its runner's name, and the machine's
-// job-started check has admitted it, as its record says.
-func (w *World) StartMachineJob(r service.Run) service.Job {
-	wj := w.GitHub.Queue(w.run(r), ghemu.JobSpec{Labels: []string{"self-hosted"}})
-	name := fmt.Sprintf("lsr-%d-%08x", r.Repository.ID, w.id())
-	w.GitHub.RunJobOn(wj, name)
-	data, err := json.Marshal(machines.Admission{Machine: name, Zone: "northamerica-northeast1-a", RepositoryID: r.Repository.ID,
-		JobID: wj.ID, RunID: r.ID, RunAttempt: wj.Attempt, Allowed: true, At: time.Now().UTC()})
-	if err != nil {
-		w.T.Fatal(err)
-	}
-	w.Storage.Put(State, machines.AdmissionKey(name), data)
-	w.mu.Lock()
-	w.jobs[wj.ID] = wj
-	w.onMachine[wj.ID] = name
-	w.mu.Unlock()
-	r.Attempt = wj.Attempt
-	return service.Job{Run: r, ID: wj.ID}
 }
 
 // WorkflowJob is the GitHub emulator's job behind a Job.
@@ -419,18 +351,10 @@ func (w *World) Token(j service.Job, overrides map[string]any) string {
 	return w.GitHub.JobToken(w.WorkflowJob(j), ghemu.Job{Audience: w.url, WorkflowRef: j.WorkflowRef}, overrides)
 }
 
-// FinishJob implements service.World. A job on one of the service's
-// machines has its machine's report recorded, as its supervisor sends it.
+// FinishJob implements service.World.
 func (w *World) FinishJob(j service.Job, conclusion string) {
 	wj := w.WorkflowJob(j)
 	w.GitHub.CompleteJob(wj, conclusion)
-	w.mu.Lock()
-	name := w.onMachine[j.ID]
-	w.mu.Unlock()
-	if name != "" {
-		data, _ := json.Marshal(machines.Report{Machine: name, At: time.Now().UTC()})
-		w.Storage.Put(State, "machines/"+name+"/report.json", data)
-	}
 	w.deliver("workflow_job", w.GitHub.WorkflowJobPayload(wj.Run, w.Inst, "completed", wj.ID, wj.Labels))
 }
 
@@ -481,24 +405,6 @@ func (w *World) PushMessages() {
 	}
 }
 
-// FinishRun finishes every job of a run still going, as FinishJob does.
-func (w *World) FinishRun(r service.Run, conclusion string) {
-	w.mu.Lock()
-	var jobs []int64
-	for id, wj := range w.jobs {
-		if wj.Run.ID == r.ID {
-			jobs = append(jobs, id)
-		}
-	}
-	w.mu.Unlock()
-	slices.Sort(jobs)
-	for _, id := range jobs {
-		if w.GitHub.Job(id).Status != "completed" {
-			w.FinishJob(service.Job{Run: r, ID: id}, conclusion)
-		}
-	}
-}
-
 // Unavailable implements service.World: every call to GitHub's API answers
 // 503 while it's on.
 func (w *World) Unavailable(on bool) {
@@ -507,53 +413,6 @@ func (w *World) Unavailable(on bool) {
 		return
 	}
 	w.GitHub.Faults().Add(fault.Rule{Respond: fault.Status(http.StatusServiceUnavailable, nil, `{"message": "Service Unavailable"}`)})
-}
-
-// Advance implements service.World: the service's clock moves on by d.
-// Cloud Storage's emulator, and the signing of URLs, keep real time, so a
-// test that moves time on doesn't rely on a URL's expiry across it.
-func (w *World) Advance(d time.Duration) {
-	w.T.Helper()
-	switch c := w.clock.(type) {
-	case *clockwork.FakeClock:
-		c.Advance(d)
-	case *offsetClock:
-		c.advance(d)
-	default:
-		w.T.Fatal("the service's clock can't be moved on")
-	}
-}
-
-// offsetClock is real time, moved on by Advance: time still passes between
-// a test's steps, as it does for the service.
-type offsetClock struct {
-	clockwork.Clock
-	mu     sync.Mutex
-	offset time.Duration
-}
-
-func (c *offsetClock) advance(d time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.offset += d
-}
-
-func (c *offsetClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.Clock.Now().Add(c.offset)
-}
-
-func (c *offsetClock) Since(t time.Time) time.Duration { return c.Now().Sub(t) }
-func (c *offsetClock) Until(t time.Time) time.Duration { return t.Sub(c.Now()) }
-
-// Pass implements service.World: one pass, the disks' part and the
-// cache's.
-func (w *World) Pass() {
-	w.T.Helper()
-	if err := w.Passes.Run(context.Background(), w.Body); err != nil {
-		w.T.Fatalf("pass: %v", err)
-	}
 }
 
 // Binding implements service.World.
@@ -567,40 +426,4 @@ func (w *World) Binding(r service.Run) (string, bool) {
 		w.T.Fatal(err)
 	}
 	return b.Scope.String(), true
-}
-
-func (w *World) records(prefix string, into func([]byte)) {
-	for _, name := range w.Storage.Names(State) {
-		if strings.HasPrefix(name, prefix) {
-			data, _, ok := w.Storage.Object(State, name)
-			if ok {
-				into(data)
-			}
-		}
-	}
-}
-
-// Entries implements service.World.
-func (w *World) Entries(r service.Repository) []service.Entry {
-	var out []service.Entry
-	w.records(fmt.Sprintf("cache/entries/%d/", r.ID), func(data []byte) {
-		var e cache.Entry
-		if json.Unmarshal(data, &e) == nil && e.State != cache.Marked {
-			out = append(out, service.Entry{ID: e.ID, Scope: e.Scope, Store: e.Store, Platform: e.Platform, Family: e.Family, Key: e.Key,
-				State: e.State, Size: e.Size, SHA256: e.SHA256})
-		}
-	})
-	return out
-}
-
-// Choices implements service.World.
-func (w *World) Choices(r service.Run) []service.Choice {
-	var out []service.Choice
-	w.records(fmt.Sprintf("cache/choices/%d/%d/", r.Repository.ID, r.ID), func(data []byte) {
-		var c cache.Choice
-		if json.Unmarshal(data, &c) == nil {
-			out = append(out, service.Choice{Store: c.Store, Platform: c.Platform, Family: c.Family, Key: c.Key, Step: c.Step, Entry: c.Entry})
-		}
-	})
-	return out
 }

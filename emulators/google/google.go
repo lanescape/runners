@@ -1,9 +1,7 @@
 // Package google emulates Google's ID token issuer, as Cloud Scheduler and
 // Pub/Sub push subscriptions sign their calls: tokens for a service
 // account's email, with the audience the caller was configured with; the
-// bodies of Pub/Sub's pushes; Pub/Sub's publishing (PubSub); and IAM's
-// signBlob, with which a service account signs URLs without a key of its own
-// (IAM).
+// bodies of Pub/Sub's pushes; and Pub/Sub's publishing (PubSub).
 package google
 
 import (

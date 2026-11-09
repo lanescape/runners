@@ -9,7 +9,7 @@ It holds:
 - the Artifact Registry repository, `lanescape-runners`;
 - the Cloud Run service, `lanescape-runners`, as an unreachable shell that `infra/` adopts and deploys, with the infra identity's grant on it alone;
 - every service account: the service's, the machines' (with no role anywhere), the scheduler's, the push subscriptions', CD's (`lanescape-runners-deployer`) and the infra identity (`lanescape-runners-infra`);
-- the service's custom roles and every project-level grant, each limited by IAM Conditions to the service's own resources by name wherever IAM can do that, and the service's grant to sign the cache's URLs, with `iam.serviceAccounts.signBlob` alone, on its own account alone;
+- the service's custom roles and every project-level grant, each limited by IAM Conditions to the service's own resources by name wherever IAM can do that;
 - the network, `lanescape-runners`, its subnetwork, with no firewall rules, and who may attach to the subnetwork;
 - the Pub/Sub topics and push subscriptions, the scheduler job, and the log sink for Compute Engine's preemption and guest-shutdown events of the service's machines, with its fixed filter;
 - CD's workload identity pool, `lanescape-runners-github`, whose provider accepts only a push to `main` by `cd.yml` in this repository, checked by the repository's and the organization's IDs.

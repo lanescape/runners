@@ -137,3 +137,19 @@ func (p *PubSub) serve(w http.ResponseWriter, r *http.Request) {
 	p.topics[m[1]] = msgs
 	writeJSON(w, http.StatusOK, map[string]any{"messageIds": ids})
 }
+
+// GoogleError answers as Google's JSON APIs do with an error, such as 503
+// UNAVAILABLE or 429 RESOURCE_EXHAUSTED, for fault rules.
+func GoogleError(code int, status, message string) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, _ *http.Request) { writeGoogleError(w, code, status, message) }
+}
+
+func writeGoogleError(w http.ResponseWriter, code int, status, message string) {
+	writeJSON(w, code, map[string]any{"error": map[string]any{"code": code, "message": message, "status": status}})
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}

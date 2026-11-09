@@ -28,7 +28,6 @@ type claims struct {
 	refType    string
 	sha        string
 	workflow   string
-	checkRunID int64
 }
 
 func numeric(s string) (int64, bool) {
@@ -67,13 +66,6 @@ func (e *Emulator) token(r *http.Request) (*claims, error) {
 		}
 		*into = n
 	}
-	if s := str("check_run_id"); s != "" {
-		n, ok := numeric(s)
-		if !ok {
-			return nil, errors.New("the token isn't one the service accepts: check_run_id isn't a numeric ID")
-		}
-		c.checkRunID = n
-	}
 	if c.ownerID != e.org {
 		return nil, errors.New("the token's repository isn't the organization's")
 	}
@@ -83,29 +75,12 @@ func (e *Emulator) token(r *http.Request) (*claims, error) {
 	return c, nil
 }
 
-// binding is a run's bound scope, and for a pull request's, its base.
+// binding is a run's bound scope, and the head it was made for.
 type binding struct {
 	scope    string
-	base     string
-	event    string
 	headRepo int64
 	// headSHA is the head commit a pull request's binding was made for.
 	headSHA string
-	at      time.Time
-}
-
-// chain is a binding's restore chain (specs/0002-machines.md, Scope): its
-// own scope, if it saves, then its base; main's and read's are main's.
-func (b *binding) chain() []string {
-	switch {
-	case b.scope == "main" || b.scope == "read":
-		return []string{"main"}
-	case strings.HasPrefix(b.scope, "branch-"):
-		return []string{b.scope, "main"}
-	case b.base != "":
-		return []string{b.scope, b.base}
-	}
-	return []string{b.scope, "main"}
 }
 
 type bindRequest struct {
@@ -164,7 +139,6 @@ func (e *Emulator) bind(w http.ResponseWriter, r *http.Request) {
 	b := e.bindings[rn.id]
 	if b == nil {
 		b = e.decide(c, req, rp, rn)
-		b.at = e.now()
 		e.bindings[rn.id] = b
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"scope": b.scope})
@@ -176,14 +150,6 @@ func (e *Emulator) binds(rn *run) bool {
 		return rn.status == "in_progress"
 	}
 	return e.runInProgress(rn)
-}
-
-// finished reports whether a run has finished, so its choices go.
-func (e *Emulator) finished(rn *run) bool {
-	if e.gh != nil {
-		return rn.status == "completed"
-	}
-	return !e.runInProgress(rn)
 }
 
 // runInProgress reports whether any of a run's jobs is still going, or it
@@ -204,7 +170,7 @@ func (e *Emulator) runInProgress(rn *run) bool {
 // decide is the binder's rules (specs/0002-machines.md, Scope), from what
 // the emulator holds of GitHub's records.
 func (e *Emulator) decide(c *claims, req bindRequest, rp *repo, rn *run) *binding {
-	read := &binding{scope: "read", event: rn.event, headRepo: rn.headRepo}
+	read := &binding{scope: "read", headRepo: rn.headRepo}
 	if rn.event == "pull_request_target" {
 		read.headRepo = 0
 	}
@@ -225,13 +191,13 @@ func (e *Emulator) decide(c *claims, req bindRequest, rp *repo, rn *run) *bindin
 			if !rp.onBranch(rp.def, rn.sha) {
 				return read
 			}
-			return &binding{scope: "main", event: rn.event, headRepo: rp.id}
+			return &binding{scope: "main", headRepo: rp.id}
 		}
 		name, listed := f.branches[branch]
 		if !listed || rn.ref != c.ref || !rp.onBranch(branch, rn.sha) {
 			return read
 		}
-		return &binding{scope: "branch-" + name, event: rn.event, headRepo: rp.id}
+		return &binding{scope: "branch-" + name, headRepo: rp.id}
 	case "pull_request":
 		m := pullRef.FindStringSubmatch(c.ref)
 		if m == nil || rn.headRepo != rp.id {
@@ -243,7 +209,7 @@ func (e *Emulator) decide(c *claims, req bindRequest, rp *repo, rn *run) *bindin
 		if p == nil || p.headRepo != rn.headRepo || rn.pull != p || p.headSHA != rn.headSHA {
 			return read
 		}
-		b = &binding{scope: fmt.Sprintf("pr%d", n), base: baseOf(f, p.base), event: rn.event, headRepo: p.headRepo, headSHA: rn.headSHA}
+		b = &binding{scope: fmt.Sprintf("pr%d", n), headRepo: p.headRepo, headSHA: rn.headSHA}
 	case "pull_request_target":
 		prefix := strings.ToLower(c.repository + "/.github/workflows/")
 		if f.bootstrap == "" || !strings.HasPrefix(strings.ToLower(f.bootstrap), prefix) || !strings.HasSuffix(f.bootstrap, "@refs/heads/"+rp.def) ||
@@ -257,7 +223,7 @@ func (e *Emulator) decide(c *claims, req bindRequest, rp *repo, rn *run) *bindin
 		if p == nil || p.headRepo != req.HeadRepositoryID || !rp.pullCommit(p, req.HeadSHA) {
 			return read
 		}
-		b = &binding{scope: fmt.Sprintf("pr%d", p.number), base: baseOf(f, p.base), event: rn.event, headRepo: p.headRepo, headSHA: req.HeadSHA}
+		b = &binding{scope: fmt.Sprintf("pr%d", p.number), headRepo: p.headRepo, headSHA: req.HeadSHA}
 	default:
 		return read
 	}
@@ -270,7 +236,7 @@ func (e *Emulator) decide(c *claims, req bindRequest, rp *repo, rn *run) *bindin
 		}
 	}
 	if heads > 1 {
-		return &binding{scope: "read", event: rn.event, headRepo: b.headRepo}
+		return &binding{scope: "read", headRepo: b.headRepo}
 	}
 	return b
 }
@@ -315,13 +281,4 @@ func parseRunners(file, def string) runners {
 		}
 	}
 	return out
-}
-
-// baseOf is a pull request's base: its branch's scope if listed, or else
-// main's.
-func baseOf(f runners, branch string) string {
-	if name, ok := f.branches[branch]; ok {
-		return "branch-" + name
-	}
-	return "main"
 }

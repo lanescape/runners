@@ -1,19 +1,15 @@
 // Package service emulates this repository's service as its interface for
 // actions describes it (specs/0005-interface.md), and nothing more: run
-// binding, the cache's restore, save and commit in the service's own store
-// and in a consumer's index stores, and the URLs the service's store hands
-// out, only to jobs on its own machines, which the emulator serves itself,
-// for resumable uploads and ranged downloads, until they expire. It runs in-process, as an
-// httptest server, and verifies tokens against an OIDC issuer emulator,
-// as the service verifies GitHub's.
+// binding. It runs in-process, as an httptest server, and verifies tokens
+// against an OIDC issuer emulator, as the service verifies GitHub's.
 //
 // Consumers test their actions against it, at a pinned version of this
 // module; the conformance suite in package conformance holds it to the
 // real service's answers, in this repository's CI (specs/0004-deployment.md).
 // Tests drive it through World: they declare repositories, their
 // runners.json and branches, pull requests, runs and jobs, as GitHub would
-// show them; finish jobs; close pull requests; make GitHub unavailable;
-// and read what was bound, saved and chosen. Faults adds any other failure,
+// show them; finish jobs; rerun runs; make GitHub unavailable; and read
+// what was bound. Faults adds any other failure,
 // with Refuse and Unavailable answering as the service does. A test that
 // runs this module's GitHub emulator hands it over with WithGitHub, and the
 // emulator takes its view of GitHub from that one state.
@@ -57,27 +53,11 @@ type Emulator struct {
 	runs        map[int64]*run
 	jobs        map[int64]*job
 	bindings    map[int64]*binding
-	entries     map[string]*entry
-	reserved    map[string]*reservation
-	choices     map[string]*choice
-	closures    map[string]time.Time
-	recents     map[string]recent
-	familyUsed  map[string]time.Time
-	objects     map[string][]byte
-	grants      map[string]*grant
-	sessions    map[string]*session
 	unavailable bool
-	advanced    time.Duration
 
-	// With WithGitHub: the GitHub emulator the emulator reads, and what
-	// it keeps of its own beside it: the jobs on the service's machines,
-	// the runs due an automatic rerun, the closings it has seen, and the
-	// bot whose reruns are the service's own.
+	// With WithGitHub: the GitHub emulator the emulator reads, and the
+	// maintainer who opens pull requests and reruns runs there.
 	gh         *ghemu.Emulator
-	machines   map[int64]bool
-	due        map[int64]bool
-	closings   map[string]int
-	bot        *ghemu.Account
 	maintainer *ghemu.Account
 }
 
@@ -88,8 +68,8 @@ type Option func(*Emulator)
 // place of an issuer of the emulator's own.
 func WithIssuer(issuer *emuoidc.Issuer) Option { return func(e *Emulator) { e.issuer = issuer } }
 
-// WithClock sets the emulator's clock, which decides when URLs, upload
-// sessions and reservations expire.
+// WithClock sets the emulator's clock, against which tokens' expiry is
+// checked.
 func WithClock(c clockwork.Clock) Option { return func(e *Emulator) { e.clock = c } }
 
 // WithOrganization sets the organization the emulator serves, by ID and
@@ -101,9 +81,7 @@ func WithOrganization(id int64, login string) Option {
 // New starts an emulator. Close it when done.
 func New(opts ...Option) *Emulator {
 	e := &Emulator{clock: clockwork.NewRealClock(), org: endpoints.Organization, login: "lanescape", nextID: 1_000_000,
-		repos: map[int64]*repo{}, runs: map[int64]*run{}, jobs: map[int64]*job{}, bindings: map[int64]*binding{},
-		entries: map[string]*entry{}, reserved: map[string]*reservation{}, choices: map[string]*choice{},
-		closures: map[string]time.Time{}, recents: map[string]recent{}, familyUsed: map[string]time.Time{}, objects: map[string][]byte{}, grants: map[string]*grant{}, sessions: map[string]*session{}}
+		repos: map[int64]*repo{}, runs: map[int64]*run{}, jobs: map[int64]*job{}, bindings: map[int64]*binding{}}
 	for _, o := range opts {
 		o(e)
 	}
@@ -112,7 +90,6 @@ func New(opts ...Option) *Emulator {
 			panic("service emulator: WithGitHub verifies the GitHub emulator's own tokens, not another issuer's")
 		}
 		e.issuer = e.gh.Actions
-		e.machines, e.due, e.closings = map[int64]bool{}, map[int64]bool{}, map[string]int{}
 	}
 	if e.issuer == nil {
 		e.issuer = emuoidc.New(emuoidc.WithClock(e.clock))
@@ -120,10 +97,6 @@ func New(opts ...Option) *Emulator {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/bind", e.bind)
-	mux.HandleFunc("POST /v1/cache/restore", e.serveCache(e.restore))
-	mux.HandleFunc("POST /v1/cache/save", e.serveCache(e.save))
-	mux.HandleFunc("POST /v1/cache/commit", e.serveCache(e.commit))
-	mux.HandleFunc("/storage/", e.storage)
 	e.srv = httptest.NewServer(e.faults.Wrap(mux))
 	e.url = e.srv.URL
 	keys := oidc.NewRemoteKeySet(context.Background(), e.issuer.JWKSURL)
@@ -150,8 +123,7 @@ func (e *Emulator) Organization() int64 { return e.org }
 func (e *Emulator) Issuer() *emuoidc.Issuer { return e.issuer }
 
 // Faults is where tests make requests fail in other ways, such as answering
-// with Refuse or Unavailable, slowly, or by dropping the connection; it
-// applies to the URLs the emulator hands out too.
+// with Refuse or Unavailable, slowly, or by dropping the connection.
 func (e *Emulator) Faults() *fault.Injector { return &e.faults }
 
 // Refuse answers as the service does when it won't do something: 403, with
@@ -227,14 +199,7 @@ type run struct {
 	// when the run is made.
 	headSHA string
 	attempt int
-	// triggers are whether each attempt after the first was the service's
-	// own automatic rerun.
-	automatic map[int]bool
-	pull      *pull
-	approved  bool
-	// due says a Spot job of its latest attempt was preempted, so it's due
-	// an automatic rerun, which keeps its choices.
-	due bool
+	pull    *pull
 	// status is GitHub's status of the run, with a GitHub emulator; with
 	// none, the run's jobs say whether it's in progress.
 	status string
@@ -246,8 +211,6 @@ type job struct {
 	attempt     int
 	workflowRef string
 	status      string
-	conclusion  string
-	onMachine   bool
 }
 
 func (e *Emulator) repo(r Repository) *repo {
@@ -403,38 +366,8 @@ func (e *Emulator) pull(pr PullRequest) *pull {
 	return p
 }
 
-// ClosePullRequest implements World: the emulator records the closing as
-// the service records GitHub's delivery of it.
-func (e *Emulator) ClosePullRequest(pr PullRequest) {
-	if e.gh != nil {
-		e.ghClosePullRequest(pr)
-		return
-	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.pull(pr).open = false
-	// GitHub's closed_at is to the second, so the service records the
-	// closing as seen the second after it: a run bound in that second
-	// counts as bound before.
-	e.seen(pr.Repository.ID, fmt.Sprintf("pr%d", pr.Number), e.now().Truncate(time.Second).Add(time.Second))
-	e.retain()
-}
-
-// ReopenPullRequest implements World.
-func (e *Emulator) ReopenPullRequest(pr PullRequest) {
-	if e.gh != nil {
-		e.gh.ReopenPull(e.GitHubPull(pr))
-		return
-	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.pull(pr).open = true
-}
-
-func closureKey(repo int64, sc string) string { return fmt.Sprintf("%d/%s", repo, sc) }
-
 func (e *Emulator) addRun(rp *repo, r *run) Run {
-	r.id, r.repo, r.attempt, r.automatic = e.id(), rp, 1, map[int]bool{}
+	r.id, r.repo, r.attempt = e.id(), rp, 1
 	if r.headRepo == 0 {
 		r.headRepo = rp.id
 	}
@@ -507,36 +440,15 @@ func (e *Emulator) PullRequestTargetRun(pr PullRequest) Run {
 	return e.addRun(rp, &run{event: "pull_request_target", ref: "refs/heads/main", refType: "branch", sha: rp.branches["main"], pull: p})
 }
 
-// Approve implements World.
-func (e *Emulator) Approve(r Run) {
+// Rerun implements World.
+func (e *Emulator) Rerun(r Run) Run {
 	if e.gh != nil {
-		e.gh.Approve(e.GitHubRun(r), contributionEnvironment, e.ghMaintainer())
-		return
-	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.runs[r.ID].approved = true
-}
-
-// Rerun implements World: a maintainer's rerun, whose jobs pick their
-// restore choices again.
-func (e *Emulator) Rerun(r Run) Run { return e.rerun(r, false) }
-
-// AutomaticRerun starts a run's next attempt as the service's own
-// automatic rerun of a preempted job does, whose jobs keep the run's
-// restore choices.
-func (e *Emulator) AutomaticRerun(r Run) Run { return e.rerun(r, true) }
-
-func (e *Emulator) rerun(r Run, automatic bool) Run {
-	if e.gh != nil {
-		return e.ghRerun(r, automatic)
+		return e.ghRerun(r)
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	rn := e.runs[r.ID]
 	rn.attempt++
-	rn.automatic[rn.attempt] = automatic
-	rn.due = false
 	r.Attempt = rn.attempt
 	return r
 }
@@ -544,7 +456,7 @@ func (e *Emulator) rerun(r Run, automatic bool) Run {
 // StartJob implements World.
 func (e *Emulator) StartJob(r Run, workflowRef string) Job {
 	if e.gh != nil {
-		return e.ghStartJob(r, workflowRef, false)
+		return e.ghStartJob(r, workflowRef)
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -560,18 +472,6 @@ func (e *Emulator) StartJob(r Run, workflowRef string) Job {
 	e.jobs[j.id] = j
 	r.Attempt = rn.attempt
 	return Job{Run: r, ID: j.id, WorkflowRef: j.workflowRef}
-}
-
-// StartMachineJob implements World.
-func (e *Emulator) StartMachineJob(r Run) Job {
-	if e.gh != nil {
-		return e.ghStartJob(r, "", true)
-	}
-	j := e.StartJob(r, "")
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.jobs[j.ID].onMachine = true
-	return j
 }
 
 // Claims are a job's token's claims, as GitHub signs them, for the
@@ -611,36 +511,15 @@ func (e *Emulator) Token(j Job, overrides map[string]any) string {
 	return e.issuer.Mint(c)
 }
 
-// FinishJob implements World: the emulator settles the job's pending
-// entries at once, as the service does on GitHub's delivery.
+// FinishJob implements World.
 func (e *Emulator) FinishJob(j Job, conclusion string) {
 	if e.gh != nil {
-		e.ghFinishJob(j, conclusion, false)
+		e.gh.CompleteJobByID(j.ID, conclusion)
 		return
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	jb := e.jobs[j.ID]
-	jb.status, jb.conclusion = "completed", conclusion
-	e.settle(jb)
-	e.retain()
-}
-
-// PreemptJob finishes a job as a preempted Spot machine's job finishes:
-// failed, with its run due one of the service's automatic reruns, which
-// keeps the run's restore choices until AutomaticRerun starts it.
-func (e *Emulator) PreemptJob(j Job) {
-	if e.gh != nil {
-		e.ghFinishJob(j, "failure", true)
-		return
-	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	jb := e.jobs[j.ID]
-	jb.status, jb.conclusion = "completed", "failure"
-	jb.run.due = true
-	e.settle(jb)
-	e.retain()
+	e.jobs[j.ID].status = "completed"
 }
 
 // Unavailable implements World.
@@ -648,15 +527,6 @@ func (e *Emulator) Unavailable(on bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.unavailable = on
-}
-
-// Pass implements World: the emulator deletes what the service's pass
-// would.
-func (e *Emulator) Pass() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.observe()
-	e.retain()
 }
 
 // Binding implements World.
@@ -669,61 +539,6 @@ func (e *Emulator) Binding(r Run) (string, bool) {
 		return "", false
 	}
 	return b.scope, true
-}
-
-// Entries implements World.
-func (e *Emulator) Entries(r Repository) []Entry {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.observe()
-	var out []Entry
-	for _, en := range e.entries {
-		if en.repo == r.ID {
-			out = append(out, Entry{ID: en.id, Scope: en.scope, Store: en.store, Platform: en.platform, Family: en.family, Key: en.key,
-				State: en.state, Size: en.size, SHA256: en.sha256})
-		}
-	}
-	return out
-}
-
-// Choices implements World.
-func (e *Emulator) Choices(r Run) []Choice {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.observe()
-	var out []Choice
-	for _, c := range e.choices {
-		if c.run == r.ID {
-			out = append(out, Choice{Store: c.store, Platform: c.platform, Family: c.family, Key: c.key, Step: c.step, Entry: c.entry})
-		}
-	}
-	return out
-}
-
-// Object is an entry's bytes, for tests to inspect.
-func (e *Emulator) Object(id string) ([]byte, bool) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	en := e.entries[id]
-	if en == nil {
-		return nil, false
-	}
-	b, ok := e.objects[en.object]
-	return b, ok
-}
-
-// now is the service's time: its clock's, moved on by Advance. Tokens are
-// checked at the clock's own time, as GitHub mints them.
-func (e *Emulator) now() time.Time { return e.clock.Now().UTC().Add(e.advanced) }
-
-// Advance implements World: the service's time moves on by d, as if that
-// long had passed with nothing else happening.
-func (e *Emulator) Advance(d time.Duration) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	// What GitHub shows so far happened before the time moves on.
-	e.observe()
-	e.advanced += d
 }
 
 var _ World = (*Emulator)(nil)

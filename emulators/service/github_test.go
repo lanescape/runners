@@ -62,57 +62,43 @@ func TestOneGitHubServesTheTestAndTheEmulator(t *testing.T) {
 	if s, ok := e.Binding(e.RunOf(run)); !ok || s != want {
 		t.Fatalf("the emulator keeps %q, %v", s, ok)
 	}
-	// A job GitHub's emulator finishes settles what it saved: the
-	// emulator sees it at its next look.
-	other := gh.Queue(run, ghemu.JobSpec{Labels: []string{"ubuntu-24.04"}})
-	gh.RunJob(other)
-	jtok := e.Token(e.JobOf(other, ""), nil)
-	a, id := c.SaveIndex(jtok, "actions", linux, "build", key, 3, conformance.Sum([]byte("abc")))
-	if a.Status != http.StatusOK {
-		t.Fatalf("save answered %d: %s", a.Status, a.Reason)
-	}
-	if a := c.Commit(jtok, id, 3, conformance.Sum([]byte("abc"))); a.Status != http.StatusOK {
-		t.Fatalf("commit answered %d: %s", a.Status, a.Reason)
-	}
-	gh.CompleteJob(other, "success")
-	if es := e.Entries(e.RepositoryOf(repo)); len(es) != 1 || es[0].State != "ready" || es[0].Scope != want {
-		t.Fatalf("entries %+v", es)
+	// Once GitHub's emulator shows the run finished, the emulator sees it
+	// at its next request, and binds nothing more of it.
+	gh.CompleteJob(wj, "success")
+	if a := c.Bind(tok, nil); a.Status != http.StatusForbidden {
+		t.Fatalf("a finished run's bind answered %d", a.Status)
 	}
 }
 
-// A closing the emulator never saw open again, because the test closed
-// and reopened the pull request in GitHub between two of its requests,
-// still retires what the pull request's earlier run saves, as the
-// service's delivery of the closing would.
-func TestAClosingSeenOnlyAfterItsReopeningCounts(t *testing.T) {
-	e, gh, clock, c, repo := onGitHub(t)
+// A pull request closed in GitHub's emulator no longer counts among the
+// open pull requests whose heads a binding compares, as GitHub's list of
+// them shows.
+func TestAClosedPullRequestsHeadIsNoLongerOpen(t *testing.T) {
+	e, gh, _, c, repo := onGitHub(t)
 	member := gh.User(8001, "member")
 	repo.Commit("fix", map[string]string{"a": "1"})
 	pr := gh.PullRequest(repo, "main", repo, "fix", member)
-	run := gh.PullRequestRun(pr)
-	wj := gh.Queue(run, ghemu.JobSpec{Labels: []string{"ubuntu-24.04"}})
-	gh.RunJob(wj)
-	tok := e.Token(e.JobOf(wj, ""), nil)
-	if a := c.Bind(tok, nil); a.Scope() != fmt.Sprintf("pr%d", pr.Number) {
-		t.Fatalf("bound %q (%s)", a.Scope(), a.Reason)
+	repo.Commit("release", map[string]string{"r": "1"})
+	twin := gh.PullRequest(repo, "release", repo, "fix", member)
+	if gh.PullHead(pr) != gh.PullHead(twin) {
+		t.Fatal("the pull requests have different heads")
 	}
-	clock.Advance(2 * time.Second)
-	gh.ClosePull(pr)
-	gh.ReopenPull(pr)
-	clock.Advance(2 * time.Second)
-	_, id := c.SaveIndex(tok, "actions", linux, "build", key, 3, conformance.Sum([]byte("abc")))
-	if a := c.Commit(tok, id, 3, conformance.Sum([]byte("abc"))); a.Status != http.StatusOK {
-		t.Fatalf("commit answered %d: %s", a.Status, a.Reason)
+	bind := func() string {
+		wj := gh.Queue(gh.PullRequestRun(pr), ghemu.JobSpec{Labels: []string{"ubuntu-24.04"}})
+		gh.RunJob(wj)
+		a := c.Bind(e.Token(e.JobOf(wj, ""), nil), nil)
+		if a.Status != http.StatusOK {
+			t.Fatalf("bind answered %d: %s", a.Status, a.Reason)
+		}
+		return a.Scope()
 	}
-	gh.CompleteJob(wj, "success")
-	if es := e.Entries(e.RepositoryOf(repo)); len(es) != 0 {
-		t.Fatalf("a run bound before the closing kept %+v", es)
+	if s := bind(); s != "read" {
+		t.Fatalf("a head two open pull requests share bound %q", s)
 	}
-}
-
-func TestAnAutomaticRerunKeepsItsRunsChoicesOnGitHub(t *testing.T) {
-	e, _, clock, c, repo := onGitHub(t)
-	automaticRerun(t, e, clock, c, e.RepositoryOf(repo))
+	gh.ClosePull(twin)
+	if s := bind(); s != fmt.Sprintf("pr%d", pr.Number) {
+		t.Fatalf("with the other closed, bound %q", s)
+	}
 }
 
 // World's handles name GitHub's own objects.
@@ -144,8 +130,8 @@ func TestHandlesNameGitHubsObjects(t *testing.T) {
 	}
 }
 
-// A repository transferred out of the organization after a run restored
-// is no consumer: the emulator's pass and its requests go on.
+// A repository transferred out of the organization after a run was bound
+// is no consumer: its later requests are refused.
 func TestATransferredRepositoryIsNoConsumer(t *testing.T) {
 	e, gh, _, c, repo := onGitHub(t)
 	run := gh.PushRun(repo, "main")
@@ -155,16 +141,9 @@ func TestATransferredRepositoryIsNoConsumer(t *testing.T) {
 	if a := c.Bind(tok, nil); a.Scope() != "main" {
 		t.Fatalf("bound %q", a.Scope())
 	}
-	if a, _ := c.Restore(tok, "actions", linux, "build", key, false); a.Status != http.StatusOK {
-		t.Fatalf("restore answered %d", a.Status)
-	}
 	gh.Transfer(repo, gh.User(9100, "elsewhere"))
-	e.Pass()
-	if a, _ := c.Restore(tok, "actions", linux, "build", key, false); a.Status != http.StatusForbidden {
-		t.Fatalf("a transferred repository's restore answered %d", a.Status)
-	}
-	if cs := e.Choices(e.RunOf(run)); len(cs) != 0 {
-		t.Fatalf("choices %+v", cs)
+	if a := c.Bind(tok, nil); a.Status != http.StatusForbidden {
+		t.Fatalf("a transferred repository's bind answered %d", a.Status)
 	}
 }
 
@@ -187,80 +166,10 @@ func TestWorldsMethodsRunTogether(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 8 {
 		wg.Go(func() {
-			e.Approve(e.PullRequestTargetRun(e.PullRequest(r, "main", fmt.Sprintf("b%d", e.GitHub().NewID()))))
+			e.StartJob(e.PullRequestTargetRun(e.PullRequest(r, "main", fmt.Sprintf("b%d", e.GitHub().NewID()))), e.Bootstrap(r))
 		})
 	}
 	wg.Wait()
-}
-
-// pullRun starts a job of a new pull_request run of pr, binds it, and
-// returns its token.
-func pullRun(t *testing.T, e *service.Emulator, gh *ghemu.Emulator, c *conformance.Client, pr *ghemu.Pull) (*ghemu.WorkflowJob, string) {
-	t.Helper()
-	wj := gh.Queue(gh.PullRequestRun(pr), ghemu.JobSpec{Labels: []string{"ubuntu-24.04"}})
-	gh.RunJob(wj)
-	tok := e.Token(e.JobOf(wj, ""), nil)
-	if a := c.Bind(tok, nil); a.Scope() != fmt.Sprintf("pr%d", pr.Number) {
-		t.Fatalf("bound %q (%s)", a.Scope(), a.Reason)
-	}
-	return wj, tok
-}
-
-func commitIndex(t *testing.T, c *conformance.Client, tok string) {
-	t.Helper()
-	_, id := c.SaveIndex(tok, "actions", linux, "build", key, 3, conformance.Sum([]byte("abc")))
-	if a := c.Commit(tok, id, 3, conformance.Sum([]byte("abc"))); a.Status != http.StatusOK {
-		t.Fatalf("commit answered %d: %s", a.Status, a.Reason)
-	}
-}
-
-// A closing the emulator sees late counts from when GitHub closed the pull
-// request, not from when the emulator looked: a run bound after it, once
-// the service's time has moved on, keeps what it saves.
-// Time moves on by GitHub's clock, which the service's follows, or by
-// Advance, which moves the service's alone.
-func TestALateSeenClosingCountsFromItsClosedAt(t *testing.T) {
-	for _, clocks := range []string{"both", "the service's"} {
-		t.Run(clocks, func(t *testing.T) {
-			e, gh, clock, c, repo := onGitHub(t)
-			repo.Commit("fix", map[string]string{"a": "1"})
-			pr := gh.PullRequest(repo, "main", repo, "fix", gh.User(8001, "member"))
-			gh.ClosePull(pr)
-			gh.ReopenPull(pr)
-			if clocks == "both" {
-				clock.Advance(10 * time.Second)
-			} else {
-				e.Advance(10 * time.Second)
-			}
-			wj, tok := pullRun(t, e, gh, c, pr)
-			commitIndex(t, c, tok)
-			gh.CompleteJob(wj, "success")
-			if es := e.Entries(e.RepositoryOf(repo)); len(es) != 1 || es[0].State != "ready" {
-				t.Fatalf("a run bound after the closing kept %+v", es)
-			}
-		})
-	}
-}
-
-// While GitHub is unavailable, a job GitHub shows finished settles
-// nothing; once it answers again, its entries settle.
-func TestAnOutageSettlesNothing(t *testing.T) {
-	e, gh, _, c, repo := onGitHub(t)
-	repo.Commit("fix", map[string]string{"a": "1"})
-	pr := gh.PullRequest(repo, "main", repo, "fix", gh.User(8001, "member"))
-	wj, tok := pullRun(t, e, gh, c, pr)
-	commitIndex(t, c, tok)
-	e.Unavailable(true)
-	gh.CompleteJob(wj, "failure")
-	e.Pass()
-	if es := e.Entries(e.RepositoryOf(repo)); len(es) != 1 || es[0].State != "pending" {
-		t.Fatalf("during an outage, entries %+v", es)
-	}
-	e.Unavailable(false)
-	e.Pass()
-	if es := e.Entries(e.RepositoryOf(repo)); len(es) != 0 {
-		t.Fatalf("after the outage, entries %+v", es)
-	}
 }
 
 // Repositories made at once share the organization's one account.

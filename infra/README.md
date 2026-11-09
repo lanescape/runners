@@ -3,7 +3,7 @@
 The service's own resources (specs/0004-deployment.md, CI and CD):
 
 - the service on Cloud Run, `lanescape-runners`, adopted from the shell `bootstrap/` makes, scaled to zero, with a 10-minute request timeout, one request at a time per instance, CPU allocated outside requests (a supervisor's report starts a pass after its response), its environment and its secrets mounted from Secret Manager;
-- the buckets `lanescape-runners`, for the service's state, and `lanescape-runners-cache`, for the cache's uploads and entries: Standard class, no versions, soft delete off, and a lifecycle rule deleting uploads a day old, the backstop for any the service misses; both with public access prevention, and the service as the only identity granted on either;
+- the bucket `lanescape-runners`, for the service's state, with public access prevention, and the service as the only identity granted on it;
 - the metadata of the App's two secrets, `lanescape-runners-app-key` and `lanescape-runners-webhook-secret`;
 - who may use each of these, set on the resource itself.
 
@@ -11,7 +11,7 @@ The accounts, every project-level grant, the network, Pub/Sub, the scheduler job
 
 ## Who applies it
 
-Only Infrastructure Manager, from CD, as `lanescape-runners-infra`, never anyone by hand. That identity can change nothing but these resources: the buckets and secrets by name, and the Cloud Run service by a grant on it alone. It can't make or delete a Cloud Run service. What it holds that IAM can't limit is in `bootstrap/README.md`, What IAM can't limit. CD starts the apply, from this repository at the commit it has just built, with the image's digest:
+Only Infrastructure Manager, from CD, as `lanescape-runners-infra`, never anyone by hand. That identity can change nothing but these resources: the bucket and secrets by name, and the Cloud Run service by a grant on it alone. It can't make or delete a Cloud Run service. What it holds that IAM can't limit is in `bootstrap/README.md`, What IAM can't limit. CD starts the apply, from this repository at the commit it has just built, with the image's digest:
 
 ```sh
 gcloud infra-manager deployments apply \
@@ -45,4 +45,4 @@ A new version takes effect as instances start; nothing here needs changing.
 
 ## What the programs are given
 
-- **The service:** `RUNNERS_AUDIENCE` (its own URL, which must be `endpoints.Service`, or it refuses to start), `RUNNERS_PROJECT` (the project its machines are in), `RUNNERS_BUCKET`, `RUNNERS_CACHE_BUCKET` (the cache's), `RUNNERS_GITHUB_APP_ID`, `RUNNERS_GITHUB_APP_KEY_FILE`, `RUNNERS_WEBHOOK_SECRET_FILE` and `RUNNERS_RECONCILE_ACCOUNTS` (the scheduler's and the push subscriptions' accounts), as `cmd/runners` reads them; it listens on `PORT`, 8080.
+- **The service:** `RUNNERS_AUDIENCE` (its own URL, which must be `endpoints.Service`, or it refuses to start), `RUNNERS_PROJECT` (the project its machines are in), `RUNNERS_BUCKET`, `RUNNERS_WEBHOOK_TOPIC` (the topic the webhook publishes deliveries to), `RUNNERS_GITHUB_APP_ID`, `RUNNERS_GITHUB_APP_KEY_FILE`, `RUNNERS_WEBHOOK_SECRET_FILE` and `RUNNERS_RECONCILE_ACCOUNTS` (the scheduler's and the push subscriptions' accounts), as `cmd/runners` reads them; it listens on `PORT`, 8080.

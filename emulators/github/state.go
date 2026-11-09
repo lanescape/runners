@@ -4,7 +4,6 @@ import (
 	"cmp"
 	"maps"
 	"slices"
-	"time"
 )
 
 // State is the emulator's state, held still while Read's function runs:
@@ -71,14 +70,6 @@ func (s *State) PullCommits(p *Pull) []string {
 	return s.e.between(p.Base.branches[p.BaseRef], p.HeadSHA)
 }
 
-// Closings are when a pull request was closed, each time it was, as
-// GitHub's pull_request deliveries with action closed would tell, with
-// their closed_at.
-func (s *State) Closings(p *Pull) []time.Time { return slices.Clone(p.closings) }
-
-// Now is the emulator's time.
-func (s *State) Now() time.Time { return s.e.clock.Now() }
-
 // Runs are every workflow run, by ID.
 func (s *State) Runs() []*Run {
 	out := slices.Collect(maps.Values(s.e.runs))
@@ -91,7 +82,3 @@ func (s *State) Run(id int64) *Run { return s.e.runs[id] }
 
 // Job is the workflow job with an ID, or nil.
 func (s *State) Job(id int64) *WorkflowJob { return s.e.jobs[id] }
-
-// Approved reports whether a reviewer approved a run's deployments to an
-// environment.
-func (s *State) Approved(r *Run, env string) bool { return r.approved(env) }

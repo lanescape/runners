@@ -130,31 +130,13 @@ resource "google_project_iam_member" "service_compute_reader" {
   member  = google_service_account.service.member
 }
 
-# The cache hands out V4 signed URLs for one object at a time
-# (specs/0006-cache.md). The service has no key, so it signs with IAM's
-# signBlob, as its own account and only that: this role holds nothing else,
-# and is granted on the service's account alone.
-resource "google_project_iam_custom_role" "signer" {
-  role_id     = "lanescapeRunnersSigner"
-  title       = "Lanescape Runners signer"
-  description = "Signs blobs as an account. Granted only to the service, on its own account, for the cache's signed URLs."
-  permissions = ["iam.serviceAccounts.signBlob"]
-  depends_on  = [google_project_service.apis]
-}
-
-resource "google_service_account_iam_member" "service_signs_as_itself" {
-  service_account_id = google_service_account.service.name
-  role               = google_project_iam_custom_role.signer.name
-  member             = google_service_account.service.member
-}
-
 # --- The infra identity -----------------------------------------------------
 #
 # It holds no project-level IAM administration, no service account creation
 # or keys, no role definitions and no log sinks, so a merged change can't
 # widen what any account holds in the project (specs/0004-deployment.md).
 
-# Exactly the buckets and secrets infra/ manages, and the access to each,
+# Exactly the bucket and secrets infra/ manages, and the access to each,
 # set on the resource itself.
 resource "google_project_iam_custom_role" "infra_named" {
   role_id     = "lanescapeRunnersInfraNamed"

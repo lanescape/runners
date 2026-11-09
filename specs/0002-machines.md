@@ -21,7 +21,7 @@ Jobs don't write selectors by hand: the `runners` action in `lanescape/actions` 
 
 **Saved disks.** `-disk-<family>-<key>` asks for a work disk made from a saved one (specs/0003-disks.md). `<family>` is a name the consumer chooses, 1 to 32 lowercase letters, digits and hyphens, starting with a letter; `<key>` is 20 lowercase hex digits the consumer computes from whatever the disk's contents depend on.
 
-**Scope** is where the run may read and save disks and cache entries, and it's what keeps one run's disks and entries from reaching another's jobs:
+**Scope** is where the run may read and save disks, and it's what keeps one run's disks from reaching another's jobs:
 
 | Scope | The run | Reads | Saves |
 |---|---|---|---|
@@ -30,7 +30,7 @@ Jobs don't write selectors by hand: the `runners` action in `lanescape/actions` 
 | `pr<number>` | A pull request's run, the repository's own or an approved contribution | Its pull request's, then its base's: the listed branch's it targets, or else main's | Its pull request's |
 | `read` | Anything else | Main's | Nothing |
 
-What a scope reads and saves are its saved disks (specs/0003-disks.md) and its cache entries (specs/0006-cache.md) alike. What it reads, in that order, is its **restore chain**: its own scope, if it saves, then its **base**, the scope it falls back to, if it has one. A pull request's base is the listed branch it targets, or else main's; a long-lived branch's push falls back to main's, so a new branch starts warm; `read` reads main's alone, as main does.
+What a scope reads and saves are its saved disks (specs/0003-disks.md). What it reads, in that order, is its **restore chain**: its own scope, if it saves, then its **base**, the scope it falls back to, if it has one. A pull request's base is the listed branch it targets, or else main's; a long-lived branch's push falls back to main's, so a new branch starts warm; `read` reads main's alone, as main does.
 
 **Long-lived branches.** A consumer lists its long-lived branches, such as release branches, in its default branch's `.github/runners.json`, under `"branches"`, each with a name for its scope (specs/0005-interface.md): `{"support/v1": "v1"}` gives pushes to `support/v1` the scope `branch-v1`, which saves and reads as main's does for the default branch. A name is 1 to 16 lowercase letters and digits, starting with a letter, so a scope's name never holds a key's 20 hex digits and a selector reads one way only. The service ignores an entry for the default branch, one whose name isn't valid, and every entry whose name another entry shares, and logs why. Listing a branch trusts everyone who can push to it, as main's scope trusts everyone who can push to the default branch, so a consumer lists only branches it protects as it does the default branch.
 

@@ -30,7 +30,6 @@ func (e *Emulator) routes() http.Handler {
 	mux.HandleFunc("GET /repos/{owner}/{repo}/git/ref/{ref...}", e.authed(e.repo(e.getRef)))
 	mux.HandleFunc("GET /repos/{owner}/{repo}/contents/{path...}", e.authed(e.repo(e.getContents)))
 	e.actionsRoutes(mux)
-	e.cacheRoutes(mux)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "Not Found")
 	})

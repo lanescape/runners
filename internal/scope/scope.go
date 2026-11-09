@@ -1,5 +1,5 @@
-// Package scope is a run's scope: where it may read and save disks and cache
-// entries (specs/0002-machines.md, Scope).
+// Package scope is a run's scope: where it may read and save disks
+// (specs/0002-machines.md, Scope).
 package scope
 
 import (
@@ -58,7 +58,7 @@ func (s Scope) IsMain() bool { return s.main }
 // IsRead reports whether the scope is read.
 func (s Scope) IsRead() bool { return s == Read }
 
-// Saves reports whether jobs in the scope may save disks and cache entries.
+// Saves reports whether jobs in the scope may save disks.
 func (s Scope) Saves() bool { return s.main || s.pr > 0 || s.branch != "" }
 
 // Lasting reports whether the scope is main's or a long-lived branch's:

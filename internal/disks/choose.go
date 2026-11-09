@@ -365,7 +365,7 @@ func (s *Service) chain(ctx context.Context, repo, runID int64, sc scope.Scope) 
 }
 
 // Steps names the steps of the restore order that a choice from a scope
-// came from, exact and newest (specs/0003-disks.md, specs/0006-cache.md).
+// came from, exact and newest (specs/0003-disks.md).
 func Steps(sc scope.Scope) (exact, newest string) {
 	switch {
 	case sc.IsMain():

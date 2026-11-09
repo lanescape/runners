@@ -1,10 +1,8 @@
 package service
 
-import "time"
-
 // World is what a test of the interface drives (specs/0005-interface.md):
 // this package's emulator, or the real service wired to this repository's
-// emulators of GitHub, Google's OIDC issuers and Cloud Storage. Every
+// emulators of GitHub, Google's OIDC issuers, Pub/Sub and Cloud Storage. Every
 // method acts as GitHub would, or as the service would once GitHub tells
 // it something, and fails the test itself if it can't. The conformance
 // suite in package conformance runs against both, and they must agree.
@@ -40,10 +38,6 @@ type World interface {
 	// new head. Runs made before the push keep the event they were made
 	// with.
 	PushPullRequest(pr PullRequest) PullRequest
-	// ClosePullRequest closes a pull request, and the service learns of it
-	// from GitHub's delivery; ReopenPullRequest reopens it.
-	ClosePullRequest(pr PullRequest)
-	ReopenPullRequest(pr PullRequest)
 
 	// Push is the run of a push to a branch, at its commit; Tag the run of
 	// a push of a new tag at the default branch's commit; Event a run of
@@ -56,20 +50,14 @@ type World interface {
 	// default branch's workflows.
 	PullRequestRun(pr PullRequest) Run
 	PullRequestTargetRun(pr PullRequest) Run
-	// Rerun starts a run's next attempt, as a maintainer rerunning it does.
+	// Rerun starts a run's next attempt, as a maintainer rerunning it does:
+	// GitHub shows the run in progress again.
 	Rerun(run Run) Run
-	// Approve records a maintainer's approval of a run's deployments to the
-	// contribution environment.
-	Approve(run Run)
 
 	// StartJob starts a job of a run, on a runner outside the service:
 	// GitHub shows it in progress. workflowRef is its job_workflow_ref, or
 	// empty for the run's own workflow's.
 	StartJob(run Run, workflowRef string) Job
-	// StartMachineJob starts a job of a run on one of the service's own
-	// machines, admitted by its job-started check: the only jobs the
-	// service's own store is open to.
-	StartMachineJob(run Run) Job
 	// Token mints a job's GitHub OIDC token, for the service, with claims
 	// changed by overrides; an override of nil removes a claim.
 	Token(job Job, overrides map[string]any) string
@@ -81,21 +69,9 @@ type World interface {
 	// it can't be reached or limits the service's requests: the service
 	// confirms nothing, and answers 503.
 	Unavailable(on bool)
-	// Pass lets the service do what it does on its own between requests,
-	// such as deleting what's no longer needed.
-	Pass()
-	// Advance moves the service's time on by d, as if that long had passed
-	// with nothing else happening. Tokens are still minted and checked in
-	// real time, as GitHub's are.
-	Advance(d time.Duration)
 
 	// Binding is a run's bound scope, if it has one.
 	Binding(run Run) (string, bool)
-	// Entries are what a repository's jobs saved and committed, that the
-	// service still has.
-	Entries(repo Repository) []Entry
-	// Choices are a run's restore choices.
-	Choices(run Run) []Choice
 }
 
 // Repository is a repository of the organization.
@@ -131,29 +107,4 @@ type Job struct {
 	Run         Run
 	ID          int64
 	WorkflowRef string
-}
-
-// Entry is a cache entry as the service keeps it.
-type Entry struct {
-	ID       string
-	Scope    string
-	Store    string
-	Platform string
-	Family   string
-	Key      string
-	// State is pending, until its job is shown to have succeeded, or ready.
-	State  string
-	Size   int64
-	SHA256 string
-}
-
-// Choice is a run's restore choice for a platform, family and key: the step
-// of the restore order it came from, and its entry's ID, or none.
-type Choice struct {
-	Store    string
-	Platform string
-	Family   string
-	Key      string
-	Step     string
-	Entry    string
 }
