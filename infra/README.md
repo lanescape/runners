@@ -2,7 +2,7 @@
 
 The service's own resources (specs/0004-deployment.md, CI and CD):
 
-- the service on Cloud Run, `lanescape-runners`, adopted from the shell `bootstrap/` makes, scaled to zero, with a 10-minute request timeout and one request at a time per instance, its environment and its secrets mounted from Secret Manager;
+- the service on Cloud Run, `lanescape-runners`, adopted from the shell `bootstrap/` makes, scaled to zero, with a 10-minute request timeout, one request at a time per instance, CPU allocated outside requests (a supervisor's report starts a pass after its response), its environment and its secrets mounted from Secret Manager;
 - the HTTP proxy on Cloud Run, `lanescape-runners-proxy`, adopted the same way;
 - the proxy's git machine, `lsr-proxy-git`: a standard machine on Container-Optimized OS that runs the git server's image, with its mirrors on a persistent disk, `lsr-proxy-git-mirrors`, at a fixed internal address in the service's network;
 - the buckets `lanescape-runners` and `lanescape-runners-proxy`, with public access prevention;
@@ -47,7 +47,7 @@ A new version takes effect as instances start; nothing here needs changing.
 
 ## What the programs are given
 
-- **The service:** `RUNNERS_AUDIENCE` (its own URL), `RUNNERS_BUCKET`, `RUNNERS_GITHUB_APP_ID`, `RUNNERS_GITHUB_APP_KEY_FILE`, `RUNNERS_WEBHOOK_SECRET_FILE` and `RUNNERS_RECONCILE_ACCOUNTS` (the scheduler's and the push subscriptions' accounts), as `cmd/runners` reads them; it listens on `PORT`, 8080.
+- **The service:** `RUNNERS_AUDIENCE` (its own URL, which must be `endpoints.Service`, or it refuses to start), `RUNNERS_PROJECT` (the project its machines are in), `RUNNERS_BUCKET`, `RUNNERS_GITHUB_APP_ID`, `RUNNERS_GITHUB_APP_KEY_FILE`, `RUNNERS_WEBHOOK_SECRET_FILE` and `RUNNERS_RECONCILE_ACCOUNTS` (the scheduler's and the push subscriptions' accounts), as `cmd/runners` reads them; it listens on `PORT`, 8080.
 - **The HTTP proxy:** `RUNNERS_AUDIENCE` (its own URL), `RUNNERS_PROXY_BUCKET` (its own bucket), `RUNNERS_BUCKET` (the service's, to check callers), `RUNNERS_GITHUB_APP_ID` and `RUNNERS_GITHUB_APP_KEY_FILE`; it listens on `PORT`.
 - **The git server:** a container listening on `PORT`, 8443, published on the machine's port 443, with `RUNNERS_AUDIENCE` (the proxy's URL), `RUNNERS_BUCKET` and its mirrors in `RUNNERS_MIRRORS`, `/var/lib/proxy-git`, a directory owned by UID 65532. Its image must hold `git`.
 

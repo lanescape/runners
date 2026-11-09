@@ -50,17 +50,24 @@ resource "google_cloud_run_v2_service" "service" {
         container_port = 8080
       }
 
+      # CPU stays allocated outside requests: a supervisor's report starts
+      # a pass after its response has been sent.
       resources {
         limits = {
           cpu    = "1"
           memory = "512Mi"
         }
-        cpu_idle = true
+        cpu_idle = false
       }
 
+      # The service refuses to start unless this is endpoints.Service.
       env {
         name  = "RUNNERS_AUDIENCE"
         value = local.service_url
+      }
+      env {
+        name  = "RUNNERS_PROJECT"
+        value = var.project_id
       }
       env {
         name  = "RUNNERS_BUCKET"
