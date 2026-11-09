@@ -718,3 +718,24 @@ func TestASpotMachinePreemptedMidJobAndItsRunResumed(t *testing.T) {
 	})
 	w.noCredentials()
 }
+
+// An action binding a run while GitHub can't confirm it gets a retryable
+// answer, and binds once it can.
+func TestBindingWhileGitHubIsDown(t *testing.T) {
+	w := newWorld(t)
+	run := w.gh.PushRun(w.repo, "main")
+	tok := w.gh.ActionsToken(run, ghemu.Job{Audience: w.act.service}, nil)
+	w.gh.ServerError("/repos/lanescape/app/compare/", http.StatusBadGateway, 1)
+	if a := w.act.bind(tok, nil); a.Status != http.StatusServiceUnavailable {
+		t.Fatalf("bind with GitHub down: %d", a.Status)
+	}
+	if a := w.act.bind(tok, nil); a.Status != http.StatusOK || a.Scope != "main" {
+		t.Fatalf("bind once GitHub is back: %+v", a)
+	}
+	// A finished run isn't one the service binds.
+	done := w.gh.PushRun(w.repo, "main")
+	w.gh.SetRunStatus(done, "completed")
+	if a := w.act.bind(w.gh.ActionsToken(done, ghemu.Job{Audience: w.act.service}, nil), nil); a.Status != http.StatusForbidden {
+		t.Fatalf("bind of a finished run: %+v", a)
+	}
+}

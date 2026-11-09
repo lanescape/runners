@@ -383,6 +383,9 @@ func (e *Emulator) instanceJSON(in *instance) *gce.Instance {
 	if in.maxRun > 0 {
 		out.Scheduling.MaxRunDuration = &gce.Duration{Seconds: int64(in.maxRun / time.Second)}
 	}
+	if !in.stopped.IsZero() {
+		out.LastStopTimestamp = in.stopped.Format(timeFormat)
+	}
 	for _, it := range in.metadata {
 		out.Metadata.Items = append(out.Metadata.Items, &gce.MetadataItems{Key: it.key, Value: new(it.value)})
 	}
@@ -1031,6 +1034,9 @@ func (e *Emulator) deleteImage(r *http.Request, _ string) (*operation, *apiError
 		return nil, notFound("projects/" + e.Project + "/global/images/" + r.PathValue("name"))
 	}
 	op := e.newOp("", "delete", e.imageURL(im), im.id)
+	if code, ok := e.failing("images.delete"); ok {
+		return op.fail(http.StatusInternalServerError, code, "The operation failed."), nil
+	}
 	delete(e.images, im.name)
 	return op, nil
 }

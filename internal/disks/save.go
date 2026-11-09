@@ -319,25 +319,21 @@ func (s *Service) markOne(ctx context.Context, rec Image, gen int64) (Image, err
 }
 
 // mark marks images for deletion under the consumer's disks lease, except
-// those a choice names or a claim of an unfinished job holds, each read
-// afresh; it returns those it marked. One whose record changed since it was
-// read is left for a later pass.
-func (s *Service) mark(ctx context.Context, repo int64, images []string, finished map[int64]bool) ([]Image, error) {
+// those a choice names or a claim of an unfinished job holds, read inside
+// the lease after the candidates were; it returns those it marked. Each is
+// marked only at the generation its candidate was read at, when the
+// decision to delete it was made, so a choice or use of it since then,
+// which rewrites the record, leaves it for a later pass.
+func (s *Service) mark(ctx context.Context, repo int64, cands []record[Image], finished map[int64]bool) ([]Image, error) {
 	var marked []Image
 	err := s.step(ctx, repo, func(ctx context.Context) error {
 		named, err := s.named(ctx, repo, finished)
 		if err != nil {
 			return err
 		}
-		for _, name := range images {
-			if named[name] {
-				continue
-			}
-			rec, gen, ok, err := getJSON[Image](ctx, s.Objects, imageKey(repo, name))
-			if err != nil {
-				return err
-			}
-			if !ok || rec.State != ImageReady {
+		for _, c := range cands {
+			rec, gen := c.v, c.gen
+			if named[rec.Image] || rec.State != ImageReady {
 				continue
 			}
 			v, err := s.markOne(ctx, rec, gen)
@@ -360,7 +356,7 @@ func (s *Service) deleteMarked(ctx context.Context, rec Image) error {
 	if rec.State != ImageMarked {
 		return fmt.Errorf("image %s isn't marked for deletion", rec.Image)
 	}
-	err := s.Compute.DeleteImage(ctx, rec.Image, compute.RequestID("delete image", rec.Image))
+	err := s.Compute.DeleteImage(ctx, rec.Image, freshID("delete image", rec.Image))
 	if err != nil && !errors.Is(err, compute.ErrNotFound) {
 		return err
 	}
@@ -385,18 +381,18 @@ func (s *Service) supersede(ctx context.Context, rec Image) error {
 	if err != nil {
 		return err
 	}
-	var older []string
+	var older []record[Image]
 	for _, r := range recs {
 		v := r.v
 		if v.Kind == KindSaved && v.State == ImageReady && v.Image != rec.Image && v.Scope == rec.Scope && v.Arch == rec.Arch &&
 			v.Family == rec.Family && v.Key == rec.Key && v.SavedAt.Before(rec.SavedAt) {
-			older = append(older, v.Image)
+			older = append(older, r)
 		}
 	}
 	if len(older) == 0 {
 		return nil
 	}
-	slices.Sort(older)
+	slices.SortFunc(older, func(x, y record[Image]) int { return strings.Compare(x.v.Image, y.v.Image) })
 	marked, err := s.mark(ctx, rec.RepositoryID, older, nil)
 	if err != nil {
 		return err

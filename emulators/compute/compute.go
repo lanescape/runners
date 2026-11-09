@@ -113,6 +113,7 @@ type instance struct {
 	maxRun         time.Duration
 	hostMaint      string
 	started        time.Time
+	stopped        time.Time
 	guest          map[string]string // namespace/key
 	serial         strings.Builder
 }
@@ -260,7 +261,7 @@ func (e *Emulator) RefuseForCapacity(zone, machineType string, spot bool) {
 }
 
 // FailNextOperation makes the next operation of a kind, "instances.delete",
-// "disks.insert" or "images.insert", finish with an error of code, such as INTERNAL_ERROR or
+// "disks.insert", "images.insert" or "images.delete", finish with an error of code, such as INTERNAL_ERROR or
 // RESOURCE_NOT_READY, having done nothing, as Compute Engine sometimes does
 // after accepting a request.
 func (e *Emulator) FailNextOperation(kind, code string) {
@@ -353,6 +354,9 @@ func (e *Emulator) boot(in *instance) {
 // e.mu.
 func (e *Emulator) halt(in *instance, status string) {
 	was := in.status == "RUNNING"
+	if was {
+		in.stopped = e.clock.Now()
+	}
 	in.status = status
 	delete(e.booted, in.id)
 	if was && e.onStop != nil {

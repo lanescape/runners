@@ -410,6 +410,9 @@ func TestBind(t *testing.T) {
 		{"unknown field", tok, `{"scope": "main"}`, http.StatusForbidden},
 		{"not JSON", tok, `pr1`, http.StatusForbidden},
 		{"two objects", tok, `{} {}`, http.StatusForbidden},
+		{"a stray bracket", tok, `{}]`, http.StatusForbidden},
+		{"a stray brace", tok, `{}}`, http.StatusForbidden},
+		{"trailing text", tok, `{} x`, http.StatusForbidden},
 		{"too large", tok, `{"pull_request": 1` + strings.Repeat(" ", 5000) + `}`, http.StatusForbidden},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

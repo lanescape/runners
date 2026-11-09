@@ -256,6 +256,24 @@ func TestReruns(t *testing.T) {
 			}
 		}
 	})
+	t.Run("a third attempt whose rerun failed once", func(t *testing.T) {
+		e := setup(t)
+		run := e.mainRun()
+		jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+		jb.preempt()
+		e.pass()
+		jb = e.admit(run, e.rerunJob(run, 2, "build"))
+		jb.preempt()
+		e.gh.ServerError("/repos/lanescape/app/actions/runs/"+strconv.FormatInt(run.ID, 10)+"/rerun-failed-jobs", 502, 1)
+		e.pass()
+		if e.attempt(run) != 2 {
+			t.Fatal("rerun despite the error")
+		}
+		e.pass()
+		if e.attempt(run) != 3 {
+			t.Fatalf("attempt %d; the failed rerun wasn't asked for again", e.attempt(run))
+		}
+	})
 	t.Run("a GitHub answer that's lost", func(t *testing.T) {
 		e := setup(t)
 		run := e.mainRun()
@@ -271,6 +289,54 @@ func TestReruns(t *testing.T) {
 			t.Fatal("not rerun after GitHub came back")
 		}
 	})
+}
+
+func TestADayCountsFromTheStop(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+	stopped := e.clock.Now().UTC()
+	if err := e.gce.Preempt(jb.in.Zone, jb.in.Name); err != nil {
+		t.Fatal(err)
+	}
+	// The service was down for an hour.
+	e.clock.Advance(time.Hour)
+	e.pass()
+	rec, _ := e.record("preemptions/5001/" + strconv.FormatInt(run.ID, 10) + "/" + strconv.FormatUint(jb.in.ID, 10) + ".json")
+	at, _ := time.Parse(time.RFC3339Nano, rec["stopped_at"].(string))
+	// Compute Engine's timestamps are in milliseconds.
+	if d := at.Sub(stopped); d < -time.Second || d > time.Second {
+		t.Fatalf("stopped at %s, but the machine stopped at %s", at, stopped)
+	}
+	img, _ := e.record("images/5001/" + disks.ResumeName(repoID, jb.in.ID) + ".json")
+	if img["size_gb"] != float64(50) {
+		t.Fatalf("resume image record = %v; want its disk's size", img)
+	}
+	e.clock.Advance(disks.ResumeKept - time.Hour + time.Minute)
+	e.pass()
+	if e.has(disks.ResumeName(repoID, jb.in.ID)) {
+		t.Fatal("a resume image outlived a day from its machine's stop")
+	}
+}
+
+func TestAClaimedResumeImageGoesAfterADayAllTheSame(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+	jb.preempt()
+	e.pass()
+	resume := disks.ResumeName(repoID, jb.in.ID)
+	e.clock.Advance(disks.ResumeKept - time.Hour)
+	// The rerun's job claims it late in its day, and runs on.
+	again := e.admit(run, e.rerunJob(run, 2, "build"))
+	if again.source() != resume {
+		t.Fatal("no resume")
+	}
+	e.clock.Advance(2 * time.Hour)
+	e.pass()
+	if e.has(resume) {
+		t.Fatal("a claimed resume image outlived its day")
+	}
 }
 
 func TestAResumeImageGoesADayAfterItsMachineStopped(t *testing.T) {

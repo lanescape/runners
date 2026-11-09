@@ -40,6 +40,31 @@ func TestAChoiceWaitsForTheLease(t *testing.T) {
 	if jb.source() != img {
 		t.Fatalf("restored %q, want %s", jb.source(), img)
 	}
+	// The run's next job reuses its choice, under the lease too.
+	release = e.hold()
+	next := e.take(run, e.gh.Queue(run, ghemu.JobSpec{Name: "test", Labels: []string{sel(key1, "main")}}))
+	if code := next.started(); code != http.StatusServiceUnavailable {
+		t.Fatalf("reusing a choice while the disks' lease is held: %d, want a retryable 503", code)
+	}
+	release()
+	if code := next.started(); code != http.StatusOK || next.source() != img {
+		t.Fatalf("reusing the choice: %d, %q", code, next.source())
+	}
+}
+
+func TestADeletionThatFailedIsTriedAgain(t *testing.T) {
+	e := setup(t)
+	old := e.saveMain(key1)
+	e.clock.Advance(time.Minute)
+	e.gce.FailNextOperation("images.delete", "INTERNAL_ERROR")
+	newer := e.saveMain(key1)
+	if !e.has(old) {
+		t.Fatal("the deletion didn't fail")
+	}
+	e.pass()
+	if e.has(old) || !e.has(newer) {
+		t.Fatal("a marked image whose deletion failed wasn't deleted on the next try")
+	}
 }
 
 func TestMarkingWaitsForTheLease(t *testing.T) {

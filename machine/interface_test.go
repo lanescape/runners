@@ -50,10 +50,13 @@ func (a action) bind(token string, event *bindEvent) bindAnswer {
 	}
 	defer resp.Body.Close()
 	var out struct {
-		Scope  string `json:"scope"`
-		Reason string `json:"reason"`
+		Scope     string `json:"scope"`
+		Reason    string `json:"reason"`
+		Retryable bool   `json:"retryable"`
 	}
-	_ = json.NewDecoder(resp.Body).Decode(&out)
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		a.t.Fatalf("bind answered %d with a body that isn't JSON: %v", resp.StatusCode, err)
+	}
 	switch resp.StatusCode {
 	case http.StatusOK:
 		if !scopePattern.MatchString(out.Scope) {
@@ -64,6 +67,9 @@ func (a action) bind(token string, event *bindEvent) bindAnswer {
 			a.t.Fatal("bind answered 403 with no reason")
 		}
 	case http.StatusServiceUnavailable:
+		if !out.Retryable || resp.Header.Get("Retry-After") == "" {
+			a.t.Fatalf("bind answered 503 without retryable and Retry-After: %+v", out)
+		}
 	default:
 		a.t.Fatalf("bind answered %d, which the interface doesn't have", resp.StatusCode)
 	}

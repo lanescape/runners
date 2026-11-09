@@ -92,7 +92,10 @@ type Instance struct {
 	Status      string
 	Spot        bool
 	Created     time.Time
-	Labels      map[string]string
+	// LastStop is when Compute Engine last stopped it, for whatever
+	// reason, zero if it never has.
+	LastStop time.Time
+	Labels   map[string]string
 	// Metadata holds the instance's metadata, which can include
 	// credentials: never log it.
 	Metadata map[string]string
@@ -370,7 +373,7 @@ func parseTime(s string) time.Time {
 
 func instanceOf(i *gce.Instance) Instance {
 	out := Instance{Name: i.Name, ID: i.Id, Zone: last(i.Zone), MachineType: last(i.MachineType), Status: i.Status,
-		Created: parseTime(i.CreationTimestamp), Labels: i.Labels, Metadata: map[string]string{}}
+		Created: parseTime(i.CreationTimestamp), LastStop: parseTime(i.LastStopTimestamp), Labels: i.Labels, Metadata: map[string]string{}}
 	if i.Scheduling != nil {
 		out.Spot = i.Scheduling.ProvisioningModel == "SPOT"
 	}

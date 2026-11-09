@@ -148,7 +148,10 @@ func (s *Service) resume(ctx context.Context, m machines.Machine, a machines.Adm
 
 // restore is the run's restore choice for the job's selector, picked and
 // recorded under the disks' lease the first time, then the same for every
-// job of the run with that selector. It returns nil for an empty disk.
+// job of the run with that selector. A recorded choice is read, and its
+// image touched, under the lease too, so a pass that drops the choice or
+// marks the image does so wholly before or after. It returns nil for an
+// empty disk.
 func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Admission) (*Image, error) {
 	repo, sel := m.RepositoryID, m.Selector
 	key := choiceKey(repo, a.RunID, sel)
@@ -173,14 +176,6 @@ func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Ad
 		}
 		return &rec, matches(im, rec), nil
 	}
-	if c, _, ok, err := getJSON[Choice](ctx, s.Objects, key); err != nil {
-		return nil, err
-	} else if ok {
-		im, good, err := valid(ctx, c)
-		if err != nil || good {
-			return im, err
-		}
-	}
 	var out *Image
 	err := s.step(ctx, repo, func(ctx context.Context) error {
 		c, gen, ok, err := getJSON[Choice](ctx, s.Objects, key)
@@ -193,6 +188,11 @@ func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Ad
 				return err
 			}
 			if good {
+				if im != nil {
+					if err := s.touch(ctx, repo, im.Image); err != nil {
+						return err
+					}
+				}
 				out = im
 				return nil
 			}

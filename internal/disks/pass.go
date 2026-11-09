@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/lanescape/runners/internal/compute"
 	"github.com/lanescape/runners/internal/github"
@@ -196,11 +197,14 @@ func (s *Service) runState(ctx context.Context, st *state, repoID, runID int64) 
 				r.failed[j.ID] = true
 			}
 		}
-		asked := 0
+		// An attempt already recorded as rerun, which GitHub still shows
+		// as the latest, is one whose rerun didn't take: it's asked for
+		// again, without counting again.
+		asked, pending := 0, false
 		if rr, ok := st.reruns[rerunKey(repoID, runID)]; ok {
-			asked = len(rr.v.Attempts)
+			asked, pending = len(rr.v.Attempts), slices.Contains(rr.v.Attempts, r.attempt)
 		}
-		if r.attempt < MaxAttempts && asked < MaxAttempts-1 {
+		if r.attempt < MaxAttempts && (asked < MaxAttempts-1 || pending) {
 			for _, p := range st.preemptions {
 				v := p.v
 				if v.RepositoryID != repoID || v.RunID != runID || v.RunAttempt != r.attempt || !r.failed[v.JobID] {
@@ -282,14 +286,35 @@ func (s *Service) rerun(ctx context.Context, st *state, repoID, runID int64, rs 
 
 // dropChoices drops the restore choices of runs that have finished and have
 // no automatic rerun left; a later rerun, by a maintainer, picks again.
+// Each is dropped under the disks' lease, which every reading of a choice
+// takes, once GitHub shows its run still finished: a rerun's job that read
+// the choice first has its run shown in progress, and one that comes after
+// picks again.
 func (s *Service) dropChoices(ctx context.Context, st *state) {
+	byRepo := map[int64][]string{}
 	for key, r := range st.choices {
 		rs, err := s.runState(ctx, st, r.v.RepositoryID, r.v.RunID)
 		if err != nil || !rs.finished || rs.due {
 			continue
 		}
-		if err := s.Objects.Delete(ctx, key, r.gen); err == nil || errors.Is(err, store.ErrNotFound) {
-			delete(st.choices, key)
+		byRepo[r.v.RepositoryID] = append(byRepo[r.v.RepositoryID], key)
+	}
+	for repo, keys := range byRepo {
+		slices.Sort(keys)
+		err := s.step(ctx, repo, func(ctx context.Context) error {
+			for _, key := range keys {
+				r := st.choices[key]
+				if ok, err := s.settled(ctx, repo, r.v.RunID); err != nil || !ok {
+					continue
+				}
+				if err := s.Objects.Delete(ctx, key, r.gen); err == nil || errors.Is(err, store.ErrNotFound) {
+					delete(st.choices, key)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			s.log().Warn("dropping finished runs' restore choices", "repository_id", repo, "err", err.Error())
 		}
 	}
 }
@@ -372,11 +397,11 @@ func (s *Service) expire(ctx context.Context, st *state) {
 		}
 		recs := byRepo[repo]
 		finished := map[int64]bool{}
-		var due []string
+		var due []record[Image]
 		why := map[string]string{}
 		add := func(image, reason string) {
 			if _, ok := why[image]; !ok {
-				due = append(due, image)
+				due = append(due, recs[image])
 				why[image] = reason
 			}
 		}
@@ -424,6 +449,16 @@ func (s *Service) expire(ctx context.Context, st *state) {
 				}
 			case KindResume:
 				c, claimed := st.claims[claimKey(repo, v.Image)]
+				// A day after its machine stopped, it goes whatever its
+				// record or claim says: a claimed job's disk is made by
+				// then, or chooses again.
+				if s.now().Sub(v.SavedAt) >= ResumeKept {
+					if claimed {
+						finished[c.v.JobID] = true
+					}
+					add(v.Image, "a day since its machine stopped")
+					continue
+				}
 				if claimed {
 					done, err := s.finishedJob(ctx, st, repo, c.v.JobID)
 					if err != nil {
@@ -433,17 +468,13 @@ func (s *Service) expire(ctx context.Context, st *state) {
 					if done {
 						finished[c.v.JobID] = true
 						add(v.Image, "its job has finished")
-						continue
 					}
-				}
-				if s.now().Sub(v.SavedAt) >= ResumeKept {
-					add(v.Image, "a day since its machine stopped")
 				}
 			}
 		}
 		var marked []Image
 		if len(due) > 0 {
-			slices.Sort(due)
+			slices.SortFunc(due, func(x, y record[Image]) int { return strings.Compare(x.v.Image, y.v.Image) })
 			var err error
 			if marked, err = s.mark(ctx, repo, due, finished); err != nil {
 				s.log().Warn("marking images for deletion", "repository_id", repo, "err", err.Error())
@@ -498,7 +529,7 @@ func (s *Service) tidy(ctx context.Context, st *state) {
 		if recorded[name] {
 			continue
 		}
-		if err := s.Compute.DeleteImage(ctx, name, compute.RequestID("delete image", name)); err != nil && !errors.Is(err, compute.ErrNotFound) {
+		if err := s.Compute.DeleteImage(ctx, name, freshID("delete image", name)); err != nil && !errors.Is(err, compute.ErrNotFound) {
 			s.log().Warn("deleting an orphaned image", "image", name, "err", err.Error())
 			continue
 		}

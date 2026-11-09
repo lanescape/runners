@@ -284,7 +284,7 @@ func (s *server) bind(w http.ResponseWriter, r *http.Request) {
 	if len(bytes.TrimSpace(body)) > 0 {
 		dec := json.NewDecoder(bytes.NewReader(body))
 		dec.DisallowUnknownFields()
-		if err := dec.Decode(&req); err != nil || dec.More() {
+		if err := dec.Decode(&req); err != nil || dec.Decode(&struct{}{}) != io.EOF {
 			refuse("the body isn't a binding request")
 			return
 		}

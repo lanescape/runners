@@ -31,10 +31,16 @@ func (s *Service) Stopped(ctx context.Context, m machines.Machine, a machines.Ad
 	if preempted {
 		evidence = Preempted
 	}
+	// The day a resume image is kept, and evidence looked for, counts from
+	// when Compute Engine stopped the machine, not from when a pass saw it.
+	stopped := m.LastStop.UTC()
+	if stopped.IsZero() || stopped.After(s.now()) {
+		stopped = s.now()
+	}
 	key := preemptionKey(repo, a.RunID, m.ID)
 	rec, gen, err := createOnce(ctx, s.Objects, key, Preemption{InstanceID: m.ID, Machine: m.Name, Zone: m.Zone, RepositoryID: repo,
 		JobID: a.JobID, RunnerID: m.RunnerID, JobName: a.JobName, RunID: a.RunID, RunAttempt: a.RunAttempt, Selector: a.Selector,
-		Preempted: evidence, StoppedAt: s.now()})
+		Preempted: evidence, StoppedAt: stopped})
 	if err != nil {
 		return err
 	}
@@ -73,11 +79,15 @@ func (s *Service) Stopped(ctx context.Context, m machines.Machine, a machines.Ad
 		return err
 	}
 	if im.SizeGB == 0 && im.State == ImageMaking {
-		if d, err := s.Compute.Disk(ctx, m.Zone, machines.WorkDisk(m.Name)); err == nil {
-			im.SizeGB = d.SizeGB
-			if igen, err = replaceJSON(ctx, s.Objects, ikey, im, igen); err != nil {
-				return err
-			}
+		// A resume image's disk is made at least this size, so it's never
+		// ready without it.
+		d, err := s.Compute.Disk(ctx, m.Zone, machines.WorkDisk(m.Name))
+		if err != nil {
+			return err
+		}
+		im.SizeGB = d.SizeGB
+		if igen, err = replaceJSON(ctx, s.Objects, ikey, im, igen); err != nil {
+			return err
 		}
 	}
 	if im, _, err = s.make(ctx, ikey, im, igen); err != nil {

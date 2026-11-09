@@ -25,6 +25,8 @@ package disks
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -369,6 +371,16 @@ func listJSON[T any](ctx context.Context, o store.Objects, prefix string) (map[s
 type record[T any] struct {
 	v   T
 	gen int64
+}
+
+// freshID is a request ID for a deletion, new each time it's tried:
+// Compute Engine answers an ID it has seen with its first outcome, even a
+// failure, and a deletion is safe to ask for again. Within one call, a
+// retry with no answer keeps the ID.
+func freshID(parts ...string) string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return compute.RequestID(append(parts, hex.EncodeToString(b[:]))...)
 }
 
 // errBusy means the disks' lease was held for longer than a step waits.
