@@ -57,6 +57,10 @@ type World interface {
 	// GitHub shows it in progress. workflowRef is its job_workflow_ref, or
 	// empty for the run's own workflow's.
 	StartJob(run Run, workflowRef string) Job
+	// StartMachineJob starts a job of a run on one of the service's own
+	// machines, admitted by its job-started check: the only jobs the
+	// service's own store is open to.
+	StartMachineJob(run Run) Job
 	// Token mints a job's GitHub OIDC token, for the service, with claims
 	// changed by overrides; an override of nil removes a claim.
 	Token(job Job, overrides map[string]any) string
@@ -120,6 +124,7 @@ type Job struct {
 type Entry struct {
 	ID       string
 	Scope    string
+	Store    string
 	Platform string
 	Family   string
 	Key      string
@@ -132,6 +137,7 @@ type Entry struct {
 // Choice is a run's restore choice for a platform, family and key: the step
 // of the restore order it came from, and its entry's ID, or none.
 type Choice struct {
+	Store    string
 	Platform string
 	Family   string
 	Key      string

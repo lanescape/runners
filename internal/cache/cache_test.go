@@ -31,19 +31,24 @@ type env struct {
 	c     *conformance.Client
 	clock *clockwork.FakeClock
 	repo  service.Repository
+	// store is the store the test uses; the service's, unless it says.
+	store string
 }
 
 func setup(t *testing.T) *env {
 	t.Helper()
 	clock := clockwork.NewFakeClockAt(time.Now())
 	w := servicetest.New(t, clock)
-	e := &env{World: w, t: t, c: &conformance.Client{T: t, URL: w.URL()}, clock: clock}
+	e := &env{World: w, t: t, c: &conformance.Client{T: t, URL: w.URL()}, clock: clock, store: cache.ServiceStore}
 	e.repo = w.Repository("app")
 	return e
 }
 
 func (e *env) job(run service.Run) (service.Job, string) {
 	j := e.StartJob(run, "")
+	if e.store == cache.ServiceStore {
+		j = e.StartMachineJob(run)
+	}
 	return j, e.Token(j, nil)
 }
 
@@ -64,12 +69,18 @@ func (e *env) save(run service.Run, key string, data []byte) string {
 		before[en.ID] = true
 	}
 	j, tok := e.job(run)
-	_, r := e.c.Save(tok, linux, "build", key)
-	e.c.Upload(r, data, 1<<20, false)
-	if a := e.c.Commit(tok, r.ID, int64(len(data)), conformance.Sum(data)); a.Status != http.StatusOK {
+	var id string
+	if e.store == cache.ServiceStore {
+		_, r := e.c.Save(tok, linux, "build", key)
+		e.c.Upload(r, data, 1<<20, false)
+		id = r.ID
+	} else {
+		_, id = e.c.SaveIndex(tok, e.store, linux, "build", key, int64(len(data)), conformance.Sum(data))
+	}
+	if a := e.c.Commit(tok, id, int64(len(data)), conformance.Sum(data)); a.Status != http.StatusOK {
 		e.t.Fatalf("commit: %d %s", a.Status, a.Reason)
 	}
-	var id string
+	id = ""
 	for _, en := range e.Entries(e.repo) {
 		if !before[en.ID] {
 			id = en.ID
@@ -109,7 +120,7 @@ func (e *env) objects(prefix string) []string {
 func (e *env) restore(run service.Run, key string) *conformance.Restored {
 	e.t.Helper()
 	_, tok := e.job(run)
-	a, r := e.c.Restore(tok, linux, "build", key, false)
+	a, r := e.c.Restore(tok, e.store, linux, "build", key, false)
 	if a.Status != http.StatusOK {
 		e.t.Fatalf("restore: %d %s", a.Status, a.Reason)
 	}
@@ -146,7 +157,7 @@ func TestARunsChoiceKeepsWhatItChose(t *testing.T) {
 	}
 	// Once the run has finished, with no rerun due, its choice goes, and
 	// so does the entry.
-	e.GitHub.SetRunStatus(e.WorkflowJob(e.StartJob(run, "")).Run, "completed")
+	e.FinishRun(run, "success")
 	e.Pass()
 	e.Pass()
 	if e.has(old) {
@@ -175,7 +186,7 @@ func TestLastingScopesKeepTheirTwoNewestKeys(t *testing.T) {
 	run := e.PullRequestRun(pr)
 	e.bind(run, fmt.Sprintf("pr%d", pr.Number))
 	e.restore(run, key1)
-	e.GitHub.SetRunStatus(e.WorkflowJob(e.StartJob(run, "")).Run, "completed")
+	e.FinishRun(run, "success")
 	e.clock.Advance(time.Second)
 	k2 := e.mainSave(key2, []byte("2"))
 	e.clock.Advance(time.Second)
@@ -213,7 +224,7 @@ func TestUnusedEntriesGo(t *testing.T) {
 	run := e.PullRequestRun(pr)
 	e.bind(run, fmt.Sprintf("pr%d", pr.Number))
 	own := e.save(run, key2, []byte("pr"))
-	e.GitHub.SetRunStatus(e.WorkflowJob(e.StartJob(run, "")).Run, "completed")
+	e.FinishRun(run, "success")
 	e.clock.Advance(cache.PullRequestUnused - time.Hour)
 	e.Pass()
 	if !e.has(own) {
@@ -326,5 +337,65 @@ func TestNothingSecretIsLogged(t *testing.T) {
 	}
 	if !strings.Contains(logs, `msg="cache restore choice"`) || !strings.Contains(logs, "step=main_exact") {
 		t.Fatal("the restore choice wasn't logged")
+	}
+}
+
+// An index's entries keep every rule the service's store's do, and no
+// object of the cache's bucket is ever involved.
+func TestAnIndexsEntriesFollowTheSameRules(t *testing.T) {
+	e := setup(t)
+	e.store = "actions"
+	old := e.mainSave(key1, []byte("old"))
+	e.clock.Advance(time.Second)
+	newer := e.mainSave(key1, []byte("new"))
+	if e.has(old) || !e.has(newer) {
+		t.Fatalf("old %v, new %v", e.has(old), e.has(newer))
+	}
+	pr := e.PullRequest(e.repo, "main", "fix")
+	run := e.PullRequestRun(pr)
+	e.bind(run, fmt.Sprintf("pr%d", pr.Number))
+	first := e.save(run, key1, []byte("one"))
+	e.clock.Advance(time.Second)
+	second := e.save(run, key2, []byte("two"))
+	if e.has(first) || !e.has(second) {
+		t.Fatalf("first %v, second %v", e.has(first), e.has(second))
+	}
+	failed := e.Push(e.repo, "main")
+	e.bind(failed, "main")
+	j, tok := e.job(failed)
+	_, id := e.c.SaveIndex(tok, e.store, linux, "build", key3, 1, conformance.Sum([]byte("x")))
+	e.c.Commit(tok, id, 1, conformance.Sum([]byte("x")))
+	e.FinishJob(j, "failure")
+	for _, en := range e.Entries(e.repo) {
+		if en.Key == key3 {
+			t.Fatal("a failed job's index entry stayed")
+		}
+	}
+	e.ClosePullRequest(pr)
+	if e.has(second) {
+		t.Fatal("a closed pull request's index entry stayed")
+	}
+	if objs := e.objects(""); len(objs) != 0 {
+		t.Fatalf("an index's entries touched the bucket: %v", objs)
+	}
+}
+
+// The service's store is open only to a job its machine's job-started
+// check admitted, by GitHub's runner name and the admission's job.
+func TestTheServicesStoreNeedsTheAdmittedJob(t *testing.T) {
+	e := setup(t)
+	run := e.Push(e.repo, "main")
+	e.bind(run, "main")
+	j := e.StartMachineJob(run)
+	wj := e.WorkflowJob(j)
+	// Another job of the run, on a runner named like a machine whose
+	// admission was for the first job.
+	other := e.StartJob(run, "")
+	e.GitHub.RunJobOn(e.WorkflowJob(other), wj.Runner.Name)
+	if a, _ := e.c.Restore(e.Token(other, nil), cache.ServiceStore, linux, "build", key1, false); a.Status != http.StatusForbidden {
+		t.Fatalf("a job its machine didn't admit answered %d", a.Status)
+	}
+	if a, _ := e.c.Restore(e.Token(j, nil), cache.ServiceStore, linux, "build", key1, false); a.Status != http.StatusOK {
+		t.Fatalf("the admitted job answered %d: %s", a.Status, a.Reason)
 	}
 }

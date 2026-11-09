@@ -31,33 +31,39 @@ var (
 	platformPattern = regexp.MustCompile(`^[a-z0-9]{1,16}-[a-z0-9]{1,16}$`)
 	sha256Pattern   = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	idPattern       = regexp.MustCompile(`^[0-9a-f]{32}$`)
+	storePattern    = regexp.MustCompile(`^[a-z0-9]{1,16}$`)
 )
 
+// ServiceStore is the store whose entries' bytes the service keeps, open
+// only to jobs on its own machines; every other store is an index.
+const ServiceStore = "service"
+
 type entry struct {
-	id, scope, platform, family, key string
-	repo                             int64
-	state                            string
-	object                           string
-	size                             int64
-	sha256                           string
-	job                              int64
-	boundAt, committedAt             time.Time
+	id, scope, store, platform, family, key string
+	repo                                    int64
+	state                                   string
+	object                                  string
+	size                                    int64
+	sha256                                  string
+	job                                     int64
+	boundAt, committedAt                    time.Time
 }
 
 type reservation struct {
-	id, scope, platform, family, key string
-	repo, run, job                   int64
-	boundAt, expires                 time.Time
-	entry                            string
-	size                             int64
-	sha256                           string
+	id, scope, store, platform, family, key string
+	repo, run, job                          int64
+	boundAt, expires                        time.Time
+	entry                                   string
+	size                                    int64
+	sha256                                  string
+	committed                               bool
 }
 
 type choice struct {
-	run                   int64
-	platform, family, key string
-	step, entry           string
-	attempt               int
+	run                          int64
+	store, platform, family, key string
+	step, entry                  string
+	attempt                      int
 }
 
 func randomID() string {
@@ -81,6 +87,7 @@ type caller struct {
 	c       *claims
 	repo    *repo
 	run     *run
+	job     *job
 	binding *binding
 }
 
@@ -151,7 +158,16 @@ func (e *Emulator) caller(c *claims) (*caller, error) {
 			return nil, refuse("the contribution's run has no approval of the contribution environment")
 		}
 	}
-	return &caller{c: c, repo: rp, run: jb.run, binding: b}, nil
+	return &caller{c: c, repo: rp, run: jb.run, job: jb, binding: b}, nil
+}
+
+// storeOpen refuses the service's store to a job that isn't on one of the
+// service's own machines.
+func storeOpen(cl *caller, store string) error {
+	if store == ServiceStore && !cl.job.onMachine {
+		return refuse("the %s store is open only to jobs on the service's own machines", ServiceStore)
+	}
+	return nil
 }
 
 // decode reads a body as exactly one JSON object with no other fields.
@@ -182,15 +198,20 @@ func (e *Emulator) restore(cl *caller, body []byte) (any, error) {
 		Family   string `json:"family"`
 		Key      string `json:"key"`
 		Platform string `json:"platform"`
+		Store    string `json:"store"`
 		Lookup   bool   `json:"lookup"`
 	}
 	if err := decode(body, &q, "restore"); err != nil {
 		return nil, err
 	}
-	if !familyPattern.MatchString(q.Family) || !keyPattern.MatchString(q.Key) || !platformPattern.MatchString(q.Platform) {
-		return nil, refuse("the body isn't a restore request: its family, key or platform isn't the interface's")
+	if !familyPattern.MatchString(q.Family) || !keyPattern.MatchString(q.Key) || !platformPattern.MatchString(q.Platform) ||
+		!storePattern.MatchString(q.Store) {
+		return nil, refuse("the body isn't a restore request: its family, key, platform or store isn't the interface's")
 	}
-	ck := fmt.Sprintf("%d\x00%s\x00%s\x00%s", cl.run.id, q.Platform, q.Family, q.Key)
+	if err := storeOpen(cl, q.Store); err != nil {
+		return nil, err
+	}
+	ck := fmt.Sprintf("%d\x00%s\x00%s\x00%s\x00%s", cl.run.id, q.Store, q.Platform, q.Family, q.Key)
 	ch := e.choices[ck]
 	if ch != nil && cl.c.attempt > int64(ch.attempt) {
 		// Only the service's own automatic reruns keep a run's choices.
@@ -207,8 +228,8 @@ func (e *Emulator) restore(cl *caller, body []byte) (any, error) {
 		}
 	}
 	if ch == nil {
-		ch = &choice{run: cl.run.id, platform: q.Platform, family: q.Family, key: q.Key, step: "none", attempt: int(cl.c.attempt)}
-		if en, step := e.pick(cl, q.Platform, q.Family, q.Key); en != nil {
+		ch = &choice{run: cl.run.id, store: q.Store, platform: q.Platform, family: q.Family, key: q.Key, step: "none", attempt: int(cl.c.attempt)}
+		if en, step := e.pick(cl, q.Store, q.Platform, q.Family, q.Key); en != nil {
 			ch.entry, ch.step = en.id, step
 		}
 		e.choices[ck] = ch
@@ -218,7 +239,7 @@ func (e *Emulator) restore(cl *caller, body []byte) (any, error) {
 	}
 	en := e.entries[ch.entry]
 	out := map[string]any{"scope": en.scope, "key": en.key, "step": ch.step, "size": en.size, "sha256": en.sha256}
-	if !q.Lookup {
+	if !q.Lookup && en.store == ServiceStore {
 		expires := e.now().Add(RestoreFor)
 		out["url"], out["expires"] = e.grant(http.MethodGet, en.object, expires), expires.Format(time.RFC3339)
 	}
@@ -229,10 +250,10 @@ func (e *Emulator) restore(cl *caller, body []byte) (any, error) {
 // chain: each scope's ready entry for the key, then its newest of the
 // platform and family. A pull request's entry committed by a run bound
 // before it was last closed is never chosen.
-func (e *Emulator) pick(cl *caller, platform, family, key string) (*entry, string) {
+func (e *Emulator) pick(cl *caller, store, platform, family, key string) (*entry, string) {
 	var pool []*entry
 	for _, en := range e.entries {
-		if en.repo != cl.repo.id || en.state != "ready" || en.platform != platform || en.family != family {
+		if en.repo != cl.repo.id || en.state != "ready" || en.store != store || en.platform != platform || en.family != family {
 			continue
 		}
 		if closed, ok := e.closures[closureKey(en.repo, en.scope)]; ok && !en.boundAt.After(closed) {
@@ -259,25 +280,41 @@ func (e *Emulator) pick(cl *caller, platform, family, key string) (*entry, strin
 	return nil, "none"
 }
 
-// save is POST /v1/cache/save.
+// save is POST /v1/cache/save: an upload in the service's store, or an
+// index's entry, with its size and SHA-256 and nothing uploaded.
 func (e *Emulator) save(cl *caller, body []byte) (any, error) {
 	var q struct {
 		Family   string `json:"family"`
 		Key      string `json:"key"`
 		Platform string `json:"platform"`
+		Store    string `json:"store"`
+		Size     *int64 `json:"size"`
+		SHA256   string `json:"sha256"`
 	}
 	if err := decode(body, &q, "save"); err != nil {
 		return nil, err
 	}
-	if !familyPattern.MatchString(q.Family) || !keyPattern.MatchString(q.Key) || !platformPattern.MatchString(q.Platform) {
-		return nil, refuse("the body isn't a save request: its family, key or platform isn't the interface's")
+	if !familyPattern.MatchString(q.Family) || !keyPattern.MatchString(q.Key) || !platformPattern.MatchString(q.Platform) ||
+		!storePattern.MatchString(q.Store) {
+		return nil, refuse("the body isn't a save request: its family, key, platform or store isn't the interface's")
+	}
+	index := q.Store != ServiceStore
+	if index && (q.Size == nil || *q.Size < 0 || !sha256Pattern.MatchString(q.SHA256)) || !index && (q.Size != nil || q.SHA256 != "") {
+		return nil, refuse("the body isn't a save request: an index's entry has its size and sha256, and the service store's has neither")
+	}
+	if err := storeOpen(cl, q.Store); err != nil {
+		return nil, err
 	}
 	if cl.binding.scope == "read" {
 		return nil, refuse("the run's scope, read, saves nothing")
 	}
-	r := &reservation{id: randomID(), scope: cl.binding.scope, platform: q.Platform, family: q.Family, key: q.Key,
+	r := &reservation{id: randomID(), scope: cl.binding.scope, store: q.Store, platform: q.Platform, family: q.Family, key: q.Key,
 		repo: cl.repo.id, run: cl.run.id, job: cl.c.checkRunID, boundAt: cl.binding.at, expires: e.now().Add(ReserveFor)}
 	e.reserved[r.id] = r
+	if index {
+		r.size, r.sha256 = *q.Size, q.SHA256
+		return map[string]any{"id": r.id, "expires": r.expires.Format(time.RFC3339)}, nil
+	}
 	headers := map[string]string{"x-goog-resumable": "start", "x-goog-if-generation-match": "0"}
 	return map[string]any{"id": r.id, "url": e.grant(http.MethodPost, uploadObject(r), r.expires), "headers": headers,
 		"expires": r.expires.Format(time.RFC3339)}, nil
@@ -305,7 +342,7 @@ func (e *Emulator) commit(cl *caller, body []byte) (any, error) {
 	if r.job != cl.c.checkRunID || r.run != cl.run.id {
 		return nil, refuse("the reservation isn't this job's")
 	}
-	if r.entry != "" {
+	if r.committed {
 		if r.size != *q.Size || r.sha256 != q.SHA256 {
 			return nil, refuse("the reservation was committed with another size or SHA-256")
 		}
@@ -318,6 +355,16 @@ func (e *Emulator) commit(cl *caller, body []byte) (any, error) {
 		delete(e.objects, uploadObject(r))
 		return nil, refuse("the reservation has expired")
 	}
+	if r.store != ServiceStore {
+		if r.size != *q.Size || r.sha256 != q.SHA256 {
+			return nil, refuse("the commit's size or SHA-256 isn't the save's")
+		}
+		en := &entry{id: randomID(), scope: r.scope, store: r.store, platform: r.platform, family: r.family, key: r.key, repo: r.repo,
+			state: "pending", size: r.size, sha256: r.sha256, job: r.job, boundAt: r.boundAt, committedAt: e.now()}
+		r.entry, r.committed = en.id, true
+		e.entries[en.id] = en
+		return map[string]any{"state": "pending"}, nil
+	}
 	data, ok := e.objects[uploadObject(r)]
 	if !ok {
 		return nil, refuse("nothing has been uploaded for the reservation")
@@ -325,12 +372,12 @@ func (e *Emulator) commit(cl *caller, body []byte) (any, error) {
 	if int64(len(data)) != *q.Size {
 		return nil, refuse("the upload's size, %d, isn't the commit's", len(data))
 	}
-	en := &entry{id: randomID(), scope: r.scope, platform: r.platform, family: r.family, key: r.key, repo: r.repo, state: "pending",
+	en := &entry{id: randomID(), scope: r.scope, store: r.store, platform: r.platform, family: r.family, key: r.key, repo: r.repo, state: "pending",
 		size: *q.Size, sha256: q.SHA256, job: r.job, boundAt: r.boundAt, committedAt: e.now()}
 	en.object = fmt.Sprintf("entries/%d/%s", en.repo, en.id)
 	e.objects[en.object] = data
 	delete(e.objects, uploadObject(r))
-	r.entry, r.size, r.sha256 = en.id, en.size, en.sha256
+	r.entry, r.size, r.sha256, r.committed = en.id, en.size, en.sha256, true
 	e.entries[en.id] = en
 	return map[string]any{"state": "pending"}, nil
 }
@@ -345,7 +392,9 @@ func (e *Emulator) settle(jb *job) {
 		}
 		closed, isClosed := e.closures[closureKey(en.repo, en.scope)]
 		if jb.conclusion != "success" || (isClosed && !en.boundAt.After(closed)) {
-			delete(e.objects, en.object)
+			if en.object != "" {
+				delete(e.objects, en.object)
+			}
 			delete(e.entries, id)
 			continue
 		}

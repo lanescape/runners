@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -83,6 +84,7 @@ type World struct {
 	pulls     map[string]*ghemu.Pull
 	runs      map[int64]*ghemu.Run
 	jobs      map[int64]*ghemu.WorkflowJob
+	onMachine map[int64]string
 	published int
 }
 
@@ -206,7 +208,7 @@ func New(t testing.TB, clock clockwork.Clock) *World {
 	return &World{T: t, GitHub: gh, Storage: gcs, PubSub: ps, Google: gg, IAM: iam, Compute: gce, Org: org, Inst: inst,
 		Objects: objects, Cache: cch, Disks: dks, Passes: passes, Body: body, Logs: logs, url: audience,
 		maintainer: gh.User(42, "maintainer"), nextID: 5000, repos: map[int64]*ghemu.Repo{}, pulls: map[string]*ghemu.Pull{},
-		runs: map[int64]*ghemu.Run{}, jobs: map[int64]*ghemu.WorkflowJob{}}
+		runs: map[int64]*ghemu.Run{}, jobs: map[int64]*ghemu.WorkflowJob{}, onMachine: map[int64]string{}}
 }
 
 type reconciler pass.Body
@@ -372,6 +374,27 @@ func (w *World) StartJob(r service.Run, workflowRef string) service.Job {
 	return service.Job{Run: r, ID: wj.ID, WorkflowRef: workflowRef}
 }
 
+// StartMachineJob implements service.World: GitHub shows the job on one
+// of the service's machines, by its runner's name, and the machine's
+// job-started check has admitted it, as its record says.
+func (w *World) StartMachineJob(r service.Run) service.Job {
+	wj := w.GitHub.Queue(w.run(r), ghemu.JobSpec{Labels: []string{"self-hosted"}})
+	name := fmt.Sprintf("lsr-%d-%08x", r.Repository.ID, w.id())
+	w.GitHub.RunJobOn(wj, name)
+	data, err := json.Marshal(machines.Admission{Machine: name, Zone: "northamerica-northeast1-a", RepositoryID: r.Repository.ID,
+		JobID: wj.ID, RunID: r.ID, RunAttempt: wj.Attempt, Allowed: true, At: time.Now().UTC()})
+	if err != nil {
+		w.T.Fatal(err)
+	}
+	w.Storage.Put(State, machines.AdmissionKey(name), data)
+	w.mu.Lock()
+	w.jobs[wj.ID] = wj
+	w.onMachine[wj.ID] = name
+	w.mu.Unlock()
+	r.Attempt = wj.Attempt
+	return service.Job{Run: r, ID: wj.ID}
+}
+
 // WorkflowJob is the GitHub emulator's job behind a Job.
 func (w *World) WorkflowJob(j service.Job) *ghemu.WorkflowJob {
 	w.mu.Lock()
@@ -384,10 +407,18 @@ func (w *World) Token(j service.Job, overrides map[string]any) string {
 	return w.GitHub.JobToken(w.WorkflowJob(j), ghemu.Job{Audience: w.url, WorkflowRef: j.WorkflowRef}, overrides)
 }
 
-// FinishJob implements service.World.
+// FinishJob implements service.World. A job on one of the service's
+// machines has its machine's report recorded, as its supervisor sends it.
 func (w *World) FinishJob(j service.Job, conclusion string) {
 	wj := w.WorkflowJob(j)
 	w.GitHub.CompleteJob(wj, conclusion)
+	w.mu.Lock()
+	name := w.onMachine[j.ID]
+	w.mu.Unlock()
+	if name != "" {
+		data, _ := json.Marshal(machines.Report{Machine: name, At: time.Now().UTC()})
+		w.Storage.Put(State, "machines/"+name+"/report.json", data)
+	}
 	w.deliver("workflow_job", w.GitHub.WorkflowJobPayload(wj.Run, w.Inst, "completed", wj.ID, wj.Labels))
 }
 
@@ -434,6 +465,24 @@ func (w *World) PushMessages() {
 				w.T.Fatalf("the reconcile endpoint answered a push %d", resp.StatusCode)
 			}
 			time.Sleep(50 * time.Millisecond)
+		}
+	}
+}
+
+// FinishRun finishes every job of a run still going, as FinishJob does.
+func (w *World) FinishRun(r service.Run, conclusion string) {
+	w.mu.Lock()
+	var jobs []int64
+	for id, wj := range w.jobs {
+		if wj.Run.ID == r.ID {
+			jobs = append(jobs, id)
+		}
+	}
+	w.mu.Unlock()
+	slices.Sort(jobs)
+	for _, id := range jobs {
+		if w.GitHub.Job(id).Status != "completed" {
+			w.FinishJob(service.Job{Run: r, ID: id}, conclusion)
 		}
 	}
 }
@@ -487,7 +536,7 @@ func (w *World) Entries(r service.Repository) []service.Entry {
 	w.records(fmt.Sprintf("cache/entries/%d/", r.ID), func(data []byte) {
 		var e cache.Entry
 		if json.Unmarshal(data, &e) == nil && e.State != cache.Marked {
-			out = append(out, service.Entry{ID: e.ID, Scope: e.Scope, Platform: e.Platform, Family: e.Family, Key: e.Key,
+			out = append(out, service.Entry{ID: e.ID, Scope: e.Scope, Store: e.Store, Platform: e.Platform, Family: e.Family, Key: e.Key,
 				State: e.State, Size: e.Size, SHA256: e.SHA256})
 		}
 	})
@@ -500,7 +549,7 @@ func (w *World) Choices(r service.Run) []service.Choice {
 	w.records(fmt.Sprintf("cache/choices/%d/%d/", r.Repository.ID, r.ID), func(data []byte) {
 		var c cache.Choice
 		if json.Unmarshal(data, &c) == nil {
-			out = append(out, service.Choice{Platform: c.Platform, Family: c.Family, Key: c.Key, Step: c.Step, Entry: c.Entry})
+			out = append(out, service.Choice{Store: c.Store, Platform: c.Platform, Family: c.Family, Key: c.Key, Step: c.Step, Entry: c.Entry})
 		}
 	})
 	return out

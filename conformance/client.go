@@ -141,15 +141,19 @@ type Restored struct {
 	Expires time.Time
 }
 
+// ServiceStore is the store whose entries' bytes the service keeps, open
+// only to jobs on its own machines; every other store is an index.
+const ServiceStore = "service"
+
 // Restore is POST /v1/cache/restore. A 200 is checked, and its entry
 // returned, nil for none.
-func (c *Client) Restore(token, platform, family, key string, lookup bool) (Answer, *Restored) {
+func (c *Client) Restore(token, store, platform, family, key string, lookup bool) (Answer, *Restored) {
 	c.T.Helper()
-	q := map[string]any{"family": family, "key": key, "platform": platform}
+	q := map[string]any{"family": family, "key": key, "platform": platform, "store": store}
 	if lookup {
 		q["lookup"] = true
 	}
-	return c.RestoreRaw(token, marshal(q), lookup)
+	return c.RestoreRaw(token, marshal(q), lookup || store != ServiceStore)
 }
 
 var (
@@ -157,8 +161,9 @@ var (
 	sha256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
-// RestoreRaw is POST /v1/cache/restore with any body.
-func (c *Client) RestoreRaw(token string, body []byte, lookup bool) (Answer, *Restored) {
+// RestoreRaw is POST /v1/cache/restore with any body. noURL says the
+// entry must come without a URL: a lookup's, or an index's.
+func (c *Client) RestoreRaw(token string, body []byte, noURL bool) (Answer, *Restored) {
 	c.T.Helper()
 	a := c.post("/v1/cache/restore", token, body)
 	if a.Status != http.StatusOK {
@@ -188,9 +193,9 @@ func (c *Client) RestoreRaw(token string, body []byte, lookup bool) (Answer, *Re
 		c.T.Fatalf("restore's entry isn't the interface's: %v", m)
 	}
 	exp, _ := m["expires"].(string)
-	if lookup {
+	if noURL {
 		if r.URL != "" || exp != "" {
-			c.T.Fatalf("a lookup's entry has a url or expires: %v", m)
+			c.T.Fatalf("a lookup's or an index's entry has a url or expires: %v", m)
 		}
 		return a, r
 	}
@@ -215,10 +220,29 @@ var (
 	keyPattern    = regexp.MustCompile(`^[0-9a-f]{20}$`)
 )
 
-// Save is POST /v1/cache/save.
+// SaveIndex is POST /v1/cache/save of an index's entry, with what the job
+// keeps in its own runner's cache: nothing is uploaded, and the answer has
+// a reservation's ID and no URL.
+func (c *Client) SaveIndex(token, store, platform, family, key string, size int64, sum string) (Answer, string) {
+	c.T.Helper()
+	a := c.post("/v1/cache/save", token, marshal(map[string]any{"family": family, "key": key, "platform": platform, "store": store,
+		"size": size, "sha256": sum}))
+	if a.Status != http.StatusOK {
+		return a, ""
+	}
+	id, _ := a.Body["id"].(string)
+	exp, _ := a.Body["expires"].(string)
+	if _, err := time.Parse(time.RFC3339, exp); id == "" || err != nil || a.Body["url"] != nil || a.Body["headers"] != nil {
+		c.T.Fatalf("an index's save answered %v", a.Body)
+	}
+	return a, id
+}
+
+// Save is POST /v1/cache/save in the service's store, which reserves an
+// upload.
 func (c *Client) Save(token, platform, family, key string) (Answer, *Reserved) {
 	c.T.Helper()
-	a := c.post("/v1/cache/save", token, marshal(map[string]any{"family": family, "key": key, "platform": platform}))
+	a := c.post("/v1/cache/save", token, marshal(map[string]any{"family": family, "key": key, "platform": platform, "store": ServiceStore}))
 	if a.Status != http.StatusOK {
 		return a, nil
 	}

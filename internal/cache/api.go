@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/machines"
+	"github.com/lanescape/runners/internal/store"
 )
 
 // The cache's endpoints (specs/0005-interface.md, The cache).
@@ -112,7 +114,41 @@ func decode(body []byte, into any, what string) error {
 type caller struct {
 	claims  *auth.ActionsClaims
 	repo    github.Repository
+	job     github.Job
 	binding binding.Binding
+}
+
+// machineRunner is a runner name of one of the service's machines.
+var machineRunner = regexp.MustCompile(`^lsr-[1-9][0-9]*-[a-z0-9]{8}$`)
+
+// storeOpen refuses a store to a job that may not use it: the service's
+// store, whose entries' bytes are in the cache's bucket, is open only to a
+// job that GitHub shows running on one of the service's own machines, by
+// its runner's name, and that the machine's job-started check admitted.
+// Every other store, an index, is open to every job, which never gets a
+// URL, so no bytes ever leave the region.
+func (s *Service) storeOpen(ctx context.Context, c *caller, name string) error {
+	if name != ServiceStore {
+		return nil
+	}
+	if !machineRunner.MatchString(c.job.RunnerName) {
+		return refuse("the %s store is open only to jobs on the service's own machines", ServiceStore)
+	}
+	data, _, err := s.Objects.Get(ctx, machines.AdmissionKey(c.job.RunnerName))
+	if errors.Is(err, store.ErrNotFound) {
+		return refuse("the %s store is open only to jobs on the service's own machines", ServiceStore)
+	}
+	if err != nil {
+		return err
+	}
+	var a machines.Admission
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	if !a.Allowed || a.Machine != c.job.RunnerName || a.JobID != c.claims.CheckRunID || a.RepositoryID != c.repo.ID {
+		return refuse("the %s store is open only to jobs on the service's own machines", ServiceStore)
+	}
+	return nil
 }
 
 // authenticate checks a request's caller (specs/0006-cache.md, Who may use
@@ -188,5 +224,5 @@ func (s *Service) authenticate(ctx context.Context, r *http.Request) (*caller, e
 			return nil, refuse("the contribution's run has no approval of the %s environment", machines.ContributionEnvironment)
 		}
 	}
-	return &caller{claims: claims, repo: repo, binding: bd}, nil
+	return &caller{claims: claims, repo: repo, job: job, binding: bd}, nil
 }

@@ -230,10 +230,11 @@ func (s *Service) expire(ctx context.Context, st *state) {
 
 func (s *Service) expireRepo(ctx context.Context, st *state, repo int64, recs map[string]record[Entry]) {
 	// Which version is newest is read only from entries whose objects are
-	// there: a record of one that's gone mustn't stand in for it.
+	// there, or that are an index's, with no object: a record of one whose
+	// object is gone mustn't stand in for it.
 	there := map[string]record[Entry]{}
 	for id, r := range recs {
-		if _, ok := st.objects[r.v.Object]; ok && r.v.State == Ready {
+		if _, ok := st.objects[r.v.Object]; (ok || r.v.Object == "") && r.v.State == Ready {
 			there[id] = r
 		}
 	}
@@ -287,7 +288,7 @@ func (s *Service) expireRepo(ctx context.Context, st *state, repo int64, recs ma
 	used := map[string]time.Time{}
 	for _, r := range st.families {
 		if f := r.v; f.RepositoryID == repo {
-			used[f.Scope+"\x00"+f.Platform+"\x00"+f.Family] = f.LastUsed
+			used[f.Scope+"\x00"+f.Store+"\x00"+f.Platform+"\x00"+f.Family] = f.LastUsed
 		}
 	}
 	for _, r := range there {
@@ -299,7 +300,7 @@ func (s *Service) expireRepo(ctx context.Context, st *state, repo int64, recs ma
 		if b, ok := latest[v.Series]; !ok || olderThan(b, v) {
 			latest[v.Series] = v
 		}
-		f := v.Scope + "\x00" + v.Platform + "\x00" + v.Family
+		f := v.Scope + "\x00" + v.Store + "\x00" + v.Platform + "\x00" + v.Family
 		if b, ok := lineage[f]; !ok || olderThan(b, v) {
 			lineage[f] = v
 		}
@@ -313,7 +314,7 @@ func (s *Service) expireRepo(ctx context.Context, st *state, repo int64, recs ma
 	keys := map[string][]Entry{}
 	for _, v := range latest {
 		if lasting(v.Scope) {
-			f := v.Scope + "\x00" + v.Platform + "\x00" + v.Family
+			f := v.Scope + "\x00" + v.Store + "\x00" + v.Platform + "\x00" + v.Family
 			keys[f] = append(keys[f], v)
 		}
 	}
@@ -341,7 +342,7 @@ func (s *Service) expireRepo(ctx context.Context, st *state, repo int64, recs ma
 			continue
 		}
 		if lasting(c.EntryScope) {
-			keep[Series(c.EntryScope, c.Platform, c.Family, c.Key)] = true
+			keep[Series(c.EntryScope, c.Store, c.Platform, c.Family, c.Key)] = true
 		}
 	}
 
@@ -356,7 +357,7 @@ func (s *Service) expireRepo(ctx context.Context, st *state, repo int64, recs ma
 	}
 	for _, r := range there {
 		v := r.v
-		f := v.Scope + "\x00" + v.Platform + "\x00" + v.Family
+		f := v.Scope + "\x00" + v.Store + "\x00" + v.Platform + "\x00" + v.Family
 		if l, ok := latest[v.Series]; ok && l.ID != v.ID {
 			mark(r, "superseded by "+l.ID)
 			replacedBy[v.ID] = l
@@ -389,7 +390,7 @@ func (s *Service) expireRepo(ctx context.Context, st *state, repo int64, recs ma
 	// else deleted it, goes too, record and all, once Cloud Storage
 	// confirms it.
 	for _, r := range recs {
-		if r.v.State != Ready {
+		if r.v.State != Ready || r.v.Object == "" {
 			continue
 		}
 		if _, ok := st.objects[r.v.Object]; ok {
@@ -409,7 +410,7 @@ func (s *Service) expireRepo(ctx context.Context, st *state, repo int64, recs ma
 			}
 			// A family's retirement rests on its other entries' use too,
 			// which a choice of one of them records in the family's record.
-			f, _, found, err := getJSON[Family](ctx, s.Objects, familyKey(repo, v.Scope, v.Platform, v.Family))
+			f, _, found, err := getJSON[Family](ctx, s.Objects, familyKey(repo, v.Scope, v.Store, v.Platform, v.Family))
 			if err != nil || !found {
 				return err == nil, err
 			}
@@ -500,7 +501,7 @@ func (s *Service) tidy(ctx context.Context, st *state) {
 	}
 	have := map[string]bool{}
 	for _, r := range st.entries {
-		have[familyKey(r.v.RepositoryID, r.v.Scope, r.v.Platform, r.v.Family)] = true
+		have[familyKey(r.v.RepositoryID, r.v.Scope, r.v.Store, r.v.Platform, r.v.Family)] = true
 	}
 	for key, r := range st.families {
 		if !have[key] {

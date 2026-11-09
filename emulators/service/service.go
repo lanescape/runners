@@ -1,8 +1,9 @@
 // Package service emulates this repository's service as its interface for
 // actions describes it (specs/0005-interface.md), and nothing more: run
-// binding, the cache's restore, save and commit, and the URLs the cache
-// hands out, which the emulator serves itself, for resumable uploads and
-// ranged downloads, until they expire. It runs in-process, as an
+// binding, the cache's restore, save and commit in the service's own store
+// and in a consumer's index stores, and the URLs the service's store hands
+// out, only to jobs on its own machines, which the emulator serves itself,
+// for resumable uploads and ranged downloads, until they expire. It runs in-process, as an
 // httptest server, and verifies tokens against an OIDC issuer emulator,
 // as the service verifies GitHub's.
 //
@@ -204,6 +205,7 @@ type job struct {
 	workflowRef string
 	status      string
 	conclusion  string
+	onMachine   bool
 }
 
 func (e *Emulator) repo(r Repository) *repo {
@@ -407,6 +409,15 @@ func (e *Emulator) StartJob(r Run, workflowRef string) Job {
 	return Job{Run: r, ID: j.id, WorkflowRef: j.workflowRef}
 }
 
+// StartMachineJob implements World.
+func (e *Emulator) StartMachineJob(r Run) Job {
+	j := e.StartJob(r, "")
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.jobs[j.ID].onMachine = true
+	return j
+}
+
 // Claims are a job's token's claims, as GitHub signs them, for the
 // service.
 func (e *Emulator) Claims(j Job) map[string]any {
@@ -480,7 +491,7 @@ func (e *Emulator) Entries(r Repository) []Entry {
 	var out []Entry
 	for _, en := range e.entries {
 		if en.repo == r.ID {
-			out = append(out, Entry{ID: en.id, Scope: en.scope, Platform: en.platform, Family: en.family, Key: en.key,
+			out = append(out, Entry{ID: en.id, Scope: en.scope, Store: en.store, Platform: en.platform, Family: en.family, Key: en.key,
 				State: en.state, Size: en.size, SHA256: en.sha256})
 		}
 	}
@@ -494,7 +505,7 @@ func (e *Emulator) Choices(r Run) []Choice {
 	var out []Choice
 	for _, c := range e.choices {
 		if c.run == r.ID {
-			out = append(out, Choice{Platform: c.platform, Family: c.family, Key: c.key, Step: c.step, Entry: c.entry})
+			out = append(out, Choice{Store: c.store, Platform: c.platform, Family: c.family, Key: c.key, Step: c.step, Entry: c.entry})
 		}
 	}
 	return out

@@ -391,3 +391,6 @@ func createOnce[T any](ctx context.Context, o store.Objects, key string, v T) (T
 	}
 	return got, gen, nil
 }
+
+// AdmissionKey is where a machine's admission is recorded.
+func AdmissionKey(machine string) string { return admissionKey(machine) }

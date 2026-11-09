@@ -12,6 +12,11 @@ type saveRequest struct {
 	Family   string `json:"family"`
 	Key      string `json:"key"`
 	Platform string `json:"platform"`
+	Store    string `json:"store"`
+	// Size and SHA256 are an index entry's: what the job keeps in its own
+	// runner's cache. The service's store's are given at commit.
+	Size   *int64 `json:"size"`
+	SHA256 string `json:"sha256"`
 }
 
 // The headers a reservation's URL is signed with, which the caller sends
@@ -19,26 +24,43 @@ type saveRequest struct {
 // once.
 var uploadHeaders = map[string]string{"x-goog-resumable": "start", "x-goog-if-generation-match": "0"}
 
-// save is POST /v1/cache/save: it reserves an upload for the job, in its
-// run's own scope, and hands out a signed URL that starts a resumable upload
-// of the reservation's one object.
+// save is POST /v1/cache/save: it reserves an entry for the job, in its
+// run's own scope. In the service's store, it hands out a signed URL that
+// starts a resumable upload of the reservation's one object; in an index,
+// it records the size and SHA-256 the job gives, and nothing is uploaded.
 func (s *Service) save(ctx context.Context, c *caller, body []byte) (any, error) {
 	var q saveRequest
 	if err := decode(body, &q, "save"); err != nil {
 		return nil, err
 	}
-	if !familyPattern.MatchString(q.Family) || !keyPattern.MatchString(q.Key) || !platformPattern.MatchString(q.Platform) {
-		return nil, refuse("the body isn't a save request: its family, key or platform isn't the interface's")
+	index := q.Store != ServiceStore
+	if !familyPattern.MatchString(q.Family) || !keyPattern.MatchString(q.Key) || !platformPattern.MatchString(q.Platform) ||
+		!storePattern.MatchString(q.Store) {
+		return nil, refuse("the body isn't a save request: its family, key, platform or store isn't the interface's")
+	}
+	if index != (q.Size != nil && *q.Size >= 0 && sha256Pattern.MatchString(q.SHA256)) || (!index && (q.Size != nil || q.SHA256 != "")) {
+		return nil, refuse("the body isn't a save request: an index's entry has its size and sha256, and the %s store's has neither", ServiceStore)
+	}
+	if err := s.storeOpen(ctx, c, q.Store); err != nil {
+		return nil, err
 	}
 	if !c.binding.Scope.Saves() {
 		return nil, refuse("the run's scope, %s, saves nothing", c.binding.Scope)
 	}
 	now := s.now()
 	r := Reservation{ID: newID(), RepositoryID: c.repo.ID, RunID: c.claims.RunID, RunAttempt: c.claims.RunAttempt,
-		JobID: c.claims.CheckRunID, Scope: c.binding.Scope.String(), Platform: q.Platform, Family: q.Family, Key: q.Key,
+		JobID: c.claims.CheckRunID, Scope: c.binding.Scope.String(), Store: q.Store, Platform: q.Platform, Family: q.Family, Key: q.Key,
 		BoundAt: c.binding.BoundAt, Created: now, Expires: now.Add(ReserveFor)}
+	if index {
+		r.Size, r.SHA256 = *q.Size, q.SHA256
+	}
 	if _, _, err := createOnce(ctx, s.Objects, reservationKey(r.RepositoryID, r.ID), r); err != nil {
 		return nil, err
+	}
+	if index {
+		s.log().Info("cache index entry reserved", "repository_id", r.RepositoryID, "run_id", r.RunID, "job_id", r.JobID,
+			"reservation", r.ID, "scope", r.Scope, "store", r.Store, "platform", r.Platform, "family", r.Family, "key", r.Key)
+		return map[string]any{"id": r.ID, "expires": r.Expires.Format(time.RFC3339)}, nil
 	}
 	var headers []string
 	for _, k := range []string{"x-goog-if-generation-match", "x-goog-resumable"} {
@@ -99,6 +121,21 @@ func (s *Service) commit(ctx context.Context, c *caller, body []byte) (any, erro
 			s.dropUpload(ctx, r)
 			return nil, refuse("the reservation has expired")
 		}
+		if r.Store != ServiceStore {
+			// An index's entry: nothing was uploaded, and the commit says
+			// again what the save did.
+			if r.Size != *q.Size || r.SHA256 != q.SHA256 {
+				return nil, refuse("the commit's size or SHA-256 isn't the save's")
+			}
+			r.Entry = newID()
+			if _, err = replaceJSON(ctx, s.Objects, key, r, gen); err == nil {
+				break
+			}
+			if !errors.Is(err, store.ErrPrecondition) || attempt == 2 {
+				return nil, err
+			}
+			continue
+		}
 		up, err := s.Bucket.Attrs(ctx, UploadObject(repo, r.ID))
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, refuse("nothing has been uploaded for the reservation")
@@ -118,9 +155,13 @@ func (s *Service) commit(ctx context.Context, c *caller, body []byte) (any, erro
 			return nil, err
 		}
 	}
-	series := Series(r.Scope, r.Platform, r.Family, r.Key)
+	series := Series(r.Scope, r.Store, r.Platform, r.Family, r.Key)
+	object := ""
+	if r.Store == ServiceStore {
+		object = EntryObject(repo, series, r.Entry)
+	}
 	e, egen, err := createOnce(ctx, s.Objects, entryKey(repo, r.Entry), Entry{ID: r.Entry, RepositoryID: repo, Scope: r.Scope,
-		Platform: r.Platform, Family: r.Family, Key: r.Key, Series: series, State: Pending, Object: EntryObject(repo, series, r.Entry),
+		Store: r.Store, Platform: r.Platform, Family: r.Family, Key: r.Key, Series: series, State: Pending, Object: object,
 		Size: r.Size, SHA256: r.SHA256, JobID: r.JobID, RunID: r.RunID, RunAttempt: r.RunAttempt, Reservation: r.ID,
 		BoundAt: r.BoundAt, CommittedAt: s.now()})
 	if err != nil {
@@ -129,7 +170,7 @@ func (s *Service) commit(ctx context.Context, c *caller, body []byte) (any, erro
 	if e.State != Pending {
 		return nil, refuse("the entry this reservation made is %s", e.State)
 	}
-	if e.Generation == 0 {
+	if e.Object != "" && e.Generation == 0 {
 		a, err := s.Bucket.CopyNew(ctx, UploadObject(repo, r.ID), r.UploadGeneration, e.Object)
 		if errors.Is(err, store.ErrPrecondition) || errors.Is(err, store.ErrNotFound) {
 			// Copied by an earlier try, whose answer was lost; or the
@@ -150,9 +191,11 @@ func (s *Service) commit(ctx context.Context, c *caller, body []byte) (any, erro
 			return nil, err
 		}
 	}
-	s.dropUpload(ctx, r)
+	if e.Object != "" {
+		s.dropUpload(ctx, r)
+	}
 	s.log().Info("cache entry committed", "repository_id", repo, "run_id", r.RunID, "job_id", r.JobID, "entry", e.ID,
-		"scope", e.Scope, "platform", e.Platform, "family", e.Family, "key", e.Key, "size", e.Size)
+		"scope", e.Scope, "store", e.Store, "platform", e.Platform, "family", e.Family, "key", e.Key, "size", e.Size)
 	return map[string]any{"state": Pending}, nil
 }
 

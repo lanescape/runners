@@ -104,7 +104,7 @@ func (s *Service) settle(ctx context.Context, e Entry, job *github.Job) error {
 		return nil
 	case job.Conclusion != "success":
 		return s.discard(ctx, e, "its job's conclusion is "+job.Conclusion)
-	case e.Generation == 0:
+	case e.Object != "" && e.Generation == 0:
 		return s.discard(ctx, e, "its commit never finished")
 	}
 	return s.ready(ctx, e)
@@ -134,8 +134,9 @@ func (s *Service) ready(ctx context.Context, e Entry) error {
 			}
 		}
 		if lasting(cur.Scope) {
-			if err := putJSON(ctx, s.Objects, familyKey(cur.RepositoryID, cur.Scope, cur.Platform, cur.Family), Family{
-				RepositoryID: cur.RepositoryID, Scope: cur.Scope, Platform: cur.Platform, Family: cur.Family, LastUsed: s.now()}); err != nil {
+			if err := putJSON(ctx, s.Objects, familyKey(cur.RepositoryID, cur.Scope, cur.Store, cur.Platform, cur.Family), Family{
+				RepositoryID: cur.RepositoryID, Scope: cur.Scope, Store: cur.Store, Platform: cur.Platform, Family: cur.Family,
+				LastUsed: s.now()}); err != nil {
 				return err
 			}
 		}
@@ -171,10 +172,10 @@ func (s *Service) ready(ctx context.Context, e Entry) error {
 
 // replaces reports whether a ready entry, older than a newly ready one, is
 // one the new one replaces: an older version of its series, or in a pull
-// request's scope, any of its entries of the platform and family, whatever
+// request's scope, any of its entries of the store, platform and family, whatever
 // its key, since a pull request keeps one of each.
 func replaces(newer, v Entry) bool {
-	if v.State != Ready || v.ID == newer.ID || v.Scope != newer.Scope || v.Platform != newer.Platform ||
+	if v.State != Ready || v.ID == newer.ID || v.Scope != newer.Scope || v.Store != newer.Store || v.Platform != newer.Platform ||
 		v.Family != newer.Family || !olderThan(v, newer) {
 		return false
 	}

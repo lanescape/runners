@@ -1,8 +1,19 @@
 # Cache
 
-Jobs save and restore build state through the service's cache, from any runner: the service's own machines, and runners outside the service. A cache **entry** is one object a job packs, such as an archive of a build tree, named by family and key as saved disks are, and scoped exactly as they are: a job reads only its run's restore chain, and writes only its run's own scope (specs/0002-machines.md, Scope). Saved disks are still how the service's own machines start warm; the cache is how runners outside the service do, approved contributions included, and how any job keeps state apart from its work disk.
+Jobs save and restore build state through the service's cache, from any runner: the service's own machines, and runners outside the service. A cache **entry** is one object a job packs, such as an archive of a build tree, in a **store**, named by family and key as saved disks are, and scoped exactly as they are: a job reads only its run's restore chain, and writes only its run's own scope (specs/0002-machines.md, Scope). Saved disks are still how the service's own machines start warm; the cache is how runners outside the service do, approved contributions included, and how any job keeps state apart from its work disk.
 
-The service never holds an entry's bytes. It decides who may read and write which entry, and hands out short-lived signed URLs for one object at a time in its bucket, `lanescape-runners-cache`; the bytes pass between the job and Cloud Storage, never through Cloud Run, whose requests are limited to 32 MiB. The interface's requests and answers are in specs/0005-interface.md.
+The service never holds an entry's bytes, and no bytes leave the region. It decides who may read and write which entry. For its own machines, it hands out short-lived signed URLs for one object at a time in its bucket, `lanescape-runners-cache`; the bytes pass between the job and Cloud Storage, never through Cloud Run, whose requests are limited to 32 MiB. For every other runner it keeps only an index. The interface's requests and answers are in specs/0005-interface.md.
+
+## Stores
+
+An entry's bytes stay local to where its job runs. Runners outside the service, such as a hosted provider's machines, never download from or upload to the service's bucket, since internet egress is too costly per byte: their bytes live in the runner's own store, such as its Actions cache, and they fetch sources from upstream on a miss.
+
+- **The service's store,** `service`, holds bytes, in the cache's bucket, and is open only to jobs on the service's own machines: a request names it only from a job whose `check_run_id` GitHub shows running on one of them, matched by the runner's name, and that its machine's job-started check admitted (specs/0002-machines.md). Its restores and saves hand out signed URLs, as below.
+- **An index** is any other store, named by the consumer, 1 to 16 lowercase letters and digits, such as `actions`. Its entries hold no bytes: a save records the size and SHA-256 of what the job keeps in its own store, then a commit, and a restore answers the entry's scope, key, step, size and SHA-256, with no URL. The job checks the bytes it finds in its own store against them, and treats a mismatch or a miss as nothing restored. No bucket object, upload or download is involved.
+
+Stores are kept apart: a request is offered only entries of the store it names. Every entry, whatever its store, keeps every other rule here: the scopes, the restore order and the run's choice, success gating, one entry of each family in a pull request, and retention.
+
+**What the index is for.** A runner's own store has scopes of its provider's, not the service's: an approved contribution, for one, may be able to write to the default branch's scope of the runner's Actions cache. The index is what keeps untrusted code from poisoning a later main or published build there: a job of main's restores only bytes whose SHA-256 an entry of main's restore chain names, and only a successful job of a run bound to that scope commits one.
 
 ## Why a cache, and not something else
 
@@ -35,29 +46,30 @@ An entry belongs to a consumer, a scope, a platform, a family and a key:
 
 - **Family and key** follow the selectors' rules (specs/0005-interface.md): a family is 1 to 32 lowercase letters, digits and hyphens, starting with a letter; a key is 20 lowercase hex digits, which the consumer computes from whatever the entry's contents depend on.
 - **Platform** is `<os>-<arch>`, the runner's operating system and architecture, each 1 to 16 lowercase letters and digits, such as `linux-x64`, `linux-arm64` or `macos-arm64`. Entries are kept apart by platform, as disks are by architecture: one saved on one platform is never restored on another. The platform is the job's word, and it decides only which of the entries the job may read anyway it's given.
-- **Series** is the first 20 hex digits of the SHA-256 of the scope, platform, family and key, joined by NUL characters. Saving again for the same series makes a new version.
+- **Store** is the store the entry is in (Stores, above).
+- **Series** is the first 20 hex digits of the SHA-256 of the scope, store, platform, family and key, joined by NUL characters. Saving again for the same series makes a new version.
 
 The service keeps its records in its own bucket, and the bytes in the cache's:
 
 ```
 lanescape-runners:
   cache/reservations/<repository ID>/<reservation ID>.json  an upload, until it's committed or expires
-  cache/entries/<repository ID>/<entry ID>.json             an entry: pending, ready or marked
-  cache/choices/<repository ID>/<run ID>/<hash>.json         a run's restore choice for a family, platform and key
-  cache/recent/<repository ID>/<scope>/<hash>.json           a pull request's most recent choice for a family and platform
-  cache/families/<repository ID>/<hash>.json                 when a family and platform of main's or a branch's was last used
+  cache/entries/<repository ID>/<entry ID>.json             an entry of any store: pending, ready or marked
+  cache/choices/<repository ID>/<run ID>/<hash>.json         a run's restore choice for a store, family, platform and key
+  cache/recent/<repository ID>/<scope>/<hash>.json           a pull request's most recent choice for a store, family and platform
+  cache/families/<repository ID>/<hash>.json                 when a store's family and platform of main's or a branch's was last used
   closures/<repository ID>/<scope>.json                      the last time the service saw a pull request closed, shared with the disks
   leases/disks/<repository ID>                               the consumer's short lease for choosing and marking, the disks' too
 lanescape-runners-cache:
   uploads/<repository ID>/<reservation ID>                   an upload's object
-  entries/<repository ID>/<series>/<entry ID>                an entry's object
+  entries/<repository ID>/<series>/<entry ID>                an entry's object, in the service's store
 ```
 
 Every record is written before what it describes, as the disks' are (specs/0003-disks.md), and an object of the cache's names with no record goes, under the lease, as an orphaned image does.
 
 ## Restoring
 
-A restore asks for a family, platform and key. The service picks once per run and entry, the first time a job of the run asks, and records the choice; every later request of the run for the same family, platform and key gets the same entry, even after a newer one is committed. It picks the first that exists of:
+A restore asks for a store, family, platform and key. The service picks once per run and entry, the first time a job of the run asks, and records the choice; every later request of the run for the same store, family, platform and key gets the same entry, even after a newer one is committed. It picks the first that exists, of the store's entries, of:
 
 1. the first scope of the run's restore chain's ready entry for that family, platform and key (specs/0002-machines.md, Scope);
 2. that scope's newest ready entry of that family and platform, whatever its key;
@@ -78,7 +90,7 @@ The answer names the chosen entry with a V4 signed URL for a `GET` of its object
 
 ## Saving
 
-A save is three steps:
+A save in an index is two steps: the job records the entry's size and SHA-256 with a reservation, and commits it, saying them again, before the reservation expires. The service writes the entry's record as `pending`, with when its run was bound, and nothing is uploaded or copied. A save in the service's store, from one of its machines, is three steps:
 
 1. **Reserve.** The service records a reservation for the job, by its `check_run_id`, with the run's scope and the entry's platform, family and key, and hands out a V4 signed URL that starts a resumable upload of one object, `uploads/<repository ID>/<reservation ID>`. Its signed headers include `x-goog-resumable: start` and `x-goog-if-generation-match: 0`, so it can only create that object, once. It's valid for an hour, which is the reservation's lifetime.
 2. **Upload.** The job starts the upload with the signed URL, and sends the bytes in chunks to the session URI Cloud Storage answers with, resuming after a failure as Cloud Storage's resumable uploads allow. The session URI is as much a credential as the signed URL.
@@ -105,4 +117,4 @@ Nothing has a size limit. Every entry goes as early as nothing needs it, under t
 
 `lanescape-runners-cache` is a bucket in the service's project, in `northamerica-northeast1`, which `infra/` makes, with public access prevention and uniform access, and the service's account as the only identity granted on it. It's Standard class, since the other classes charge for deleting an object early, and entries go as early as their rules allow. It keeps no versions, and soft delete is off, which would otherwise bill every deleted entry for 7 more days. The service signs URLs with IAM's `signBlob` as its own account, which holds no key, under a grant on its own account and nothing else (specs/0004-deployment.md, Bootstrap); a signed URL acts as the service, for one object and one method, until it expires.
 
-Storage is billed per GB-month. Uploads cost nothing per byte; each request is an operation, and a commit's copy is one more, while its bytes are stored twice until the upload is deleted. **Restores to runners outside Google Cloud pay internet egress, per byte**, from `northamerica-northeast1`; restores to the service's own machines, in the same region, don't.
+Storage is billed per GB-month. Uploads cost nothing per byte; each request is an operation, and a commit's copy is one more, while its bytes are stored twice until the upload is deleted. Only the service's own machines, in the same region, read and write the bucket, so no restore pays internet egress: runners outside Google Cloud, which would pay it per byte, keep their bytes in their own stores, and the service holds only their index (Stores, above).

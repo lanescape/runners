@@ -18,23 +18,31 @@ type restoreRequest struct {
 	Family   string `json:"family"`
 	Key      string `json:"key"`
 	Platform string `json:"platform"`
+	Store    string `json:"store"`
 	Lookup   bool   `json:"lookup"`
 }
 
 func (q restoreRequest) valid() bool {
-	return familyPattern.MatchString(q.Family) && keyPattern.MatchString(q.Key) && platformPattern.MatchString(q.Platform)
+	return familyPattern.MatchString(q.Family) && keyPattern.MatchString(q.Key) && platformPattern.MatchString(q.Platform) &&
+		storePattern.MatchString(q.Store)
 }
 
-// restore is POST /v1/cache/restore: the run's choice for the platform,
-// family and key, picked and recorded the first time a job of the run asks,
-// with a signed URL to read it unless it's a lookup.
+// restore is POST /v1/cache/restore: the run's choice for the store,
+// platform, family and key, picked and recorded the first time a job of the
+// run asks. An entry of the service's store comes with a signed URL to read
+// it, unless it's a lookup, and only to a job on one of the service's own
+// machines; an index's comes without, for the job to check the bytes it
+// finds in its own runner's cache against.
 func (s *Service) restore(ctx context.Context, c *caller, body []byte) (any, error) {
 	var q restoreRequest
 	if err := decode(body, &q, "restore"); err != nil {
 		return nil, err
 	}
 	if !q.valid() {
-		return nil, refuse("the body isn't a restore request: its family, key or platform isn't the interface's")
+		return nil, refuse("the body isn't a restore request: its family, key, platform or store isn't the interface's")
+	}
+	if err := s.storeOpen(ctx, c, q.Store); err != nil {
+		return nil, err
 	}
 	e, step, err := s.choose(ctx, c, q)
 	if err != nil {
@@ -44,7 +52,7 @@ func (s *Service) restore(ctx context.Context, c *caller, body []byte) (any, err
 		return map[string]any{"entry": nil}, nil
 	}
 	out := map[string]any{"scope": e.Scope, "key": e.Key, "step": step, "size": e.Size, "sha256": e.SHA256}
-	if !q.Lookup {
+	if !q.Lookup && e.Store == ServiceStore {
 		expires := s.now().Add(RestoreFor)
 		u, err := s.Signer.SignedURL(ctx, e.Object, "GET", url.Values{"generation": {strconv.FormatInt(e.Generation, 10)}}, nil, expires)
 		if err != nil {
@@ -64,7 +72,7 @@ var errNotReady = errors.New("the entry is no longer ready")
 // reruns didn't start picks again. It returns nil for none.
 func (s *Service) choose(ctx context.Context, c *caller, q restoreRequest) (*Entry, string, error) {
 	repo, run, attempt := c.repo.ID, c.claims.RunID, c.claims.RunAttempt
-	key := choiceKey(repo, run, q.Platform, q.Family, q.Key)
+	key := choiceKey(repo, run, q.Store, q.Platform, q.Family, q.Key)
 	var out *Entry
 	var step string
 	err := s.Disks.Step(ctx, repo, func(ctx context.Context) error {
@@ -99,8 +107,8 @@ func (s *Service) choose(ctx context.Context, c *caller, q restoreRequest) (*Ent
 		if err != nil {
 			return err
 		}
-		choice := Choice{RepositoryID: repo, RunID: run, Scope: c.binding.Scope.String(), Platform: q.Platform, Family: q.Family,
-			Key: q.Key, Step: pickStep, Attempt: attempt, At: s.now()}
+		choice := Choice{RepositoryID: repo, RunID: run, Scope: c.binding.Scope.String(), Store: q.Store, Platform: q.Platform,
+			Family: q.Family, Key: q.Key, Step: pickStep, Attempt: attempt, At: s.now()}
 		if pick != nil {
 			choice.Entry = pick.ID
 		}
@@ -110,11 +118,12 @@ func (s *Service) choose(ctx context.Context, c *caller, q restoreRequest) (*Ent
 		// the entry's record before the touch fails to mark it, and one that
 		// read it after reads this too.
 		if _, isPR := c.binding.Scope.PullRequestNumber(); isPR {
-			rec := Recent{RepositoryID: repo, Scope: choice.Scope, Platform: q.Platform, Family: q.Family, Step: pickStep, RunID: run, At: s.now()}
+			rec := Recent{RepositoryID: repo, Scope: choice.Scope, Store: q.Store, Platform: q.Platform, Family: q.Family, Step: pickStep,
+				RunID: run, At: s.now()}
 			if pick != nil {
 				rec.Entry, rec.EntryScope, rec.Key = pick.ID, pick.Scope, pick.Key
 			}
-			if err := putJSON(ctx, s.Objects, recentKey(repo, rec.Scope, rec.Platform, rec.Family), rec); err != nil {
+			if err := putJSON(ctx, s.Objects, recentKey(repo, rec.Scope, rec.Store, rec.Platform, rec.Family), rec); err != nil {
 				return err
 			}
 		}
@@ -137,7 +146,7 @@ func (s *Service) choose(ctx context.Context, c *caller, q restoreRequest) (*Ent
 		// What each restore found, so the order and what's kept can be
 		// tuned from evidence. Nothing here is a URL, a token or anything
 		// of the entry's contents.
-		s.log().Info("cache restore choice", "repository_id", repo, "run_id", run, "scope", choice.Scope, "platform", q.Platform,
+		s.log().Info("cache restore choice", "repository_id", repo, "run_id", run, "scope", choice.Scope, "store", q.Store, "platform", q.Platform,
 			"family", q.Family, "key", q.Key, "step", pickStep, "entry", choice.Entry)
 		out, step = pick, pickStep
 		return nil
@@ -164,7 +173,7 @@ func (s *Service) pick(ctx context.Context, c *caller, q restoreRequest) (*Entry
 	var pool []Entry
 	for _, r := range recs {
 		e := r.v
-		if e.State == Ready && e.Generation > 0 && e.Platform == q.Platform && e.Family == q.Family &&
+		if e.State == Ready && (e.Object == "" || e.Generation > 0) && e.Store == q.Store && e.Platform == q.Platform && e.Family == q.Family &&
 			!disks.Retired(e.Scope, e.BoundAt, closure) {
 			pool = append(pool, e)
 		}
@@ -198,14 +207,14 @@ func (s *Service) touch(ctx context.Context, repo int64, id string, use bool) (E
 		if err != nil {
 			return Entry{}, err
 		}
-		if !ok || e.State != Ready || e.Generation == 0 {
+		if !ok || e.State != Ready || (e.Object != "" && e.Generation == 0) {
 			return Entry{}, errNotReady
 		}
 		e.TouchedAt = s.now()
 		if use && day(e.LastUsed) != day(s.now()) {
 			if lasting(e.Scope) {
-				if err := putJSON(ctx, s.Objects, familyKey(repo, e.Scope, e.Platform, e.Family), Family{RepositoryID: repo,
-					Scope: e.Scope, Platform: e.Platform, Family: e.Family, LastUsed: s.now()}); err != nil {
+				if err := putJSON(ctx, s.Objects, familyKey(repo, e.Scope, e.Store, e.Platform, e.Family), Family{RepositoryID: repo,
+					Scope: e.Scope, Store: e.Store, Platform: e.Platform, Family: e.Family, LastUsed: s.now()}); err != nil {
 					return Entry{}, err
 				}
 			}

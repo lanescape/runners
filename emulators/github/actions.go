@@ -241,6 +241,18 @@ func (e *Emulator) RunJob(j *WorkflowJob) {
 	e.notify()
 }
 
+// RunJobOn starts a queued job on a runner of name in the organization's
+// Default group, as GitHub shows a job a registered runner has taken,
+// without a runner stand-in playing it.
+func (e *Emulator) RunJobOn(j *WorkflowJob, name string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	g := e.defaultGroup(j.Run.Repo.Owner)
+	j.Runner = &Runner{ID: e.id(), Name: name, Group: g, Ephemeral: true, Job: j, used: true}
+	j.Status, j.Started = "in_progress", e.clock.Now()
+	e.notify()
+}
+
 // CompleteJob finishes a job with a conclusion, as if its runner reported
 // it.
 func (e *Emulator) CompleteJob(j *WorkflowJob, conclusion string) {

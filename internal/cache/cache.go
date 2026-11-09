@@ -1,7 +1,12 @@
 // Package cache is the service's cache (specs/0006-cache.md): jobs on any
 // runner save and restore entries, scoped as saved disks are, by their
-// run's binding, through short-lived signed URLs for one object at a time
-// in the cache's bucket. The service never holds an entry's bytes.
+// run's binding. An entry is in a store the consumer names. The service's
+// own store, service, holds bytes, in the cache's bucket, moved through
+// short-lived signed URLs for one object at a time, and only for jobs on
+// the service's own machines; every other store is an index, whose entries
+// hold only a size and SHA-256 that the job checks the bytes it keeps in
+// its runner's own cache against. The service never holds an entry's
+// bytes, and no bytes leave the region.
 //
 // Its records are in the service's own bucket, and the bytes in the
 // cache's:
@@ -71,13 +76,16 @@ type Entry struct {
 	ID           string `json:"id"`
 	RepositoryID int64  `json:"repository_id"`
 	Scope        string `json:"scope"`
-	Platform     string `json:"platform"`
-	Family       string `json:"family"`
-	Key          string `json:"key"`
-	Series       string `json:"series"`
-	State        string `json:"state"`
+	// Store is the store it's in: service, whose entries' bytes are in the
+	// cache's bucket, or one of the consumer's, whose entries are an index.
+	Store    string `json:"store"`
+	Platform string `json:"platform"`
+	Family   string `json:"family"`
+	Key      string `json:"key"`
+	Series   string `json:"series"`
+	State    string `json:"state"`
 	// Object is its object in the cache's bucket, and Generation the
-	// copy's, 0 until the commit has made it.
+	// copy's, 0 until the commit has made it; an index entry has neither.
 	Object     string `json:"object"`
 	Generation int64  `json:"generation,omitempty"`
 	// Size and SHA256 are the job's word, which every restore checks.
@@ -112,6 +120,7 @@ type Reservation struct {
 	RunAttempt   int64     `json:"run_attempt"`
 	JobID        int64     `json:"job_id"`
 	Scope        string    `json:"scope"`
+	Store        string    `json:"store"`
 	Platform     string    `json:"platform"`
 	Family       string    `json:"family"`
 	Key          string    `json:"key"`
@@ -120,7 +129,8 @@ type Reservation struct {
 	Expires      time.Time `json:"expires"`
 	// Entry is the entry its commit makes, named before the entry's record
 	// is written, so a commit tried again carries on with it; Size, SHA256
-	// and UploadGeneration are that commit's.
+	// and UploadGeneration are that commit's. An index entry's Size and
+	// SHA256 are its save's, which its commit must repeat.
 	Entry            string `json:"entry,omitempty"`
 	Size             int64  `json:"size,omitempty"`
 	SHA256           string `json:"sha256,omitempty"`
@@ -134,6 +144,7 @@ type Choice struct {
 	RepositoryID int64  `json:"repository_id"`
 	RunID        int64  `json:"run_id"`
 	Scope        string `json:"scope"`
+	Store        string `json:"store"`
 	Platform     string `json:"platform"`
 	Family       string `json:"family"`
 	Key          string `json:"key"`
@@ -151,6 +162,7 @@ type Choice struct {
 type Recent struct {
 	RepositoryID int64     `json:"repository_id"`
 	Scope        string    `json:"scope"`
+	Store        string    `json:"store"`
 	Platform     string    `json:"platform"`
 	Family       string    `json:"family"`
 	Step         string    `json:"step"`
@@ -167,6 +179,7 @@ type Recent struct {
 type Family struct {
 	RepositoryID int64     `json:"repository_id"`
 	Scope        string    `json:"scope"`
+	Store        string    `json:"store"`
 	Platform     string    `json:"platform"`
 	Family       string    `json:"family"`
 	LastUsed     time.Time `json:"last_used"`
@@ -215,12 +228,17 @@ var (
 	platformPattern = regexp.MustCompile(`^[a-z0-9]{1,16}-[a-z0-9]{1,16}$`)
 	sha256Pattern   = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	idPattern       = regexp.MustCompile(`^[0-9a-f]{32}$`)
+	storePattern    = regexp.MustCompile(`^[a-z0-9]{1,16}$`)
 )
 
-// Series names an entry's versions: the hash of its scope, platform, family
-// and key.
-func Series(sc, platform, family, key string) string {
-	return selector.Hash(sc + "\x00" + platform + "\x00" + family + "\x00" + key)
+// ServiceStore is the store whose entries' bytes are in the cache's bucket,
+// open only to jobs on the service's own machines.
+const ServiceStore = "service"
+
+// Series names an entry's versions: the hash of its scope, store, platform,
+// family and key.
+func Series(sc, store, platform, family, key string) string {
+	return selector.Hash(sc + "\x00" + store + "\x00" + platform + "\x00" + family + "\x00" + key)
 }
 
 func newID() string {
@@ -236,14 +254,14 @@ func reservationKey(repo int64, id string) string {
 func entryPrefix(repo int64) string         { return fmt.Sprintf("cache/entries/%d/", repo) }
 func entryKey(repo int64, id string) string { return entryPrefix(repo) + id + ".json" }
 func choicePrefix(repo, run int64) string   { return fmt.Sprintf("cache/choices/%d/%d/", repo, run) }
-func recentKey(repo int64, sc, platform, family string) string {
-	return fmt.Sprintf("cache/recent/%d/%s/%s.json", repo, sc, selector.Hash(platform+"\x00"+family))
+func recentKey(repo int64, sc, store, platform, family string) string {
+	return fmt.Sprintf("cache/recent/%d/%s/%s.json", repo, sc, selector.Hash(store+"\x00"+platform+"\x00"+family))
 }
-func familyKey(repo int64, sc, platform, family string) string {
-	return fmt.Sprintf("cache/families/%d/%s.json", repo, selector.Hash(sc+"\x00"+platform+"\x00"+family))
+func familyKey(repo int64, sc, store, platform, family string) string {
+	return fmt.Sprintf("cache/families/%d/%s.json", repo, selector.Hash(sc+"\x00"+store+"\x00"+platform+"\x00"+family))
 }
-func choiceKey(repo, run int64, platform, family, key string) string {
-	return choicePrefix(repo, run) + selector.Hash(platform+"\x00"+family+"\x00"+key) + ".json"
+func choiceKey(repo, run int64, store, platform, family, key string) string {
+	return choicePrefix(repo, run) + selector.Hash(store+"\x00"+platform+"\x00"+family+"\x00"+key) + ".json"
 }
 
 // UploadObject is a reservation's upload's object in the cache's bucket.

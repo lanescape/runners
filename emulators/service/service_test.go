@@ -33,7 +33,7 @@ func setup(t *testing.T) (*service.Emulator, *clockwork.FakeClock, *conformance.
 func saved(t *testing.T, e *service.Emulator, c *conformance.Client, repo service.Repository, data []byte) *conformance.Restored {
 	t.Helper()
 	run := e.Push(repo, "main")
-	j := e.StartJob(run, "")
+	j := e.StartMachineJob(run)
 	tok := e.Token(j, nil)
 	if a := c.Bind(tok, nil); a.Scope() != "main" {
 		t.Fatalf("bound %q", a.Scope())
@@ -42,10 +42,10 @@ func saved(t *testing.T, e *service.Emulator, c *conformance.Client, repo servic
 	c.Upload(r, data, 1<<20, false)
 	c.Commit(tok, r.ID, int64(len(data)), conformance.Sum(data))
 	e.FinishJob(j, "success")
-	next := e.StartJob(e.Push(repo, "main"), "")
+	next := e.StartMachineJob(e.Push(repo, "main"))
 	tok = e.Token(next, nil)
 	c.Bind(tok, nil)
-	_, got := c.Restore(tok, linux, "build", key, false)
+	_, got := c.Restore(tok, service.ServiceStore, linux, "build", key, false)
 	if got == nil {
 		t.Fatal("nothing restored")
 	}
@@ -69,7 +69,7 @@ func TestURLsExpire(t *testing.T) {
 
 func TestASessionTakesBytesForAWeek(t *testing.T) {
 	e, clock, c, repo := setup(t)
-	j := e.StartJob(e.Push(repo, "main"), "")
+	j := e.StartMachineJob(e.Push(repo, "main"))
 	tok := e.Token(j, nil)
 	c.Bind(tok, nil)
 	_, r := c.Save(tok, linux, "build", key)
@@ -110,7 +110,7 @@ func TestASessionTakesBytesForAWeek(t *testing.T) {
 
 func TestFaults(t *testing.T) {
 	e, _, c, repo := setup(t)
-	j := e.StartJob(e.Push(repo, "main"), "")
+	j := e.StartMachineJob(e.Push(repo, "main"))
 	tok := e.Token(j, nil)
 	e.Faults().Add(fault.Rule{PathPrefix: "/v1/bind", Times: 1, Respond: service.Refuse("no binding today")})
 	if a := c.Bind(tok, nil); a.Status != http.StatusForbidden || a.Reason != "no binding today" {
@@ -118,10 +118,10 @@ func TestFaults(t *testing.T) {
 	}
 	e.Faults().Add(fault.Rule{PathPrefix: "/v1/cache/", Times: 1, Respond: service.Unavailable(30 * time.Second)})
 	c.Bind(tok, nil)
-	if a, _ := c.Restore(tok, linux, "build", key, false); a.Status != http.StatusServiceUnavailable {
+	if a, _ := c.Restore(tok, service.ServiceStore, linux, "build", key, false); a.Status != http.StatusServiceUnavailable {
 		t.Fatalf("restore answered %d", a.Status)
 	}
-	if a, _ := c.Restore(tok, linux, "build", key, false); a.Status != http.StatusOK {
+	if a, _ := c.Restore(tok, service.ServiceStore, linux, "build", key, false); a.Status != http.StatusOK {
 		t.Fatalf("restore answered %d once the fault was used", a.Status)
 	}
 }
@@ -130,17 +130,17 @@ func TestAnAutomaticRerunKeepsItsRunsChoices(t *testing.T) {
 	e, _, c, repo := setup(t)
 	first := saved(t, e, c, repo, []byte("first"))
 	run := e.Push(repo, "main")
-	j := e.StartJob(run, "")
+	j := e.StartMachineJob(run)
 	tok := e.Token(j, nil)
 	c.Bind(tok, nil)
-	if _, r := c.Restore(tok, linux, "build", key, false); r == nil || r.SHA256 != first.SHA256 {
+	if _, r := c.Restore(tok, service.ServiceStore, linux, "build", key, false); r == nil || r.SHA256 != first.SHA256 {
 		t.Fatal("no first choice")
 	}
 	saved(t, e, c, repo, []byte("second"))
 	e.FinishJob(j, "failure")
 	again := e.AutomaticRerun(run)
-	tok = e.Token(e.StartJob(again, ""), nil)
-	if _, r := c.Restore(tok, linux, "build", key, false); r == nil || r.SHA256 != first.SHA256 {
+	tok = e.Token(e.StartMachineJob(again), nil)
+	if _, r := c.Restore(tok, service.ServiceStore, linux, "build", key, false); r == nil || r.SHA256 != first.SHA256 {
 		t.Fatal("an automatic rerun picked again")
 	}
 	if es := e.Entries(repo); len(es) != 2 {
