@@ -308,3 +308,20 @@ func TestASmallerJobWaitsForAnOlderLargerOne(t *testing.T) {
 	e.pass()
 	e.wantMachines(3)
 }
+
+// Spot machines of every family share one quota: a younger Spot job of
+// another family doesn't take what an older Spot job is waiting for.
+func TestAYoungerSpotJobWaitsForAnOlderOne(t *testing.T) {
+	e := setup(t)
+	e.gce.SetQuota("northamerica-northeast1", "PREEMPTIBLE_CPUS", 16)
+	e.gce.SetQuota("northamerica-northeast1", "N4_CPUS", 0)
+	e.gce.SetQuota("northamerica-northeast1", "C4_CPUS", 0)
+	big := e.queue(e.mainRun(), "lanescape-80vcpu-linux-amd64-spot-main")
+	time.Sleep(1100 * time.Millisecond)
+	arm := e.queue(e.mainRun(), "lanescape-16vcpu-linux-arm64-spot-main")
+	e.pass()
+	e.wantMachines(0)
+	if e.gh.Job(big.ID).Status != "queued" || e.gh.Job(arm.ID).Status != "queued" {
+		t.Fatal("a job held back by quota isn't queued")
+	}
+}
