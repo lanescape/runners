@@ -193,3 +193,23 @@ func TestARestoredDiskIsAtLeastItsImage(t *testing.T) {
 		t.Fatalf("work disk %d GB", big.size())
 	}
 }
+
+// A maintainer's rerun picks again, as a new run would, even before a pass
+// has dropped the run's choices; an automatic rerun keeps them.
+func TestAMaintainersRerunPicksAgain(t *testing.T) {
+	e := setup(t)
+	old := e.saveMain(key1)
+	run := e.mainRun()
+	first := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}})
+	if first.source() != old {
+		t.Fatal("no restore")
+	}
+	e.clock.Advance(time.Minute)
+	newer := e.saveMain(key1)
+	// The run finishes, and a maintainer reruns it at once.
+	e.gh.CompleteJobByID(first.j.ID, "success")
+	e.gh.Rerun(run)
+	if src := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}}).source(); src != newer {
+		t.Fatalf("a maintainer's rerun started from %q, want the newest %s", src, newer)
+	}
+}

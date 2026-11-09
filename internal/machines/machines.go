@@ -120,9 +120,10 @@ type Saver interface {
 
 // Preemptions deals with a Spot machine that stopped with its job admitted:
 // preempted, or perhaps (specs/0002-machines.md, Preemption). It returns
-// once the machine may be deleted.
+// once the machine may be deleted. resume says whether to make a resume
+// image of its work disk, which a machine past its age limit doesn't get.
 type Preemptions interface {
-	Stopped(ctx context.Context, m Machine, a Admission, preempted bool) error
+	Stopped(ctx context.Context, m Machine, a Admission, preempted, resume bool) error
 }
 
 // Service is the machines' part of the service.

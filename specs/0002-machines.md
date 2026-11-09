@@ -74,7 +74,7 @@ A runner can be taken by a job of the same consumer that was never meant for it:
 | The supervisor's report is recorded | Saves the work disk if the job succeeded, asked and its scope saves; saves the boot log; deletes the machine and its disks |
 | GitHub shows the job finished, but no report has arrived after 10 minutes | Goes on as if the report asked for no save |
 | A Spot machine was preempted, or might have been | Records it, makes a resume image of its work disk if its scope saves (below), then deletes the machine and its disks |
-| The machine is past 5 hours | Deletes it, even mid-job, without saving anything. Compute Engine itself stops every machine at 6 hours |
+| The machine is past 5 hours | Deletes it, even mid-job, without saving anything; a stopped Spot machine is recorded first (below), with no resume image. Compute Engine itself stops every machine at 6 hours |
 | The machine stopped before its job started | Deletes it; another is made while the job is still queued, up to an hour from the job's first machine, after which the service leaves the job queued and logs why |
 | The machine hasn't picked up a job after 20 minutes | Deletes it, with the same hour's limit |
 | A disk attached to nothing, and not recorded as being made or waiting to be attached | Deletes it |

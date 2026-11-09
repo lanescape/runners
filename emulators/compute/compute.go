@@ -261,7 +261,8 @@ func (e *Emulator) RefuseForCapacity(zone, machineType string, spot bool) {
 }
 
 // FailNextOperation makes the next operation of a kind, "instances.delete",
-// "disks.insert", "images.insert" or "images.delete", finish with an error of code, such as INTERNAL_ERROR or
+// "disks.insert", "images.insert" or "images.delete", or
+// "images.insert.leave", which also leaves a FAILED image behind, finish with an error of code, such as INTERNAL_ERROR or
 // RESOURCE_NOT_READY, having done nothing, as Compute Engine sometimes does
 // after accepting a request.
 func (e *Emulator) FailNextOperation(kind, code string) {

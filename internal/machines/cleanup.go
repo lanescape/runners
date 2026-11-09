@@ -62,6 +62,14 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 	}
 	switch {
 	case age >= MaxAge:
+		// A stopped Spot machine is recorded all the same, without a
+		// resume image, so its run may be rerun; the age limit comes
+		// first if it can't be.
+		if admitted && a.Allowed && m.Stopped() && m.Spot && s.Preemptions != nil && inv.recordsComplete {
+			if err := s.Preemptions.Stopped(ctx, m, a, s.preempted(ctx, m), false); err != nil {
+				s.log().Warn("recording a stopped Spot machine past the age limit; it goes without the record", "machine", m.Name, "err", err.Error())
+			}
+		}
 		s.finish(ctx, inv, m, "past "+MaxAge.String()+", deleted even mid-job, saving nothing", nil)
 	case !inv.recordsComplete:
 		return
@@ -127,12 +135,9 @@ func (s *Service) retire(ctx context.Context, m Machine, why string) bool {
 // stoppedSpot deals with a Spot machine that stopped with its job admitted:
 // preempted, by Compute Engine's record, or perhaps.
 func (s *Service) stoppedSpot(ctx context.Context, inv *inventory, m Machine, a Admission) {
-	preempted := false
-	if ids, err := s.Compute.Preempted(ctx, m.Zone); err == nil {
-		preempted = slices.Contains(ids, m.ID)
-	}
+	preempted := s.preempted(ctx, m)
 	if s.Preemptions != nil {
-		if err := s.Preemptions.Stopped(ctx, m, a, preempted); err != nil {
+		if err := s.Preemptions.Stopped(ctx, m, a, preempted, true); err != nil {
 			s.log().Warn("recording a stopped Spot machine", "machine", m.Name, "err", err.Error())
 			return
 		}
@@ -142,6 +147,13 @@ func (s *Service) stoppedSpot(ctx context.Context, inv *inventory, m Machine, a 
 		why = "its Spot machine was preempted"
 	}
 	s.finish(ctx, inv, m, why, nil)
+}
+
+// preempted reports whether Compute Engine's zone operations show it
+// preempted a machine.
+func (s *Service) preempted(ctx context.Context, m Machine) bool {
+	ids, err := s.Compute.Preempted(ctx, m.Zone)
+	return err == nil && slices.Contains(ids, m.ID)
 }
 
 // finish ends a machine's life: it saves the work disk if the report asks

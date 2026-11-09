@@ -162,3 +162,48 @@ func mustGen(t *testing.T, e *env, key string) int64 {
 	}
 	return gen
 }
+
+// An image whose making failed, and left a failed image behind, isn't a
+// save: it's deleted and made again, and nothing is superseded meanwhile.
+func TestAFailedImageIsMadeAgain(t *testing.T) {
+	e := setup(t)
+	old := e.saveMain(key1)
+	e.clock.Advance(time.Minute)
+	jb := e.start(e.mainRun(), ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}})
+	e.gce.FailNextOperation("images.insert.leave", "INTERNAL_ERROR")
+	before := e.images()
+	jb.finish(true)
+	if !e.has(old) {
+		t.Fatal("an older version went for a save that failed")
+	}
+	if _, ok := e.gce.Instance(jb.in.Zone, jb.in.Name); !ok {
+		t.Fatal("the machine went before its save was made")
+	}
+	ready := func() bool {
+		for n, im := range e.images() {
+			if _, ok := before[n]; !ok && im.Status == "READY" {
+				return true
+			}
+		}
+		return false
+	}
+	for i := 0; i < 3 && !ready(); i++ {
+		e.pass()
+	}
+	var newer string
+	for n, im := range e.images() {
+		if _, ok := before[n]; !ok {
+			if im.Status != "READY" {
+				t.Fatalf("saved image %s is %s", n, im.Status)
+			}
+			newer = n
+		}
+	}
+	if newer == "" {
+		t.Fatalf("no save: images %v", e.images())
+	}
+	e.pass()
+	if e.has(old) {
+		t.Fatal("the older version outlived the save that superseded it")
+	}
+}

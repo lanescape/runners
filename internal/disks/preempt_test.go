@@ -11,6 +11,7 @@ import (
 	ghemu "github.com/lanescape/runners/emulators/github"
 	"github.com/lanescape/runners/emulators/google"
 	"github.com/lanescape/runners/internal/disks"
+	"github.com/lanescape/runners/internal/machines"
 	"github.com/lanescape/runners/internal/selector"
 )
 
@@ -382,5 +383,59 @@ func TestAResumeImageGoesADayAfterItsMachineStopped(t *testing.T) {
 	e.pass()
 	if e.has(resume) {
 		t.Fatal("a resume image outlived its day")
+	}
+}
+
+// A Spot machine that a pass first finds stopped past its age limit is
+// recorded all the same, with no resume image, and its run rerun.
+func TestAPreemptionPastTheAgeLimit(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+	e.clock.Advance(machines.MaxAge - time.Minute)
+	jb.preempt()
+	e.clock.Advance(2 * time.Minute)
+	e.pass()
+	if _, ok := e.gce.Instance(jb.in.Zone, jb.in.Name); ok {
+		t.Fatal("a machine past its age limit wasn't deleted")
+	}
+	rec, ok := e.record("preemptions/5001/" + strconv.FormatInt(run.ID, 10) + "/" + strconv.FormatUint(jb.in.ID, 10) + ".json")
+	if !ok || rec["preempted"] != disks.Preempted {
+		t.Fatalf("preemption record = %v", rec)
+	}
+	if len(e.images()) != 0 {
+		t.Fatalf("images %v; a machine past its age limit saves nothing", e.images())
+	}
+	if e.attempt(run) != 2 {
+		t.Fatal("the run wasn't rerun")
+	}
+}
+
+// An automatic rerun keeps its run's restore choices.
+func TestAnAutomaticRerunKeepsItsRunsChoice(t *testing.T) {
+	e := setup(t)
+	old := e.saveMain(key1)
+	run := e.mainRun()
+	label := "lanescape-2vcpu-linux-amd64-spot-disk-build-" + key1 + "-main"
+	lost := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{label}})
+	if lost.source() != old {
+		t.Fatal("no restore")
+	}
+	e.clock.Advance(time.Minute)
+	newer := e.saveMain(key1)
+	lost.preempt()
+	e.pass()
+	if e.attempt(run) != 2 {
+		t.Fatal("not rerun")
+	}
+	if !e.has(old) {
+		t.Fatal("the choice of a run due a rerun lost its image")
+	}
+	if src := e.admit(run, e.rerunJob(run, 2, "build")).source(); src != disks.ResumeName(repoID, lost.in.ID) {
+		t.Fatalf("the rerun's lost job started from %q, not its resume image", src)
+	}
+	other := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{label}})
+	if src := other.source(); src != old || src == newer {
+		t.Fatalf("an automatic rerun's job started from %q, want its run's choice %s", src, old)
 	}
 }

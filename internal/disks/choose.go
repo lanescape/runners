@@ -182,7 +182,24 @@ func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Ad
 		if err != nil {
 			return err
 		}
-		if ok {
+		stale := false
+		if ok && a.RunAttempt > c.Attempt {
+			// Every attempt since the choice's must be one the service's
+			// own reruns started, each from the one before.
+			rr, _, _, err := getJSON[Rerun](ctx, s.Objects, rerunKey(repo, a.RunID))
+			if err != nil {
+				return err
+			}
+			for k := c.Attempt; k < a.RunAttempt; k++ {
+				if !slices.Contains(rr.Attempts, k) {
+					s.log().Info("a maintainer's rerun picks its restore choice again", "run_id", a.RunID, "selector", a.Selector,
+						"attempt", a.RunAttempt)
+					stale = true
+					break
+				}
+			}
+		}
+		if ok && !stale {
 			im, good, err := valid(ctx, c)
 			if err != nil {
 				return err
@@ -218,7 +235,7 @@ func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Ad
 				break
 			}
 		}
-		choice := Choice{RepositoryID: repo, RunID: a.RunID, Selector: sel.String(), At: s.now()}
+		choice := Choice{RepositoryID: repo, RunID: a.RunID, Selector: sel.String(), Attempt: a.RunAttempt, At: s.now()}
 		if pick != nil {
 			choice.Image = pick.Image
 		}

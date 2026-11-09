@@ -219,11 +219,15 @@ type Image struct {
 // Choice is a run's restore choice for a selector: the exact image version
 // every job of the run with that selector starts from, or none.
 type Choice struct {
-	RepositoryID int64     `json:"repository_id"`
-	RunID        int64     `json:"run_id"`
-	Selector     string    `json:"selector"`
-	Image        string    `json:"image,omitempty"`
-	At           time.Time `json:"at"`
+	RepositoryID int64  `json:"repository_id"`
+	RunID        int64  `json:"run_id"`
+	Selector     string `json:"selector"`
+	Image        string `json:"image,omitempty"`
+	// Attempt is the run attempt it was picked in. It holds for the
+	// attempts the service's automatic reruns started from it; one a
+	// maintainer started picks again, as a new run would.
+	Attempt int       `json:"attempt"`
+	At      time.Time `json:"at"`
 }
 
 // Claim is the one job a resume image is for.
@@ -492,10 +496,26 @@ func (s *Service) make(ctx context.Context, key string, rec Image, gen int64) (I
 	}
 	err := s.Compute.CreateImage(ctx, compute.ImageSpec{Name: rec.Image, SourceZone: rec.Zone, SourceDisk: machines.WorkDisk(rec.Machine),
 		Labels: labels(rec)}, compute.RequestID("image", rec.Image, strconv.Itoa(rec.Attempt)))
-	if errors.Is(err, compute.ErrExists) {
-		// Made by an earlier request of ours: only the service makes
-		// images of these names.
-		err = nil
+	if err == nil || errors.Is(err, compute.ErrExists) {
+		// Made, or there from an earlier request of ours, since only the
+		// service makes images of these names; but it's made only once
+		// Compute Engine shows it ready. One still being made is waited
+		// for; a failed one is deleted, and made again by the next try.
+		im, ierr := s.Compute.Image(ctx, rec.Image)
+		switch {
+		case ierr != nil:
+			err = ierr
+		case im.Status == "READY" && matches(im, rec):
+			err = nil
+		case im.Status == "PENDING":
+			return rec, gen, fmt.Errorf("image %s is still being made", rec.Image)
+		default:
+			s.log().Warn("an image that failed, or isn't the one recorded, is deleted to be made again", "image", rec.Image, "status", im.Status)
+			if derr := s.Compute.DeleteImage(ctx, rec.Image, freshID("delete image", rec.Image)); derr != nil && !errors.Is(derr, compute.ErrNotFound) {
+				return rec, gen, derr
+			}
+			err = fmt.Errorf("image %s was %s", rec.Image, im.Status)
+		}
 	}
 	if err != nil {
 		if !compute.IsUnavailable(err) {

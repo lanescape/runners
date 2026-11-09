@@ -18,7 +18,7 @@ import (
 // selector, and whether it was preempted, yes or unknown. If its scope
 // saves disks, it then makes a resume image of its work disk. It implements
 // machines.Preemptions, and is called again until it returns nil.
-func (s *Service) Stopped(ctx context.Context, m machines.Machine, a machines.Admission, preempted bool) error {
+func (s *Service) Stopped(ctx context.Context, m machines.Machine, a machines.Admission, preempted, resume bool) error {
 	repo := m.RepositoryID
 	if !preempted {
 		_, _, ok, err := getJSON[Event](ctx, s.Objects, eventKey(m.ID))
@@ -51,6 +51,10 @@ func (s *Service) Stopped(ctx context.Context, m machines.Machine, a machines.Ad
 		}
 	}
 	log := s.log().With("machine", m.Name, "instance_id", m.ID, "run_id", a.RunID, "job_id", a.JobID, "preempted", rec.Preempted)
+	if !resume {
+		log.Info("stopped Spot machine recorded, past its age limit, with no resume image")
+		return nil
+	}
 	if !m.Selector.Scope.Saves() || rec.NoDisk {
 		log.Info("stopped Spot machine recorded")
 		return nil

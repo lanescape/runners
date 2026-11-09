@@ -1004,6 +1004,13 @@ func (e *Emulator) insertImage(r *http.Request, _ string) (*operation, *apiError
 	if code, ok := e.failing("images.insert"); ok {
 		return op.fail(http.StatusInternalServerError, code, "The operation failed."), nil
 	}
+	if code, ok := e.failing("images.insert.leave"); ok {
+		// Compute Engine can leave a failed image behind its failed
+		// operation.
+		im.status = "FAILED"
+		e.images[im.name] = im
+		return op.fail(http.StatusInternalServerError, code, "The operation failed."), nil
+	}
 	e.images[im.name] = im
 	return op, nil
 }

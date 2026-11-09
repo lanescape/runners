@@ -171,7 +171,7 @@ type preemptions struct {
 	calls map[string]bool
 }
 
-func (p *preemptions) Stopped(_ context.Context, m machines.Machine, _ machines.Admission, preempted bool) error {
+func (p *preemptions) Stopped(_ context.Context, m machines.Machine, _ machines.Admission, preempted, _ bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.calls[m.Name] = preempted
