@@ -103,7 +103,7 @@ func TestPullRequests(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := github.PullRequest{Number: p.Number, State: "open", BaseRepositoryID: 5001, HeadRepositoryID: 7001, HeadSHA: shas[2], BaseSHA: e.repo.Head("main"), Commits: 3}
+	want := github.PullRequest{Number: p.Number, State: "open", BaseRepositoryID: 5001, HeadRepositoryID: 7001, HeadSHA: shas[2], BaseRef: "main", BaseSHA: e.repo.Head("main"), Commits: 3}
 	if got != want {
 		t.Fatalf("pull request = %+v, want %+v", got, want)
 	}

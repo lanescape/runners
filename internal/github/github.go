@@ -69,8 +69,10 @@ type PullRequest struct {
 	BaseRepositoryID int64
 	HeadRepositoryID int64
 	HeadSHA          string
-	BaseSHA          string
-	Commits          int
+	// BaseRef is the branch the pull request targets.
+	BaseRef string
+	BaseSHA string
+	Commits int
 }
 
 // API is what the service reads from GitHub.
@@ -325,6 +327,7 @@ func pullOf(p *gh.PullRequest) PullRequest {
 		BaseRepositoryID: p.GetBase().GetRepo().GetID(),
 		HeadRepositoryID: p.GetHead().GetRepo().GetID(),
 		HeadSHA:          p.GetHead().GetSHA(),
+		BaseRef:          p.GetBase().GetRef(),
 		BaseSHA:          p.GetBase().GetSHA(),
 		Commits:          p.GetCommits(),
 	}

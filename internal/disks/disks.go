@@ -14,7 +14,7 @@
 //	choices/<repository>/<run>/<selector hash>.json  a run's restore choice for a selector
 //	recent/<repository>/<scope>/<family hash>.json  a pull request's most recent choice for a family
 //	closures/<repository>/<scope>.json          when a pull request was last seen closed
-//	families/<repository>/<family hash>.json    when a family of main's was last used
+//	families/<repository>/<family hash>.json    when a family of main's or a long-lived branch's was last used
 //	claims/<repository>/<image>.json            the job a resume image is claimed for
 //	preemptions/<repository>/<run>/<instance ID>.json  a stopped Spot machine, preempted or perhaps
 //	events/<instance ID>.json                   Compute Engine's event that it preempted an instance
@@ -125,6 +125,8 @@ const (
 	StepPullRequestNewest = "pull_request_newest"
 	StepMainExact         = "main_exact"
 	StepMainNewest        = "main_newest"
+	StepBranchExact       = "branch_exact"
+	StepBranchNewest      = "branch_newest"
 	StepNone              = "none"
 )
 
@@ -300,8 +302,8 @@ func retired(v Image, c *Closure) bool {
 	return c != nil && v.Kind == KindSaved && v.Scope == c.Scope && !v.BoundAt.After(c.SeenAt)
 }
 
-// Family is when a family of main's was last used, kept apart from its
-// images' records so that deleting a version never makes the family look
+// Family is when a family of main's or a long-lived branch's was last
+// used, kept apart from its images' records so that deleting a version never makes the family look
 // unused for longer than it has been.
 type Family struct {
 	RepositoryID int64     `json:"repository_id"`
@@ -539,7 +541,7 @@ func (s *Service) touch(ctx context.Context, repo int64, image string) error {
 		// a pass that read this image's record before the touch fails to
 		// mark it, and one that read it after reads the family's use.
 		if rec.Kind == KindSaved && day(rec.LastUsed) != day(s.now()) {
-			if rec.Scope == "main" {
+			if lasting(rec.Scope) {
 				if err := s.putJSON(ctx, familyKey(repo, rec.Scope, rec.Arch, rec.Family), Family{RepositoryID: repo,
 					Scope: rec.Scope, Arch: rec.Arch, Family: rec.Family, LastUsed: s.now()}); err != nil {
 					return err

@@ -9,9 +9,11 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/compute"
 	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/machines"
+	"github.com/lanescape/runners/internal/scope"
 	"github.com/lanescape/runners/internal/selector"
 	"github.com/lanescape/runners/internal/store"
 )
@@ -222,6 +224,10 @@ func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Ad
 		if err != nil {
 			return err
 		}
+		chain, err := s.chain(ctx, repo, a.RunID, sel.Scope)
+		if err != nil {
+			return err
+		}
 		var closure *Closure
 		if _, isPR := sel.Scope.PullRequestNumber(); isPR {
 			c, _, found, err := getJSON[Closure](ctx, s.Objects, closureKey(repo, sel.Scope.String()))
@@ -234,7 +240,7 @@ func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Ad
 		}
 		var pick *Image
 		step := StepNone
-		for _, cand := range candidates(recs, sel, closure) {
+		for _, cand := range candidates(recs, sel, chain, closure) {
 			im, err := s.Compute.Image(ctx, cand.Image.Image)
 			if errors.Is(err, compute.ErrNotFound) {
 				continue
@@ -342,14 +348,41 @@ func (s *Service) rerunBySomeoneElse(ctx context.Context, repoID, runID int64, f
 	return false, nil
 }
 
+// chain is a run's restore chain, from its binding (specs/0002-machines.md,
+// Scope): its own scope, if it saves, then its base. The job-started check
+// admits only a job whose selector's scope is its run's binding, so the
+// binding is there; if it isn't, the selector's scope stands in, with
+// main's as its base.
+func (s *Service) chain(ctx context.Context, repo, runID int64, sc scope.Scope) ([]scope.Scope, error) {
+	bd, _, found, err := getJSON[binding.Binding](ctx, s.Objects, binding.Key(repo, runID))
+	if err != nil {
+		return nil, err
+	}
+	if !found || bd.Scope != sc {
+		return scope.Chain(sc, scope.Main), nil
+	}
+	return bd.Chain(), nil
+}
+
+// Steps names the steps of the restore order that a choice from a scope
+// came from, exact and newest (specs/0003-disks.md, specs/0006-cache.md).
+func Steps(sc scope.Scope) (exact, newest string) {
+	switch {
+	case sc.IsMain():
+		return StepMainExact, StepMainNewest
+	case sc.Lasting():
+		return StepBranchExact, StepBranchNewest
+	}
+	return StepPullRequestExact, StepPullRequestNewest
+}
+
 // candidates are the saved disks a selector may start from, in the order to
-// try them (specs/0003-disks.md, Saved disks): in a pull request's scope,
-// that pull request's disk for the family and key, then its newest for the
-// family; then main's for the family and key, then main's newest for the
-// family. Only disks of the selector's architecture, ready and unmarked,
-// count, and none of a pull request's saved by a run bound before it was
-// last seen closed; of several versions, the newest comes first.
-func candidates(recs map[string]record[Image], sel selector.Selector, closure *Closure) []candidate {
+// try them (specs/0003-disks.md, Saved disks): for each scope of the run's
+// restore chain in turn, its disk for the family and key, then its newest
+// for the family. Only disks of the selector's architecture, ready and
+// unmarked, count, and none of a pull request's saved by a run bound before
+// it was last seen closed; of several versions, the newest comes first.
+func candidates(recs map[string]record[Image], sel selector.Selector, chain []scope.Scope, closure *Closure) []candidate {
 	var pool []Image
 	for _, r := range recs {
 		v := r.v
@@ -366,12 +399,11 @@ func candidates(recs map[string]record[Image], sel selector.Selector, closure *C
 			}
 		}
 	}
-	if _, ok := sel.Scope.PullRequestNumber(); ok {
-		add(sel.Scope.String(), true, StepPullRequestExact)
-		add(sel.Scope.String(), false, StepPullRequestNewest)
+	for _, sc := range chain {
+		exact, newest := Steps(sc)
+		add(sc.String(), true, exact)
+		add(sc.String(), false, newest)
 	}
-	add("main", true, StepMainExact)
-	add("main", false, StepMainNewest)
 	return out
 }
 

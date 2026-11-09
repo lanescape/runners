@@ -290,6 +290,12 @@ func isPullRequest(sc string) (int, bool) {
 	return parsed.PullRequestNumber()
 }
 
+// lasting reports whether a scope is main's or a long-lived branch's.
+func lasting(sc string) bool {
+	parsed, err := scope.Parse(sc)
+	return err == nil && parsed.Lasting()
+}
+
 // supersede deletes what a newly ready saved disk replaces, except what an
 // unfinished run's choice names, which goes once it has finished. A pull
 // request's disk saved by a run bound before the pull request was last seen

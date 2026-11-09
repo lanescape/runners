@@ -302,6 +302,13 @@ func (r *Repo) Branch(name, sha string) {
 	r.branches[name] = sha
 }
 
+// DeleteBranch deletes a branch.
+func (r *Repo) DeleteBranch(name string) {
+	r.emu.mu.Lock()
+	defer r.emu.mu.Unlock()
+	delete(r.branches, name)
+}
+
 // Tag points a tag at a commit.
 func (r *Repo) Tag(name, sha string) {
 	r.emu.mu.Lock()

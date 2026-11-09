@@ -19,6 +19,10 @@ func TestParse(t *testing.T) {
 			Arch: "amd64", Spot: true, Family: "build", Key: "3f9c2e7a10b4d5e6f708", Scope: scope.PullRequest(42)},
 		"lanescape-16vcpu-linux-arm64-disk-tool-chain-0123456789abcdef0123-read": {Shape: "lanescape-16vcpu-linux-arm64", VCPUs: 16,
 			Arch: "arm64", Family: "tool-chain", Key: "0123456789abcdef0123", Scope: scope.Read},
+		"lanescape-2vcpu-linux-amd64-disk-build-0123456789abcdef0123-branch-v1": {Shape: "lanescape-2vcpu-linux-amd64", VCPUs: 2,
+			Arch: "amd64", Family: "build", Key: "0123456789abcdef0123", Scope: scope.Branch("v1")},
+		"lanescape-2vcpu-linux-amd64-branch-release2026": {Shape: "lanescape-2vcpu-linux-amd64", VCPUs: 2, Arch: "amd64",
+			Scope: scope.Branch("release2026")},
 		"LaneScape-2VCPU-Linux-AMD64-Spot-PR7": {Shape: "lanescape-2vcpu-linux-amd64", VCPUs: 2, Arch: "amd64", Spot: true, Scope: scope.PullRequest(7)},
 		// A family is letters, digits and hyphens, starting with a
 		// letter, up to 32 of them; hyphens anywhere after the first.
@@ -50,6 +54,10 @@ func TestParse(t *testing.T) {
 		"lanescape-80vcpu-linux-amd64-pr042",                                 // leading zero
 		"lanescape-80vcpu-linux-amd64-pr",                                    // no number
 		"lanescape-80vcpu-linux-amd64-feature",                               // not a scope
+		"lanescape-80vcpu-linux-amd64-branch-",                               // no branch name
+		"lanescape-80vcpu-linux-amd64-branch-v-1",                            // a hyphen in a branch name
+		"lanescape-80vcpu-linux-amd64-branch-1v",                             // a branch name starting with a digit
+		"lanescape-80vcpu-linux-amd64-branch-abcdefghijklmnopq",              // a branch name of 17
 		"lanescape-80vcpu-linux-amd64-main-spot",                             // out of order
 		"lanescape-80vcpu-linux-amd64-disk-build-main",                       // no key
 		"lanescape-80vcpu-linux-amd64-disk-build-3f9c2e7a10b4d5e6f70-main",   // key too short

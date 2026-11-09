@@ -45,7 +45,7 @@ type Selector struct {
 	Scope  scope.Scope
 }
 
-var pattern = regexp.MustCompile(`^(lanescape-([1-9][0-9]{0,3})vcpu-linux-(amd64|arm64))(-spot)?(?:-disk-([a-z][a-z0-9-]*)-([0-9a-f]{20}))?-(main|read|pr[1-9][0-9]{0,8})$`)
+var pattern = regexp.MustCompile(`^(lanescape-([1-9][0-9]{0,3})vcpu-linux-(amd64|arm64))(-spot)?(?:-disk-([a-z][a-z0-9-]*)-([0-9a-f]{20}))?-(main|read|pr[1-9][0-9]{0,8}|branch-[a-z][a-z0-9]{0,15})$`)
 
 // Parse reads a selector, in any case.
 func Parse(label string) (Selector, error) {

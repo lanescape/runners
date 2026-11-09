@@ -3,12 +3,14 @@ package disks
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"maps"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/compute"
 	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/machines"
@@ -423,10 +425,12 @@ func (s *Service) finishedJob(ctx context.Context, st *state, repoID, jobID int6
 // rules allow (specs/0003-disks.md, Expiry): older versions of a saved disk
 // once a newer one is ready; in a pull request's scope, its other disks of
 // a family once it saves one, all of them once it has closed, and any
-// unused for 14 days; in main's, every key of a family but the two newest
-// and any an open pull request's most recent choice names, and all of a
-// family unused for 90 days; and resume images once their job has started
-// from one, or has finished, or their run has finished with no rerun left.
+// unused for 14 days; in main's and each long-lived branch's, every key of
+// a family but the two newest and any an open pull request's most recent
+// choice names, all of a family unused for 90 days, and all of a branch's
+// once it's no longer listed or no longer exists; and resume images once
+// their job has started from one, or has finished, or their run has
+// finished with no rerun left.
 // Marking leaves alone any image an unfinished run's choice names, and a
 // resume image a job has claimed and not yet started from.
 func (s *Service) expire(ctx context.Context, st *state) {
@@ -517,6 +521,7 @@ func (s *Service) expire(ctx context.Context, st *state) {
 			}
 			return nil
 		}
+		delisted := s.delisted(ctx, st, repo, there)
 		latest, lineage := map[string]Image{}, map[string]Image{}
 		mainKeys := map[string][]Image{}
 		mainUsed := map[string]time.Time{}
@@ -543,12 +548,12 @@ func (s *Service) expire(ctx context.Context, st *state) {
 			if b, ok := lineage[f]; !ok || olderThan(b, v) {
 				lineage[f] = v
 			}
-			if v.Scope == "main" && v.LastUsed.After(mainUsed[f]) {
+			if lasting(v.Scope) && v.LastUsed.After(mainUsed[f]) {
 				mainUsed[f] = v.LastUsed
 			}
 		}
 		for _, v := range latest {
-			if v.Scope == "main" {
+			if lasting(v.Scope) {
 				f := v.Scope + "\x00" + v.Arch + "\x00" + v.Family
 				mainKeys[f] = append(mainKeys[f], v)
 			}
@@ -581,8 +586,8 @@ func (s *Service) expire(ctx context.Context, st *state) {
 				}
 				continue
 			}
-			if c.ImageScope == "main" {
-				keep[Series("main", c.Arch, c.Family, c.Key)] = true
+			if lasting(c.ImageScope) {
+				keep[Series(c.ImageScope, c.Arch, c.Family, c.Key)] = true
 			}
 		}
 		for _, r := range there {
@@ -598,7 +603,11 @@ func (s *Service) expire(ctx context.Context, st *state) {
 					continue
 				}
 				f := v.Scope + "\x00" + v.Arch + "\x00" + v.Family
-				if v.Scope == "main" {
+				if delisted[v.Scope] {
+					add(v.Image, "its long-lived branch is no longer listed, or no longer exists")
+					continue
+				}
+				if lasting(v.Scope) {
 					switch {
 					case s.now().Sub(mainUsed[f]) >= MainUnused:
 						add(v.Image, familyUnused)
@@ -699,6 +708,70 @@ func (s *Service) expire(ctx context.Context, st *state) {
 		}
 		s.tidyScopes(ctx, st, repo, unknown)
 	}
+}
+
+// delisted are the long-lived branches' scopes, of those a consumer's
+// images hold, whose branches are no longer listed in the default branch's
+// .github/runners.json, or no longer exist, by GitHub's confirmed answers.
+// What GitHub can't confirm is kept.
+func (s *Service) delisted(ctx context.Context, st *state, repo int64, there map[string]record[Image]) map[string]bool {
+	scopes := map[string]bool{}
+	for _, r := range there {
+		if r.v.Kind == KindSaved && lasting(r.v.Scope) && r.v.Scope != "main" {
+			scopes[r.v.Scope] = true
+		}
+	}
+	if len(scopes) == 0 {
+		return nil
+	}
+	rp, err := s.repository(ctx, st, repo)
+	if err != nil {
+		s.log().Warn("reading a consumer with long-lived branches", "repository_id", repo, "err", err.Error())
+		return nil
+	}
+	out, err := Delisted(ctx, s.GitHub, rp, s.log(), slices.Sorted(maps.Keys(scopes)))
+	if err != nil {
+		s.log().Warn("reading a consumer's long-lived branches", "repository_id", repo, "err", err.Error())
+	}
+	return out
+}
+
+// Delisted reports which of a consumer's long-lived branches' scopes have
+// lost their branch: no longer listed in the default branch's
+// .github/runners.json, or no longer there. A repository that's gone, or
+// no longer the organization's, delists nothing: nothing of it is decided.
+// Scopes GitHub couldn't confirm are left out, with the error.
+func Delisted(ctx context.Context, gh github.API, repo *github.Repository, log *slog.Logger, scopes []string) (map[string]bool, error) {
+	out := map[string]bool{}
+	if repo == nil {
+		return out, nil
+	}
+	// A file that isn't a JSON object lists nothing, as it binds nothing;
+	// any other failure to read it confirms nothing.
+	f, err := binding.ReadRunners(ctx, gh, *repo, log)
+	if err != nil && !errors.Is(err, binding.ErrRunnersFile) {
+		return out, err
+	}
+	byName := map[string]string{}
+	for branch, name := range f.Branches {
+		byName["branch-"+name] = branch
+	}
+	var errs []error
+	for _, sc := range scopes {
+		branch, ok := byName[sc]
+		if !ok {
+			out[sc] = true
+			continue
+		}
+		_, err := gh.BranchHead(ctx, *repo, branch)
+		switch {
+		case errors.Is(err, github.ErrNotFound):
+			out[sc] = true
+		case err != nil:
+			errs = append(errs, err)
+		}
+	}
+	return out, errors.Join(errs...)
 }
 
 // seenClosed reports whether a pull request scope's pull request is closed,

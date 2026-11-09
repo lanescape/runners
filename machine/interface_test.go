@@ -84,7 +84,7 @@ type bindEvent struct {
 }
 
 var (
-	scopePattern  = regexp.MustCompile(`^(main|read|pr[1-9][0-9]*)$`)
+	scopePattern  = regexp.MustCompile(`^(main|read|pr[1-9][0-9]*|branch-[a-z][a-z0-9]{0,15})$`)
 	shapePattern  = regexp.MustCompile(`^lanescape-[1-9][0-9]*vcpu-linux-(amd64|arm64)$`)
 	familyPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
 	keyPattern    = regexp.MustCompile(`^[0-9a-f]{20}$`)
