@@ -20,6 +20,12 @@ func TestParse(t *testing.T) {
 		"lanescape-16vcpu-linux-arm64-disk-tool-chain-0123456789abcdef0123-read": {Shape: "lanescape-16vcpu-linux-arm64", VCPUs: 16,
 			Arch: "arm64", Family: "tool-chain", Key: "0123456789abcdef0123", Scope: scope.Read},
 		"LaneScape-2VCPU-Linux-AMD64-Spot-PR7": {Shape: "lanescape-2vcpu-linux-amd64", VCPUs: 2, Arch: "amd64", Spot: true, Scope: scope.PullRequest(7)},
+		// A family is letters, digits and hyphens, starting with a
+		// letter, up to 32 of them; hyphens anywhere after the first.
+		"lanescape-2vcpu-linux-amd64-disk-a--b--0123456789abcdef0123-main": {Shape: "lanescape-2vcpu-linux-amd64", VCPUs: 2,
+			Arch: "amd64", Family: "a--b-", Key: "0123456789abcdef0123", Scope: scope.Main},
+		"lanescape-2vcpu-linux-amd64-disk-" + strings.Repeat("a", 32) + "-0123456789abcdef0123-main": {Shape: "lanescape-2vcpu-linux-amd64", VCPUs: 2,
+			Arch: "amd64", Family: strings.Repeat("a", 32), Key: "0123456789abcdef0123", Scope: scope.Main},
 		// A family may be named like the parts around it.
 		"lanescape-2vcpu-linux-amd64-disk-spot-main-0123456789abcdef0123-main": {Shape: "lanescape-2vcpu-linux-amd64", VCPUs: 2,
 			Arch: "amd64", Family: "spot-main", Key: "0123456789abcdef0123", Scope: scope.Main},
@@ -50,8 +56,9 @@ func TestParse(t *testing.T) {
 		"lanescape-80vcpu-linux-amd64-disk-build-3f9c2e7a10b4d5e6f7088-main", // key too long
 		"lanescape-80vcpu-linux-amd64-disk--3f9c2e7a10b4d5e6f708-main",       // empty family
 		"lanescape-80vcpu-linux-amd64-disk-b_d-3f9c2e7a10b4d5e6f708-main",    // underscore
-		"lanescape-80vcpu-linux-amd64-disk-build--x-3f9c2e7a10b4d5e6f708-main",
-		"lanescape-80vcpu-linux-amd64-disk-" + strings.Repeat("a", 41) + "-3f9c2e7a10b4d5e6f708-main",
+		"lanescape-80vcpu-linux-amd64-disk-1build-3f9c2e7a10b4d5e6f708-main", // starts with a digit
+		"lanescape-80vcpu-linux-amd64-disk--build-3f9c2e7a10b4d5e6f708-main", // starts with a hyphen
+		"lanescape-80vcpu-linux-amd64-disk-" + strings.Repeat("a", 33) + "-3f9c2e7a10b4d5e6f708-main",
 		" lanescape-80vcpu-linux-amd64-main",
 		"lanescape-80vcpu-linux-amd64-main\n",
 		"lanescape-80vcpu-linux-amd64-spot-spot-main",

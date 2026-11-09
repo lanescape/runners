@@ -11,7 +11,7 @@ The service's address and the proxy's are constants of this module's package `gi
 `POST /v1/bind` at `endpoints.Service`, with the job's GitHub OIDC token, audience `endpoints.Service`, binds the run's scope (specs/0002-machines.md), or returns the binding the run already has. A run's first job calls it.
 
 - **The body** is empty, except from a consumer's bootstrap workflow in a `pull_request_target` run, where it's what the job's own event says: `{"pull_request": <number>, "head_repository_id": <id>, "head_sha": "<commit>"}`.
-- **The answer** is `200` with `{"scope": "main" | "pr<number>" | "read"}`; `403` when the token or its run isn't one the service binds, with a reason; or `503` when GitHub couldn't confirm an answer, which the caller retries with backoff.
+- **The answer** is `200` with `{"scope": "main" | "pr<number>" | "read"}`; `403` with `{"reason": "<why>"}` when the token or its run isn't one the service binds, or the body isn't a binding request; or `503` with `{"retryable": true}` and a `Retry-After`, when GitHub couldn't confirm an answer, which the caller retries with backoff. Answers may carry other fields, which callers ignore; nothing else is answered.
 
 ## Selectors
 
@@ -24,7 +24,11 @@ A job's selector is `lanescape-<vCPUs>vcpu-linux-<amd64|arm64>[-spot][-disk-<fam
 
 ## Asking to save a work disk
 
-On the service's machines, a job asks to save its work disk by writing `{"save": true}` to `/var/lib/lanescape-runners/save`, which the runner's user may write and the supervisor reads once the runner has exited (specs/0002-machines.md). The file is absent on other runners. Anything else in it, or none at all, asks for no save.
+On the service's machines, a job asks to save its work disk by writing `{"save": true}` to `/var/lib/lanescape-runners/save`, in a directory the runner's user may write, which the supervisor reads once the runner has exited (specs/0002-machines.md). The file is absent on other runners. Anything else in it, a link in its place, or no file at all, asks for no save. Whether the disk is saved is still the service's to decide, from GitHub's conclusion for the job and its run's scope (specs/0003-disks.md); the job learns nothing of it, since it has ended.
+
+## The machines
+
+Jobs on the service's machines run as the runner's user, with passwordless sudo, as on GitHub's runners, and find their work disk at `/work` (specs/0002-machines.md).
 
 ## Reading through the proxy
 

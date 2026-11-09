@@ -219,3 +219,20 @@ func (c *deadlineContext) Err() error {
 }
 
 func (c *deadlineContext) Value(key any) any { return c.parent.Value(key) }
+
+// All is a pass made of bodies run in order, such as the machines' part and
+// then the disks'. One that fails doesn't stop the rest, unless the lease
+// is lost; their errors are joined.
+func All(bodies ...Body) Body {
+	return func(p *Pass) error {
+		var errs []error
+		for _, b := range bodies {
+			if p.Lost() {
+				errs = append(errs, context.Cause(p.Context()))
+				break
+			}
+			errs = append(errs, b(p))
+		}
+		return errors.Join(errs...)
+	}
+}

@@ -54,6 +54,14 @@ type Reconciler interface {
 	Pass(p *pass.Pass) error
 }
 
+// EventRecorder records what a pushed message says that a pass can't read
+// back later, such as Compute Engine's word that it preempted a machine,
+// which Google keeps elsewhere for as little as an hour. It ignores any
+// other message.
+type EventRecorder interface {
+	RecordEvent(ctx context.Context, data []byte) error
+}
+
 // Config is what the server needs.
 type Config struct {
 	Logger         *slog.Logger
@@ -66,6 +74,9 @@ type Config struct {
 	ReconcileCallers *auth.Google
 	Passes           *pass.Runner
 	Reconciler       Reconciler
+	// Events records pushed messages before they're acknowledged; unset,
+	// nothing is.
+	Events EventRecorder
 
 	Actions *auth.Actions
 	Binder  *binding.Binder
@@ -196,11 +207,21 @@ func (s *server) reconcile(w http.ResponseWriter, r *http.Request) {
 		s.refuse(w, r, err)
 		return
 	}
-	// A push's body says what arrived; a pass works from what GitHub and
-	// Compute Engine report, so for now it's read only to its limit.
-	if _, err := io.Copy(io.Discard, io.LimitReader(r.Body, pushLimit)); err != nil {
-		writeError(w, http.StatusBadRequest, "reading body")
+	// A pass works from what GitHub and Compute Engine report when it
+	// runs, never from the message that started it; but what a message
+	// says that can't be read back later is recorded first, whether or not
+	// a pass can run now, so it's recorded before it's acknowledged.
+	body, err := io.ReadAll(io.LimitReader(r.Body, pushLimit+1))
+	if err != nil || len(body) > pushLimit {
+		writeError(w, http.StatusBadRequest, "body unreadable or too large")
 		return
+	}
+	if data, ok := pushData(body); ok && s.Events != nil {
+		if err := s.Events.RecordEvent(r.Context(), data); err != nil {
+			s.log.Error("recording a pushed event", "err", err)
+			retryLater(w, "event not recorded")
+			return
+		}
 	}
 	err = s.Passes.Run(r.Context(), s.Reconciler.Pass)
 	switch {
@@ -214,29 +235,57 @@ func (s *server) reconcile(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// bind is POST /v1/bind, which answers exactly as specs/0005-interface.md
+// says: 200 with the run's scope; 403, with a reason, when the token or its
+// run isn't one the service binds, or the body isn't a binding request; or
+// 503 when GitHub or the bucket couldn't confirm an answer, which the caller
+// retries with backoff. The reason never holds the token.
+// push is a Pub/Sub push subscription's request body.
+type push struct {
+	Message *struct {
+		Data      []byte `json:"data"`
+		MessageID string `json:"messageId"`
+	} `json:"message"`
+	Subscription string `json:"subscription"`
+}
+
+// pushData is a pushed message's data, if the body is a push; the
+// scheduler's calls aren't.
+func pushData(body []byte) ([]byte, bool) {
+	var p push
+	if len(bytes.TrimSpace(body)) == 0 || json.Unmarshal(body, &p) != nil || p.Message == nil || len(p.Message.Data) == 0 {
+		return nil, false
+	}
+	return p.Message.Data, true
+}
+
 func (s *server) bind(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), bindTimeout)
 	defer cancel()
+	refuse := func(reason string) {
+		s.log.Warn("run binding refused", "reason", reason)
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": http.StatusText(http.StatusForbidden), "reason": reason})
+	}
 	tok, err := auth.Bearer(r)
 	var claims *auth.ActionsClaims
 	if err == nil {
 		claims, err = s.Actions.Verify(ctx, tok)
 	}
 	if err != nil {
-		s.refuse(w, r, err)
+		refuse("the token isn't one the service binds: " + err.Error())
 		return
 	}
 	var req binding.Request
 	body, err := io.ReadAll(io.LimitReader(r.Body, bindLimit+1))
 	if err != nil || len(body) > bindLimit {
-		writeError(w, http.StatusBadRequest, "body unreadable or too large")
+		refuse("the body is unreadable or too large")
 		return
 	}
-	if len(body) > 0 {
+	if len(bytes.TrimSpace(body)) > 0 {
 		dec := json.NewDecoder(bytes.NewReader(body))
 		dec.DisallowUnknownFields()
-		if err := dec.Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, "body isn't a binding request")
+		if err := dec.Decode(&req); err != nil || dec.More() {
+			refuse("the body isn't a binding request")
 			return
 		}
 	}
@@ -244,7 +293,7 @@ func (s *server) bind(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case errors.Is(err, binding.ErrRefused):
 		s.log.Warn("run binding refused", "repository_id", claims.RepositoryID, "run_id", claims.RunID, "reason", err.Error())
-		writeError(w, http.StatusForbidden, http.StatusText(http.StatusForbidden))
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": http.StatusText(http.StatusForbidden), "reason": err.Error()})
 	case err != nil:
 		s.log.Warn("run binding not made", "repository_id", claims.RepositoryID, "run_id", claims.RunID, "err", err.Error())
 		retryLater(w, "GitHub couldn't confirm the run; try again")

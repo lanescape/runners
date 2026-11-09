@@ -157,9 +157,9 @@ func (e *env) runnerEnv() map[string]string {
 
 func TestAJobThatAsksToSave(t *testing.T) {
 	t.Setenv("SUPERVISOR_SECRET", "not for the runner")
-	e := setup(t, jit, `touch "$PWD/save"`)
-	// A stale marker from before the job doesn't count; the job's does.
-	if err := os.WriteFile(e.cfg.SaveMarker, nil, 0o644); err != nil {
+	e := setup(t, jit, `echo '{"save": true}' > "$PWD/save"`)
+	// A stale request from before the job doesn't count; the job's does.
+	if err := os.WriteFile(e.cfg.SaveMarker, []byte(`{"save": true}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	e.supervise()
@@ -219,10 +219,40 @@ func TestAJobThatDoesntAsk(t *testing.T) {
 }
 
 func TestOnlyARegularFileIsAMarker(t *testing.T) {
-	e := setup(t, jit, `ln -s /etc/passwd "$PWD/save"`)
+	e := setup(t, jit, `echo '{"save": true}' > "$PWD/elsewhere"; ln -s "$PWD/elsewhere" "$PWD/save"`)
 	e.supervise()
 	if len(e.svc.reports) != 1 || e.svc.reports[0]["save"] {
 		t.Fatalf("reports = %v; a link isn't a request to save", e.svc.reports)
+	}
+}
+
+// specs/0005-interface.md: anything but {"save": true} in the file, or none
+// at all, asks for no save.
+func TestOnlyASaveRequestAsksToSave(t *testing.T) {
+	dir := t.TempDir()
+	for content, want := range map[string]bool{
+		`{"save": true}`:         true,
+		" {\"save\":true}\n":     true,
+		``:                       false,
+		`{"save": false}`:        false,
+		`{"save": "true"}`:       false,
+		`{"save": true, "x": 1}`: false,
+		`{"save": true} {}`:      false,
+		`true`:                   false,
+		`{}`:                     false,
+		`save`:                   false,
+		`{"save": true}` + strings.Repeat(" ", 2000): false,
+	} {
+		path := filepath.Join(dir, "save")
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := asked(path); got != want {
+			t.Errorf("asked(%q) = %v, want %v", content, got, want)
+		}
+	}
+	if asked(filepath.Join(dir, "absent")) {
+		t.Error("no file asked to save")
 	}
 }
 

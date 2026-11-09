@@ -81,8 +81,33 @@ func (r *reconciler) Pass(p *pass.Pass) error {
 	return nil
 }
 
+// events records pushed messages' data, as the service's event recorder
+// does, failing while fail is set.
+type events struct {
+	mu   sync.Mutex
+	got  [][]byte
+	fail bool
+}
+
+func (ev *events) RecordEvent(_ context.Context, data []byte) error {
+	ev.mu.Lock()
+	defer ev.mu.Unlock()
+	if ev.fail {
+		return errors.New("bucket down")
+	}
+	ev.got = append(ev.got, data)
+	return nil
+}
+
+func (ev *events) count() int {
+	ev.mu.Lock()
+	defer ev.mu.Unlock()
+	return len(ev.got)
+}
+
 type env struct {
 	t     *testing.T
+	ev    *events
 	gh    *ghemu.Emulator
 	gg    *google.Issuer
 	gcs   *gcsemu.Emulator
@@ -150,7 +175,9 @@ func setupPass(t *testing.T, deadline time.Duration) *env {
 	clock := clockwork.NewRealClock()
 	pub := &publisher{}
 	rec := &reconciler{}
+	ev := &events{}
 	h, err := server.New(server.Config{
+		Events:           ev,
 		Logger:           log,
 		OrganizationID:   orgID,
 		WebhookSecret:    secret,
@@ -166,7 +193,7 @@ func setupPass(t *testing.T, deadline time.Duration) *env {
 	}
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
-	return &env{t: t, gh: gh, gg: gg, gcs: gcs, org: org, repo: repo, inst: inst, pub: pub, rec: rec, url: srv.URL, logs: logs, logMu: logMu}
+	return &env{t: t, ev: ev, gh: gh, gg: gg, gcs: gcs, org: org, repo: repo, inst: inst, pub: pub, rec: rec, url: srv.URL, logs: logs, logMu: logMu}
 }
 
 func (e *env) post(path, token, body string) (int, map[string]any) {
@@ -376,17 +403,23 @@ func TestBind(t *testing.T) {
 		name, token, body string
 		status            int
 	}{
-		{"no token", "", "", http.StatusUnauthorized},
-		{"wrong audience", e.gh.ActionsToken(other, ghemu.Job{}, nil), "", http.StatusUnauthorized},
+		{"no token", "", "", http.StatusForbidden},
+		{"wrong audience", e.gh.ActionsToken(other, ghemu.Job{}, nil), "", http.StatusForbidden},
 		{"another organization", e.gh.ActionsToken(other, ghemu.Job{Audience: audience}, map[string]any{"repository_owner_id": "1234"}), "", http.StatusForbidden},
-		{"a Google token", e.gg.Token(scheduler, audience), "", http.StatusUnauthorized},
-		{"unknown field", tok, `{"scope": "main"}`, http.StatusBadRequest},
-		{"not JSON", tok, `pr1`, http.StatusBadRequest},
-		{"too large", tok, `{"pull_request": 1` + strings.Repeat(" ", 5000) + `}`, http.StatusBadRequest},
+		{"a Google token", e.gg.Token(scheduler, audience), "", http.StatusForbidden},
+		{"unknown field", tok, `{"scope": "main"}`, http.StatusForbidden},
+		{"not JSON", tok, `pr1`, http.StatusForbidden},
+		{"two objects", tok, `{} {}`, http.StatusForbidden},
+		{"too large", tok, `{"pull_request": 1` + strings.Repeat(" ", 5000) + `}`, http.StatusForbidden},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if code, _ := e.post(server.BindPath, tc.token, tc.body); code != tc.status {
+			code, body := e.post(server.BindPath, tc.token, tc.body)
+			if code != tc.status {
 				t.Fatalf("status = %d, want %d", code, tc.status)
+			}
+			// specs/0005-interface.md: a 403 comes with a reason.
+			if reason, _ := body["reason"].(string); reason == "" {
+				t.Fatalf("a refusal with no reason: %v", body)
 			}
 			e.noSecrets(tc.token)
 		})
@@ -395,8 +428,9 @@ func TestBind(t *testing.T) {
 	t.Run("finished run", func(t *testing.T) {
 		done := e.gh.PushRun(e.repo, "main")
 		e.gh.SetRunStatus(done, "completed")
-		if code, _ := e.post(server.BindPath, e.gh.ActionsToken(done, ghemu.Job{Audience: audience}, nil), ""); code != http.StatusForbidden {
-			t.Fatalf("status = %d, want 403", code)
+		code, body := e.post(server.BindPath, e.gh.ActionsToken(done, ghemu.Job{Audience: audience}, nil), "")
+		if reason, _ := body["reason"].(string); code != http.StatusForbidden || !strings.Contains(reason, "not in progress") {
+			t.Fatalf("finished run: %d %v, want 403 with a reason", code, body)
 		}
 	})
 	t.Run("GitHub down", func(t *testing.T) {
@@ -416,6 +450,46 @@ func TestBind(t *testing.T) {
 		}
 	})
 	e.noSecrets(boot, contributor, tok)
+}
+
+func TestPushedEventsAreRecordedBeforeTheyreAcknowledged(t *testing.T) {
+	e := setup(t)
+	tok := e.gg.Token(pusher, audience)
+	data := []byte(`{"protoPayload": {"methodName": "compute.instances.preempted"}}`)
+	body := string(google.Push("lanescape-dev", "lanescape-runners-compute-events-reconcile", "1", data))
+	if code, _ := e.post(server.ReconcilePath, tok, body); code != http.StatusNoContent || e.ev.count() != 1 || string(e.ev.got[0]) != string(data) {
+		t.Fatalf("push: %d, recorded %d", code, e.ev.count())
+	}
+	// A message that can't be recorded isn't acknowledged, and Pub/Sub
+	// delivers it again; no pass runs for it.
+	e.ev.fail = true
+	passes := e.rec.passes
+	if code, body := e.post(server.ReconcilePath, tok, body); code != http.StatusServiceUnavailable || body["retryable"] != true || e.rec.passes != passes {
+		t.Fatalf("unrecorded push: %d %v", code, body)
+	}
+	e.ev.fail = false
+	// A push that finds the lease held is recorded all the same.
+	e.rec.block = make(chan struct{})
+	done := make(chan int)
+	go func() {
+		code, _ := e.post(server.ReconcilePath, e.gg.Token(scheduler, audience), "{}")
+		done <- code
+	}()
+	for {
+		if _, _, ok := e.gcs.Object("state", pass.LeaseName); ok {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if code, _ := e.post(server.ReconcilePath, tok, body); code != http.StatusServiceUnavailable || e.ev.count() != 2 {
+		t.Fatalf("push while a pass runs: %d, recorded %d", code, e.ev.count())
+	}
+	close(e.rec.block)
+	<-done
+	// The scheduler's calls carry no message.
+	if code, _ := e.post(server.ReconcilePath, e.gg.Token(scheduler, audience), "{}"); code != http.StatusNoContent || e.ev.count() != 2 {
+		t.Fatalf("scheduler: %d, recorded %d", code, e.ev.count())
+	}
 }
 
 func TestAPassCutShortIsRetried(t *testing.T) {

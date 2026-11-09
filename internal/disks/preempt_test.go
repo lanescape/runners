@@ -1,0 +1,299 @@
+package disks_test
+
+import (
+	"context"
+	"strconv"
+	"testing"
+	"time"
+
+	ghemu "github.com/lanescape/runners/emulators/github"
+	"github.com/lanescape/runners/emulators/google"
+	"github.com/lanescape/runners/internal/disks"
+	"github.com/lanescape/runners/internal/selector"
+)
+
+const spot = "lanescape-2vcpu-linux-amd64-spot-main"
+
+// preempt preempts an admitted job's Spot machine, and GitHub fails the job
+// whose runner it lost.
+func (jb *job) preempt() {
+	jb.e.t.Helper()
+	if err := jb.e.gce.Preempt(jb.in.Zone, jb.in.Name); err != nil {
+		jb.e.t.Fatal(err)
+	}
+	jb.e.gh.CompleteJobByID(jb.j.ID, "failure")
+}
+
+// rerunJob is the job of a name in a run's attempt.
+func (e *env) rerunJob(run *ghemu.Run, attempt int, name string) *ghemu.WorkflowJob {
+	e.t.Helper()
+	for _, j := range e.gh.RunJobs(run, attempt) {
+		if j.Name == name && j.Status == "queued" {
+			return &ghemu.WorkflowJob{ID: j.ID}
+		}
+	}
+	e.t.Fatalf("no queued job %s in attempt %d", name, attempt)
+	return nil
+}
+
+func (e *env) attempt(run *ghemu.Run) int {
+	e.t.Helper()
+	repo, err := e.disks.GitHub.RepositoryByID(context.Background(), repoID)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	r, err := e.disks.GitHub.WorkflowRun(context.Background(), repo, run.ID)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return r.Attempt
+}
+
+func TestAPreemptedJobResumes(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+	if jb.in.Provisioning != "SPOT" {
+		t.Fatalf("machine is %s", jb.in.Provisioning)
+	}
+	jb.preempt()
+	e.pass()
+	if _, ok := e.gce.Instance(jb.in.Zone, jb.in.Name); ok {
+		t.Fatal("a preempted machine wasn't deleted")
+	}
+	rec, ok := e.record("preemptions/5001/" + strconv.FormatInt(run.ID, 10) + "/" + strconv.FormatUint(jb.in.ID, 10) + ".json")
+	if !ok || rec["preempted"] != disks.Preempted || rec["job_id"] != float64(jb.j.ID) || rec["job_name"] != "build" ||
+		rec["run_attempt"] != float64(1) || rec["selector"] != spot || rec["zone"] != jb.in.Zone || rec["runner_id"] == float64(0) {
+		t.Fatalf("preemption record = %v", rec)
+	}
+	resume := disks.ResumeName(repoID, jb.in.ID)
+	im, ok := e.images()[resume]
+	if !ok || im.Labels[disks.LabelKind] != disks.KindResume || im.Labels[disks.LabelRun] != strconv.FormatInt(run.ID, 10) ||
+		im.Labels[disks.LabelSelector] != selector.Hash(spot) || im.Labels[disks.LabelJobName] != selector.Hash("build") {
+		t.Fatalf("resume image = %+v, %v", im, ok)
+	}
+	// The run has finished with its Spot job lost, so it's rerun.
+	if a := e.attempt(run); a != 2 {
+		t.Fatalf("attempt %d; the run should have been rerun", a)
+	}
+	if rr, ok := e.record("reruns/5001/" + strconv.FormatInt(run.ID, 10) + ".json"); !ok || len(rr["attempts"].([]any)) != 1 {
+		t.Fatalf("rerun record = %v", rr)
+	}
+	// The rerun's job of the same name resumes from it, claimed by its ID.
+	j2 := e.rerunJob(run, 2, "build")
+	again := e.admit(run, j2)
+	if src := again.source(); src != resume {
+		t.Fatalf("the rerun's job started from %q, want the resume image %s", src, resume)
+	}
+	claim, ok := e.record("claims/5001/" + resume + ".json")
+	if !ok || claim["job_id"] != float64(j2.ID) {
+		t.Fatalf("claim = %v", claim)
+	}
+	// Once its job has finished, the resume image goes.
+	again.finish(false)
+	if e.has(resume) {
+		t.Fatal("a resume image outlived its job")
+	}
+	if a := e.attempt(run); a != 2 {
+		t.Fatalf("a run whose rerun succeeded was rerun again: attempt %d", a)
+	}
+}
+
+func TestOnlyAJobOfAUniqueNameResumes(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	a := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{spot}})
+	b := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{spot}})
+	a.preempt()
+	b.finish(false)
+	e.pass()
+	if e.attempt(run) != 2 {
+		t.Fatal("the run wasn't rerun")
+	}
+	j := e.rerunJob(run, 2, "test")
+	if src := e.admit(run, j).source(); src != "" {
+		t.Fatalf("a job whose name its matrix shares resumed from %s", src)
+	}
+}
+
+func TestAnotherJobNeverGetsAResumeImage(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	a := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+	a.preempt()
+	e.pass()
+	resume := disks.ResumeName(repoID, a.in.ID)
+	// The rerun's job claims it; another job of the rerun of the same name
+	// can't be, so a second machine for the same job ID is the one case.
+	j := e.rerunJob(run, 2, "build")
+	first := e.admit(run, j)
+	if first.source() != resume {
+		t.Fatal("no resume")
+	}
+	// Another run's job of the same name and selector doesn't get it.
+	other := e.mainRun()
+	if src := e.start(other, ghemu.JobSpec{Name: "build", Labels: []string{spot}}).source(); src != "" {
+		t.Fatalf("another run's job started from %s", src)
+	}
+}
+
+func TestAReadRunIsRerunWithoutAResumeImage(t *testing.T) {
+	e := setup(t)
+	run := e.gh.EventRun(e.repo, "workflow_dispatch", "main")
+	if e.bind(run) != "read" {
+		t.Fatal("not read")
+	}
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{"lanescape-2vcpu-linux-amd64-spot-read"}})
+	jb.preempt()
+	e.pass()
+	if len(e.images()) != 0 {
+		t.Fatalf("images %v; the read scope saves nothing", e.images())
+	}
+	if e.attempt(run) != 2 {
+		t.Fatal("a read run that lost a Spot job wasn't rerun")
+	}
+}
+
+func TestEvidenceFromTheRecordedEvent(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+	jb.preempt()
+	entry, _ := e.gce.LogEntry(jb.in.Zone, jb.in.Name, "compute.instances.preempted")
+	// Google forgets the operation before the pass sees it.
+	e.gce.ForgetOperations()
+	e.pass()
+	key := "preemptions/5001/" + strconv.FormatInt(run.ID, 10) + "/" + strconv.FormatUint(jb.in.ID, 10) + ".json"
+	if rec, _ := e.record(key); rec["preempted"] != disks.Unknown {
+		t.Fatalf("record = %v; want unknown", rec)
+	}
+	if e.attempt(run) != 1 {
+		t.Fatal("a run whose job was never shown preempted was rerun")
+	}
+	if !e.has(disks.ResumeName(repoID, jb.in.ID)) {
+		t.Fatal("no resume image while the evidence is unknown")
+	}
+	// The event arrives late, through the push subscription.
+	if err := e.disks.RecordEvent(context.Background(), entry); err != nil {
+		t.Fatal(err)
+	}
+	e.pass()
+	if rec, _ := e.record(key); rec["preempted"] != disks.Preempted {
+		t.Fatalf("record = %v; want yes", rec)
+	}
+	if e.attempt(run) != 2 {
+		t.Fatal("the run wasn't rerun once its job was shown preempted")
+	}
+}
+
+func TestEventsOfOtherKinds(t *testing.T) {
+	e := setup(t)
+	jb := e.start(e.mainRun(), ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+	shutdown, _ := e.gce.LogEntry(jb.in.Zone, jb.in.Name, "compute.instances.guestTerminate")
+	if _, ok := e.disks.ParseEvent(shutdown); ok {
+		t.Fatal("a guest's shutdown was read as a preemption")
+	}
+	preempted, _ := e.gce.LogEntry(jb.in.Zone, jb.in.Name, "compute.instances.preempted")
+	ev, ok := e.disks.ParseEvent(preempted)
+	if !ok || ev.InstanceID != jb.in.ID || ev.Machine != jb.in.Name || ev.Zone != jb.in.Zone {
+		t.Fatalf("event = %+v, %v", ev, ok)
+	}
+	other := *e.disks
+	other.Project = "someone-else"
+	if _, ok := other.ParseEvent(preempted); ok {
+		t.Fatal("another project's event was read")
+	}
+	for _, junk := range []string{"", "{}", "not json", `{"protoPayload": {"methodName": "compute.instances.preempted"}}`} {
+		if _, ok := e.disks.ParseEvent([]byte(junk)); ok {
+			t.Fatalf("%q read as an event", junk)
+		}
+	}
+	// A push's data is the entry, as Pub/Sub delivers it.
+	if len(google.Push(e.gce.Project, "s", "1", preempted)) == 0 {
+		t.Fatal("no push")
+	}
+}
+
+func TestReruns(t *testing.T) {
+	t.Run("up to three attempts", func(t *testing.T) {
+		e := setup(t)
+		run := e.mainRun()
+		jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+		jb.preempt()
+		e.pass()
+		jb = e.admit(run, e.rerunJob(run, 2, "build"))
+		jb.preempt()
+		e.pass()
+		if e.attempt(run) != 3 {
+			t.Fatalf("attempt %d, want 3", e.attempt(run))
+		}
+		jb = e.admit(run, e.rerunJob(run, 3, "build"))
+		jb.preempt()
+		e.pass()
+		e.pass()
+		if e.attempt(run) != 3 {
+			t.Fatalf("a run was rerun past 3 attempts: %d", e.attempt(run))
+		}
+	})
+	t.Run("not while a job runs", func(t *testing.T) {
+		e := setup(t)
+		run := e.mainRun()
+		lost := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+		other := e.start(run, ghemu.JobSpec{Name: "lint", Labels: []string{"lanescape-2vcpu-linux-amd64-main"}})
+		lost.preempt()
+		e.pass()
+		if e.attempt(run) != 1 {
+			t.Fatal("a run was rerun before it finished")
+		}
+		other.finish(false)
+		if e.attempt(run) != 2 {
+			t.Fatal("the run wasn't rerun once it finished")
+		}
+		// Rerunning failed jobs carried the one that succeeded.
+		for _, j := range e.gh.RunJobs(run, 2) {
+			if j.Name == "lint" && j.Status != "completed" {
+				t.Fatalf("lint was rerun: %+v", j)
+			}
+		}
+	})
+	t.Run("a GitHub answer that's lost", func(t *testing.T) {
+		e := setup(t)
+		run := e.mainRun()
+		jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+		jb.preempt()
+		e.gh.ServerError("/repos/lanescape/app/actions/runs/"+strconv.FormatInt(run.ID, 10)+"/rerun-failed-jobs", 502, 1)
+		e.pass()
+		if e.attempt(run) != 1 {
+			t.Fatal("rerun despite the error")
+		}
+		e.pass()
+		if e.attempt(run) != 2 {
+			t.Fatal("not rerun after GitHub came back")
+		}
+	})
+}
+
+func TestAResumeImageGoesADayAfterItsMachineStopped(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+	if err := e.gce.Preempt(jb.in.Zone, jb.in.Name); err != nil {
+		t.Fatal(err)
+	}
+	// Its job's run never finishes, so it's never rerun.
+	e.pass()
+	resume := disks.ResumeName(repoID, jb.in.ID)
+	if !e.has(resume) {
+		t.Fatal("no resume image")
+	}
+	e.clock.Advance(disks.ResumeKept - time.Minute)
+	e.pass()
+	if !e.has(resume) {
+		t.Fatal("a resume image went before a day")
+	}
+	e.clock.Advance(2 * time.Minute)
+	e.pass()
+	if e.has(resume) {
+		t.Fatal("a resume image outlived its day")
+	}
+}

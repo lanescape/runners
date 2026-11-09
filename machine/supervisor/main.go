@@ -51,7 +51,7 @@ type Config struct {
 	// Hook is the job-started hook the runner runs.
 	Hook string `json:"hook"`
 	// SaveMarker is where the save action asks for the work disk to be
-	// saved.
+	// saved, writing {"save": true}.
 	SaveMarker string `json:"save_marker"`
 	// PowerOff is the command that powers the machine off.
 	PowerOff []string `json:"poweroff"`
@@ -200,9 +200,9 @@ func supervise(ctx context.Context, cfg Config, logger *log.Logger, out io.Write
 		report(ctx, md, service, false, cfg, logger)
 		return
 	}
-	// A marker from before the job isn't the job's.
+	// A request from before the job isn't the job's.
 	if err := os.Remove(cfg.SaveMarker); err != nil && !errors.Is(err, os.ErrNotExist) {
-		logger.Printf("removing a stale save marker: %v", err)
+		logger.Printf("removing a stale save request: %v", err)
 	}
 	md.state(ctx, "running")
 	logger.Printf("starting the runner")
@@ -256,12 +256,39 @@ func runRunner(ctx context.Context, cfg Config, jit string, out io.Writer) error
 	return cmd.Run()
 }
 
-// asked reports whether the job asked to save its work disk: the save
-// action left a regular file as its marker. A link or anything else isn't
-// one.
-func asked(marker string) bool {
-	fi, err := os.Lstat(marker)
-	return err == nil && fi.Mode().IsRegular()
+// maxSaveRequest bounds what's read of the save request, which is a few
+// bytes.
+const maxSaveRequest = 1 << 10
+
+// asked reports whether the job asked to save its work disk: the file is a
+// regular one, not a link, holding the JSON object {"save": true}.
+// Anything else in it, or none at all, asks for no save.
+func asked(path string) bool {
+	fi, err := os.Lstat(path)
+	if err != nil || !fi.Mode().IsRegular() {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxSaveRequest+1))
+	if err != nil || len(data) > maxSaveRequest {
+		return false
+	}
+	var req struct {
+		Save *bool `json:"save"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil || req.Save == nil || dec.More() {
+		return false
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return false
+	}
+	return *req.Save
 }
 
 // report tells the service the job is done, and whether it asked to save,

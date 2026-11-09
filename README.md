@@ -15,7 +15,7 @@ The specs in [`specs/`](specs/) describe what it does:
 
 ## Building and testing
 
-The service is being built in stages. So far there's the configuration in `config/`, the emulators in `emulators/`, the pass's lease, the endpoints' authentication, the run binding, and the machines: selectors, making a machine for each queued job, the job-started check, the supervisor's report, cleanup, and the supervisor and job-started hook in `machine/`. Saved disks, preemption reruns, base images, the actions and the proxy come next.
+The service is being built in stages. So far there's the configuration in `config/`, the emulators in `emulators/`, the pass's lease, the endpoints' authentication, the run binding, the machines (selectors, making a machine for each queued job, the job-started check, the supervisor's report, cleanup, and the supervisor and job-started hook in `machine/`), saved disks with their restore choices, limits and expiry, preemption records, resume images and reruns, the interface's constants in `endpoints/`, and the Terraform in `bootstrap/` and `infra/`. The webhook's publishing to Pub/Sub, base images, CD and the proxy come next; the actions are in `lanescape/actions`.
 
 ```sh
 go vet ./...

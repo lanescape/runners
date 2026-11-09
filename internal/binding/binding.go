@@ -36,7 +36,7 @@ var ErrRefused = errors.New("run binding refused")
 var ErrRetry = errors.New("run binding not made; try again")
 
 // RunnersFile is the consumer's file naming its runners and its bootstrap
-// workflow (specs/0005-actions.md).
+// workflow (specs/0005-interface.md).
 const RunnersFile = ".github/runners.json"
 
 // Request is what the caller may say. Only the bootstrap workflow's word is

@@ -41,8 +41,11 @@ import (
 
 // The spec's names and timings.
 const (
-	// Network is the service's network, which every machine joins.
-	Network = "lanescape-runners"
+	// Network is the service's network, which every machine joins, in its
+	// subnetwork of the same name; the proxy's git machine has a
+	// subnetwork of its own.
+	Network    = "lanescape-runners"
+	Subnetwork = "lanescape-runners"
 	// AccountID is the machines' account, which has no role anywhere.
 	AccountID = "lanescape-runners-machine"
 	// GroupPrefix names each consumer's runner group, with its repository
@@ -151,9 +154,9 @@ type Service struct {
 	AssignmentWait  time.Duration
 	AssignmentRetry time.Duration
 
-	// The later parts of a machine's life, to come (specs/0003-disks.md):
-	// unset, every work disk starts empty, nothing is saved, and a stopped
-	// Spot machine is deleted.
+	// The later parts of a machine's life, which the disks package serves
+	// (specs/0003-disks.md): unset, every work disk starts empty, nothing
+	// is saved, and a stopped Spot machine is deleted.
 	Disks       DiskSource
 	Saves       Saver
 	Preemptions Preemptions

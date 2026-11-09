@@ -11,6 +11,7 @@ import (
 	"github.com/jonboulle/clockwork"
 
 	gcsemu "github.com/lanescape/runners/emulators/storage"
+	"github.com/lanescape/runners/endpoints"
 	"github.com/lanescape/runners/internal/lease"
 	"github.com/lanescape/runners/internal/pass"
 	"github.com/lanescape/runners/internal/store"
@@ -22,7 +23,7 @@ func env(m map[string]string) func(string) string {
 
 func good() map[string]string {
 	return map[string]string{
-		"RUNNERS_AUDIENCE":            "https://runners.example.test",
+		"RUNNERS_AUDIENCE":            endpoints.Service,
 		"RUNNERS_PROJECT":             "lanescape-dev",
 		"RUNNERS_BUCKET":              "lanescape-runners",
 		"RUNNERS_GITHUB_APP_ID":       "12345",
@@ -46,7 +47,8 @@ func TestSettings(t *testing.T) {
 func TestBadSettings(t *testing.T) {
 	for name, tc := range map[string]struct{ key, value, want string }{
 		"no audience":     {"RUNNERS_AUDIENCE", "", "RUNNERS_AUDIENCE is required"},
-		"http audience":   {"RUNNERS_AUDIENCE", "http://runners", "https URL"},
+		"http audience":   {"RUNNERS_AUDIENCE", "http://lanescape-runners-168731703350.northamerica-northeast1.run.app", "endpoints.Service"},
+		"other audience":  {"RUNNERS_AUDIENCE", "https://runners.example.test", "endpoints.Service"},
 		"no bucket":       {"RUNNERS_BUCKET", "", "RUNNERS_BUCKET is required"},
 		"no project":      {"RUNNERS_PROJECT", "", "RUNNERS_PROJECT is required"},
 		"app by name":     {"RUNNERS_GITHUB_APP_ID", "lanescape-runners", "numeric ID"},
@@ -56,7 +58,6 @@ func TestBadSettings(t *testing.T) {
 		"no app key file": {"RUNNERS_GITHUB_APP_KEY_FILE", "", "RUNNERS_GITHUB_APP_KEY_FILE is required"},
 		"negative app ID": {"RUNNERS_GITHUB_APP_ID", "-1", "numeric ID"},
 		"missing app ID":  {"RUNNERS_GITHUB_APP_ID", "", "numeric ID"},
-		"ftp audience":    {"RUNNERS_AUDIENCE", "ftp://x", "https URL"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			m := good()

@@ -794,7 +794,7 @@ func (s *Service) make(ctx context.Context, inv *inventory, repo github.Reposito
 			MetaSelector: sel.String(), MetaService: s.ServiceURL, MetaRunnerID: strconv.FormatInt(runner.ID, 10),
 			MetaJob: strconv.FormatInt(job.ID, 10), MetaJITConfig: jit, "enable-guest-attributes": "TRUE",
 		},
-		ServiceAccount: s.MachineAccount, Scopes: scopes, Network: Network, MaxRunDuration: MaxRunDuration,
+		ServiceAccount: s.MachineAccount, Scopes: scopes, Network: Network, Subnetwork: Subnetwork, MaxRunDuration: MaxRunDuration,
 	}
 	var last error
 	for _, pl := range selector.Placements(shape, s.Config.Shapes.Zones, sel.Spot) {

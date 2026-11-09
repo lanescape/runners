@@ -275,3 +275,16 @@ func TestASlowReleaseStopsAtTheDeadline(t *testing.T) {
 	}
 	e.emu.Faults().Reset()
 }
+
+func TestAllRunsEveryPartInOrder(t *testing.T) {
+	e := setup(t)
+	var ran []string
+	part := func(name string, err error) pass.Body {
+		return func(*pass.Pass) error { ran = append(ran, name); return err }
+	}
+	failed := errors.New("the machines' part failed")
+	err := e.runner.Run(context.Background(), pass.All(part("machines", failed), part("disks", nil)))
+	if !errors.Is(err, failed) || len(ran) != 2 || ran[0] != "machines" || ran[1] != "disks" {
+		t.Fatalf("ran %v, err %v; a failed part doesn't stop the next", ran, err)
+	}
+}

@@ -158,8 +158,14 @@ func (s *Service) finish(ctx context.Context, inv *inventory, m Machine, why str
 				log.Warn("the job asked to save its work disk, but saving isn't built yet; deleting it")
 			} else {
 				if !m.Stopped() {
-					// The disk is saved from the stopped machine.
-					return
+					// The disk is saved from the stopped machine. The
+					// report says the job is done, and the supervisor
+					// powers the machine off next; the service stops it
+					// itself rather than wait for the next pass.
+					if err := s.Compute.StopInstance(ctx, m.Zone, m.Name, s.requestID("stop", m.Name)); err != nil && !errors.Is(err, compute.ErrNotFound) {
+						log.Warn("stopping a reported machine to save its disk", "err", err.Error())
+						return
+					}
 				}
 				a := inv.admissions[m.Name]
 				if err := s.Saves.Save(ctx, m, a); err != nil {

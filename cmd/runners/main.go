@@ -4,7 +4,7 @@
 // comes from the environment, set by Terraform:
 //
 //	PORT                         where to listen; Cloud Run sets it
-//	RUNNERS_AUDIENCE             the audience callers' tokens must name: the service's URL
+//	RUNNERS_AUDIENCE             the service's URL, as Cloud Run gives it, which must be endpoints.Service
 //	RUNNERS_PROJECT              the project the service's machines are in
 //	RUNNERS_BUCKET               the service's state bucket
 //	RUNNERS_GITHUB_APP_ID        the GitHub App's ID
@@ -12,8 +12,12 @@
 //	RUNNERS_WEBHOOK_SECRET_FILE  the App's webhook secret, mounted from Secret Manager
 //	RUNNERS_RECONCILE_ACCOUNTS   the scheduler's and push subscriptions' accounts, comma-separated
 //
-// The issuers it trusts are Google's and GitHub's own, and aren't
-// configurable. It refuses to start unless the organization requires
+// The audience every caller's token must name is endpoints.Service, the
+// address the actions rely on (specs/0005-interface.md); the service refuses
+// to start if Cloud Run's address for it, which infra/ passes as
+// RUNNERS_AUDIENCE, isn't that, or if its configuration's organization isn't
+// endpoints.Organization. The issuers it trusts are Google's and GitHub's
+// own, and aren't configurable. It refuses to start unless the organization requires
 // approval for every outside contributor's fork workflows.
 package main
 
@@ -33,9 +37,11 @@ import (
 	"github.com/jonboulle/clockwork"
 
 	"github.com/lanescape/runners/config"
+	"github.com/lanescape/runners/endpoints"
 	"github.com/lanescape/runners/internal/auth"
 	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/compute"
+	"github.com/lanescape/runners/internal/disks"
 	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/lease"
 	"github.com/lanescape/runners/internal/machines"
@@ -93,8 +99,8 @@ func loadSettings(getenv func(string) string) (settings, error) {
 			errs = append(errs, fmt.Errorf("%s is required", name))
 		}
 	}
-	if !strings.HasPrefix(s.Audience, "https://") && s.Audience != "" {
-		errs = append(errs, errors.New("RUNNERS_AUDIENCE must be the service's https URL"))
+	if s.Audience != "" && s.Audience != endpoints.Service {
+		errs = append(errs, fmt.Errorf("RUNNERS_AUDIENCE is %q, and the actions call the service at %s (endpoints.Service)", s.Audience, endpoints.Service))
 	}
 	id, err := strconv.ParseInt(getenv("RUNNERS_GITHUB_APP_ID"), 10, 64)
 	if err != nil || id <= 0 {
@@ -132,6 +138,10 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 	if err != nil {
 		return err
 	}
+	if cfg.Organization.ID != endpoints.Organization {
+		return fmt.Errorf("config/organization.yaml names organization %d, and the actions compare with %d (endpoints.Organization)",
+			cfg.Organization.ID, endpoints.Organization)
+	}
 	s, err := loadSettings(getenv)
 	if err != nil {
 		return err
@@ -153,16 +163,16 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 		return err
 	}
 	defer objects.Close()
-	callers, err := auth.NewGoogle(auth.Options{Issuer: auth.GoogleIssuer, Audience: s.Audience}, s.ReconcileAccounts)
+	callers, err := auth.NewGoogle(auth.Options{Issuer: auth.GoogleIssuer, Audience: endpoints.Service}, s.ReconcileAccounts)
 	if err != nil {
 		return err
 	}
-	actions, err := auth.NewActions(auth.Options{Issuer: auth.ActionsIssuer, Audience: s.Audience}, cfg.Organization.ID)
+	actions, err := auth.NewActions(auth.Options{Issuer: auth.ActionsIssuer, Audience: endpoints.Service}, cfg.Organization.ID)
 	if err != nil {
 		return err
 	}
 	account := machines.MachineAccountOf(s.Project)
-	machineTokens, err := auth.NewMachines(auth.Options{Issuer: auth.GoogleIssuer, Audience: s.Audience}, s.Project, account)
+	machineTokens, err := auth.NewMachines(auth.Options{Issuer: auth.GoogleIssuer, Audience: endpoints.Service}, s.Project, account)
 	if err != nil {
 		return err
 	}
@@ -178,10 +188,13 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 	}
 	clock := clockwork.NewRealClock()
 	binder := &binding.Binder{GitHub: gh, Objects: objects, OrganizationID: cfg.Organization.ID, Clock: clock, Logger: log}
-	svc := &machines.Service{Config: cfg, Project: s.Project, ServiceURL: s.Audience, MachineAccount: account,
-		GitHub: gh, Compute: gce, Objects: objects, Binder: binder, Machines: machineTokens, Clock: clock, Logger: log}
+	dks := &disks.Service{Config: cfg, Project: s.Project, GitHub: gh, Compute: gce, Objects: objects, Clock: clock, Logger: log}
+	svc := &machines.Service{Config: cfg, Project: s.Project, ServiceURL: endpoints.Service, MachineAccount: account,
+		GitHub: gh, Compute: gce, Objects: objects, Binder: binder, Machines: machineTokens, Clock: clock, Logger: log,
+		Disks: dks, Saves: dks, Preemptions: dks}
 	passes := &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log}
-	svc.Kick = kicker(ctx, passes, svc.Pass, 15*time.Second, log)
+	body := pass.All(svc.Pass, dks.Pass)
+	svc.Kick = kicker(ctx, passes, body, 15*time.Second, log)
 	h, err := server.New(server.Config{
 		Logger:           log,
 		OrganizationID:   cfg.Organization.ID,
@@ -189,7 +202,8 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 		Publisher:        noPublisher{},
 		ReconcileCallers: callers,
 		Passes:           passes,
-		Reconciler:       svc,
+		Reconciler:       reconciler(body),
+		Events:           dks,
 		Actions:          actions,
 		Binder:           binder,
 		JobStarted:       svc.JobStarted(),
@@ -260,6 +274,11 @@ func kicker(ctx context.Context, passes *pass.Runner, body pass.Body, every time
 		}
 	}
 }
+
+// reconciler is a pass's body as the server runs it.
+type reconciler pass.Body
+
+func (r reconciler) Pass(p *pass.Pass) error { return r(p) }
 
 // noPublisher stands in until the service publishes to Pub/Sub: a delivery
 // gets a retryable error, and passes' sweeps catch what it would have

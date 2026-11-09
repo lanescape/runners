@@ -24,8 +24,10 @@ import (
 // Prefix begins every selector, and every label that claims to be one.
 const Prefix = "lanescape-"
 
-// MaxFamily is the longest a saved disk's family may be.
-const MaxFamily = 40
+// MaxFamily is the longest a saved disk's family may be: 1 to 32
+// lowercase letters, digits and hyphens, starting with a letter
+// (specs/0005-interface.md, Selectors).
+const MaxFamily = 32
 
 // HashLength is how many hex digits of a selector's SHA-256 its machine's
 // labels carry.
@@ -43,7 +45,7 @@ type Selector struct {
 	Scope  scope.Scope
 }
 
-var pattern = regexp.MustCompile(`^(lanescape-([1-9][0-9]{0,3})vcpu-linux-(amd64|arm64))(-spot)?(?:-disk-([a-z0-9]+(?:-[a-z0-9]+)*)-([0-9a-f]{20}))?-(main|read|pr[1-9][0-9]{0,8})$`)
+var pattern = regexp.MustCompile(`^(lanescape-([1-9][0-9]{0,3})vcpu-linux-(amd64|arm64))(-spot)?(?:-disk-([a-z][a-z0-9-]*)-([0-9a-f]{20}))?-(main|read|pr[1-9][0-9]{0,8})$`)
 
 // Parse reads a selector, in any case.
 func Parse(label string) (Selector, error) {

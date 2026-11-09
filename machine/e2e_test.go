@@ -30,6 +30,7 @@ import (
 	"github.com/lanescape/runners/internal/auth"
 	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/compute"
+	"github.com/lanescape/runners/internal/disks"
 	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/lease"
 	"github.com/lanescape/runners/internal/machines"
@@ -45,6 +46,7 @@ import (
 const (
 	orgID     = 303994381
 	scheduler = "scheduler@lanescape-dev.iam.gserviceaccount.com"
+	pusher    = "lanescape-runners-push@lanescape-dev.iam.gserviceaccount.com"
 	bootstrap = "lanescape/app/.github/workflows/bootstrap.yml@refs/heads/main"
 	sel       = "lanescape-2vcpu-linux-amd64-main"
 	diskSel   = "lanescape-2vcpu-linux-amd64-disk-build-0123456789abcdef0123-main"
@@ -78,6 +80,8 @@ type world struct {
 	fork        *ghemu.Repo
 	contributor *ghemu.Account
 	client      *github.Client
+	disks       *disks.Service
+	act         action
 	url         string
 	logs        *lockedBuffer
 	fake        string
@@ -150,7 +154,7 @@ func newWorld(t *testing.T) *world {
 	if err != nil {
 		t.Fatal(err)
 	}
-	callers, err := auth.NewGoogle(auth.Options{Issuer: auth.Issuer{URL: gg.URL, JWKSURL: gg.JWKSURL}, Audience: audience}, []string{scheduler})
+	callers, err := auth.NewGoogle(auth.Options{Issuer: auth.Issuer{URL: gg.URL, JWKSURL: gg.JWKSURL}, Audience: audience}, []string{scheduler, pusher})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,29 +171,37 @@ func newWorld(t *testing.T) *world {
 	})
 	clock := clockwork.NewRealClock()
 	binder := &binding.Binder{GitHub: ghc, Objects: objects, OrganizationID: orgID, Clock: clock, Logger: log}
+	dks := &disks.Service{Config: cfg, Project: gcp.Project, GitHub: ghc, Compute: gcec, Objects: objects, Clock: clock, Logger: log}
 	svc := &machines.Service{Config: cfg, Project: gcp.Project, ServiceURL: audience, MachineAccount: account,
-		GitHub: ghc, Compute: gcec, Objects: objects, Binder: binder, Machines: tokens, Clock: clock, Logger: log}
+		GitHub: ghc, Compute: gcec, Objects: objects, Binder: binder, Machines: tokens, Clock: clock, Logger: log,
+		Disks: dks, Saves: dks, Preemptions: dks}
 	passes := &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log}
+	body := pass.All(svc.Pass, dks.Pass)
 	var kicks sync.WaitGroup
 	t.Cleanup(kicks.Wait)
-	svc.Kick = func() { kicks.Go(func() { _ = passes.Run(context.Background(), svc.Pass) }) }
+	svc.Kick = func() { kicks.Go(func() { _ = passes.Run(context.Background(), body) }) }
 	handler, err = server.New(server.Config{
 		Logger: log, OrganizationID: orgID, WebhookSecret: []byte("secret"), Publisher: nopPublisher{},
 		ReconcileCallers: callers,
 		Passes:           passes,
-		Reconciler:       svc, Actions: actions, Binder: binder,
+		Reconciler:       reconciler(body), Events: dks, Actions: actions, Binder: binder,
 		JobStarted: svc.JobStarted(), JobFinished: svc.JobFinished(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	w := &world{t: t, gh: gh, gce: gcp, gcs: gcs, gg: gg, org: org, repo: repo, fork: fork, contributor: contributor, client: ghc,
-		url: srv.URL, logs: logs, fake: fakeBin(t), supervisor: supervisor, standIn: standIn, machines: map[string]*booted{}}
+		disks: dks, act: action{t: t, service: srv.URL}, url: srv.URL, logs: logs, fake: fakeBin(t), supervisor: supervisor, standIn: standIn, machines: map[string]*booted{}}
 	gcp.OnBoot(w.boot)
 	gcp.OnStop(w.halt)
 	t.Cleanup(w.haltAll)
 	return w
 }
+
+// reconciler is a pass's body as the server runs it.
+type reconciler pass.Body
+
+func (r reconciler) Pass(p *pass.Pass) error { return r(p) }
 
 type nopPublisher struct{}
 
@@ -287,22 +299,35 @@ func (w *world) post(path, token string, body any) (int, map[string]any) {
 	return resp.StatusCode, out
 }
 
-// bind is the runners action binding a run, from its first job.
+// bind is the runners action binding a run, from its first job, through
+// the interface for actions.
 func (w *world) bind(run *ghemu.Run, job ghemu.Job, req binding.Request) string {
 	w.t.Helper()
-	job.Audience = w.url
-	code, out := w.post(server.BindPath, w.gh.ActionsToken(run, job, nil), req)
-	if code != http.StatusOK {
-		w.t.Fatalf("bind: %d %v", code, out)
+	job.Audience = w.act.service
+	var ev *bindEvent
+	if req != (binding.Request{}) {
+		ev = &bindEvent{PullRequest: req.PullRequest, HeadRepositoryID: req.HeadRepositoryID, HeadSHA: req.HeadSHA}
 	}
-	return out["scope"].(string)
+	a := w.act.bind(w.gh.ActionsToken(run, job, nil), ev)
+	if a.Status != http.StatusOK {
+		w.t.Fatalf("bind: %d %s", a.Status, a.Reason)
+	}
+	return a.Scope
 }
 
-// pass is the scheduler calling the reconcile endpoint.
+// pass is the scheduler calling the reconcile endpoint. A pass that a
+// report started may hold the lease; the call is made again, as the next
+// sweep would be.
 func (w *world) pass() {
 	w.t.Helper()
-	if code, out := w.post(server.ReconcilePath, w.gg.Token(scheduler, w.url), map[string]any{}); code != http.StatusNoContent {
-		w.t.Fatalf("reconcile: %d %v", code, out)
+	for end := time.Now().Add(30 * time.Second); ; time.Sleep(100 * time.Millisecond) {
+		code, out := w.post(server.ReconcilePath, w.gg.Token(scheduler, w.url), map[string]any{})
+		if code == http.StatusNoContent {
+			return
+		}
+		if code != http.StatusServiceUnavailable || time.Now().After(end) {
+			w.t.Fatalf("reconcile: %d %v", code, out)
+		}
 	}
 }
 
@@ -324,6 +349,31 @@ func (w *world) ours() []gceemu.InstanceState {
 		}
 	}
 	return out
+}
+
+// saved are the saved disks and resume images there are, by name.
+func (w *world) saved() map[string]gceemu.ImageState {
+	out := map[string]gceemu.ImageState{}
+	for _, im := range w.gce.Images() {
+		if !strings.HasPrefix(im.Name, "lsr-base-") {
+			out[im.Name] = im
+		}
+	}
+	return out
+}
+
+// push is the push subscription delivering a message to the reconcile
+// endpoint.
+func (w *world) push(subscription string, data []byte) int {
+	w.t.Helper()
+	req, _ := http.NewRequest(http.MethodPost, w.url+server.ReconcilePath, bytes.NewReader(google.Push(w.gce.Project, subscription, "1", data)))
+	req.Header.Set("Authorization", "Bearer "+w.gg.Token(pusher, w.url))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		w.t.Fatal(err)
+	}
+	resp.Body.Close()
+	return resp.StatusCode
 }
 
 func (w *world) done(j *ghemu.WorkflowJob) bool { return w.gh.Job(j.ID).Status == "completed" }
@@ -348,7 +398,7 @@ func TestAJobRunsOnItsMachine(t *testing.T) {
 		t.Fatalf("scope %s", scope)
 	}
 	j := w.gh.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{diskSel},
-		Steps: `[ -d "$(dirname "$LSR_TEST_SAVE")/work" ] && touch "$LSR_TEST_SAVE"`})
+		Steps: `[ -d "$(dirname "$LSR_TEST_SAVE")/work" ] && ` + w.act.saveStep()})
 	w.pass()
 	ms := w.ours()
 	if len(ms) != 1 {
@@ -376,12 +426,12 @@ func TestAJobRunsOnItsMachine(t *testing.T) {
 	if n := len(w.gce.Disks()); n != 0 {
 		t.Fatalf("%d disks left", n)
 	}
+	if !strings.Contains(w.logs.String(), `msg="work disk saved" machine=`+m.Name) || len(w.saved()) != 1 {
+		t.Fatalf("the save the job asked for wasn't made: images %v", w.saved())
+	}
 	log, _, ok := w.gcs.Object("state", "logs/"+m.Name+"-"+m.Labels[machines.LabelCreated]+".txt")
 	if !ok || !strings.Contains(string(log), "the runner exited") || !strings.Contains(string(log), "Running job: build") {
 		t.Fatalf("boot log = %q", log)
-	}
-	if !strings.Contains(w.logs.String(), "saving isn't built yet") {
-		t.Fatal("the save the job asked for wasn't considered")
 	}
 	w.noCredentials()
 }
@@ -492,4 +542,179 @@ func TestTheHookWaitsForAnAnswer(t *testing.T) {
 	if c := w.gh.Job(j.ID).Conclusion; c != "success" {
 		t.Fatalf("job: %s", c)
 	}
+}
+
+// restored is the image the service logged a machine's work disk was
+// restored from, or "".
+func (w *world) restored(machine string) string {
+	for _, l := range strings.Split(w.logs.String(), "\n") {
+		if strings.Contains(l, "machine="+machine+" ") && (strings.Contains(l, `msg="work disk restored"`) || strings.Contains(l, `msg="work disk from a resume image"`)) {
+			if _, img, ok := strings.Cut(l, " image="); ok {
+				return strings.Fields(img)[0]
+			}
+		}
+	}
+	return ""
+}
+
+// runJob queues a job, gives it a machine, and waits for it to finish
+// successfully, returning its machine's name.
+func (w *world) runJob(run *ghemu.Run, spec ghemu.JobSpec) string {
+	w.t.Helper()
+	j := w.gh.Queue(run, spec)
+	w.pass()
+	var name string
+	for _, m := range w.ours() {
+		if m.Labels[machines.LabelJob] == strconv.FormatInt(j.ID, 10) {
+			name = m.Name
+		}
+	}
+	if name == "" {
+		w.t.Fatal("no machine for the job")
+	}
+	w.eventually("the job is done", 60*time.Second, func() bool { return w.done(j) })
+	if c := w.gh.Job(j.ID).Conclusion; c != "success" {
+		w.t.Fatalf("job %s", c)
+	}
+	w.eventually("its machine is deleted", 60*time.Second, func() bool {
+		for _, m := range w.ours() {
+			if m.Name == name {
+				return false
+			}
+		}
+		return true
+	})
+	return name
+}
+
+func TestAPullRequestsRunThroughToItsSaves(t *testing.T) {
+	w := newWorld(t)
+	const key = "3f9c2e7a10b4d5e6f708"
+	shape := "lanescape-2vcpu-linux-amd64"
+	// Main saves first.
+	main := w.gh.PushRun(w.repo, "main")
+	scope := w.bind(main, ghemu.Job{}, binding.Request{})
+	w.runJob(main, ghemu.JobSpec{Name: "build", Labels: []string{w.act.selector(shape, false, "build", key, scope)}, Steps: w.act.saveStep()})
+	mains := w.saved()
+	if len(mains) != 1 {
+		t.Fatalf("images %v, want main's", mains)
+	}
+	var mainImage string
+	for n := range mains {
+		mainImage = n
+	}
+
+	// A pull request starts from main's, and saves its own.
+	w.repo.Commit("feature", map[string]string{"x": "1"})
+	p := w.gh.PullRequest(w.repo, "main", w.repo, "feature", w.gh.User(42, "maintainer"))
+	run := w.gh.PullRequestRun(p)
+	scope = w.bind(run, ghemu.Job{}, binding.Request{})
+	if scope != "pr"+strconv.Itoa(p.Number) {
+		t.Fatalf("the pull request's run bound %s", scope)
+	}
+	label := w.act.selector(shape, false, "build", key, scope)
+	m := w.runJob(run, ghemu.JobSpec{Name: "build", Labels: []string{label}, Steps: w.act.saveStep()})
+	if got := w.restored(m); got != mainImage {
+		t.Fatalf("the pull request's job restored %q, want main's %s", got, mainImage)
+	}
+	var prImage string
+	for n := range w.saved() {
+		if n != mainImage {
+			prImage = n
+		}
+	}
+	if prImage == "" || len(w.saved()) != 2 {
+		t.Fatalf("images %v; the pull request's save is missing", w.saved())
+	}
+
+	// Its next run starts from its own; main's next run from main's.
+	next := w.gh.PullRequestRun(p)
+	if s := w.bind(next, ghemu.Job{}, binding.Request{}); s != scope {
+		t.Fatalf("bound %s", s)
+	}
+	if got := w.restored(w.runJob(next, ghemu.JobSpec{Name: "build", Labels: []string{label}})); got != prImage {
+		t.Fatalf("the pull request's next run restored %q, want %s", got, prImage)
+	}
+	again := w.gh.PushRun(w.repo, "main")
+	scope = w.bind(again, ghemu.Job{}, binding.Request{})
+	if got := w.restored(w.runJob(again, ghemu.JobSpec{Name: "build", Labels: []string{w.act.selector(shape, false, "build", key, scope)}})); got != mainImage {
+		t.Fatalf("main restored %q, want its own %s", got, mainImage)
+	}
+	w.noCredentials()
+}
+
+func TestASpotMachinePreemptedMidJobAndItsRunResumed(t *testing.T) {
+	w := newWorld(t)
+	run := w.gh.PushRun(w.repo, "main")
+	scope := w.bind(run, ghemu.Job{}, binding.Request{})
+	label := w.act.selector("lanescape-2vcpu-linux-amd64", true, "build", "0123456789abcdef0123", scope)
+	// The first attempt runs until it's preempted; its rerun finishes.
+	j := w.gh.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{label},
+		Steps: `if [ "$GITHUB_RUN_ATTEMPT" = 1 ]; then sleep 600; fi`})
+	w.pass()
+	m := w.ours()[0]
+	if m.Provisioning != "SPOT" {
+		t.Fatalf("machine is %s", m.Provisioning)
+	}
+	w.eventually("the job runs with its work disk", 60*time.Second, func() bool {
+		in, _ := w.gce.Instance(m.Zone, m.Name)
+		return w.gh.Job(j.ID).Status == "in_progress" && in.Disks[machines.WorkDevice] != ""
+	})
+	if err := w.gce.Preempt(m.Zone, m.Name); err != nil {
+		t.Fatal(err)
+	}
+	// Compute Engine's event arrives through the push subscription, which
+	// records it before acknowledging; the zone operation is forgotten.
+	entry, _ := w.gce.LogEntry(m.Zone, m.Name, "compute.instances.preempted")
+	w.gce.ForgetOperations()
+	if code := w.push("lanescape-runners-compute-events-reconcile", entry); code != http.StatusNoContent {
+		t.Fatalf("push: %d", code)
+	}
+	if _, _, ok := w.gcs.Object("state", "events/"+strconv.FormatUint(m.ID, 10)+".json"); !ok {
+		t.Fatal("the preemption event wasn't recorded")
+	}
+	// GitHub fails the job whose runner it lost.
+	w.gh.CompleteJobByID(j.ID, "failure")
+	w.pass()
+	resume := disks.ResumeName(5001, m.ID)
+	if _, ok := w.saved()[resume]; !ok {
+		t.Fatalf("no resume image: %v", w.saved())
+	}
+	rec, _, ok := w.gcs.Object("state", "preemptions/5001/"+strconv.FormatInt(run.ID, 10)+"/"+strconv.FormatUint(m.ID, 10)+".json")
+	if !ok || !strings.Contains(string(rec), `"preempted":"yes"`) {
+		t.Fatalf("preemption record = %s", rec)
+	}
+	status, _ := w.gh.RunState(run)
+	if status != "in_progress" {
+		t.Fatal("the run wasn't rerun")
+	}
+	var rerun *ghemu.WorkflowJob
+	for _, j := range w.gh.RunJobs(run, 2) {
+		if j.Name == "build" {
+			rerun = &ghemu.WorkflowJob{ID: j.ID}
+		}
+	}
+	if rerun == nil {
+		t.Fatal("no rerun job")
+	}
+	w.pass()
+	var second string
+	for _, in := range w.ours() {
+		if in.Labels[machines.LabelJob] == strconv.FormatInt(rerun.ID, 10) {
+			second = in.Name
+		}
+	}
+	w.eventually("the rerun's job is done", 60*time.Second, func() bool { return w.done(rerun) })
+	if c := w.gh.Job(rerun.ID).Conclusion; c != "success" {
+		t.Fatalf("the rerun's job: %s", c)
+	}
+	if got := w.restored(second); got != resume {
+		t.Fatalf("the rerun's job started from %q, want its resume image %s", got, resume)
+	}
+	w.eventually("the resume image goes once its job has finished", 60*time.Second, func() bool {
+		w.pass()
+		_, ok := w.saved()[resume]
+		return !ok
+	})
+	w.noCredentials()
 }

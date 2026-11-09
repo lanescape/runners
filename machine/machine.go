@@ -21,10 +21,13 @@ var files embed.FS
 const (
 	HookPath       = "/usr/local/lib/lanescape-runners/job-started.sh"
 	SupervisorPath = "/usr/local/lib/lanescape-runners/supervisor"
-	// SaveMarker is where the save action asks for the job's work disk
-	// to be saved, on the boot disk, for the supervisor to read once the
-	// runner has exited (specs/0005-actions.md).
+	// SaveMarker is where a job asks for its work disk to be saved, by
+	// writing {"save": true}, on the boot disk, in a directory the
+	// runner's user may write, for the supervisor to read once the runner
+	// has exited (specs/0005-interface.md, Asking to save a work disk).
 	SaveMarker = "/var/lib/lanescape-runners/save"
+	// SaveRequest is what a job writes to SaveMarker to ask for a save.
+	SaveRequest = `{"save": true}`
 )
 
 // Files are the embedded files, by their paths in this directory.
