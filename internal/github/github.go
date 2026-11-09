@@ -97,7 +97,11 @@ type API interface {
 // Client is API over GitHub's REST API.
 type Client struct {
 	gh    *gh.Client
+	app   *gh.Client
 	orgID int64
+
+	botMu sync.Mutex
+	bot   string
 
 	orgMu    sync.Mutex
 	orgLogin string
@@ -139,8 +143,27 @@ func NewAppClient(o Options) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.orgID = o.OrganizationID
+	c.orgID, c.app = o.OrganizationID, appClient.gh
 	return c, nil
+}
+
+// Bot is the login of the App's bot user, which acts for its installation,
+// such as when it reruns a run: <slug>[bot].
+func (c *Client) Bot(ctx context.Context) (string, error) {
+	c.botMu.Lock()
+	defer c.botMu.Unlock()
+	if c.bot != "" {
+		return c.bot, nil
+	}
+	a, _, err := c.app.Apps.Get(ctx, "")
+	if err != nil {
+		return "", classify(err)
+	}
+	if a.GetSlug() == "" {
+		return "", &Unavailable{Err: errors.New("the App has no slug")}
+	}
+	c.bot = a.GetSlug() + "[bot]"
+	return c.bot, nil
 }
 
 func newClient(hc *http.Client, base string) (*Client, error) {

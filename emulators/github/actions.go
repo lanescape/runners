@@ -216,12 +216,16 @@ func (e *Emulator) review(r *Run, env string, reviewer *Account, state string) {
 	e.notify()
 }
 
-// Rerun starts a finished run's next attempt, as rerunning it does; jobs
-// queued after it are the new attempt's.
+// Rerun starts a finished run's next attempt, as a maintainer rerunning it
+// does; jobs queued after it are the new attempt's.
 func (e *Emulator) Rerun(r *Run) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	r.Attempt++
+	if r.Triggers == nil {
+		r.Triggers = map[int]*Account{}
+	}
+	r.Triggers[r.Attempt] = &Account{ID: 42, Login: "maintainer", Type: "User"}
 	r.Status, r.Conclusion = "in_progress", ""
 	e.notify()
 }
@@ -449,7 +453,9 @@ func (e *Emulator) actionsRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /repos/{owner}/{repo}/actions/runs/{id}/approvals", e.authed(e.repo(e.listApprovals)))
 	mux.HandleFunc("POST /repos/{owner}/{repo}/actions/runs/{id}/cancel", e.authed(e.repo(e.cancelRun)))
 	mux.HandleFunc("POST /repos/{owner}/{repo}/actions/runs/{id}/force-cancel", e.authed(e.repo(e.forceCancelRun)))
-	mux.HandleFunc("POST /repos/{owner}/{repo}/actions/runs/{id}/rerun-failed-jobs", e.authed(e.repo(e.rerunFailedJobs)))
+	mux.HandleFunc("POST /repos/{owner}/{repo}/actions/runs/{id}/rerun-failed-jobs", e.authed(func(w http.ResponseWriter, r *http.Request, in *Installation) {
+		e.repo(func(w http.ResponseWriter, r *http.Request, rp *Repo) { e.rerunFailedJobs(w, r, rp, in) })(w, r, in)
+	}))
 	mux.HandleFunc("GET /repos/{owner}/{repo}/actions/jobs/{id}", e.authed(e.repo(e.getJob)))
 
 	mux.HandleFunc("POST /_runner/connect", e.standIn(e.runnerConnect))
@@ -981,7 +987,7 @@ var failedConclusions = map[string]bool{"failure": true, "cancelled": true, "tim
 // failed jobs are queued again, with new IDs, and the rest are carried into
 // the attempt with their results. The emulator knows no job's needs, so no
 // dependent job is rerun with them.
-func (e *Emulator) rerunFailedJobs(w http.ResponseWriter, r *http.Request, rp *Repo) {
+func (e *Emulator) rerunFailedJobs(w http.ResponseWriter, r *http.Request, rp *Repo, in *Installation) {
 	e.tick()
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	run := e.runs[id]
@@ -1007,6 +1013,10 @@ func (e *Emulator) rerunFailedJobs(w http.ResponseWriter, r *http.Request, rp *R
 	}
 	run.Attempt++
 	run.Status, run.Conclusion = "in_progress", ""
+	if run.Triggers == nil {
+		run.Triggers = map[int]*Account{}
+	}
+	run.Triggers[run.Attempt] = in.App.Bot
 	for _, j := range last {
 		n := &WorkflowJob{ID: e.id(), Run: run, Attempt: run.Attempt, Name: j.Name, Labels: slices.Clone(j.Labels),
 			Environment: j.Environment, Env: j.Env, Steps: j.Steps, Status: "queued", Created: e.clock.Now()}

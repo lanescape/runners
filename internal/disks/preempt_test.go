@@ -14,6 +14,7 @@ import (
 	"github.com/lanescape/runners/emulators/google"
 	"github.com/lanescape/runners/internal/disks"
 	"github.com/lanescape/runners/internal/machines"
+	"github.com/lanescape/runners/internal/pass"
 	"github.com/lanescape/runners/internal/selector"
 )
 
@@ -602,10 +603,6 @@ func TestARefusedRerunWithNoReadBack(t *testing.T) {
 	if e.attempt(run) != 1 {
 		t.Fatal("rerun despite GitHub's refusal")
 	}
-	rr, _ := e.record("reruns/5001/" + strconv.FormatInt(run.ID, 10) + ".json")
-	if started, _ := rr["started"].([]any); len(started) != 0 {
-		t.Fatalf("rerun record = %v; a refused rerun is recorded as the service's", rr)
-	}
 	e.gh.Rerun(run)
 	if src := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{label}}).source(); src != newer {
 		t.Fatalf("a maintainer's rerun started from %q, want the newest %s", src, newer)
@@ -636,11 +633,34 @@ func TestARefusalWhileAMaintainersRerunBegins(t *testing.T) {
 			_, _ = w.Write([]byte(`{"message": "This workflow is already running"}`))
 		}})
 	e.pass()
-	rr, _ := e.record("reruns/5001/" + strconv.FormatInt(run.ID, 10) + ".json")
-	if started, _ := rr["started"].([]any); len(started) != 0 {
-		t.Fatalf("rerun record = %v; a refused rerun is recorded as the service's", rr)
-	}
 	if src := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{label}}).source(); src != newer {
 		t.Fatalf("the maintainer's rerun started from %q, want the newest %s", src, newer)
+	}
+}
+
+// A maintainer who reruns a run while a pass waits to rerun it gets the
+// rerun; the pass doesn't rerun the maintainer's attempt on what it read
+// before.
+func TestARerunWaitsAndReadsAgain(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+	jb.preempt()
+	release := e.hold()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = e.runner.Run(context.Background(), pass.All(e.svc.Pass, e.disks.Pass))
+	}()
+	time.Sleep(300 * time.Millisecond)
+	e.gh.Rerun(run)
+	e.gh.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+	release()
+	<-done
+	if a := e.attempt(run); a != 2 {
+		t.Fatalf("attempt %d; the service reran a maintainer's attempt", a)
+	}
+	if rr, ok := e.record("reruns/5001/" + strconv.FormatInt(run.ID, 10) + ".json"); ok && len(rr["attempts"].([]any)) != 0 {
+		t.Fatalf("rerun record = %v", rr)
 	}
 }

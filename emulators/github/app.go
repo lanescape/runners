@@ -21,6 +21,11 @@ import (
 type App struct {
 	ID  int64
 	Key *rsa.PrivateKey
+	// Slug names the App; its bot user, which acts for its
+	// installations, is <slug>[bot].
+	Slug string
+	// Bot is the App's bot user.
+	Bot *Account
 }
 
 // PrivateKeyPEM is the App's private key as GitHub hands it out.
@@ -49,9 +54,21 @@ func (e *Emulator) NewApp(id int64) *App {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	a := &App{ID: id, Key: k}
+	a := &App{ID: id, Key: k, Slug: "lanescape-runners"}
+	a.Bot = &Account{ID: 40_000_000 + id, Login: a.Slug + "[bot]", Type: "Bot"}
+	e.accounts[a.Bot.ID] = a.Bot
 	e.apps[id] = a
 	return a
+}
+
+// getApp is GET /app, the authenticated App itself.
+func (e *Emulator) getApp(w http.ResponseWriter, r *http.Request) {
+	app, err := e.appFromJWT(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": app.ID, "slug": app.Slug, "name": "Lanescape Runners"})
 }
 
 // Install installs an App on an account.

@@ -3,7 +3,6 @@ package disks
 import (
 	"context"
 	"errors"
-	"fmt"
 	"slices"
 	"strconv"
 	"strings"
@@ -263,64 +262,43 @@ func (s *Service) follow(ctx context.Context, st *state) {
 }
 
 // rerun asks GitHub to rerun a run's failed jobs, under the disks' lease,
-// which every reading of a restore choice takes: whether the attempt it
-// begins is the service's is settled before any of that attempt's jobs
-// reads its run's choices.
+// which every reading of a restore choice takes.
 func (s *Service) rerun(ctx context.Context, st *state, repoID, runID int64, rs *run) error {
 	return s.step(ctx, repoID, func(ctx context.Context) error { return s.rerunLocked(ctx, st, repoID, runID, rs) })
 }
 
 func (s *Service) rerunLocked(ctx context.Context, st *state, repoID, runID int64, rs *run) error {
+	repo := st.repos[repoID]
+	// What the pass read may have changed while it waited for the lease:
+	// a maintainer may have rerun the run since.
+	if wr, err := s.GitHub.WorkflowRun(ctx, *repo, runID); err != nil {
+		return err
+	} else if wr.Attempt != rs.attempt || wr.Status != "completed" {
+		rs.rerun = false
+		return nil
+	}
 	key := rerunKey(repoID, runID)
 	rec, gen, err := createOnce(ctx, s.Objects, key, Rerun{RepositoryID: repoID, RunID: runID, At: s.now()})
 	if err != nil {
 		return err
 	}
-	// The rerun is recorded, as asked for and as the service's own,
-	// before it's asked for, so a rerun GitHub begins is never one the
-	// bucket doesn't know of; if GitHub's attempt hasn't moved on after
-	// the asking, it's taken back as the service's, and a maintainer's
-	// rerun after it picks its restore choices again.
-	if !slices.Contains(rec.Attempts, rs.attempt) || !slices.Contains(rec.Started, rs.attempt) {
-		if !slices.Contains(rec.Attempts, rs.attempt) {
-			rec.Attempts = append(rec.Attempts, rs.attempt)
-		}
-		if !slices.Contains(rec.Started, rs.attempt) {
-			rec.Started = append(rec.Started, rs.attempt)
-		}
-		rec.At = s.now()
+	// Each attempt rerun is counted before it's asked for, so a lost
+	// answer never lets one be asked for twice. Whether the attempt it
+	// began is the service's own is GitHub's record of who triggered it.
+	if !slices.Contains(rec.Attempts, rs.attempt) {
+		rec.Attempts, rec.At = append(rec.Attempts, rs.attempt), s.now()
 		if gen, err = replaceJSON(ctx, s.Objects, key, rec, gen); err != nil {
 			return err
 		}
 		st.reruns[key] = record[Rerun]{rec, gen}
 	}
-	repo := st.repos[repoID]
 	err = s.GitHub.RerunFailedJobs(ctx, *repo, runID)
-	wr, rerr := s.GitHub.WorkflowRun(ctx, *repo, runID)
-	refused := err != nil && !github.IsUnavailable(err)
-	switch {
-	case !refused && rerr == nil && wr.Attempt > rs.attempt:
-		// Begun, whatever the answer said: an answer lost after GitHub
-		// began the next attempt is a rerun all the same. A confirmed
-		// refusal never is, even if another attempt has begun, which
-		// then is someone else's.
-		err = nil
-	case rerr == nil && err == nil:
-		err = fmt.Errorf("GitHub accepted the rerun but still shows attempt %d", wr.Attempt)
-		fallthrough
-	case rerr == nil, refused:
-		// GitHub's attempt didn't move on, or GitHub confirmed its
-		// refusal: not a rerun of the service's.
-		rec.Started = slices.DeleteFunc(rec.Started, func(a int) bool { return a == rs.attempt })
-		if g, werr := replaceJSON(ctx, s.Objects, key, rec, gen); werr == nil {
-			st.reruns[key] = record[Rerun]{rec, g}
-		} else {
-			s.log().Warn("taking back a rerun that didn't begin", "run_id", runID, "err", werr.Error())
+	if err != nil && github.IsUnavailable(err) {
+		// An answer lost after GitHub began the next attempt is a rerun
+		// all the same.
+		if wr, rerr := s.GitHub.WorkflowRun(ctx, *repo, runID); rerr == nil && wr.Attempt > rs.attempt {
+			err = nil
 		}
-	case err == nil:
-		// Accepted, and the run can't be read back: it's taken as begun.
-	default:
-		err = errors.Join(err, rerr)
 	}
 	if err != nil {
 		return err

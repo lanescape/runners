@@ -16,11 +16,13 @@ import (
 
 func (e *Emulator) routes() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /app", e.getApp)
 	mux.HandleFunc("GET /app/installations", e.listInstallations)
 	mux.HandleFunc("POST /app/installations/{id}/access_tokens", e.createToken)
 	mux.HandleFunc("GET /repositories/{id}", e.authed(e.getRepoByID))
 	mux.HandleFunc("GET /repos/{owner}/{repo}", e.authed(e.repo(e.getRepo)))
 	mux.HandleFunc("GET /repos/{owner}/{repo}/actions/runs/{id}", e.authed(e.repo(e.getRun)))
+	mux.HandleFunc("GET /repos/{owner}/{repo}/actions/runs/{id}/attempts/{attempt}", e.authed(e.repo(e.getRunAttempt)))
 	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls", e.authed(e.repo(e.listPulls)))
 	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}", e.authed(e.repo(e.getPull)))
 	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}/commits", e.authed(e.repo(e.listPullCommits)))
@@ -135,6 +137,12 @@ func (e *Emulator) getRepo(w http.ResponseWriter, _ *http.Request, rp *Repo) {
 }
 
 func (e *Emulator) runJSON(run *Run) map[string]any {
+	return e.attemptJSON(run, run.Attempt)
+}
+
+// attemptJSON is a run as GitHub shows one of its attempts: with the
+// attempt's number and who triggered it.
+func (e *Emulator) attemptJSON(run *Run, attempt int) map[string]any {
 	var pulls []map[string]any
 	for _, p := range run.Pulls {
 		pulls = append(pulls, map[string]any{
@@ -149,26 +157,38 @@ func (e *Emulator) runJSON(run *Run) map[string]any {
 		conclusion = run.Conclusion
 	}
 	return map[string]any{
-		"id":              run.ID,
-		"name":            run.Path,
-		"node_id":         fmt.Sprintf("WFR_%d", run.ID),
-		"head_branch":     run.HeadBranch,
-		"head_sha":        run.HeadSHA,
-		"path":            run.Path,
-		"run_number":      run.Number,
-		"run_attempt":     run.Attempt,
-		"event":           run.Event,
-		"status":          run.Status,
-		"conclusion":      conclusion,
-		"workflow_id":     1,
-		"url":             fmt.Sprintf("%s/repos/%s/actions/runs/%d", e.URL, run.Repo.FullName(), run.ID),
-		"pull_requests":   pulls,
-		"actor":           accountJSON(run.Actor),
-		"repository":      e.repoJSON(run.Repo),
-		"head_repository": e.repoJSON(run.HeadRepo),
-		"created_at":      run.Created.UTC().Format(time.RFC3339),
-		"updated_at":      e.clock.Now().UTC().Format(time.RFC3339),
+		"id":               run.ID,
+		"name":             run.Path,
+		"node_id":          fmt.Sprintf("WFR_%d", run.ID),
+		"head_branch":      run.HeadBranch,
+		"head_sha":         run.HeadSHA,
+		"path":             run.Path,
+		"run_number":       run.Number,
+		"run_attempt":      attempt,
+		"triggering_actor": accountJSON(run.trigger(attempt)),
+		"event":            run.Event,
+		"status":           run.Status,
+		"conclusion":       conclusion,
+		"workflow_id":      1,
+		"url":              fmt.Sprintf("%s/repos/%s/actions/runs/%d", e.URL, run.Repo.FullName(), run.ID),
+		"pull_requests":    pulls,
+		"actor":            accountJSON(run.Actor),
+		"repository":       e.repoJSON(run.Repo),
+		"head_repository":  e.repoJSON(run.HeadRepo),
+		"created_at":       run.Created.UTC().Format(time.RFC3339),
+		"updated_at":       e.clock.Now().UTC().Format(time.RFC3339),
 	}
+}
+
+func (e *Emulator) getRunAttempt(w http.ResponseWriter, r *http.Request, rp *Repo) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	n, nerr := strconv.Atoi(r.PathValue("attempt"))
+	run := e.runs[id]
+	if err != nil || nerr != nil || run == nil || run.Repo != rp || n < 1 || n > run.Attempt {
+		writeError(w, http.StatusNotFound, "Not Found")
+		return
+	}
+	writeJSON(w, http.StatusOK, e.attemptJSON(run, n))
 }
 
 func (e *Emulator) getRun(w http.ResponseWriter, r *http.Request, rp *Repo) {

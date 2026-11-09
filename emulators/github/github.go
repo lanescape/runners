@@ -142,6 +142,10 @@ type Run struct {
 	Jobs      []*WorkflowJob
 	Approvals []Approval
 
+	// Triggers are who triggered each attempt after the first, by number:
+	// a maintainer who reran it, or an App's bot.
+	Triggers map[int]*Account
+
 	// EventPull is what the event's payload says of its pull request, as
 	// github.event.pull_request carries it, for pull_request and
 	// pull_request_target runs: fixed when the run is made.
@@ -153,6 +157,15 @@ type EventPull struct {
 	Number           int
 	HeadRepositoryID int64
 	HeadSHA          string
+}
+
+// trigger is who triggered an attempt of a run: the run's actor for the
+// first, unless a rerun says otherwise.
+func (r *Run) trigger(attempt int) *Account {
+	if a := r.Triggers[attempt]; a != nil {
+		return a
+	}
+	return r.Actor
 }
 
 // Option configures an Emulator.

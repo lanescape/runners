@@ -451,3 +451,30 @@ func TestRerunFailedJobs(t *testing.T) {
 		t.Fatalf("latest jobs = %+v", latest)
 	}
 }
+
+func TestWhoTriggeredAnAttempt(t *testing.T) {
+	ctx := context.Background()
+	e := setup(t)
+	repo := e.repository(t)
+	run := e.emu.PushRun(e.repo, "main")
+	j := e.emu.Queue(run, ghemu.JobSpec{Name: "build"})
+	e.emu.CompleteJob(j, "failure")
+	if err := e.c.RerunFailedJobs(ctx, repo, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	bot, err := e.c.Bot(ctx)
+	if err != nil || bot != "lanescape-runners[bot]" {
+		t.Fatalf("bot = %q, %v", bot, err)
+	}
+	if by, err := e.c.AttemptTrigger(ctx, repo, run.ID, 2); err != nil || by != bot {
+		t.Fatalf("attempt 2 triggered by %q, %v; want the App's bot", by, err)
+	}
+	e.emu.CompleteJobByID(e.emu.RunJobs(run, 2)[0].ID, "success")
+	e.emu.Rerun(run)
+	if by, err := e.c.AttemptTrigger(ctx, repo, run.ID, 3); err != nil || by == bot {
+		t.Fatalf("attempt 3 triggered by %q, %v; want the maintainer", by, err)
+	}
+	if _, err := e.c.AttemptTrigger(ctx, repo, run.ID, 4); !errors.Is(err, github.ErrNotFound) {
+		t.Fatalf("an attempt that isn't: %v", err)
+	}
+}

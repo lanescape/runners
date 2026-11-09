@@ -86,6 +86,11 @@ type Actions interface {
 	// RerunFailedJobs starts a finished run's next attempt, rerunning its
 	// failed jobs and those that depend on them.
 	RerunFailedJobs(ctx context.Context, repo Repository, runID int64) error
+	// AttemptTrigger is the login of whoever triggered one of a run's
+	// attempts, such as a maintainer who reran it, or the App's bot.
+	AttemptTrigger(ctx context.Context, repo Repository, runID int64, attempt int) (string, error)
+	// Bot is the login of the App's own bot user.
+	Bot(ctx context.Context) (string, error)
 	// ForkApprovalPolicy is the organization's setting for which outside
 	// contributors' fork pull request workflows need a maintainer's
 	// approval.
@@ -286,6 +291,18 @@ func (c *Client) ForceCancelRun(ctx context.Context, repo Repository, runID int6
 	}
 	_, err = c.gh.Do(req, nil)
 	return accepted(err)
+}
+
+// AttemptTrigger implements Actions.
+func (c *Client) AttemptTrigger(ctx context.Context, repo Repository, runID int64, attempt int) (string, error) {
+	r, _, err := c.gh.Actions.GetWorkflowRunAttempt(ctx, repo.Owner, repo.Name, runID, attempt, nil)
+	if err != nil {
+		return "", classify(err)
+	}
+	if r.GetRunAttempt() != attempt || r.GetTriggeringActor().GetLogin() == "" {
+		return "", &Unavailable{Err: fmt.Errorf("run %d attempt %d: incomplete answer", runID, attempt)}
+	}
+	return r.GetTriggeringActor().GetLogin(), nil
 }
 
 // RerunFailedJobs implements Actions. GitHub answers 201 Created, and a

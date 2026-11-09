@@ -188,18 +188,14 @@ func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Ad
 		stale := false
 		if ok && a.RunAttempt > c.Attempt {
 			// Every attempt since the choice's must be one the service's
-			// own reruns started, each from the one before.
-			rr, _, _, err := getJSON[Rerun](ctx, s.Objects, rerunKey(repo, a.RunID))
+			// own reruns started, by GitHub's record of who triggered it.
+			stale, err = s.rerunBySomeoneElse(ctx, m.RepositoryID, a.RunID, c.Attempt, a.RunAttempt)
 			if err != nil {
 				return err
 			}
-			for k := c.Attempt; k < a.RunAttempt; k++ {
-				if !slices.Contains(rr.Started, k) {
-					s.log().Info("a maintainer's rerun picks its restore choice again", "run_id", a.RunID, "selector", a.Selector,
-						"attempt", a.RunAttempt)
-					stale = true
-					break
-				}
+			if stale {
+				s.log().Info("a maintainer's rerun picks its restore choice again", "run_id", a.RunID, "selector", a.Selector,
+					"attempt", a.RunAttempt)
 			}
 		}
 		if ok && !stale {
@@ -263,6 +259,30 @@ func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Ad
 		return nil
 	})
 	return out, err
+}
+
+// rerunBySomeoneElse reports whether any attempt of a run after from, up to
+// to, was triggered by anyone but the App's own bot: by GitHub's record of
+// each attempt.
+func (s *Service) rerunBySomeoneElse(ctx context.Context, repoID, runID int64, from, to int) (bool, error) {
+	repo, err := s.GitHub.RepositoryByID(ctx, repoID)
+	if err != nil {
+		return false, err
+	}
+	bot, err := s.GitHub.Bot(ctx)
+	if err != nil {
+		return false, err
+	}
+	for k := from + 1; k <= to; k++ {
+		by, err := s.GitHub.AttemptTrigger(ctx, repo, runID, k)
+		if err != nil {
+			return false, err
+		}
+		if by != bot {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // candidates are the saved disks a selector may start from, in the order to
