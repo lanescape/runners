@@ -1144,6 +1144,9 @@ func (e *Emulator) jobEnv(j *WorkflowJob) map[string]string {
 		"GITHUB_SHA":                 run.SHA,
 		"RUNNER_NAME":                j.Runner.Name,
 		"RUNNER_OS":                  "Linux",
+		"ACTIONS_RESULTS_URL":        e.ResultsURL(),
+		"ACTIONS_RUNTIME_TOKEN":      e.runtimeToken(j),
+		"ACTIONS_CACHE_SERVICE_V2":   "True",
 	} {
 		env[k] = v
 	}

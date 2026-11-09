@@ -291,7 +291,7 @@ func TestStandInTakesAnyJobItsLabelsMatch(t *testing.T) {
 	// A job that asked only for self-hosted is queued first, so it's handed
 	// out first, to a runner made for the other.
 	stray := e.emu.Queue(run, ghemu.JobSpec{Name: "stray", Labels: []string{"Self-Hosted"},
-		Env: map[string]string{"GITHUB_RUN_ID": "1", "FROM_JOB": "yes"}, Steps: `echo "steps ran" > "$OUT/steps"`})
+		Env: map[string]string{"GITHUB_RUN_ID": "1", "FROM_JOB": "yes"}, Steps: `echo "steps ran" > "$OUT/steps"; echo "$ACTIONS_RESULTS_URL $ACTIONS_CACHE_SERVICE_V2 ${#ACTIONS_RUNTIME_TOKEN}" > "$OUT/cache"`})
 	meant := e.emu.Queue(run, ghemu.JobSpec{Name: "meant", Labels: []string{sel}})
 
 	dir := t.TempDir()
@@ -315,6 +315,10 @@ func TestStandInTakesAnyJobItsLabelsMatch(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "steps")); err != nil {
 		t.Fatal("steps didn't run after the hook")
+	}
+	// The job finds the Actions cache service, as the runner sets it.
+	if b, _ := os.ReadFile(filepath.Join(dir, "cache")); !strings.HasPrefix(string(b), e.emu.ResultsURL()+" True ") || strings.TrimSpace(string(b)) == e.emu.ResultsURL()+" True 0" {
+		t.Fatalf("the job's cache environment is %q", b)
 	}
 	if e.emu.Job(meant.ID).Status != "queued" {
 		t.Fatal("a one-job runner took a second job")

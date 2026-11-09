@@ -3,8 +3,9 @@
 // Actions OIDC issuer; and signed webhook deliveries. It keeps repositories,
 // commits, branches, tags, pull requests, workflow runs and their jobs,
 // environments' approvals, runner groups and just-in-time runners, and hands
-// queued jobs to registered runners as GitHub does. A runner stand-in
-// (StandIn) plays a runner's part. It fails as GitHub does, with rate limits
+// queued jobs to registered runners as GitHub does. It serves the Actions
+// cache service, as the current @actions/cache calls it (cache.go). A runner
+// stand-in (StandIn) plays a runner's part. It fails as GitHub does, with rate limits
 // and server errors.
 //
 // Commits live in one store shared by every repository, as a fork network
@@ -56,6 +57,11 @@ type Emulator struct {
 	forkApproval map[int64]string
 	protected    map[string]bool
 	changed      chan struct{}
+
+	caches        map[int64]*CacheEntry
+	runtimeTokens map[string]*runtimeGrant
+	cacheLimits   map[int64]int64
+	cacheKey      []byte
 }
 
 // Account is a user or organization.
@@ -190,6 +196,7 @@ func New(opts ...Option) *Emulator {
 		nextID:        1_000_000,
 	}
 	e.initActions()
+	e.initCache()
 	for _, o := range opts {
 		o(e)
 	}
