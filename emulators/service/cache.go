@@ -128,11 +128,12 @@ func (e *Emulator) serveCache(h func(c *caller, body []byte) (any, error)) http.
 }
 
 func (e *Emulator) caller(c *claims) (*caller, error) {
-	if e.unavailable {
-		return nil, errUnavailable
-	}
+	// What the token says is checked before anything of GitHub's.
 	if c.checkRunID == 0 {
 		return nil, refuse("the token names no job: it has no check_run_id")
+	}
+	if e.unavailable {
+		return nil, errUnavailable
 	}
 	rp := e.repos[c.repoID]
 	if rp == nil {

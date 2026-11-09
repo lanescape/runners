@@ -345,6 +345,35 @@ func (c *Client) Upload(r *Reserved, data []byte, chunk int, interrupt bool) {
 	}
 }
 
+// UploadWhole starts a resumable upload with a reservation's URL and
+// headers, and sends all of data to its session URI in one PUT, with no
+// Content-Range, as Cloud Storage takes a whole object.
+func (c *Client) UploadWhole(r *Reserved, data []byte) {
+	c.T.Helper()
+	req, _ := http.NewRequest(http.MethodPost, r.URL, nil)
+	for k, v := range r.Headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := c.http().Do(req)
+	if err != nil {
+		c.T.Fatalf("starting an upload: %v", err)
+	}
+	resp.Body.Close()
+	session := resp.Header.Get("Location")
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK || session == "" {
+		c.T.Fatalf("starting an upload answered %d", resp.StatusCode)
+	}
+	req, _ = http.NewRequest(http.MethodPut, session, bytes.NewReader(data))
+	resp, err = c.http().Do(req)
+	if err != nil {
+		c.T.Fatalf("uploading: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		c.T.Fatalf("uploading the whole object answered %d", resp.StatusCode)
+	}
+}
+
 // Download reads a restored entry through its URL, in ranges of chunk
 // bytes, as a job does, and checks its size and SHA-256 before returning
 // it.

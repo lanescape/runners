@@ -142,6 +142,13 @@ func (e *Emulator) upload(w http.ResponseWriter, r *http.Request, sid string) {
 		return
 	}
 	cr := r.Header.Get("Content-Range")
+	if cr == "" {
+		// The whole object, in one request.
+		cr = fmt.Sprintf("bytes 0-%d/%d", len(body)-1, len(body))
+		if len(body) == 0 {
+			cr = "bytes */0"
+		}
+	}
 	spec, ok := strings.CutPrefix(cr, "bytes ")
 	if !ok {
 		storageError(w, http.StatusBadRequest, "InvalidArgument")

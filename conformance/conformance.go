@@ -72,6 +72,7 @@ func Cases() []Case {
 		both("only a successful job's entries are restored", successGating),
 		both("a pending entry goes after 5 days", pendingFor),
 		both("a closed pull request's run saves nothing it reopens to", closedRun),
+		both("an outage decides nothing of GitHub's", outage),
 		both("a pull request keeps one entry of each family", oneOfEachFamily),
 		both("main keeps its two newest keys", twoNewestKeys),
 		both("read runs restore main's and save nothing", readRuns),
@@ -715,9 +716,14 @@ func cacheErrors(t T, w *world) {
 	}
 	w.Unavailable(true)
 	a, _ := w.rs(tok, linux, "build", key1, false)
+	// What the token says is refused before anything of GitHub's is read.
+	noJob, _ := w.rs(w.Token(j, map[string]any{"check_run_id": nil}), linux, "build", key1, false)
 	w.Unavailable(false)
 	if a.Status != http.StatusServiceUnavailable {
 		t.Fatalf("a restore with GitHub unavailable answered %d", a.Status)
+	}
+	if noJob.Status != http.StatusForbidden {
+		t.Fatalf("a token naming no job, with GitHub unavailable, answered %d", noJob.Status)
 	}
 	// A finished job's token is good for nothing.
 	w.FinishJob(j, "success")
@@ -751,8 +757,18 @@ func transfers(t T, w *world) {
 		t.Fatalf("commit answered %d: %s", a.Status, a.Reason)
 	}
 	w.FinishJob(j, "success")
+	// An upload sent whole, in one request.
+	j2, tok2 := w.job(run)
+	_, r2 := w.c.Save(tok2, linux, "build", key2)
+	small := data("whole")
+	w.c.UploadWhole(r2, small)
+	if a := w.c.Commit(tok2, r2.ID, int64(len(small)), Sum(small)); a.Status != http.StatusOK {
+		t.Fatalf("a whole upload's commit answered %d: %s", a.Status, a.Reason)
+	}
+	w.FinishJob(j2, "success")
 	next := w.Push(repo, "main")
 	w.bound(next, "main")
+	w.restore(next, linux, key2, "main_exact", small)
 	got := w.restore(next, linux, key1, "main_exact", big)
 	// A URL is for its method alone.
 	if code := w.c.Get(http.MethodPut, got.URL); code < 400 {
@@ -934,4 +950,48 @@ func closedRun(t T, w *world) {
 	next := w.PullRequestRun(pr)
 	w.bound(next, fmt.Sprintf("pr%d", pr.Number))
 	w.restore(next, linux, key1, "main_exact", main1)
+}
+
+func outage(t T, w *world) {
+	repo := w.Repository("app")
+	w.SetRunners(repo, `{"branches": {"support/v1": "v1"}}`)
+	w.Branch(repo, "support/v1")
+	push := w.Push(repo, "support/v1")
+	w.bound(push, "branch-v1")
+	w.save(push, linux, "build", key1, data("v1"), "success")
+	// A pull request closed, and its run bound and committed since.
+	pr := w.PullRequest(repo, "main", "fix")
+	run := w.PullRequestRun(pr)
+	w.ClosePullRequest(pr)
+	w.Advance(time.Minute)
+	w.bound(run, fmt.Sprintf("pr%d", pr.Number))
+	j, tok := w.job(run)
+	payload := data("bound after the closing")
+	id, _ := w.reserve(tok, linux, "build", key2, payload)
+	w.c.Commit(tok, id, int64(len(payload)), Sum(payload))
+	w.SetRunners(repo, `{}`)
+	// While GitHub can't confirm anything, a pass decides nothing of its:
+	// the branch's entry stays, and the closing isn't seen again.
+	w.Unavailable(true)
+	w.Pass()
+	w.Unavailable(false)
+	branch := false
+	for _, e := range w.Entries(repo) {
+		branch = branch || e.Scope == "branch-v1"
+	}
+	if !branch {
+		t.Fatalf("a delisted branch's entry went while GitHub couldn't confirm it")
+	}
+	w.ReopenPullRequest(pr)
+	w.FinishJob(j, "success")
+	next := w.PullRequestRun(pr)
+	w.bound(next, fmt.Sprintf("pr%d", pr.Number))
+	w.restore(next, linux, key2, "pull_request_exact", payload)
+	// Once GitHub answers, the delisted branch's entry goes.
+	w.Pass()
+	for _, e := range w.Entries(repo) {
+		if e.Scope == "branch-v1" {
+			t.Fatalf("a delisted branch's entry stayed")
+		}
+	}
 }

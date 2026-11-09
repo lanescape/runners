@@ -59,15 +59,20 @@ func (e *Emulator) retain() {
 	// A pull request seen closed now, whose entries or most recent choices
 	// are held, is recorded as closed now: what a run bound up to now
 	// saves is retired, even once it's reopened.
-	for _, en := range e.entries {
-		e.seenClosed(en.repo, en.scope)
-	}
-	for k := range e.recents {
-		e.seenClosed(e.recentScope(k))
+	// What rests on GitHub's word is decided only while GitHub answers:
+	// closings, runs' ends and branches' listings.
+	github := !e.unavailable
+	if github {
+		for _, en := range e.entries {
+			e.seenClosed(en.repo, en.scope)
+		}
+		for k := range e.recents {
+			e.seenClosed(e.recentScope(k))
+		}
 	}
 	named := map[string]bool{}
 	for k, c := range e.choices {
-		if rn := e.runs[c.run]; rn.due || e.runInProgress(rn) {
+		if rn := e.runs[c.run]; rn.due || e.runInProgress(rn) || !github {
 			if c.entry != "" {
 				named[c.entry] = true
 			}
@@ -122,7 +127,7 @@ func (e *Emulator) retain() {
 	}
 	for k, r := range e.recents {
 		repo, scope := e.recentScope(k)
-		if p := e.pullOf(repo, scope); p == nil || !p.open {
+		if p := e.pullOf(repo, scope); github && (p == nil || !p.open) {
 			delete(e.recents, k)
 			continue
 		}
@@ -152,10 +157,10 @@ func (e *Emulator) retain() {
 		case latest[en.series()] != en:
 			gone = true
 		case lasting(en.scope):
-			gone = e.delisted(en) || e.now().Sub(used[en.lineage()]) >= LastingUnused || !keep[en.series()]
+			gone = (github && e.delisted(en)) || e.now().Sub(used[en.lineage()]) >= LastingUnused || !keep[en.series()]
 		default:
 			p := e.pullOf(en.repo, en.scope)
-			gone = p == nil || !p.open || lineage[en.lineage()] != en || e.now().Sub(en.lastUsed) >= PullRequestUnused
+			gone = (github && (p == nil || !p.open)) || lineage[en.lineage()] != en || e.now().Sub(en.lastUsed) >= PullRequestUnused
 		}
 		if gone {
 			if en.object != "" {
