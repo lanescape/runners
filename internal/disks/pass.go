@@ -601,15 +601,54 @@ func (s *Service) tidy(ctx context.Context, st *state) {
 			s.log().Info("record of an image that's gone removed", "image", v.Image, "state", v.State)
 		}
 	}
-	for name := range st.images {
-		if recorded[name] {
-			continue
+	// An image of the service's names that no record describes goes like
+	// any other: under the disks' lease, never while a choice or claim
+	// names it, recorded as marked before it's deleted.
+	orphans := map[int64][]string{}
+	for name, im := range st.images {
+		if !recorded[name] {
+			repo, _ := ours(im)
+			orphans[repo] = append(orphans[repo], name)
 		}
-		if err := s.Compute.DeleteImage(ctx, name, freshID("delete image", name)); err != nil && !errors.Is(err, compute.ErrNotFound) {
-			s.log().Warn("deleting an orphaned image", "image", name, "err", err.Error())
-			continue
+	}
+	for repo, names := range orphans {
+		slices.Sort(names)
+		var marked []Image
+		err := s.step(ctx, repo, func(ctx context.Context) error {
+			named, err := s.named(ctx, repo, nil)
+			if err != nil {
+				return err
+			}
+			for _, name := range names {
+				if named[name] {
+					s.log().Warn("an image with no record is named by a choice or claim; it's kept", "image", name)
+					continue
+				}
+				kind := KindSaved
+				if resumeName.MatchString(name) {
+					kind = KindResume
+				}
+				rec := Image{Image: name, RepositoryID: repo, Kind: kind, State: ImageMarked, MarkedAt: s.now()}
+				got, _, err := createOnce(ctx, s.Objects, imageKey(repo, name), rec)
+				if err != nil {
+					return err
+				}
+				if got.State == ImageMarked {
+					marked = append(marked, got)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			s.log().Warn("marking orphaned images", "repository_id", repo, "err", err.Error())
 		}
-		s.log().Info("orphaned image deleted", "image", name)
+		for _, v := range marked {
+			if err := s.deleteMarked(ctx, v); err != nil {
+				s.log().Warn("deleting an orphaned image", "image", v.Image, "err", err.Error())
+				continue
+			}
+			s.log().Info("orphaned image deleted", "image", v.Image)
+		}
 	}
 	present := map[string]bool{}
 	for _, r := range st.records {

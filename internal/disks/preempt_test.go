@@ -544,3 +544,27 @@ func TestARunningSpotMachinePastTheAgeLimitIsRecorded(t *testing.T) {
 		t.Fatal("a machine past its age limit saved something")
 	}
 }
+
+// A running Spot machine past its age limit is stopped even while the
+// records can't be read, and waits for them.
+func TestARunningSpotMachinePastTheAgeLimitStopsWithoutTheRecords(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+	e.clock.Advance(machines.MaxAge + time.Minute)
+	e.gcs.Faults().Add(fault.Rule{Method: http.MethodGet, Times: 1,
+		Match:   func(r *http.Request) bool { return r.URL.Query().Get("prefix") == "machines/" },
+		Respond: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusForbidden) }})
+	e.pass()
+	in, ok := e.gce.Instance(jb.in.Zone, jb.in.Name)
+	if !ok || in.Status != "TERMINATED" {
+		t.Fatalf("machine %v, %s; want it stopped and kept", ok, in.Status)
+	}
+	e.pass()
+	if _, ok := e.gce.Instance(jb.in.Zone, jb.in.Name); ok {
+		t.Fatal("not deleted once the records were read")
+	}
+	if _, ok := e.record("preemptions/5001/" + strconv.FormatInt(run.ID, 10) + "/" + strconv.FormatUint(jb.in.ID, 10) + ".json"); !ok {
+		t.Fatal("not recorded")
+	}
+}

@@ -68,16 +68,18 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 		// preemption since then isn't lost with it. A stopped machine
 		// waits for its record, and, without the records, for them, since
 		// whether it was admitted isn't known.
-		if m.Spot && s.Preemptions != nil && !inv.recordsComplete {
-			return
-		}
-		if admitted && a.Allowed && m.Spot && s.Preemptions != nil {
+		if m.Spot && s.Preemptions != nil {
 			if !m.Stopped() {
 				if err := s.Compute.StopInstance(ctx, m.Zone, m.Name, s.requestID("stop", m.Name)); err != nil && !errors.Is(err, compute.ErrNotFound) {
 					s.log().Warn("stopping a Spot machine past the age limit to record it", "machine", m.Name, "err", err.Error())
 					return
 				}
 			}
+			if !inv.recordsComplete {
+				return
+			}
+		}
+		if admitted && a.Allowed && m.Spot && s.Preemptions != nil {
 			if err := s.Preemptions.Stopped(ctx, m, a, s.preempted(ctx, m), false); err != nil {
 				s.log().Warn("recording a stopped Spot machine past the age limit; it waits for its record", "machine", m.Name, "err", err.Error())
 				return

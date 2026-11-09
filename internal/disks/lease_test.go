@@ -283,3 +283,22 @@ func TestTheNewestThatsThereIsKept(t *testing.T) {
 		t.Fatal("the only disk of a family that's there was deleted as not the newest")
 	}
 }
+
+// An image with no record that an unfinished run's choice names is kept.
+func TestAnOrphanAChoiceNamesIsKept(t *testing.T) {
+	e := setup(t)
+	img := e.saveMain(key1)
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}})
+	if jb.source() != img {
+		t.Fatal("no restore")
+	}
+	key := "images/5001/" + img + ".json"
+	if err := e.objects.Delete(context.Background(), key, mustGen(t, e, key)); err != nil {
+		t.Fatal(err)
+	}
+	e.pass()
+	if !e.has(img) {
+		t.Fatal("an image an unfinished run's choice names was deleted as an orphan")
+	}
+}
