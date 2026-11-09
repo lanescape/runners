@@ -59,6 +59,23 @@ func (e *Emulator) retain() {
 	// A pull request seen closed now, whose entries or most recent choices
 	// are held, is recorded as closed now: what a run bound up to now
 	// saves is retired, even once it's reopened.
+	// An expired reservation goes, with whatever is at its upload's name,
+	// and so does an upload with no reservation, such as one finished
+	// later through its session.
+	reserved := map[string]bool{}
+	for id, r := range e.reserved {
+		if !e.now().Before(r.expires) {
+			delete(e.objects, uploadObject(r))
+			delete(e.reserved, id)
+			continue
+		}
+		reserved[uploadObject(r)] = true
+	}
+	for name := range e.objects {
+		if strings.HasPrefix(name, "uploads/") && !reserved[name] {
+			delete(e.objects, name)
+		}
+	}
 	// What rests on GitHub's word is decided only while GitHub answers:
 	// closings, runs' ends and branches' listings.
 	github := !e.unavailable

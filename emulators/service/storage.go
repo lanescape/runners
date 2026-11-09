@@ -94,7 +94,8 @@ func (e *Emulator) storage(w http.ResponseWriter, r *http.Request) {
 }
 
 // start begins a resumable upload, only with the headers the grant was
-// signed with, and only if its object doesn't exist yet.
+// signed with. Its precondition, that the object doesn't exist yet, is
+// checked when the upload finishes, as Cloud Storage checks it.
 func (e *Emulator) start(w http.ResponseWriter, r *http.Request, g *grant) {
 	if r.Header.Get("x-goog-resumable") != "start" || r.Header.Get("x-goog-if-generation-match") != "0" {
 		storageError(w, http.StatusForbidden, "SignatureDoesNotMatch")
@@ -102,10 +103,6 @@ func (e *Emulator) start(w http.ResponseWriter, r *http.Request, g *grant) {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if _, exists := e.objects[g.object]; exists {
-		storageError(w, http.StatusPreconditionFailed, "PreconditionFailed")
-		return
-	}
 	sid := randomID()
 	e.sessions[sid] = &session{object: g.object, expires: e.now().Add(SessionFor)}
 	w.Header().Set("Location", e.url+"/storage/session/"+sid)
@@ -142,6 +139,11 @@ func (e *Emulator) upload(w http.ResponseWriter, r *http.Request, sid string) {
 		return
 	}
 	cr := r.Header.Get("Content-Range")
+	if cr == "" && len(s.data) > 0 {
+		// A whole object, sent once part of one has been.
+		storageError(w, http.StatusBadRequest, "InvalidArgument")
+		return
+	}
 	if cr == "" {
 		// The whole object, in one request.
 		cr = fmt.Sprintf("bytes 0-%d/%d", len(body)-1, len(body))

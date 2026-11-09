@@ -725,6 +725,13 @@ func cacheErrors(t T, w *world) {
 	if noJob.Status != http.StatusForbidden {
 		t.Fatalf("a token naming no job, with GitHub unavailable, answered %d", noJob.Status)
 	}
+	// Once its reservation has expired, and a pass has run, a commit is
+	// refused, even one tried again.
+	w.Advance(time.Hour)
+	w.Pass()
+	if a := w.c.Commit(tok, w.rid, int64(len(body)), Sum(body)); a.Status != http.StatusForbidden {
+		t.Fatalf("a commit after its reservation expired answered %d", a.Status)
+	}
 	// A finished job's token is good for nothing.
 	w.FinishJob(j, "success")
 	if a, _ := w.rs(tok, linux, "build", key1, false); a.Status != http.StatusForbidden {
@@ -766,6 +773,26 @@ func transfers(t T, w *world) {
 		t.Fatalf("a whole upload's commit answered %d: %s", a.Status, a.Reason)
 	}
 	w.FinishJob(j2, "success")
+	// An upload's start is checked when it finishes: one started again
+	// after the first finished starts, and can't finish.
+	j3, tok3 := w.job(run)
+	_, r3 := w.c.Save(tok3, linux, "build", key3)
+	w.c.UploadWhole(r3, small)
+	if code, session := w.c.StartUpload(r3); code != http.StatusCreated && code != http.StatusOK || session == "" {
+		t.Fatalf("an upload started again answered %d", code)
+	} else if code := w.c.Put(session, small, ""); code < 400 {
+		t.Fatalf("an upload of an object that's there finished: %d", code)
+	}
+	// A whole object can't follow part of one.
+	_, r4 := w.c.Save(tok3, linux, "build", key3)
+	_, session := w.c.StartUpload(r4)
+	if code := w.c.Put(session, []byte("a"), "bytes 0-0/*"); code != http.StatusPermanentRedirect {
+		t.Fatalf("a chunk answered %d", code)
+	}
+	if code := w.c.Put(session, []byte("ab"), ""); code != http.StatusBadRequest {
+		t.Fatalf("a whole object after part of one answered %d", code)
+	}
+	w.FinishJob(j3, "success")
 	next := w.Push(repo, "main")
 	w.bound(next, "main")
 	w.restore(next, linux, key2, "main_exact", small)

@@ -345,6 +345,38 @@ func (c *Client) Upload(r *Reserved, data []byte, chunk int, interrupt bool) {
 	}
 }
 
+// StartUpload starts a resumable upload with a reservation's URL and
+// headers, and returns the status and the session URI.
+func (c *Client) StartUpload(r *Reserved) (int, string) {
+	c.T.Helper()
+	req, _ := http.NewRequest(http.MethodPost, r.URL, nil)
+	for k, v := range r.Headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := c.http().Do(req)
+	if err != nil {
+		c.T.Fatalf("starting an upload: %v", err)
+	}
+	resp.Body.Close()
+	return resp.StatusCode, resp.Header.Get("Location")
+}
+
+// Put sends body to an upload's session URI, with contentRange if it isn't
+// empty, and returns the status.
+func (c *Client) Put(session string, body []byte, contentRange string) int {
+	c.T.Helper()
+	req, _ := http.NewRequest(http.MethodPut, session, bytes.NewReader(body))
+	if contentRange != "" {
+		req.Header.Set("Content-Range", contentRange)
+	}
+	resp, err := c.http().Do(req)
+	if err != nil {
+		c.T.Fatalf("uploading: %v", err)
+	}
+	resp.Body.Close()
+	return resp.StatusCode
+}
+
 // UploadWhole starts a resumable upload with a reservation's URL and
 // headers, and sends all of data to its session URI in one PUT, with no
 // Content-Range, as Cloud Storage takes a whole object.
