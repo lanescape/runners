@@ -177,9 +177,24 @@ func newWorld(t *testing.T) *world {
 		Disks: dks, Saves: dks, Preemptions: dks}
 	passes := &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log}
 	body := pass.All(svc.Pass, dks.Pass)
+	// A report can arrive as the test ends: no pass starts once cleanup
+	// has begun waiting for those that did.
 	var kicks sync.WaitGroup
-	t.Cleanup(kicks.Wait)
-	svc.Kick = func() { kicks.Go(func() { _ = passes.Run(context.Background(), body) }) }
+	var kickMu sync.Mutex
+	ended := false
+	t.Cleanup(func() {
+		kickMu.Lock()
+		ended = true
+		kickMu.Unlock()
+		kicks.Wait()
+	})
+	svc.Kick = func() {
+		kickMu.Lock()
+		defer kickMu.Unlock()
+		if !ended {
+			kicks.Go(func() { _ = passes.Run(context.Background(), body) })
+		}
+	}
 	handler, err = server.New(server.Config{
 		Logger: log, OrganizationID: orgID, WebhookSecret: []byte("secret"), Publisher: nopPublisher{},
 		ReconcileCallers: callers,

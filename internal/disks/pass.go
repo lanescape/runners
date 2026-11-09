@@ -302,9 +302,13 @@ func (s *Service) dropChoices(ctx context.Context, st *state) {
 	for repo, keys := range byRepo {
 		slices.Sort(keys)
 		err := s.step(ctx, repo, func(ctx context.Context) error {
+			live, err := s.unreported(ctx, "")
+			if err != nil {
+				return err
+			}
 			for _, key := range keys {
 				r := st.choices[key]
-				if ok, err := s.settled(ctx, repo, r.v.RunID); err != nil || !ok {
+				if ok, err := s.settled(ctx, repo, r.v.RunID, live); err != nil || !ok {
 					continue
 				}
 				if err := s.Objects.Delete(ctx, key, r.gen); err == nil || errors.Is(err, store.ErrNotFound) {

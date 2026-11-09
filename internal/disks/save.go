@@ -57,7 +57,7 @@ func (s *Service) Save(ctx context.Context, m machines.Machine, a machines.Admis
 		return err
 	}
 	if !ok {
-		fits, why, err := s.makeRoom(ctx, m.RepositoryID, sel.Scope.String(), sel.Arch, sel.Family, sv.SizeGB)
+		fits, why, err := s.makeRoom(ctx, m.RepositoryID, m.Name, sel.Scope.String(), sel.Arch, sel.Family, sv.SizeGB)
 		if err != nil {
 			return err
 		}
@@ -90,10 +90,53 @@ func (s *Service) Save(ctx context.Context, m machines.Machine, a machines.Admis
 	return err
 }
 
+// unreported are the runs, by ID, with a machine whose job was admitted and
+// that hasn't reported, other than except: one may be a stopped Spot
+// machine that a pass hasn't yet recorded, or couldn't, whose run may be
+// due a rerun that needs its choices. A machine's records go only once
+// it's deleted, after any such record is made.
+func (s *Service) unreported(ctx context.Context, except string) (map[int64]bool, error) {
+	objs, err := s.Objects.List(ctx, "machines/")
+	if err != nil {
+		return nil, err
+	}
+	admitted, reported := map[string]bool{}, map[string]bool{}
+	for _, o := range objs {
+		parts := strings.Split(o.Name, "/")
+		if len(parts) != 3 || parts[1] == except {
+			continue
+		}
+		switch parts[2] {
+		case "admission.json":
+			admitted[parts[1]] = true
+		case "report.json":
+			reported[parts[1]] = true
+		}
+	}
+	out := map[int64]bool{}
+	for m := range admitted {
+		if reported[m] {
+			continue
+		}
+		a, _, ok, err := getJSON[machines.Admission](ctx, s.Objects, "machines/"+m+"/admission.json")
+		if err != nil {
+			return nil, err
+		}
+		if ok && a.Allowed {
+			out[a.RunID] = true
+		}
+	}
+	return out, nil
+}
+
 // settled reports whether a run has finished with no automatic rerun it is,
 // or may yet be, due, read afresh from GitHub and the bucket, as a pass
-// reads it: a run or repository GitHub confirms is gone has settled.
-func (s *Service) settled(ctx context.Context, repo, runID int64) (bool, error) {
+// reads it: a run or repository GitHub confirms is gone has settled. A run
+// among unreported hasn't.
+func (s *Service) settled(ctx context.Context, repo, runID int64, unreported map[int64]bool) (bool, error) {
+	if unreported[runID] {
+		return false, nil
+	}
 	ps, err := listJSON[Preemption](ctx, s.Objects, preemptionPrefix(repo, runID))
 	if err != nil {
 		return false, err
@@ -145,7 +188,7 @@ func newest(recs map[string]record[Image]) map[string]bool {
 // deletes nothing, and says why the save is skipped. The saving job's own
 // run has often just finished, and its choice is still recorded: a run
 // counts as finished only once GitHub shows it, read inside the lease.
-func (s *Service) makeRoom(ctx context.Context, repo int64, scope, arch, family string, sizeGB int64) (bool, string, error) {
+func (s *Service) makeRoom(ctx context.Context, repo int64, saver, scope, arch, family string, sizeGB int64) (bool, string, error) {
 	lim := s.Config.Limits.For(repo)
 	limit := int64(lim.PullRequestDisksGB)
 	if scope == "main" {
@@ -215,12 +258,18 @@ func (s *Service) makeRoom(ctx context.Context, repo int64, scope, arch, family 
 		// dropped before its image is marked, so that a maintainer's rerun
 		// picks again, under this lease.
 		settled := map[int64]bool{}
+		var live map[int64]bool
 		free := func(image string) (bool, error) {
+			if live == nil && len(namers[image]) > 0 {
+				if live, err = s.unreported(ctx, saver); err != nil {
+					return false, err
+				}
+			}
 			for _, k := range namers[image] {
 				run := choices[k].v.RunID
 				ok, seen := settled[run]
 				if !seen {
-					if ok, err = s.settled(ctx, repo, run); err != nil {
+					if ok, err = s.settled(ctx, repo, run, live); err != nil {
 						return false, err
 					}
 					settled[run] = ok

@@ -231,16 +231,20 @@ func TestOnlyARegularFileIsAMarker(t *testing.T) {
 func TestOnlyASaveRequestAsksToSave(t *testing.T) {
 	dir := t.TempDir()
 	for content, want := range map[string]bool{
-		`{"save": true}`:         true,
-		" {\"save\":true}\n":     true,
-		``:                       false,
-		`{"save": false}`:        false,
-		`{"save": "true"}`:       false,
-		`{"save": true, "x": 1}`: false,
-		`{"save": true} {}`:      false,
-		`true`:                   false,
-		`{}`:                     false,
-		`save`:                   false,
+		`{"save": true}`:               true,
+		" {\"save\":true}\n":           true,
+		``:                             false,
+		`{"save": false}`:              false,
+		`{"save": "true"}`:             false,
+		`{"save": true, "x": 1}`:       false,
+		`{"SAVE": true}`:               false,
+		`{"Save": true}`:               false,
+		`{"save": true, "save": true}`: false,
+		`[{"save": true}]`:             false,
+		`{"save": true} {}`:            false,
+		`true`:                         false,
+		`{}`:                           false,
+		`save`:                         false,
 		`{"save": true}` + strings.Repeat(" ", 2000): false,
 	} {
 		path := filepath.Join(dir, "save")

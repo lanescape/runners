@@ -201,3 +201,30 @@ func TestAPreemptedJobThatSucceededLetsItsRunsChoiceGo(t *testing.T) {
 		t.Fatal("a finished run due no rerun kept its choice")
 	}
 }
+
+// A run that lost a Spot job may be due a rerun that needs its choices,
+// even before a pass has recorded the stopped machine: a sibling's save in
+// the same pass, whichever machine it comes to first, doesn't evict what
+// the run chose.
+func TestASaveDoesntEvictWhatARunDueARerunChose(t *testing.T) {
+	e := setup(t)
+	e.cfg.Limits.Defaults.MainDisksGB = 50
+	m1 := e.saveMain(key1)
+	run := e.mainRun()
+	saver := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key2, "main")}})
+	lost := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{"lanescape-2vcpu-linux-amd64-spot-disk-build-" + key1 + "-main"}})
+	if saver.source() != m1 || lost.source() != m1 {
+		t.Fatal("the run's jobs didn't restore main's disk")
+	}
+	if err := e.gce.Preempt(lost.in.Zone, lost.in.Name); err != nil {
+		t.Fatal(err)
+	}
+	e.gh.CompleteJobByID(lost.j.ID, "failure")
+	saver.finish(true)
+	if !e.has(m1) {
+		t.Fatal("a save evicted the disk that a run due a rerun chose")
+	}
+	if e.attempt(run) != 2 {
+		t.Fatal("the run wasn't rerun")
+	}
+}

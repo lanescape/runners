@@ -277,18 +277,18 @@ func asked(path string) bool {
 	if err != nil || len(data) > maxSaveRequest {
 		return false
 	}
-	var req struct {
-		Save *bool `json:"save"`
-	}
+	// Exactly an object whose one member is "save": true, by its tokens:
+	// Go's struct decoding would take "SAVE" too, and a map would take a
+	// key given twice.
 	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil || req.Save == nil || dec.More() {
-		return false
+	for _, want := range []any{json.Delim('{'), "save", true, json.Delim('}')} {
+		tok, err := dec.Token()
+		if err != nil || tok != want {
+			return false
+		}
 	}
-	if _, err := dec.Token(); err != io.EOF {
-		return false
-	}
-	return *req.Save
+	_, err = dec.Token()
+	return err == io.EOF
 }
 
 // report tells the service the job is done, and whether it asked to save,

@@ -2,10 +2,12 @@ package disks_test
 
 import (
 	"context"
+	"net/http"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/lanescape/runners/emulators/fault"
 	ghemu "github.com/lanescape/runners/emulators/github"
 	"github.com/lanescape/runners/emulators/google"
 	"github.com/lanescape/runners/internal/disks"
@@ -274,7 +276,26 @@ func TestReruns(t *testing.T) {
 			t.Fatalf("attempt %d; the failed rerun wasn't asked for again", e.attempt(run))
 		}
 	})
-	t.Run("a GitHub answer that's lost", func(t *testing.T) {
+	t.Run("an answer lost after GitHub began the rerun", func(t *testing.T) {
+		e := setup(t)
+		run := e.mainRun()
+		jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+		jb.preempt()
+		path := "/repos/lanescape/app/actions/runs/" + strconv.FormatInt(run.ID, 10) + "/rerun-failed-jobs"
+		e.gh.Faults().Add(fault.Rule{Method: http.MethodPost, Times: 1, After: true,
+			Match:   func(r *http.Request) bool { return r.URL.Path == path },
+			Respond: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusBadGateway) }})
+		e.pass()
+		e.pass()
+		if e.attempt(run) != 2 {
+			t.Fatalf("attempt %d; a rerun whose answer was lost counts once, and isn't asked for again", e.attempt(run))
+		}
+		rr, _ := e.record("reruns/5001/" + strconv.FormatInt(run.ID, 10) + ".json")
+		if n := len(rr["attempts"].([]any)); n != 1 {
+			t.Fatalf("rerun record = %v; want one attempt", rr)
+		}
+	})
+	t.Run("a GitHub error before the rerun", func(t *testing.T) {
 		e := setup(t)
 		run := e.mainRun()
 		jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
