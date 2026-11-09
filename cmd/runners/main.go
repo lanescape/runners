@@ -7,6 +7,7 @@
 //	RUNNERS_AUDIENCE             the service's URL, as Cloud Run gives it, which must be endpoints.Service
 //	RUNNERS_PROJECT              the project the service's machines are in
 //	RUNNERS_BUCKET               the service's state bucket
+//	RUNNERS_WEBHOOK_TOPIC        the Pub/Sub topic the webhook publishes deliveries to, by its full name
 //	RUNNERS_GITHUB_APP_ID        the GitHub App's ID
 //	RUNNERS_GITHUB_APP_KEY_FILE  the App's private key, mounted from Secret Manager
 //	RUNNERS_WEBHOOK_SECRET_FILE  the App's webhook secret, mounted from Secret Manager
@@ -46,6 +47,7 @@ import (
 	"github.com/lanescape/runners/internal/lease"
 	"github.com/lanescape/runners/internal/machines"
 	"github.com/lanescape/runners/internal/pass"
+	"github.com/lanescape/runners/internal/pubsub"
 	"github.com/lanescape/runners/internal/server"
 	"github.com/lanescape/runners/internal/store"
 )
@@ -69,6 +71,7 @@ type settings struct {
 	Audience          string
 	Project           string
 	Bucket            string
+	WebhookTopic      string
 	AppID             int64
 	AppKeyFile        string
 	WebhookSecretFile string
@@ -81,6 +84,7 @@ func loadSettings(getenv func(string) string) (settings, error) {
 		Audience:          getenv("RUNNERS_AUDIENCE"),
 		Project:           getenv("RUNNERS_PROJECT"),
 		Bucket:            getenv("RUNNERS_BUCKET"),
+		WebhookTopic:      getenv("RUNNERS_WEBHOOK_TOPIC"),
 		AppKeyFile:        getenv("RUNNERS_GITHUB_APP_KEY_FILE"),
 		WebhookSecretFile: getenv("RUNNERS_WEBHOOK_SECRET_FILE"),
 	}
@@ -92,6 +96,7 @@ func loadSettings(getenv func(string) string) (settings, error) {
 		"RUNNERS_AUDIENCE":            s.Audience,
 		"RUNNERS_PROJECT":             s.Project,
 		"RUNNERS_BUCKET":              s.Bucket,
+		"RUNNERS_WEBHOOK_TOPIC":       s.WebhookTopic,
 		"RUNNERS_GITHUB_APP_KEY_FILE": s.AppKeyFile,
 		"RUNNERS_WEBHOOK_SECRET_FILE": s.WebhookSecretFile,
 	} {
@@ -180,6 +185,10 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 	if err != nil {
 		return err
 	}
+	publisher, err := pubsub.New(ctx, s.WebhookTopic)
+	if err != nil {
+		return err
+	}
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	err = machines.CheckForkApproval(cctx, gh)
 	cancel()
@@ -199,7 +208,7 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 		Logger:           log,
 		OrganizationID:   cfg.Organization.ID,
 		WebhookSecret:    webhookSecret,
-		Publisher:        noPublisher{},
+		Publisher:        publisher,
 		ReconcileCallers: callers,
 		Passes:           passes,
 		Reconciler:       reconciler(body),
@@ -279,12 +288,3 @@ func kicker(ctx context.Context, passes *pass.Runner, body pass.Body, every time
 type reconciler pass.Body
 
 func (r reconciler) Pass(p *pass.Pass) error { return r(p) }
-
-// noPublisher stands in until the service publishes to Pub/Sub: a delivery
-// gets a retryable error, and passes' sweeps catch what it would have
-// started.
-type noPublisher struct{}
-
-func (noPublisher) Publish(context.Context, server.Delivery) error {
-	return errors.New("publishing to Pub/Sub isn't built yet")
-}

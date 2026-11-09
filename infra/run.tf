@@ -71,6 +71,11 @@ resource "google_cloud_run_v2_service" "service" {
         name  = "RUNNERS_CACHE_BUCKET"
         value = google_storage_bucket.cache.name
       }
+      # bootstrap/ makes the topic, and grants the service publishing on it.
+      env {
+        name  = "RUNNERS_WEBHOOK_TOPIC"
+        value = "projects/${var.project_id}/topics/lanescape-runners-webhooks"
+      }
       env {
         name  = "RUNNERS_GITHUB_APP_ID"
         value = tostring(var.github_app_id)
