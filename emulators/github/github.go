@@ -346,6 +346,13 @@ func (e *Emulator) Sync(p *Pull) {
 	p.mergeSHA = ""
 }
 
+// PullHead is a pull request's head commit now.
+func (e *Emulator) PullHead(p *Pull) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return p.HeadSHA
+}
+
 // ClosePull closes a pull request.
 func (e *Emulator) ClosePull(p *Pull) {
 	e.mu.Lock()

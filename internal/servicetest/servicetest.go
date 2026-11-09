@@ -300,6 +300,17 @@ func (w *World) ForkPullRequest(r service.Repository, base string) service.PullR
 	return w.addPull(w.GitHub.PullRequest(rp, base, fork, "feature", contributor))
 }
 
+// PushPullRequest implements service.World: a commit on the pull request's
+// head branch, in its repository or fork, which GitHub's pull request then
+// follows, as a push to that branch makes it.
+func (w *World) PushPullRequest(pr service.PullRequest) service.PullRequest {
+	p := w.pull(pr)
+	p.Head.Commit(p.HeadRef, map[string]string{"pushed": strconv.FormatInt(w.id(), 10)})
+	w.GitHub.Sync(p)
+	pr.HeadSHA = w.GitHub.PullHead(p)
+	return pr
+}
+
 // ClosePullRequest implements service.World.
 func (w *World) ClosePullRequest(pr service.PullRequest) {
 	p := w.pull(pr)

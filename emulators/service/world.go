@@ -33,6 +33,13 @@ type World interface {
 	// contributor's fork.
 	PullRequest(repo Repository, base, head string) PullRequest
 	ForkPullRequest(repo Repository, base string) PullRequest
+	// PushPullRequest pushes a new commit to an open pull request's head
+	// branch, in the repository or the contributor's fork, as its author
+	// does: GitHub moves the pull request's head to it, and its earlier
+	// heads stay among its commits. It returns the pull request with its
+	// new head. Runs made before the push keep the event they were made
+	// with.
+	PushPullRequest(pr PullRequest) PullRequest
 	// ClosePullRequest closes a pull request, and the service learns of it
 	// from GitHub's delivery; ReopenPullRequest reopens it.
 	ClosePullRequest(pr PullRequest)

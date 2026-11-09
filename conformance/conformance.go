@@ -78,6 +78,8 @@ func Cases() []Case {
 		both("read runs restore main's and save nothing", readRuns),
 		both("a closed pull request's entries are never restored again", closing),
 		both("forks and contributions", contributions),
+		both("a contribution pushed to after its approval", pushedContribution),
+		one("a pull request's binding and its commits", pullCommits),
 		both("a contribution's token can't widen its scope", noWidening),
 		both("the cache's refusals and retries", cacheErrors),
 		one("stores are kept apart", stores),
@@ -597,6 +599,102 @@ func contributions(t T, w *world) {
 	push := w.Push(repo, "main")
 	w.bound(push, "main")
 	w.restore(push, linux, key2, "main_newest", main1)
+}
+
+// pushedContribution is an approved contribution whose contributor pushed
+// again after its run was approved: the run's bootstrap names the head its
+// event has, which is still one of the pull request's commits, and binds
+// the pull request's scope, as specs/0002-machines.md says.
+func pushedContribution(t T, w *world) {
+	repo := w.Repository("app")
+	w.SetRunners(repo, fmt.Sprintf(`{"bootstrap": %q}`, w.Bootstrap(repo)))
+	main1 := data("main1")
+	w.mainSaves(repo, linux, key1, main1)
+	fork := w.ForkPullRequest(repo, "main")
+	prt := w.PullRequestTargetRun(fork)
+	w.Approve(prt)
+	pushed := w.PushPullRequest(fork)
+	if pushed.HeadSHA == fork.HeadSHA || pushed.Number != fork.Number || pushed.HeadRepositoryID != fork.HeadRepositoryID {
+		t.Fatalf("the push didn't move the pull request's head")
+	}
+	want := fmt.Sprintf("pr%d", fork.Number)
+	j := w.StartJob(prt, w.Bootstrap(repo))
+	ev := &PullRequestEvent{PullRequest: fork.Number, HeadRepositoryID: fork.HeadRepositoryID, HeadSHA: fork.HeadSHA}
+	if a := w.c.Bind(w.Token(j, nil), ev); a.Status != http.StatusOK || a.Scope() != want {
+		t.Fatalf("a bootstrap naming its event's earlier head bound %d %q (%s)", a.Status, a.Scope(), a.Reason)
+	}
+	if s, ok := w.Binding(prt); !ok || s != want {
+		t.Fatalf("the binding the service keeps is %q, %v", s, ok)
+	}
+	// The run restores and saves as the pull request's.
+	w.restore(prt, linux, key1, "main_exact", main1)
+	mine := data("pushed")
+	w.save(prt, linux, "build", key2, mine, "success")
+	// The next run's bootstrap names the new head, and gets the same
+	// scope, with what the first saved.
+	next := w.PullRequestTargetRun(pushed)
+	j = w.StartJob(next, w.Bootstrap(repo))
+	ev = &PullRequestEvent{PullRequest: pushed.Number, HeadRepositoryID: pushed.HeadRepositoryID, HeadSHA: pushed.HeadSHA}
+	if a := w.c.Bind(w.Token(j, nil), ev); a.Status != http.StatusOK || a.Scope() != want {
+		t.Fatalf("a bootstrap naming the new head bound %d %q (%s)", a.Status, a.Scope(), a.Reason)
+	}
+	w.Approve(next)
+	w.restore(next, linux, key2, "pull_request_exact", mine)
+}
+
+// pullCommits holds a pull request's binding to its commits: a
+// pull_request run's head must still be its pull request's when it binds,
+// and a bootstrap's head must be one of its pull request's commits.
+func pullCommits(t T, w *world) {
+	repo := w.Repository("app")
+	w.SetRunners(repo, fmt.Sprintf(`{"bootstrap": %q}`, w.Bootstrap(repo)))
+	pr := w.PullRequest(repo, "main", "fix")
+	other := w.PullRequest(repo, "main", "other")
+	want := fmt.Sprintf("pr%d", pr.Number)
+	// A pull_request run made before a push binds read: its head is no
+	// longer its pull request's.
+	early := w.PullRequestRun(pr)
+	pushed := w.PushPullRequest(pr)
+	w.bound(early, "read")
+	w.bound(w.PullRequestRun(pushed), want)
+	// A bootstrap naming its pull request's earlier head, or its head now,
+	// binds the pull request's scope.
+	for _, head := range []string{pr.HeadSHA, pushed.HeadSHA} {
+		run := w.PullRequestTargetRun(pushed)
+		j := w.StartJob(run, w.Bootstrap(repo))
+		ev := &PullRequestEvent{PullRequest: pr.Number, HeadRepositoryID: repo.ID, HeadSHA: head}
+		if a := w.c.Bind(w.Token(j, nil), ev); a.Status != http.StatusOK || a.Scope() != want {
+			t.Fatalf("a bootstrap naming one of its pull request's commits bound %d %q (%s)", a.Status, a.Scope(), a.Reason)
+		}
+	}
+	// One naming a commit of the repository that was never one of its
+	// pull request's binds read: another pull request's head.
+	run := w.PullRequestTargetRun(pushed)
+	j := w.StartJob(run, w.Bootstrap(repo))
+	ev := &PullRequestEvent{PullRequest: pr.Number, HeadRepositoryID: repo.ID, HeadSHA: other.HeadSHA}
+	if a := w.c.Bind(w.Token(j, nil), ev); a.Status != http.StatusOK || a.Scope() != "read" {
+		t.Fatalf("a bootstrap naming another pull request's head bound %d %q", a.Status, a.Scope())
+	}
+	// A commit its head branch had before the pull request was opened is
+	// one of its commits too, unless its base has it.
+	w.Branch(repo, "release")
+	first := w.PullRequest(repo, "main", "feature")
+	second := w.PullRequest(repo, "release", "feature")
+	run = w.PullRequestTargetRun(second)
+	j = w.StartJob(run, w.Bootstrap(repo))
+	ev = &PullRequestEvent{PullRequest: second.Number, HeadRepositoryID: repo.ID, HeadSHA: first.HeadSHA}
+	if a := w.c.Bind(w.Token(j, nil), ev); a.Status != http.StatusOK || a.Scope() != fmt.Sprintf("pr%d", second.Number) {
+		t.Fatalf("a bootstrap naming its head branch's earlier commit bound %d %q (%s)", a.Status, a.Scope(), a.Reason)
+	}
+	// Nor does a fork's earlier head, for another pull request.
+	fork := w.ForkPullRequest(repo, "main")
+	w.PushPullRequest(fork)
+	run = w.PullRequestTargetRun(other)
+	j = w.StartJob(run, w.Bootstrap(repo))
+	ev = &PullRequestEvent{PullRequest: other.Number, HeadRepositoryID: fork.HeadRepositoryID, HeadSHA: fork.HeadSHA}
+	if a := w.c.Bind(w.Token(j, nil), ev); a.Status != http.StatusOK || a.Scope() != "read" {
+		t.Fatalf("a bootstrap naming a fork's commit for another pull request bound %d %q", a.Status, a.Scope())
+	}
 }
 
 func noWidening(t T, w *world) {

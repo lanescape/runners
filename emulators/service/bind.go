@@ -89,7 +89,9 @@ type binding struct {
 	base     string
 	event    string
 	headRepo int64
-	at       time.Time
+	// headSHA is the head commit a pull request's binding was made for.
+	headSHA string
+	at      time.Time
 }
 
 // chain is a binding's restore chain (specs/0002-machines.md, Scope): its
@@ -220,21 +222,25 @@ func (e *Emulator) decide(c *claims, req bindRequest, rp *repo, rn *run) *bindin
 		}
 		n, _ := strconv.Atoi(m[1])
 		p := rp.pulls[n]
-		if p == nil || p.headRepo != rn.headRepo || rn.pull != p {
+		// The pull request's head, now, must be the run's.
+		if p == nil || p.headRepo != rn.headRepo || rn.pull != p || p.headSHA != rn.headSHA {
 			return read
 		}
-		b = &binding{scope: fmt.Sprintf("pr%d", n), base: baseOf(f, p.base), event: rn.event, headRepo: p.headRepo}
+		b = &binding{scope: fmt.Sprintf("pr%d", n), base: baseOf(f, p.base), event: rn.event, headRepo: p.headRepo, headSHA: rn.headSHA}
 	case "pull_request_target":
 		prefix := strings.ToLower(c.repository + "/.github/workflows/")
 		if f.bootstrap == "" || !strings.HasPrefix(strings.ToLower(f.bootstrap), prefix) || !strings.HasSuffix(f.bootstrap, "@refs/heads/main") ||
 			c.workflow != f.bootstrap || req.PullRequest <= 0 || req.HeadRepositoryID <= 0 || !commitSHA.MatchString(req.HeadSHA) {
 			return read
 		}
+		// The event's head commit must be among the pull request's commits,
+		// not its head now: the contributor may have pushed since the run
+		// was approved, and the run builds what its event names.
 		p := rp.pulls[req.PullRequest]
-		if p == nil || p.headRepo != req.HeadRepositoryID || p.headSHA != req.HeadSHA {
+		if p == nil || p.headRepo != req.HeadRepositoryID || !rp.pullCommit(p, req.HeadSHA) {
 			return read
 		}
-		b = &binding{scope: fmt.Sprintf("pr%d", p.number), base: baseOf(f, p.base), event: rn.event, headRepo: p.headRepo}
+		b = &binding{scope: fmt.Sprintf("pr%d", p.number), base: baseOf(f, p.base), event: rn.event, headRepo: p.headRepo, headSHA: req.HeadSHA}
 	default:
 		return read
 	}
@@ -242,7 +248,7 @@ func (e *Emulator) decide(c *claims, req bindRequest, rp *repo, rn *run) *bindin
 	// pull request's run this is.
 	heads := 0
 	for _, p := range rp.pulls {
-		if p.open && p.headRepo == b.headRepo && p.headSHA == e.pullHead(rp, b) {
+		if p.open && p.headRepo == b.headRepo && p.headSHA == b.headSHA {
 			heads++
 		}
 	}
@@ -250,11 +256,6 @@ func (e *Emulator) decide(c *claims, req bindRequest, rp *repo, rn *run) *bindin
 		return &binding{scope: "read", event: rn.event, headRepo: b.headRepo}
 	}
 	return b
-}
-
-func (e *Emulator) pullHead(rp *repo, b *binding) string {
-	n, _ := strconv.Atoi(strings.TrimPrefix(b.scope, "pr"))
-	return rp.pulls[n].headSHA
 }
 
 var (

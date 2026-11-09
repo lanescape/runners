@@ -169,3 +169,95 @@ func TestADivergenceFailsTheSuite(t *testing.T) {
 		})
 	}
 }
+
+// heads is the emulator behind a proxy that binds a bootstrap's run read
+// unless its event's head commit is its pull request's head now, as the
+// emulator once did, where specs/0002-machines.md asks only that it be one
+// of the pull request's commits.
+type heads struct {
+	service.World
+	url   string
+	mu    sync.Mutex
+	heads map[int]string
+}
+
+func (h *heads) URL() string { return h.url }
+
+func (h *heads) record(pr service.PullRequest) service.PullRequest {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.heads[pr.Number] = pr.HeadSHA
+	return pr
+}
+
+func (h *heads) PullRequest(r service.Repository, base, head string) service.PullRequest {
+	return h.record(h.World.PullRequest(r, base, head))
+}
+
+func (h *heads) ForkPullRequest(r service.Repository, base string) service.PullRequest {
+	return h.record(h.World.ForkPullRequest(r, base))
+}
+
+func (h *heads) PushPullRequest(pr service.PullRequest) service.PullRequest {
+	return h.record(h.World.PushPullRequest(pr))
+}
+
+func newHeads(t *testing.T) service.World {
+	e := service.New()
+	t.Cleanup(e.Close)
+	h := &heads{World: e, heads: map[int]string{}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		req, _ := http.NewRequestWithContext(r.Context(), r.Method, e.URL()+r.URL.RequestURI(), bytes.NewReader(body))
+		req.Header = r.Header.Clone()
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		var ev conformance.PullRequestEvent
+		var answer map[string]any
+		if r.URL.Path == "/v1/bind" && json.Unmarshal(body, &ev) == nil && ev.HeadSHA != "" && json.Unmarshal(raw, &answer) == nil {
+			h.mu.Lock()
+			now := h.heads[ev.PullRequest]
+			h.mu.Unlock()
+			if s, _ := answer["scope"].(string); strings.HasPrefix(s, "pr") && now != ev.HeadSHA {
+				answer["scope"] = "read"
+				raw, _ = json.Marshal(answer)
+			}
+		}
+		for k, vs := range resp.Header {
+			w.Header()[k] = vs
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(raw)))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(raw)
+	}))
+	t.Cleanup(srv.Close)
+	h.url = srv.URL
+	return h
+}
+
+// The suite fails an emulator that binds a bootstrap's run only for its
+// pull request's head now.
+func TestABootstrapHeldToItsPullRequestsHeadFailsTheSuite(t *testing.T) {
+	var failed []string
+	for _, c := range conformance.Cases() {
+		r := &recorder{}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			c.Run(r, newHeads(t))
+		}()
+		<-done
+		if r.failed {
+			failed = append(failed, c.Name)
+		}
+	}
+	if len(failed) == 0 {
+		t.Fatal("the suite passed against an emulator that binds read for a pull request pushed to after its approval")
+	}
+	t.Logf("failed %d cases: %s", len(failed), strings.Join(failed, "; "))
+}

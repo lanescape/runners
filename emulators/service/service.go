@@ -185,6 +185,11 @@ type pull struct {
 	headRepo int64
 	headSHA  string
 	open     bool
+	// branch is the head branch of a pull request from the repository
+	// itself; empty for a fork's.
+	branch string
+	// commits are the pull request's commits: every head it has had.
+	commits map[string]bool
 }
 
 type run struct {
@@ -195,7 +200,10 @@ type run struct {
 	refType  string
 	sha      string
 	headRepo int64
-	attempt  int
+	// headSHA is a pull_request run's head commit, as GitHub records it
+	// when the run is made.
+	headSHA string
+	attempt int
 	// triggers are whether each attempt after the first was the service's
 	// own automatic rerun.
 	automatic map[int]bool
@@ -289,7 +297,9 @@ func (e *Emulator) PullRequest(r Repository, base, head string) PullRequest {
 	defer e.mu.Unlock()
 	rp := e.repo(r)
 	rp.commit(head, newSHA(rp.name+"/"+head, e.id()))
-	return e.openPull(rp, base, rp.id, rp.branches[head])
+	pr := e.openPull(rp, base, rp.id, rp.branches[head])
+	rp.pulls[pr.Number].branch = head
+	return pr
 }
 
 // ForkPullRequest implements World.
@@ -303,9 +313,36 @@ func (e *Emulator) ForkPullRequest(r Repository, base string) PullRequest {
 
 func (e *Emulator) openPull(rp *repo, base string, headRepo int64, sha string) PullRequest {
 	rp.nextPull++
-	p := &pull{number: rp.nextPull, base: base, headRepo: headRepo, headSHA: sha, open: true}
+	p := &pull{number: rp.nextPull, base: base, headRepo: headRepo, headSHA: sha, open: true, commits: map[string]bool{sha: true}}
 	rp.pulls[p.number] = p
 	return PullRequest{Repository: Repository{ID: rp.id, Name: rp.name}, Number: p.number, HeadRepositoryID: headRepo, HeadSHA: sha}
+}
+
+// pullCommit reports whether a commit is one of a pull request's, as
+// GitHub counts them: every head it has had, and, for one from a branch of
+// the repository, each commit its head branch has that its base doesn't.
+func (rp *repo) pullCommit(p *pull, sha string) bool {
+	if p.commits[sha] {
+		return true
+	}
+	return p.branch != "" && rp.onBranch(p.branch, sha) && !rp.onBranch(p.base, sha)
+}
+
+// PushPullRequest implements World.
+func (e *Emulator) PushPullRequest(pr PullRequest) PullRequest {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	rp, p := e.repo(pr.Repository), e.pull(pr)
+	if !p.open {
+		panic(fmt.Sprintf("service emulator: pull request %d isn't open", p.number))
+	}
+	sha := newSHA("push", e.id())
+	if p.branch != "" {
+		rp.commit(p.branch, sha)
+	}
+	p.headSHA, p.commits[sha] = sha, true
+	pr.HeadSHA = sha
+	return pr
 }
 
 func (e *Emulator) pull(pr PullRequest) *pull {
@@ -385,7 +422,7 @@ func (e *Emulator) PullRequestRun(pr PullRequest) Run {
 	defer e.mu.Unlock()
 	rp, p := e.repo(pr.Repository), e.pull(pr)
 	return e.addRun(rp, &run{event: "pull_request", ref: fmt.Sprintf("refs/pull/%d/merge", p.number), refType: "branch",
-		sha: newSHA("merge", e.id()), headRepo: p.headRepo, pull: p})
+		sha: newSHA("merge", e.id()), headRepo: p.headRepo, headSHA: p.headSHA, pull: p})
 }
 
 // PullRequestTargetRun implements World. As GitHub records it, the run's
