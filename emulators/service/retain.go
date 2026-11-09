@@ -195,7 +195,16 @@ func (e *Emulator) seenClosed(repo int64, scope string) {
 		return
 	}
 	if p := e.pullOf(repo, scope); p == nil || !p.open {
-		e.closures[closureKey(repo, scope)] = e.now()
+		e.seen(repo, scope, e.now())
+	}
+}
+
+// seen records a pull request scope's closing as seen at t, keeping
+// whichever time is later: a closure only moves forward.
+func (e *Emulator) seen(repo int64, scope string, t time.Time) {
+	k := closureKey(repo, scope)
+	if cur, ok := e.closures[k]; !ok || t.After(cur) {
+		e.closures[k] = t
 	}
 }
 

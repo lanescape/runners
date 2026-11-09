@@ -170,3 +170,29 @@ func TestAnIssuerOutageIsRetryable(t *testing.T) {
 		t.Fatalf("restore answered %d", a.Status)
 	}
 }
+
+// A pull request's closing counts from the second after GitHub's closed_at,
+// which is to the second: a run bound in that second, even once it's
+// reopened, saves nothing it restores.
+func TestAClosingCountsFromTheNextSecond(t *testing.T) {
+	e, clock, c, repo := setup(t)
+	clock.Advance(time.Second - time.Duration(clock.Now().Nanosecond()) + 100*time.Millisecond)
+	pr := e.PullRequest(repo, "main", "fix")
+	run := e.PullRequestRun(pr)
+	e.ClosePullRequest(pr)
+	e.ReopenPullRequest(pr)
+	clock.Advance(500 * time.Millisecond)
+	j := e.StartMachineJob(run)
+	tok := e.Token(j, nil)
+	c.Bind(tok, nil)
+	_, r := c.Save(tok, linux, "build", key)
+	c.Upload(r, []byte("x"), 1<<20, false)
+	c.Commit(tok, r.ID, 1, conformance.Sum([]byte("x")))
+	e.FinishJob(j, "success")
+	next := e.StartMachineJob(e.PullRequestRun(pr))
+	tok = e.Token(next, nil)
+	c.Bind(tok, nil)
+	if _, got := c.Restore(tok, service.ServiceStore, linux, "build", key, false); got != nil {
+		t.Fatalf("restored %s's entry, saved by a run bound in the closing's second", got.Scope)
+	}
+}

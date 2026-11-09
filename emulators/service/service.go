@@ -322,7 +322,10 @@ func (e *Emulator) ClosePullRequest(pr PullRequest) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.pull(pr).open = false
-	e.closures[closureKey(pr.Repository.ID, fmt.Sprintf("pr%d", pr.Number))] = e.now()
+	// GitHub's closed_at is to the second, so the service records the
+	// closing as seen the second after it: a run bound in that second
+	// counts as bound before.
+	e.seen(pr.Repository.ID, fmt.Sprintf("pr%d", pr.Number), e.now().Truncate(time.Second).Add(time.Second))
 	e.retain()
 }
 
