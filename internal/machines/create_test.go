@@ -285,3 +285,26 @@ func TestARunnerGroupIsKeptToItsRepository(t *testing.T) {
 		t.Fatalf("group's repositories = %v", got.Repositories)
 	}
 }
+
+// A younger job of a smaller shape doesn't take the quota an older, larger
+// job of the same machine family is waiting for.
+func TestASmallerJobWaitsForAnOlderLargerOne(t *testing.T) {
+	e := setup(t)
+	e.gce.SetQuota("northamerica-northeast1", "N4_CPUS", 2)
+	e.gce.SetQuota("northamerica-northeast1", "C4_CPUS", 0)
+	big := e.queue(e.mainRun(), "lanescape-80vcpu-linux-amd64-main")
+	time.Sleep(1100 * time.Millisecond)
+	small := e.queue(e.mainRun(), sel2)
+	arm := e.queue(e.mainRun(), "lanescape-16vcpu-linux-arm64-main")
+	e.pass()
+	ms := e.wantMachines(1)
+	if ms[0].Labels[machines.LabelJob] != strconv.FormatInt(arm.ID, 10) {
+		t.Fatalf("the machine is job %s's; want only the Arm job's", ms[0].Labels[machines.LabelJob])
+	}
+	if e.gh.Job(big.ID).Status != "queued" || e.gh.Job(small.ID).Status != "queued" {
+		t.Fatal("a job held back by quota isn't queued")
+	}
+	e.gce.SetQuota("northamerica-northeast1", "N4_CPUS", 82)
+	e.pass()
+	e.wantMachines(3)
+}

@@ -437,7 +437,8 @@ type wanted struct {
 // consumers, so no consumer or run starves another (specs/0002-machines.md,
 // One pool). A job whose machine can't be made for want of quota or
 // capacity stays queued, and is tried again by later passes; meanwhile no
-// younger job gets a machine of a type it could have had.
+// younger job gets a machine of a machine family, such as N4, that it could
+// have had, since a family's machines share their quota.
 func (s *Service) give(ctx context.Context, inv *inventory) {
 	if !inv.machinesComplete || !inv.recordsComplete {
 		s.log().Warn("making no machines this pass: the machines or records couldn't all be read")
@@ -462,9 +463,12 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 		if ctx.Err() != nil {
 			return
 		}
-		types := s.Config.Shapes.Shapes[w.sel.Shape].MachineTypes
-		if slices.ContainsFunc(types, func(t string) bool { return short[t] }) {
-			s.log().Info("a job waits: an older job is waiting for quota or capacity of its machine types", "repository_id", w.repo.ID,
+		var families []string
+		for _, t := range s.Config.Shapes.Shapes[w.sel.Shape].MachineTypes {
+			families = append(families, t[:strings.Index(t, "-")])
+		}
+		if slices.ContainsFunc(families, func(f string) bool { return short[f] }) {
+			s.log().Info("a job waits: an older job is waiting for quota or capacity of its machine families", "repository_id", w.repo.ID,
 				"job_id", w.job.ID, "selector", w.sel.String())
 			continue
 		}
@@ -475,8 +479,8 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 		s.log().Warn("no machine made; the job stays queued", "repository_id", w.repo.ID, "job_id", w.job.ID, "selector", w.sel.String(),
 			"err", err.Error())
 		if compute.IsCapacity(err) {
-			for _, t := range types {
-				short[t] = true
+			for _, f := range families {
+				short[f] = true
 			}
 		}
 	}
