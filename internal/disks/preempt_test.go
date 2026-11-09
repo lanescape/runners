@@ -524,3 +524,23 @@ func TestAPreemptionPastTheAgeLimitWaitsForTheRecords(t *testing.T) {
 		t.Fatal("the run wasn't rerun once the records were read")
 	}
 }
+
+// A Spot machine still running past its age limit is stopped and recorded
+// before it's deleted, so a preemption after the pass read it isn't lost.
+func TestARunningSpotMachinePastTheAgeLimitIsRecorded(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+	e.clock.Advance(machines.MaxAge + time.Minute)
+	e.pass()
+	if _, ok := e.gce.Instance(jb.in.Zone, jb.in.Name); ok {
+		t.Fatal("a machine past its age limit wasn't deleted")
+	}
+	rec, ok := e.record("preemptions/5001/" + strconv.FormatInt(run.ID, 10) + "/" + strconv.FormatUint(jb.in.ID, 10) + ".json")
+	if !ok || rec["preempted"] != disks.Unknown {
+		t.Fatalf("record = %v; want one, with no evidence", rec)
+	}
+	if len(e.images()) != 0 {
+		t.Fatal("a machine past its age limit saved something")
+	}
+}

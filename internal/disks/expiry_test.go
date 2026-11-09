@@ -228,3 +228,16 @@ func TestASaveDoesntEvictWhatARunDueARerunChose(t *testing.T) {
 		t.Fatal("the run wasn't rerun")
 	}
 }
+
+// A record of an image that's gone counts nothing against a limit.
+func TestAGoneImageDoesntCount(t *testing.T) {
+	e := setup(t)
+	e.cfg.Limits.Defaults.PullRequestDisksGB = 50
+	p, _ := e.pull()
+	gone := e.savePull(p, sel(key1, "pr"+strconv.Itoa(p.Number)))
+	e.gce.DeleteImageNow(gone)
+	q, _ := e.pull()
+	if img := e.savePull(q, sel(key1, "pr"+strconv.Itoa(q.Number))); !e.has(img) {
+		t.Fatal("no save")
+	}
+}

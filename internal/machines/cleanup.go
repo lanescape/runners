@@ -62,15 +62,22 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 	}
 	switch {
 	case age >= MaxAge:
-		// A stopped Spot machine is recorded all the same, without a
-		// resume image, so its run may be rerun. It's stopped, so it
-		// waits for its record, however old it is.
-		// Without the records, whether it was admitted isn't known, and
-		// a stopped Spot machine waits for them.
-		if m.Stopped() && m.Spot && s.Preemptions != nil && !inv.recordsComplete {
+		// A Spot machine is recorded all the same, without a resume
+		// image, so its run may be rerun if it was preempted: one still
+		// running when the pass read it is stopped first, so a
+		// preemption since then isn't lost with it. A stopped machine
+		// waits for its record, and, without the records, for them, since
+		// whether it was admitted isn't known.
+		if m.Spot && s.Preemptions != nil && !inv.recordsComplete {
 			return
 		}
-		if admitted && a.Allowed && m.Stopped() && m.Spot && s.Preemptions != nil {
+		if admitted && a.Allowed && m.Spot && s.Preemptions != nil {
+			if !m.Stopped() {
+				if err := s.Compute.StopInstance(ctx, m.Zone, m.Name, s.requestID("stop", m.Name)); err != nil && !errors.Is(err, compute.ErrNotFound) {
+					s.log().Warn("stopping a Spot machine past the age limit to record it", "machine", m.Name, "err", err.Error())
+					return
+				}
+			}
 			if err := s.Preemptions.Stopped(ctx, m, a, s.preempted(ctx, m), false); err != nil {
 				s.log().Warn("recording a stopped Spot machine past the age limit; it waits for its record", "machine", m.Name, "err", err.Error())
 				return

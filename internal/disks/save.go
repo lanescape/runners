@@ -218,6 +218,28 @@ func (s *Service) makeRoom(ctx context.Context, repo int64, saver, scope, arch, 
 	if err != nil {
 		return false, "", err
 	}
+	// A record of a ready image Compute Engine confirms is gone counts
+	// nothing: it goes, before the limit is reckoned.
+	listed, err := s.Compute.Images(ctx)
+	if err != nil {
+		return false, "", err
+	}
+	have := map[string]bool{}
+	for _, im := range listed {
+		have[im.Name] = true
+	}
+	for k, r := range recs {
+		if r.v.State != ImageReady || have[r.v.Image] {
+			continue
+		}
+		if _, err := s.Compute.Image(ctx, r.v.Image); !errors.Is(err, compute.ErrNotFound) {
+			continue
+		}
+		if err := s.Objects.Delete(ctx, k, r.gen); err != nil && !errors.Is(err, store.ErrNotFound) {
+			return false, "", err
+		}
+		delete(recs, k)
+	}
 	// Marked images of the limit's scopes go first.
 	var pending bool
 	for _, r := range recs {
