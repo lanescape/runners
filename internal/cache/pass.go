@@ -124,11 +124,11 @@ func (s *Service) repository(ctx context.Context, st *state, id int64) (*github.
 
 // settleAll checks every pending entry's job, in case a delivery was lost.
 func (s *Service) settleAll(ctx context.Context, st *state) {
-	byJob := map[[2]int64][]Entry{}
+	byJob := map[[2]int64][]record[Entry]{}
 	for _, r := range st.entries {
 		if r.v.State == Pending {
 			k := [2]int64{r.v.RepositoryID, r.v.JobID}
-			byJob[k] = append(byJob[k], r.v)
+			byJob[k] = append(byJob[k], r)
 		}
 	}
 	for k, es := range byJob {
@@ -140,9 +140,9 @@ func (s *Service) settleAll(ctx context.Context, st *state) {
 			s.log().Warn("reading a pending cache entry's job", "repository_id", k[0], "job_id", k[1], "err", err.Error())
 			continue
 		}
-		for _, e := range es {
-			if err := s.settle(ctx, e, job); err != nil {
-				s.log().Warn("settling a pending cache entry", "entry", e.ID, "err", err.Error())
+		for _, r := range es {
+			if err := s.settle(ctx, r, job); err != nil {
+				s.log().Warn("settling a pending cache entry", "entry", r.v.ID, "err", err.Error())
 			}
 		}
 	}

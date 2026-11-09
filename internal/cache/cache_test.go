@@ -1,6 +1,8 @@
 package cache_test
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -12,6 +14,7 @@ import (
 	"github.com/lanescape/runners/conformance"
 	"github.com/lanescape/runners/emulators/service"
 	"github.com/lanescape/runners/internal/cache"
+	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/servicetest"
 )
 
@@ -397,5 +400,38 @@ func TestTheServicesStoreNeedsTheAdmittedJob(t *testing.T) {
 	}
 	if a, _ := e.c.Restore(e.Token(j, nil), cache.ServiceStore, linux, "build", key1, false); a.Status != http.StatusOK {
 		t.Fatalf("the admitted job answered %d: %s", a.Status, a.Reason)
+	}
+}
+
+// A decision made from a reading of a pending entry from before its commit
+// finished doesn't delete it once it has.
+func TestAStaleReadingDoesntDiscardACommittedEntry(t *testing.T) {
+	e := setup(t)
+	run := e.Push(e.repo, "main")
+	e.bind(run, "main")
+	j, tok := e.job(run)
+	_, r := e.c.Save(tok, linux, "build", key1)
+	e.c.Upload(r, []byte("x"), 1<<20, false)
+	if a := e.c.Commit(tok, r.ID, 1, conformance.Sum([]byte("x"))); a.Status != http.StatusOK {
+		t.Fatalf("commit: %d", a.Status)
+	}
+	id := e.Entries(e.repo)[0].ID
+	data, gen, _ := e.Storage.Object(servicetest.State, fmt.Sprintf("cache/entries/%d/%s.json", e.repo.ID, id))
+	var stale cache.Entry
+	if err := json.Unmarshal(data, &stale); err != nil {
+		t.Fatal(err)
+	}
+	// As a pass read it before the copy's generation was recorded.
+	stale.Generation = 0
+	err := e.Cache.SettleRecord(context.Background(), stale, gen-1, &github.Job{ID: j.ID, Status: "completed", Conclusion: "success"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !e.has(id) {
+		t.Fatal("a stale reading discarded a committed entry")
+	}
+	e.FinishJob(j, "success")
+	if es := e.Entries(e.repo); len(es) != 1 || es[0].State != cache.Ready {
+		t.Fatalf("entries %+v", es)
 	}
 }

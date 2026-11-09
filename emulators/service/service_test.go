@@ -127,7 +127,7 @@ func TestFaults(t *testing.T) {
 }
 
 func TestAnAutomaticRerunKeepsItsRunsChoices(t *testing.T) {
-	e, _, c, repo := setup(t)
+	e, clock, c, repo := setup(t)
 	first := saved(t, e, c, repo, []byte("first"))
 	run := e.Push(repo, "main")
 	j := e.StartMachineJob(run)
@@ -136,8 +136,9 @@ func TestAnAutomaticRerunKeepsItsRunsChoices(t *testing.T) {
 	if _, r := c.Restore(tok, service.ServiceStore, linux, "build", key, false); r == nil || r.SHA256 != first.SHA256 {
 		t.Fatal("no first choice")
 	}
+	clock.Advance(time.Second)
 	saved(t, e, c, repo, []byte("second"))
-	e.FinishJob(j, "failure")
+	e.PreemptJob(j)
 	again := e.AutomaticRerun(run)
 	tok = e.Token(e.StartMachineJob(again), nil)
 	if _, r := c.Restore(tok, service.ServiceStore, linux, "build", key, false); r == nil || r.SHA256 != first.SHA256 {
@@ -148,5 +149,24 @@ func TestAnAutomaticRerunKeepsItsRunsChoices(t *testing.T) {
 	}
 	if b, ok := e.Object(e.Choices(run)[0].Entry); !ok || string(b) != "first" {
 		t.Fatalf("the chosen entry's bytes %q", b)
+	}
+}
+
+// When the issuer's keys can't be read, nothing is confirmed: the emulator
+// answers 503, as the service does.
+func TestAnIssuerOutageIsRetryable(t *testing.T) {
+	issuer := oidc.New()
+	e := service.New(service.WithIssuer(issuer))
+	t.Cleanup(e.Close)
+	c := &conformance.Client{T: t, URL: e.URL()}
+	repo := e.Repository("app")
+	j := e.StartJob(e.Push(repo, "main"), "")
+	tok := e.Token(j, nil)
+	issuer.Close()
+	if a := c.Bind(tok, nil); a.Status != http.StatusServiceUnavailable {
+		t.Fatalf("bind answered %d", a.Status)
+	}
+	if a, _ := c.Restore(tok, "actions", linux, "build", key, false); a.Status != http.StatusServiceUnavailable {
+		t.Fatalf("restore answered %d", a.Status)
 	}
 }

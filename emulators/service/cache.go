@@ -46,7 +46,7 @@ type entry struct {
 	size                                    int64
 	sha256                                  string
 	job                                     int64
-	boundAt, committedAt                    time.Time
+	boundAt, committedAt, lastUsed          time.Time
 }
 
 type reservation struct {
@@ -102,7 +102,9 @@ func (e *Emulator) serveCache(h func(c *caller, body []byte) (any, error)) http.
 			err = refuse("the body is unreadable or too large")
 		} else {
 			var c *claims
-			if c, err = e.token(r); err != nil {
+			if c, err = e.token(r); errors.Is(err, errKeys) {
+				// Answered as unavailable, below.
+			} else if err != nil {
 				err = refuse("%s", err.Error())
 			} else {
 				e.mu.Lock()
@@ -229,16 +231,25 @@ func (e *Emulator) restore(cl *caller, body []byte) (any, error) {
 	}
 	if ch == nil {
 		ch = &choice{run: cl.run.id, store: q.Store, platform: q.Platform, family: q.Family, key: q.Key, step: "none", attempt: int(cl.c.attempt)}
-		if en, step := e.pick(cl, q.Store, q.Platform, q.Family, q.Key); en != nil {
+		en, step := e.pick(cl, q.Store, q.Platform, q.Family, q.Key)
+		rc := recent{}
+		if en != nil {
 			ch.entry, ch.step = en.id, step
+			rc = recent{entryScope: en.scope, key: en.key}
 		}
 		e.choices[ck] = ch
+		if strings.HasPrefix(cl.binding.scope, "pr") {
+			e.recents[lineageKey(cl.repo.id, cl.binding.scope, q.Store, q.Platform, q.Family)] = rc
+		}
 	}
 	if ch.entry == "" {
 		return map[string]any{"entry": nil}, nil
 	}
 	en := e.entries[ch.entry]
 	out := map[string]any{"scope": en.scope, "key": en.key, "step": ch.step, "size": en.size, "sha256": en.sha256}
+	if !q.Lookup {
+		e.used(en)
+	}
 	if !q.Lookup && en.store == ServiceStore {
 		expires := e.now().Add(RestoreFor)
 		out["url"], out["expires"] = e.grant(http.MethodGet, en.object, expires), expires.Format(time.RFC3339)
@@ -399,5 +410,6 @@ func (e *Emulator) settle(jb *job) {
 			continue
 		}
 		en.state = "ready"
+		e.used(en)
 	}
 }

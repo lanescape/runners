@@ -69,6 +69,8 @@ func Cases() []Case {
 		both("a choice holds for its run", choiceHolds),
 		both("a maintainer's rerun picks again", rerun),
 		both("only a successful job's entries are restored", successGating),
+		both("a pull request keeps one entry of each family", oneOfEachFamily),
+		both("main keeps its two newest keys", twoNewestKeys),
 		both("read runs restore main's and save nothing", readRuns),
 		both("a closed pull request's entries are never restored again", closing),
 		both("forks and contributions", contributions),
@@ -212,6 +214,12 @@ func scopes(t T, w *world) {
 	w.Branch(repo, "feature")
 	w.bound(w.Push(repo, "main"), "main")
 	w.bound(w.Push(repo, "support/v1"), "branch-v1")
+	// A listed branch that's gone binds nothing of its own.
+	w.Branch(repo, "support/v2")
+	w.SetRunners(repo, fmt.Sprintf(`{"bootstrap": %q, "branches": {"support/v1": "v1", "support/v2": "v2"}}`, w.Bootstrap(repo)))
+	gone := w.Push(repo, "support/v2")
+	w.DeleteBranch(repo, "support/v2")
+	w.bound(gone, "read")
 	w.bound(w.Push(repo, "feature"), "read")
 	w.bound(w.Tag(repo, "v1"), "read")
 	w.bound(w.Event(repo, "workflow_dispatch", "main"), "read")
@@ -833,4 +841,29 @@ func indexEntries(t T, w *world) {
 	push := w.Push(repo, "main")
 	w.bound(push, "main")
 	w.restore(push, linux, key2, "main_newest", payload)
+}
+
+func oneOfEachFamily(t T, w *world) {
+	repo := w.Repository("app")
+	pr := w.PullRequest(repo, "main", "fix")
+	run := w.PullRequestRun(pr)
+	w.bound(run, fmt.Sprintf("pr%d", pr.Number))
+	w.save(run, linux, "build", key1, data("first"), "success")
+	w.save(run, linux, "build", key2, data("second"), "success")
+	next := w.PullRequestRun(pr)
+	w.bound(next, fmt.Sprintf("pr%d", pr.Number))
+	// Its entry for key1 went when key2's became ready: nothing chose it.
+	w.restore(next, linux, key1, "pull_request_newest", data("second"))
+}
+
+func twoNewestKeys(t T, w *world) {
+	repo := w.Repository("app")
+	w.mainSaves(repo, linux, key1, data("one"))
+	w.mainSaves(repo, linux, key2, data("two"))
+	w.mainSaves(repo, linux, key3, data("three"))
+	w.Pass()
+	run := w.Push(repo, "main")
+	w.bound(run, "main")
+	w.restore(run, linux, key2, "main_exact", data("two"))
+	w.restore(run, linux, key1, "main_newest", data("three"))
 }

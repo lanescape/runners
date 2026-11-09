@@ -58,6 +58,8 @@ type Emulator struct {
 	reserved    map[string]*reservation
 	choices     map[string]*choice
 	closures    map[string]time.Time
+	recents     map[string]recent
+	familyUsed  map[string]time.Time
 	objects     map[string][]byte
 	grants      map[string]*grant
 	sessions    map[string]*session
@@ -86,7 +88,7 @@ func New(opts ...Option) *Emulator {
 	e := &Emulator{clock: clockwork.NewRealClock(), org: endpoints.Organization, login: "lanescape", nextID: 1_000_000,
 		repos: map[int64]*repo{}, runs: map[int64]*run{}, jobs: map[int64]*job{}, bindings: map[int64]*binding{},
 		entries: map[string]*entry{}, reserved: map[string]*reservation{}, choices: map[string]*choice{},
-		closures: map[string]time.Time{}, objects: map[string][]byte{}, grants: map[string]*grant{}, sessions: map[string]*session{}}
+		closures: map[string]time.Time{}, recents: map[string]recent{}, familyUsed: map[string]time.Time{}, objects: map[string][]byte{}, grants: map[string]*grant{}, sessions: map[string]*session{}}
 	for _, o := range opts {
 		o(e)
 	}
@@ -196,6 +198,9 @@ type run struct {
 	automatic map[int]bool
 	pull      *pull
 	approved  bool
+	// due says a Spot job of its latest attempt was preempted, so it's due
+	// an automatic rerun, which keeps its choices.
+	due bool
 }
 
 type job struct {
@@ -295,6 +300,7 @@ func (e *Emulator) ClosePullRequest(pr PullRequest) {
 	defer e.mu.Unlock()
 	e.pull(pr).open = false
 	e.closures[closureKey(pr.Repository.ID, fmt.Sprintf("pr%d", pr.Number))] = e.clock.Now()
+	e.retain()
 }
 
 // ReopenPullRequest implements World.
@@ -387,6 +393,7 @@ func (e *Emulator) rerun(r Run, automatic bool) Run {
 	rn := e.runs[r.ID]
 	rn.attempt++
 	rn.automatic[rn.attempt] = automatic
+	rn.due = false
 	r.Attempt = rn.attempt
 	return r
 }
@@ -460,6 +467,20 @@ func (e *Emulator) FinishJob(j Job, conclusion string) {
 	jb := e.jobs[j.ID]
 	jb.status, jb.conclusion = "completed", conclusion
 	e.settle(jb)
+	e.retain()
+}
+
+// PreemptJob finishes a job as a preempted Spot machine's job finishes:
+// failed, with its run due one of the service's automatic reruns, which
+// keeps the run's restore choices until AutomaticRerun starts it.
+func (e *Emulator) PreemptJob(j Job) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	jb := e.jobs[j.ID]
+	jb.status, jb.conclusion = "completed", "failure"
+	jb.run.due = true
+	e.settle(jb)
+	e.retain()
 }
 
 // Unavailable implements World.
@@ -469,9 +490,13 @@ func (e *Emulator) Unavailable(on bool) {
 	e.unavailable = on
 }
 
-// Pass implements World: the emulator keeps nothing it would delete, so
-// there's nothing to do.
-func (e *Emulator) Pass() {}
+// Pass implements World: the emulator deletes what the service's pass
+// would.
+func (e *Emulator) Pass() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.retain()
+}
 
 // Binding implements World.
 func (e *Emulator) Binding(r Run) (string, bool) {

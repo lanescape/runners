@@ -13,6 +13,9 @@ import (
 	"time"
 )
 
+// errKeys means the issuer's published keys couldn't be read.
+var errKeys = errors.New("the issuer's keys couldn't be read")
+
 // claims are what the emulator uses of a job's token, as the service does.
 type claims struct {
 	repository string
@@ -42,6 +45,10 @@ func (e *Emulator) token(r *http.Request) (*claims, error) {
 		return nil, errors.New("no token")
 	}
 	t, err := e.verify.Verify(r.Context(), tok)
+	if err != nil && strings.Contains(err.Error(), "fetching keys") {
+		// The issuer's keys couldn't be read: nothing is confirmed.
+		return nil, errKeys
+	}
 	if err != nil {
 		return nil, fmt.Errorf("the token isn't one the service accepts: %v", err)
 	}
@@ -109,6 +116,10 @@ type bindRequest struct {
 func (e *Emulator) bind(w http.ResponseWriter, r *http.Request) {
 	refuse := func(reason string) { Refuse(reason)(w, r) }
 	c, err := e.token(r)
+	if errors.Is(err, errKeys) {
+		Unavailable(5*time.Second)(w, r)
+		return
+	}
 	if err != nil {
 		refuse(err.Error())
 		return
@@ -193,7 +204,7 @@ func (e *Emulator) decide(c *claims, req bindRequest, rp *repo, rn *run) *bindin
 			return &binding{scope: "main", event: rn.event, headRepo: rp.id}
 		}
 		name, listed := f.branches[branch]
-		if !listed || rn.ref != c.ref {
+		if _, exists := rp.branches[branch]; !listed || !exists || rn.ref != c.ref {
 			return read
 		}
 		return &binding{scope: "branch-" + name, event: rn.event, headRepo: rp.id}

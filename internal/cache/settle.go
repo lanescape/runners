@@ -60,7 +60,7 @@ func (s *Service) RecordEvent(ctx context.Context, attributes map[string]string,
 	}
 	var errs []error
 	for _, r := range pending {
-		errs = append(errs, s.settle(ctx, r.v, job))
+		errs = append(errs, s.settle(ctx, r, job))
 	}
 	return errors.Join(errs...)
 }
@@ -93,19 +93,24 @@ func (s *Service) job(ctx context.Context, repoID, id int64) (*github.Job, error
 // job succeeded becomes ready, unless its pull request has closed since its
 // run was bound; one whose job finished otherwise, or that GitHub doesn't
 // show finished within 5 days, or whose commit never finished, goes.
-func (s *Service) settle(ctx context.Context, e Entry, job *github.Job) error {
+//
+// The decision rests on the entry's record as r read it: an entry is
+// discarded only at that generation, so a commit that finished since,
+// which rewrites the record, keeps it for the next decision.
+func (s *Service) settle(ctx context.Context, r record[Entry], job *github.Job) error {
+	e := r.v
 	switch {
 	case job == nil:
-		return s.discard(ctx, e, "GitHub shows no such job of the organization's")
+		return s.discard(ctx, r, "GitHub shows no such job of the organization's")
 	case job.Status != "completed":
 		if s.now().Sub(e.CommittedAt) >= PendingFor {
-			return s.discard(ctx, e, "its job isn't shown finished within 5 days")
+			return s.discard(ctx, r, "its job isn't shown finished within 5 days")
 		}
 		return nil
 	case job.Conclusion != "success":
-		return s.discard(ctx, e, "its job's conclusion is "+job.Conclusion)
+		return s.discard(ctx, r, "its job's conclusion is "+job.Conclusion)
 	case e.Object != "" && e.Generation == 0:
-		return s.discard(ctx, e, "its commit never finished")
+		return s.discard(ctx, r, "its commit never finished")
 	}
 	return s.ready(ctx, e)
 }
@@ -229,15 +234,16 @@ func (s *Service) stillReplaces(ctx context.Context, by Entry) (bool, error) {
 	return !retiredBy(by, c), nil
 }
 
-// discard marks a pending entry for deletion, under the lease, and deletes
-// it.
-func (s *Service) discard(ctx context.Context, e Entry, why string) error {
-	cur, gen, ok, err := getJSON[Entry](ctx, s.Objects, entryKey(e.RepositoryID, e.ID))
+// discard marks a pending entry for deletion, under the lease, at the
+// generation the decision to discard it read, and deletes it.
+func (s *Service) discard(ctx context.Context, r record[Entry], why string) error {
+	e := r.v
+	cur, _, ok, err := getJSON[Entry](ctx, s.Objects, entryKey(e.RepositoryID, e.ID))
 	if err != nil || !ok || cur.State == Ready {
 		return err
 	}
 	if cur.State == Pending {
-		marked, err := s.mark(ctx, cur.RepositoryID, []record[Entry]{{cur, gen}}, nil)
+		marked, err := s.mark(ctx, cur.RepositoryID, []record[Entry]{r}, nil)
 		if err != nil {
 			return err
 		}
