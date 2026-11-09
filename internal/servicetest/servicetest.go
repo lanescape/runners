@@ -77,6 +77,7 @@ type World struct {
 
 	url        string
 	maintainer *ghemu.Account
+	clock      clockwork.Clock
 
 	mu        sync.Mutex
 	nextID    int64
@@ -107,12 +108,12 @@ func (l *Logs) String() string {
 }
 
 // New starts the service and the emulators, for one test, with clock as
-// the service's clock; nil is the real one.
+// the service's clock; nil is real time, which Advance moves on.
 func New(t testing.TB, clock clockwork.Clock) *World {
 	t.Helper()
 	ctx := context.Background()
 	if clock == nil {
-		clock = clockwork.NewRealClock()
+		clock = &offsetClock{Clock: clockwork.NewRealClock()}
 	}
 	gh := ghemu.New()
 	t.Cleanup(gh.Close)
@@ -206,7 +207,7 @@ func New(t testing.TB, clock clockwork.Clock) *World {
 		t.Fatal(err)
 	}
 	return &World{T: t, GitHub: gh, Storage: gcs, PubSub: ps, Google: gg, IAM: iam, Compute: gce, Org: org, Inst: inst,
-		Objects: objects, Cache: cch, Disks: dks, Passes: passes, Body: body, Logs: logs, url: audience,
+		Objects: objects, Cache: cch, Disks: dks, Passes: passes, Body: body, Logs: logs, url: audience, clock: clock,
 		maintainer: gh.User(42, "maintainer"), nextID: 5000, repos: map[int64]*ghemu.Repo{}, pulls: map[string]*ghemu.Pull{},
 		runs: map[int64]*ghemu.Run{}, jobs: map[int64]*ghemu.WorkflowJob{}, onMachine: map[int64]string{}}
 }
@@ -496,6 +497,42 @@ func (w *World) Unavailable(on bool) {
 	}
 	w.GitHub.Faults().Add(fault.Rule{Respond: fault.Status(http.StatusServiceUnavailable, nil, `{"message": "Service Unavailable"}`)})
 }
+
+// Advance implements service.World: the service's clock moves on by d.
+func (w *World) Advance(d time.Duration) {
+	w.T.Helper()
+	switch c := w.clock.(type) {
+	case *clockwork.FakeClock:
+		c.Advance(d)
+	case *offsetClock:
+		c.advance(d)
+	default:
+		w.T.Fatal("the service's clock can't be moved on")
+	}
+}
+
+// offsetClock is real time, moved on by Advance: time still passes between
+// a test's steps, as it does for the service.
+type offsetClock struct {
+	clockwork.Clock
+	mu     sync.Mutex
+	offset time.Duration
+}
+
+func (c *offsetClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.offset += d
+}
+
+func (c *offsetClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.Clock.Now().Add(c.offset)
+}
+
+func (c *offsetClock) Since(t time.Time) time.Duration { return c.Now().Sub(t) }
+func (c *offsetClock) Until(t time.Time) time.Duration { return t.Sub(c.Now()) }
 
 // Pass implements service.World: one pass, the disks' part and the
 // cache's.

@@ -1,5 +1,7 @@
 package service
 
+import "time"
+
 // World is what a test of the interface drives (specs/0005-interface.md):
 // this package's emulator, or the real service wired to this repository's
 // emulators of GitHub, Google's OIDC issuers and Cloud Storage. Every
@@ -75,6 +77,10 @@ type World interface {
 	// Pass lets the service do what it does on its own between requests,
 	// such as deleting what's no longer needed.
 	Pass()
+	// Advance moves the service's time on by d, as if that long had passed
+	// with nothing else happening. Tokens are still minted and checked in
+	// real time, as GitHub's are.
+	Advance(d time.Duration)
 
 	// Binding is a run's bound scope, if it has one.
 	Binding(run Run) (string, bool)

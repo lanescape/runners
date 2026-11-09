@@ -64,6 +64,7 @@ type Emulator struct {
 	grants      map[string]*grant
 	sessions    map[string]*session
 	unavailable bool
+	advanced    time.Duration
 }
 
 // Option configures an Emulator.
@@ -171,6 +172,8 @@ type repo struct {
 	id       int64
 	name     string
 	branches map[string]string
+	// history is each branch's commits: what's reachable from its tip.
+	history  map[string]map[string]bool
 	runners  string
 	pulls    map[int]*pull
 	nextPull int
@@ -227,9 +230,27 @@ func (e *Emulator) Repository(name string) Repository {
 	defer e.mu.Unlock()
 	id := e.id()
 	full := e.login + "/" + name
-	e.repos[id] = &repo{id: id, name: full, branches: map[string]string{"main": newSHA(full, id)}, pulls: map[int]*pull{}}
+	rp := &repo{id: id, name: full, branches: map[string]string{}, history: map[string]map[string]bool{}, pulls: map[int]*pull{}}
+	rp.commit("main", newSHA(full, id))
+	e.repos[id] = rp
 	return Repository{ID: id, Name: full}
 }
+
+// commit adds a commit on top of a branch, making the branch from the
+// default branch if it doesn't exist.
+func (rp *repo) commit(branch, sha string) {
+	if _, ok := rp.branches[branch]; !ok {
+		rp.history[branch] = map[string]bool{}
+		for c := range rp.history["main"] {
+			rp.history[branch][c] = true
+		}
+	}
+	rp.branches[branch] = sha
+	rp.history[branch][sha] = true
+}
+
+// onBranch reports whether a commit is reachable from a branch's tip.
+func (rp *repo) onBranch(branch, sha string) bool { return rp.history[branch][sha] }
 
 // SetRunners implements World.
 func (e *Emulator) SetRunners(r Repository, file string) {
@@ -237,7 +258,7 @@ func (e *Emulator) SetRunners(r Repository, file string) {
 	defer e.mu.Unlock()
 	rp := e.repo(r)
 	rp.runners = file
-	rp.branches["main"] = newSHA(rp.name, e.id())
+	rp.commit("main", newSHA(rp.name, e.id()))
 }
 
 // Bootstrap implements World.
@@ -250,14 +271,16 @@ func (e *Emulator) Branch(r Repository, name string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	rp := e.repo(r)
-	rp.branches[name] = newSHA(rp.name+"/"+name, e.id())
+	rp.commit(name, newSHA(rp.name+"/"+name, e.id()))
 }
 
 // DeleteBranch implements World.
 func (e *Emulator) DeleteBranch(r Repository, name string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	delete(e.repo(r).branches, name)
+	rp := e.repo(r)
+	delete(rp.branches, name)
+	delete(rp.history, name)
 }
 
 // PullRequest implements World.
@@ -265,7 +288,7 @@ func (e *Emulator) PullRequest(r Repository, base, head string) PullRequest {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	rp := e.repo(r)
-	rp.branches[head] = newSHA(rp.name+"/"+head, e.id())
+	rp.commit(head, newSHA(rp.name+"/"+head, e.id()))
 	return e.openPull(rp, base, rp.id, rp.branches[head])
 }
 
@@ -299,7 +322,7 @@ func (e *Emulator) ClosePullRequest(pr PullRequest) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.pull(pr).open = false
-	e.closures[closureKey(pr.Repository.ID, fmt.Sprintf("pr%d", pr.Number))] = e.clock.Now()
+	e.closures[closureKey(pr.Repository.ID, fmt.Sprintf("pr%d", pr.Number))] = e.now()
 	e.retain()
 }
 
@@ -548,6 +571,16 @@ func (e *Emulator) Object(id string) ([]byte, bool) {
 	return b, ok
 }
 
-func (e *Emulator) now() time.Time { return e.clock.Now().UTC() }
+// now is the service's time: its clock's, moved on by Advance. Tokens are
+// checked at the clock's own time, as GitHub mints them.
+func (e *Emulator) now() time.Time { return e.clock.Now().UTC().Add(e.advanced) }
+
+// Advance implements World: the service's time moves on by d, as if that
+// long had passed with nothing else happening.
+func (e *Emulator) Advance(d time.Duration) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.advanced += d
+}
 
 var _ World = (*Emulator)(nil)

@@ -12,6 +12,7 @@ const (
 	PullRequestUnused = 14 * 24 * time.Hour
 	LastingUnused     = 90 * 24 * time.Hour
 	LastingKeys       = 2
+	PendingFor        = 5 * 24 * time.Hour
 )
 
 // recent is a pull request's most recent choice for a store, platform and
@@ -116,6 +117,15 @@ func (e *Emulator) retain() {
 		keep[lineageKey(repo, r.entryScope, store, platform, family)+"\x00"+r.key] = true
 	}
 	for id, en := range e.entries {
+		// A pending entry whose job GitHub doesn't show finished within 5
+		// days goes.
+		if en.state == "pending" && e.now().Sub(en.committedAt) >= PendingFor {
+			if en.object != "" {
+				delete(e.objects, en.object)
+			}
+			delete(e.entries, id)
+			continue
+		}
 		if en.state != "ready" || named[id] {
 			continue
 		}

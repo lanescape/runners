@@ -200,11 +200,16 @@ func (e *Emulator) decide(c *claims, req bindRequest, rp *repo, rn *run) *bindin
 		if !ok || c.refType != "branch" || branch == "" || c.sha != rn.sha {
 			return read
 		}
+		// The run's commit must be on the branch now, as GitHub's
+		// comparison of the two shows.
 		if branch == "main" {
+			if !rp.onBranch("main", rn.sha) {
+				return read
+			}
 			return &binding{scope: "main", event: rn.event, headRepo: rp.id}
 		}
 		name, listed := f.branches[branch]
-		if _, exists := rp.branches[branch]; !listed || !exists || rn.ref != c.ref {
+		if !listed || rn.ref != c.ref || !rp.onBranch(branch, rn.sha) {
 			return read
 		}
 		return &binding{scope: "branch-" + name, event: rn.event, headRepo: rp.id}

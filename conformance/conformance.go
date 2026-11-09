@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lanescape/runners/emulators/service"
 )
@@ -69,6 +70,7 @@ func Cases() []Case {
 		both("a choice holds for its run", choiceHolds),
 		both("a maintainer's rerun picks again", rerun),
 		both("only a successful job's entries are restored", successGating),
+		both("a pending entry goes after 5 days", pendingFor),
 		both("a pull request keeps one entry of each family", oneOfEachFamily),
 		both("main keeps its two newest keys", twoNewestKeys),
 		both("read runs restore main's and save nothing", readRuns),
@@ -220,6 +222,13 @@ func scopes(t T, w *world) {
 	gone := w.Push(repo, "support/v2")
 	w.DeleteBranch(repo, "support/v2")
 	w.bound(gone, "read")
+	// Nor does one made again from the default branch, for a commit of
+	// the branch that went.
+	old := w.Push(repo, "support/v1")
+	w.DeleteBranch(repo, "support/v1")
+	w.Branch(repo, "support/v1")
+	w.bound(old, "read")
+	w.bound(w.Push(repo, "support/v1"), "branch-v1")
 	w.bound(w.Push(repo, "feature"), "read")
 	w.bound(w.Tag(repo, "v1"), "read")
 	w.bound(w.Event(repo, "workflow_dispatch", "main"), "read")
@@ -866,4 +875,31 @@ func twoNewestKeys(t T, w *world) {
 	w.bound(run, "main")
 	w.restore(run, linux, key2, "main_exact", data("two"))
 	w.restore(run, linux, key1, "main_newest", data("three"))
+}
+
+func pendingFor(t T, w *world) {
+	repo := w.Repository("app")
+	run := w.Push(repo, "main")
+	w.bound(run, "main")
+	j, tok := w.job(run)
+	payload := data("never finished")
+	id, _ := w.reserve(tok, linux, "build", key1, payload)
+	if a := w.c.Commit(tok, id, int64(len(payload)), Sum(payload)); a.Status != http.StatusOK {
+		t.Fatalf("commit answered %d: %s", a.Status, a.Reason)
+	}
+	w.Advance(5*24*time.Hour - time.Hour)
+	w.Pass()
+	if len(w.Entries(repo)) != 1 {
+		t.Fatalf("a pending entry went before 5 days")
+	}
+	w.Advance(time.Hour)
+	w.Pass()
+	if es := w.Entries(repo); len(es) != 0 {
+		t.Fatalf("a pending entry stayed past 5 days: %+v", es)
+	}
+	// Its job's success, late, makes nothing restorable.
+	w.FinishJob(j, "success")
+	next := w.Push(repo, "main")
+	w.bound(next, "main")
+	w.restore(next, linux, key1, "", nil)
 }
