@@ -84,6 +84,13 @@ type Repo struct {
 // FullName is owner/name.
 func (r *Repo) FullName() string { return r.Owner.Login + "/" + r.Name }
 
+// Transfer moves a repository to another owner, keeping its ID.
+func (e *Emulator) Transfer(r *Repo, to *Account) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	r.Owner = to
+}
+
 // Commit is a commit and the whole tree it records, as path to contents.
 type Commit struct {
 	SHA     string

@@ -281,7 +281,12 @@ func (s *server) bind(w http.ResponseWriter, r *http.Request) {
 		refuse("the body is unreadable or too large")
 		return
 	}
-	if len(bytes.TrimSpace(body)) > 0 {
+	if trimmed := bytes.TrimSpace(body); len(trimmed) > 0 {
+		// A request is an object: not null, nor anything else.
+		if trimmed[0] != '{' {
+			refuse("the body isn't a binding request")
+			return
+		}
 		dec := json.NewDecoder(bytes.NewReader(body))
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&req); err != nil || dec.Decode(&struct{}{}) != io.EOF {

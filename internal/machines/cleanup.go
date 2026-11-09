@@ -63,11 +63,15 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 	switch {
 	case age >= MaxAge:
 		// A stopped Spot machine is recorded all the same, without a
-		// resume image, so its run may be rerun; the age limit comes
-		// first if it can't be.
-		if admitted && a.Allowed && m.Stopped() && m.Spot && s.Preemptions != nil && inv.recordsComplete {
+		// resume image, so its run may be rerun. It's stopped, so it
+		// waits for its record, however old it is.
+		if admitted && a.Allowed && m.Stopped() && m.Spot && s.Preemptions != nil {
+			if !inv.recordsComplete {
+				return
+			}
 			if err := s.Preemptions.Stopped(ctx, m, a, s.preempted(ctx, m), false); err != nil {
-				s.log().Warn("recording a stopped Spot machine past the age limit; it goes without the record", "machine", m.Name, "err", err.Error())
+				s.log().Warn("recording a stopped Spot machine past the age limit; it waits for its record", "machine", m.Name, "err", err.Error())
+				return
 			}
 		}
 		s.finish(ctx, inv, m, "past "+MaxAge.String()+", deleted even mid-job, saving nothing", nil)

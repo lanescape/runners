@@ -272,11 +272,14 @@ type Event struct {
 	RecordedAt time.Time `json:"recorded_at"`
 }
 
-// Rerun is the attempts of a run the service has asked GitHub to rerun.
+// Rerun is the attempts of a run the service has asked GitHub to rerun,
+// recorded before it asks, and those GitHub confirmed it reran, each the
+// attempt the rerun started from.
 type Rerun struct {
 	RepositoryID int64     `json:"repository_id"`
 	RunID        int64     `json:"run_id"`
 	Attempts     []int     `json:"attempts"`
+	Started      []int     `json:"started,omitempty"`
 	At           time.Time `json:"at"`
 }
 

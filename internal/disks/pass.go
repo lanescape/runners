@@ -123,6 +123,13 @@ func (s *Service) repository(ctx context.Context, st *state, id int64) (*github.
 	if err != nil {
 		return nil, err
 	}
+	if r.OwnerID != s.Config.Organization.ID {
+		// Transferred away: no longer a consumer, so nothing of it is
+		// read or rerun.
+		s.log().Warn("a repository with records is no longer the organization's", "repository_id", id)
+		st.repos[id] = nil
+		return nil, nil
+	}
 	st.repos[id] = &r
 	return &r, nil
 }
@@ -278,6 +285,15 @@ func (s *Service) rerun(ctx context.Context, st *state, repoID, runID int64, rs 
 	}
 	if err != nil {
 		return err
+	}
+	// Confirmed: a restore choice holds for the attempt it started.
+	if !slices.Contains(rec.Started, rs.attempt) {
+		rec.Started = append(rec.Started, rs.attempt)
+		if g, err := replaceJSON(ctx, s.Objects, key, rec, gen); err == nil {
+			st.reruns[key] = record[Rerun]{rec, g}
+		} else {
+			s.log().Warn("recording a rerun as started; its jobs will pick their restore choices again", "run_id", runID, "err", err.Error())
+		}
 	}
 	rs.finished, rs.rerun = false, false
 	s.log().Info("run rerun: a Spot job was preempted", "repository_id", repoID, "run_id", runID, "attempt", rs.attempt+1)
@@ -507,6 +523,23 @@ func (s *Service) tidy(ctx context.Context, st *state) {
 	for key, r := range st.records {
 		v := r.v
 		recorded[v.Image] = true
+		// An image whose making was abandoned, its machine gone, never
+		// becomes ready: it goes, image and record, and stops counting
+		// against its scope's limit.
+		if v.State == ImageMaking && st.imagesRead && s.now().Sub(v.SavedAt) >= abandoned {
+			if _, err := s.Compute.Instance(ctx, v.Zone, v.Machine); errors.Is(err, compute.ErrNotFound) {
+				if err := s.Compute.DeleteImage(ctx, v.Image, freshID("delete image", v.Image)); err != nil && !errors.Is(err, compute.ErrNotFound) {
+					s.log().Warn("deleting an abandoned image", "image", v.Image, "err", err.Error())
+					continue
+				}
+				if err := s.Objects.Delete(ctx, key, r.gen); err == nil {
+					delete(st.records, key)
+					delete(st.images, v.Image)
+					s.log().Info("abandoned image removed", "image", v.Image)
+				}
+				continue
+			}
+		}
 		if _, there := st.images[v.Image]; there || !st.imagesRead || v.State == ImageMarked {
 			continue
 		}

@@ -411,6 +411,8 @@ func TestBind(t *testing.T) {
 		{"not JSON", tok, `pr1`, http.StatusForbidden},
 		{"two objects", tok, `{} {}`, http.StatusForbidden},
 		{"a stray bracket", tok, `{}]`, http.StatusForbidden},
+		{"null", tok, `null`, http.StatusForbidden},
+		{"an array", tok, `[]`, http.StatusForbidden},
 		{"a stray brace", tok, `{}}`, http.StatusForbidden},
 		{"trailing text", tok, `{} x`, http.StatusForbidden},
 		{"too large", tok, `{"pull_request": 1` + strings.Repeat(" ", 5000) + `}`, http.StatusForbidden},

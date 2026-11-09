@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -437,5 +438,68 @@ func TestAnAutomaticRerunKeepsItsRunsChoice(t *testing.T) {
 	other := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{label}})
 	if src := other.source(); src != old || src == newer {
 		t.Fatalf("an automatic rerun's job started from %q, want its run's choice %s", src, old)
+	}
+}
+
+// Past its age limit, a stopped Spot machine waits for its record, however
+// old it is.
+func TestAPreemptionPastTheAgeLimitWaitsForItsRecord(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+	e.clock.Advance(machines.MaxAge + time.Minute)
+	jb.preempt()
+	e.gcs.Faults().Add(fault.Rule{Method: http.MethodPost, Times: 1,
+		Match:   func(r *http.Request) bool { return strings.HasPrefix(r.URL.Query().Get("name"), "preemptions/") },
+		Respond: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusForbidden) }})
+	e.pass()
+	if _, ok := e.gce.Instance(jb.in.Zone, jb.in.Name); !ok {
+		t.Fatal("a stopped Spot machine went without its record")
+	}
+	e.pass()
+	if _, ok := e.gce.Instance(jb.in.Zone, jb.in.Name); ok {
+		t.Fatal("the machine wasn't deleted once recorded")
+	}
+	if e.attempt(run) != 2 {
+		t.Fatal("the run wasn't rerun")
+	}
+}
+
+// A rerun the service asked for and GitHub refused isn't the service's:
+// a maintainer's rerun after it picks again.
+func TestARefusedRerunThenAMaintainersPicksAgain(t *testing.T) {
+	e := setup(t)
+	old := e.saveMain(key1)
+	run := e.mainRun()
+	label := "lanescape-2vcpu-linux-amd64-spot-disk-build-" + key1 + "-main"
+	lost := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{label}})
+	if lost.source() != old {
+		t.Fatal("no restore")
+	}
+	e.clock.Advance(time.Minute)
+	newer := e.saveMain(key1)
+	lost.preempt()
+	e.gh.ServerError("/repos/lanescape/app/actions/runs/"+strconv.FormatInt(run.ID, 10)+"/rerun-failed-jobs", http.StatusForbidden, 1)
+	e.pass()
+	if e.attempt(run) != 1 {
+		t.Fatal("rerun despite GitHub's refusal")
+	}
+	e.gh.Rerun(run)
+	if src := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{label}}).source(); src != newer {
+		t.Fatalf("a maintainer's rerun started from %q, want the newest %s", src, newer)
+	}
+}
+
+// A repository transferred out of the organization is no longer a
+// consumer: nothing of it is rerun.
+func TestATransferredRepositoryIsntRerun(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+	e.gh.Transfer(e.repo, e.gh.Org(1234, "elsewhere"))
+	jb.preempt()
+	e.pass()
+	if a := e.gh.RunJobs(run, 2); len(a) != 0 {
+		t.Fatal("a transferred repository's run was rerun")
 	}
 }

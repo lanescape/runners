@@ -191,7 +191,7 @@ func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Ad
 				return err
 			}
 			for k := c.Attempt; k < a.RunAttempt; k++ {
-				if !slices.Contains(rr.Attempts, k) {
+				if !slices.Contains(rr.Started, k) {
 					s.log().Info("a maintainer's rerun picks its restore choice again", "run_id", a.RunID, "selector", a.Selector,
 						"attempt", a.RunAttempt)
 					stale = true

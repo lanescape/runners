@@ -207,3 +207,31 @@ func TestAFailedImageIsMadeAgain(t *testing.T) {
 		t.Fatal("the older version outlived the save that superseded it")
 	}
 }
+
+// An image whose making was abandoned, its machine gone, goes after an
+// hour, and stops counting against its scope's limit.
+func TestAnAbandonedImageGoes(t *testing.T) {
+	e := setup(t)
+	img := e.saveMain(key1)
+	key := "images/5001/" + img + ".json"
+	data, gen, _ := e.gcs.Object("state", key)
+	var rec disks.Image
+	_ = json.Unmarshal(data, &rec)
+	rec.State, rec.Machine = disks.ImageMaking, "lsr-5001-gonegone"
+	b, _ := json.Marshal(rec)
+	if _, err := e.objects.Replace(context.Background(), key, b, gen); err != nil {
+		t.Fatal(err)
+	}
+	e.pass()
+	if !e.has(img) {
+		t.Fatal("an image being made went before an hour")
+	}
+	e.clock.Advance(time.Hour)
+	e.pass()
+	if e.has(img) {
+		t.Fatal("an abandoned image wasn't deleted")
+	}
+	if _, ok := e.record(key); ok {
+		t.Fatal("an abandoned image's record was kept")
+	}
+}
