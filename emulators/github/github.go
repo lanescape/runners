@@ -485,6 +485,9 @@ type Job struct {
 	WorkflowSHA string
 	Audience    string
 	Environment string
+	// CheckRunID is the job's check run, which GitHub signs as
+	// check_run_id: its workflow job's ID. Zero leaves the claim out.
+	CheckRunID int64
 }
 
 // ActionsClaims are the claims GitHub signs in a job's OIDC token, which
@@ -545,6 +548,9 @@ func (e *Emulator) ActionsClaims(r *Run, j Job) map[string]any {
 	if j.Environment != "" {
 		c["environment"] = j.Environment
 	}
+	if j.CheckRunID != 0 {
+		c["check_run_id"] = fmt.Sprint(j.CheckRunID)
+	}
 	return c
 }
 
@@ -552,6 +558,17 @@ func (e *Emulator) ActionsClaims(r *Run, j Job) map[string]any {
 // an override of nil removes a claim.
 func (e *Emulator) ActionsToken(r *Run, j Job, overrides map[string]any) string {
 	c := e.ActionsClaims(r, j)
+	maps.Copy(c, overrides)
+	return e.Actions.Mint(c)
+}
+
+// JobToken mints the OIDC token of a workflow job, as GitHub signs it for
+// that job: with its check run and its attempt. job says the rest, as for
+// ActionsToken.
+func (e *Emulator) JobToken(wj *WorkflowJob, job Job, overrides map[string]any) string {
+	job.CheckRunID = wj.ID
+	c := e.ActionsClaims(wj.Run, job)
+	c["run_attempt"] = fmt.Sprint(wj.Attempt)
 	maps.Copy(c, overrides)
 	return e.Actions.Mint(c)
 }

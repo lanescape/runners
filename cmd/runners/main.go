@@ -7,6 +7,8 @@
 //	RUNNERS_AUDIENCE             the service's URL, as Cloud Run gives it, which must be endpoints.Service
 //	RUNNERS_PROJECT              the project the service's machines are in
 //	RUNNERS_BUCKET               the service's state bucket
+//	RUNNERS_CACHE_BUCKET         the cache's bucket
+//	RUNNERS_SIGNER               the service's own account, which signs the cache's URLs through IAM's signBlob
 //	RUNNERS_WEBHOOK_TOPIC        the Pub/Sub topic the webhook publishes deliveries to, by its full name
 //	RUNNERS_GITHUB_APP_ID        the GitHub App's ID
 //	RUNNERS_GITHUB_APP_KEY_FILE  the App's private key, mounted from Secret Manager
@@ -41,6 +43,7 @@ import (
 	"github.com/lanescape/runners/endpoints"
 	"github.com/lanescape/runners/internal/auth"
 	"github.com/lanescape/runners/internal/binding"
+	"github.com/lanescape/runners/internal/cache"
 	"github.com/lanescape/runners/internal/compute"
 	"github.com/lanescape/runners/internal/disks"
 	"github.com/lanescape/runners/internal/github"
@@ -71,6 +74,8 @@ type settings struct {
 	Audience          string
 	Project           string
 	Bucket            string
+	CacheBucket       string
+	Signer            string
 	WebhookTopic      string
 	AppID             int64
 	AppKeyFile        string
@@ -84,6 +89,8 @@ func loadSettings(getenv func(string) string) (settings, error) {
 		Audience:          getenv("RUNNERS_AUDIENCE"),
 		Project:           getenv("RUNNERS_PROJECT"),
 		Bucket:            getenv("RUNNERS_BUCKET"),
+		CacheBucket:       getenv("RUNNERS_CACHE_BUCKET"),
+		Signer:            getenv("RUNNERS_SIGNER"),
 		WebhookTopic:      getenv("RUNNERS_WEBHOOK_TOPIC"),
 		AppKeyFile:        getenv("RUNNERS_GITHUB_APP_KEY_FILE"),
 		WebhookSecretFile: getenv("RUNNERS_WEBHOOK_SECRET_FILE"),
@@ -96,6 +103,8 @@ func loadSettings(getenv func(string) string) (settings, error) {
 		"RUNNERS_AUDIENCE":            s.Audience,
 		"RUNNERS_PROJECT":             s.Project,
 		"RUNNERS_BUCKET":              s.Bucket,
+		"RUNNERS_CACHE_BUCKET":        s.CacheBucket,
+		"RUNNERS_SIGNER":              s.Signer,
 		"RUNNERS_WEBHOOK_TOPIC":       s.WebhookTopic,
 		"RUNNERS_GITHUB_APP_KEY_FILE": s.AppKeyFile,
 		"RUNNERS_WEBHOOK_SECRET_FILE": s.WebhookSecretFile,
@@ -119,6 +128,9 @@ func loadSettings(getenv func(string) string) (settings, error) {
 			}
 			s.ReconcileAccounts = append(s.ReconcileAccounts, a)
 		}
+	}
+	if s.Signer != "" && !strings.HasSuffix(s.Signer, ".gserviceaccount.com") {
+		errs = append(errs, fmt.Errorf("RUNNERS_SIGNER: %q isn't a service account", s.Signer))
 	}
 	if len(s.ReconcileAccounts) == 0 {
 		errs = append(errs, errors.New("RUNNERS_RECONCILE_ACCOUNTS is required"))
@@ -168,6 +180,15 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 		return err
 	}
 	defer objects.Close()
+	blobs, err := store.NewGCS(ctx, s.CacheBucket)
+	if err != nil {
+		return err
+	}
+	defer blobs.Close()
+	signer, err := cache.NewIAMSigner(ctx, s.CacheBucket, s.Signer)
+	if err != nil {
+		return err
+	}
 	callers, err := auth.NewGoogle(auth.Options{Issuer: auth.GoogleIssuer, Audience: endpoints.Service}, s.ReconcileAccounts)
 	if err != nil {
 		return err
@@ -201,8 +222,11 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 	svc := &machines.Service{Config: cfg, Project: s.Project, ServiceURL: endpoints.Service, MachineAccount: account,
 		GitHub: gh, Compute: gce, Objects: objects, Binder: binder, Machines: machineTokens, Clock: clock, Logger: log,
 		Disks: dks, Saves: dks, Preemptions: dks}
+	cch := &cache.Service{OrganizationID: cfg.Organization.ID, GitHub: gh, Objects: objects, Bucket: blobs, Signer: signer,
+		Actions: actions, Binder: binder, Disks: dks, Clock: clock, Logger: log}
+	dks.ScopesHeld = cch.ScopesHeld
 	passes := &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log}
-	body := pass.All(svc.Pass, dks.Pass)
+	body := pass.All(svc.Pass, dks.Pass, cch.Pass)
 	svc.Kick = kicker(ctx, passes, body, 15*time.Second, log)
 	h, err := server.New(server.Config{
 		Logger:           log,
@@ -212,11 +236,12 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 		ReconcileCallers: callers,
 		Passes:           passes,
 		Reconciler:       reconciler(body),
-		Events:           dks,
+		Events:           server.Recorders{dks, cch},
 		Actions:          actions,
 		Binder:           binder,
 		JobStarted:       svc.JobStarted(),
 		JobFinished:      svc.JobFinished(),
+		Cache:            cch.Handler(),
 	})
 	if err != nil {
 		return err

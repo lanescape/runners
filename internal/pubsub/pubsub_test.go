@@ -126,7 +126,7 @@ func TestAClosingReachesTheRecorder(t *testing.T) {
 		OrganizationID: orgID, WebhookSecret: secret, Publisher: pub, ReconcileCallers: callers,
 		Passes:     &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock},
 		Reconciler: nothing{}, Events: &disks.Service{Config: cfg, Objects: objects, Clock: clock},
-		Actions:    actions, Binder: &binding.Binder{Objects: objects, OrganizationID: orgID, Clock: clock},
+		Actions: actions, Binder: &binding.Binder{Objects: objects, OrganizationID: orgID, Clock: clock},
 	})
 	if err != nil {
 		t.Fatal(err)

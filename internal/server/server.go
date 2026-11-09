@@ -88,6 +88,27 @@ type Config struct {
 	// served.
 	JobStarted  http.Handler
 	JobFinished http.Handler
+
+	// Cache serves the cache's endpoints, under CachePath, which check a
+	// job's GitHub token themselves; unset, they aren't served.
+	Cache http.Handler
+}
+
+// CachePath is where the cache's endpoints are (specs/0005-interface.md).
+const CachePath = "/v1/cache/"
+
+// Recorders records a pushed message with each of its recorders in turn,
+// such as the disks' and the cache's, and fails if any fails, so the push
+// is delivered again.
+type Recorders []EventRecorder
+
+// RecordEvent implements EventRecorder.
+func (rs Recorders) RecordEvent(ctx context.Context, attributes map[string]string, data []byte) error {
+	var errs []error
+	for _, r := range rs {
+		errs = append(errs, r.RecordEvent(ctx, attributes, data))
+	}
+	return errors.Join(errs...)
 }
 
 type server struct {
@@ -117,6 +138,9 @@ func New(c Config) (http.Handler, error) {
 	}
 	if c.JobFinished != nil {
 		mux.Handle("POST "+JobFinishedPath, c.JobFinished)
+	}
+	if c.Cache != nil {
+		mux.Handle(CachePath, c.Cache)
 	}
 	return mux, nil
 }

@@ -230,6 +230,17 @@ func (e *Emulator) Rerun(r *Run) {
 	e.notify()
 }
 
+// RunJob starts a queued job on a runner that isn't one of this emulator's
+// registrations, such as GitHub's own: GitHub shows it in progress.
+func (e *Emulator) RunJob(j *WorkflowJob) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if j.Status == "queued" || j.Status == "waiting" {
+		j.Status, j.Started = "in_progress", e.clock.Now()
+	}
+	e.notify()
+}
+
 // CompleteJob finishes a job with a conclusion, as if its runner reported
 // it.
 func (e *Emulator) CompleteJob(j *WorkflowJob, conclusion string) {

@@ -164,3 +164,32 @@ func TestCallsStopAtTheContextsDeadline(t *testing.T) {
 		t.Fatalf("get took %v despite its deadline", d)
 	}
 }
+
+func TestAttrsAndCopyNew(t *testing.T) {
+	ctx := context.Background()
+	emu, s := newStore(t)
+	gen := emu.Put("state", "uploads/1", []byte("twelve bytes"))
+	a, err := s.Attrs(ctx, "uploads/1")
+	if err != nil || a.Size != 12 || a.Generation != gen {
+		t.Fatalf("attrs = %+v, %v", a, err)
+	}
+	if _, err := s.Attrs(ctx, "uploads/2"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("attrs of nothing: %v", err)
+	}
+	c, err := s.CopyNew(ctx, "uploads/1", gen, "entries/1")
+	if err != nil || c.Size != 12 || c.Generation == 0 {
+		t.Fatalf("copy = %+v, %v", c, err)
+	}
+	if data, _, ok := emu.Object("state", "entries/1"); !ok || string(data) != "twelve bytes" {
+		t.Fatalf("copied %q", data)
+	}
+	// Only if absent.
+	if _, err := s.CopyNew(ctx, "uploads/1", gen, "entries/1"); !errors.Is(err, store.ErrPrecondition) {
+		t.Fatalf("a second copy: %v", err)
+	}
+	// Only of the generation named.
+	emu.Put("state", "uploads/1", []byte("changed"))
+	if _, err := s.CopyNew(ctx, "uploads/1", gen, "entries/2"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("a copy of a generation that's gone: %v", err)
+	}
+}

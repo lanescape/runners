@@ -156,6 +156,10 @@ type Service struct {
 	// it included, may take; it defaults to 30 seconds, well inside the
 	// lease's validity.
 	StepDeadline time.Duration
+	// ScopesHeld, if set, says which scopes of a consumer something other
+	// than its disks holds, such as cache entries: a closure is shared, and
+	// goes only once nothing holds its scope.
+	ScopesHeld func(ctx context.Context, repo int64) (map[string]bool, error)
 }
 
 func (s *Service) log() *slog.Logger {
@@ -299,7 +303,7 @@ type Closure struct {
 // retired reports whether a saved disk of a pull request's was saved by a
 // run bound before its pull request was last seen closed.
 func retired(v Image, c *Closure) bool {
-	return c != nil && v.Kind == KindSaved && v.Scope == c.Scope && !v.BoundAt.After(c.SeenAt)
+	return v.Kind == KindSaved && Retired(v.Scope, v.BoundAt, c)
 }
 
 // Family is when a family of main's or a long-lived branch's was last

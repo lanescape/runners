@@ -71,6 +71,12 @@ resource "google_cloud_run_v2_service" "service" {
         name  = "RUNNERS_CACHE_BUCKET"
         value = google_storage_bucket.cache.name
       }
+      # The service signs the cache's URLs as itself, through IAM's signBlob,
+      # which bootstrap/ grants it on its own account alone.
+      env {
+        name  = "RUNNERS_SIGNER"
+        value = local.accounts.service
+      }
       # bootstrap/ makes the topic, and grants the service publishing on it.
       env {
         name  = "RUNNERS_WEBHOOK_TOPIC"

@@ -148,6 +148,49 @@ func (g *GCS) Delete(ctx context.Context, name string, generation int64) error {
 	return classify(g.bucket.Object(name).If(storage.Conditions{GenerationMatch: generation}).Delete(ctx))
 }
 
+// Attrs is what the cache reads of an object it doesn't read the contents
+// of.
+type Attrs struct {
+	Name       string
+	Size       int64
+	Generation int64
+	Created    time.Time
+}
+
+// Blobs is a bucket whose objects the service moves but never reads: the
+// cache's.
+type Blobs interface {
+	Attrs(ctx context.Context, name string) (Attrs, error)
+	// CopyNew copies an object, at a generation, to dst within the bucket,
+	// only if dst doesn't exist: Cloud Storage copies it, and its bytes
+	// never pass through the service.
+	CopyNew(ctx context.Context, src string, generation int64, dst string) (Attrs, error)
+	Delete(ctx context.Context, name string, generation int64) error
+	List(ctx context.Context, prefix string) ([]Object, error)
+}
+
+// Attrs implements Blobs.
+func (g *GCS) Attrs(ctx context.Context, name string) (Attrs, error) {
+	a, err := g.bucket.Object(name).Attrs(ctx)
+	if err != nil {
+		return Attrs{}, classify(err)
+	}
+	return Attrs{Name: a.Name, Size: a.Size, Generation: a.Generation, Created: a.Created}, nil
+}
+
+// CopyNew implements Blobs.
+func (g *GCS) CopyNew(ctx context.Context, src string, generation int64, dst string) (Attrs, error) {
+	if generation <= 0 {
+		return Attrs{}, fmt.Errorf("copy %s: generation %d isn't an existing object's", src, generation)
+	}
+	from := g.bucket.Object(src).Generation(generation)
+	a, err := g.bucket.Object(dst).If(storage.Conditions{DoesNotExist: true}).CopierFrom(from).Run(ctx)
+	if err != nil {
+		return Attrs{}, classify(err)
+	}
+	return Attrs{Name: a.Name, Size: a.Size, Generation: a.Generation, Created: a.Created}, nil
+}
+
 // List implements Objects.
 func (g *GCS) List(ctx context.Context, prefix string) ([]Object, error) {
 	q := &storage.Query{Prefix: prefix}
