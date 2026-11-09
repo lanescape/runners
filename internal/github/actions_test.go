@@ -407,3 +407,47 @@ func TestRunnerStatus(t *testing.T) {
 		}
 	})
 }
+
+func TestRerunFailedJobs(t *testing.T) {
+	ctx := context.Background()
+	e := setup(t)
+	repo := e.repository(t)
+	run := e.emu.PushRun(e.repo, "main")
+	lost := e.emu.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{"lanescape-2vcpu-linux-amd64-spot-main"}})
+	ok := e.emu.Queue(run, ghemu.JobSpec{Name: "lint"})
+	if err := e.c.RerunFailedJobs(ctx, repo, run.ID); err == nil {
+		t.Fatal("a run in progress was rerun")
+	}
+	e.emu.CompleteJob(lost, "failure")
+	e.emu.CompleteJob(ok, "success")
+	if err := e.c.RerunFailedJobs(ctx, repo, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	r, err := e.c.WorkflowRun(ctx, repo, run.ID)
+	if err != nil || r.Attempt != 2 || r.Status != "in_progress" {
+		t.Fatalf("run = %+v, %v", r, err)
+	}
+	second, err := e.c.AttemptJobs(ctx, repo, run.ID, 2)
+	if err != nil || len(second) != 2 {
+		t.Fatalf("second attempt's jobs = %+v, %v", second, err)
+	}
+	for _, j := range second {
+		switch j.Name {
+		case "build":
+			if j.ID == lost.ID || j.Status != "queued" || j.RunAttempt != 2 {
+				t.Fatalf("rerun job = %+v", j)
+			}
+		case "lint":
+			if j.Status != "completed" || j.Conclusion != "success" {
+				t.Fatalf("carried job = %+v", j)
+			}
+		}
+	}
+	first, err := e.c.AttemptJobs(ctx, repo, run.ID, 1)
+	if err != nil || len(first) != 2 || !slices.ContainsFunc(first, func(j github.Job) bool { return j.ID == lost.ID && j.Conclusion == "failure" }) {
+		t.Fatalf("first attempt's jobs = %+v, %v", first, err)
+	}
+	if latest, _ := e.c.RunJobs(ctx, repo, run.ID); len(latest) != 2 || latest[0].RunAttempt != 2 {
+		t.Fatalf("latest jobs = %+v", latest)
+	}
+}

@@ -182,6 +182,10 @@ func (e *Emulator) getRun(w http.ResponseWriter, r *http.Request, rp *Repo) {
 }
 
 func (e *Emulator) pullJSON(p *Pull) map[string]any {
+	var closedAt any
+	if !p.Closed.IsZero() {
+		closedAt = p.Closed.UTC().Format(time.RFC3339)
+	}
 	headLabel := p.HeadRef
 	var headRepo any
 	if p.Head != nil {
@@ -205,6 +209,7 @@ func (e *Emulator) pullJSON(p *Pull) map[string]any {
 		"merged":     false,
 		"commits":    len(e.between(p.Base.branches[p.BaseRef], p.HeadSHA)),
 		"created_at": p.Created.UTC().Format(time.RFC3339),
+		"closed_at":  closedAt,
 		"html_url":   fmt.Sprintf("https://github.com/%s/pull/%d", p.Base.FullName(), p.Number),
 	}
 }

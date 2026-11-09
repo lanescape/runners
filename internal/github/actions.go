@@ -73,6 +73,8 @@ type Actions interface {
 	Runs(ctx context.Context, repo Repository, status string) ([]WorkflowRun, error)
 	// RunJobs lists the jobs of a run's latest attempt.
 	RunJobs(ctx context.Context, repo Repository, runID int64) ([]Job, error)
+	// AttemptJobs lists the jobs of one of a run's attempts.
+	AttemptJobs(ctx context.Context, repo Repository, runID int64, attempt int) ([]Job, error)
 	Job(ctx context.Context, repo Repository, id int64) (Job, error)
 	// RunApprovals is a run's review history: who approved or rejected its
 	// deployments to which environments.
@@ -81,6 +83,9 @@ type Actions interface {
 	// already finished.
 	CancelRun(ctx context.Context, repo Repository, runID int64) error
 	ForceCancelRun(ctx context.Context, repo Repository, runID int64) error
+	// RerunFailedJobs starts a finished run's next attempt, rerunning its
+	// failed jobs and those that depend on them.
+	RerunFailedJobs(ctx context.Context, repo Repository, runID int64) error
 	// ForkApprovalPolicy is the organization's setting for which outside
 	// contributors' fork pull request workflows need a maintainer's
 	// approval.
@@ -211,6 +216,25 @@ func (c *Client) RunJobs(ctx context.Context, repo Repository, runID int64) ([]J
 	}
 }
 
+// AttemptJobs implements Actions.
+func (c *Client) AttemptJobs(ctx context.Context, repo Repository, runID int64, attempt int) ([]Job, error) {
+	opts := &gh.ListOptions{PerPage: 100}
+	var out []Job
+	for {
+		js, resp, err := c.gh.Actions.ListWorkflowJobsAttempt(ctx, repo.Owner, repo.Name, runID, int64(attempt), opts)
+		if err != nil {
+			return nil, classify(err)
+		}
+		for _, j := range js.Jobs {
+			out = append(out, jobOf(j))
+		}
+		if resp.NextPage == 0 {
+			return out, nil
+		}
+		opts.Page = resp.NextPage
+	}
+}
+
 // Job implements Actions.
 func (c *Client) Job(ctx context.Context, repo Repository, id int64) (Job, error) {
 	j, _, err := c.gh.Actions.GetWorkflowJobByID(ctx, repo.Owner, repo.Name, id)
@@ -261,6 +285,12 @@ func (c *Client) ForceCancelRun(ctx context.Context, repo Repository, runID int6
 		return err
 	}
 	_, err = c.gh.Do(req, nil)
+	return accepted(err)
+}
+
+// RerunFailedJobs implements Actions. GitHub answers 201 Created.
+func (c *Client) RerunFailedJobs(ctx context.Context, repo Repository, runID int64) error {
+	_, err := c.gh.Actions.RerunFailedJobsByID(ctx, repo.Owner, repo.Name, runID)
 	return accepted(err)
 }
 

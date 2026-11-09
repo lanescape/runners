@@ -1,11 +1,13 @@
 // Package google emulates Google's ID token issuer, as Cloud Scheduler and
 // Pub/Sub push subscriptions sign their calls: tokens for a service
-// account's email, with the audience the caller was configured with.
+// account's email, with the audience the caller was configured with; and
+// the bodies of Pub/Sub's pushes.
 package google
 
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"strconv"
 	"time"
 
@@ -46,4 +48,18 @@ func (i *Issuer) Claims(email, audience string) map[string]any {
 // Token mints a service account's token for audience.
 func (i *Issuer) Token(email, audience string) string {
 	return i.Mint(i.Claims(email, audience))
+}
+
+// Push is the body of a push subscription's request delivering one
+// message, as Pub/Sub sends it: the message's data, base64-encoded, its ID
+// and the subscription's full name. A redelivery has the same ID.
+func Push(project, subscription, messageID string, data []byte) []byte {
+	b, _ := json.Marshal(map[string]any{
+		"message": map[string]any{
+			"data": data, "messageId": messageID, "message_id": messageID,
+			"publishTime": time.Now().UTC().Format(time.RFC3339Nano), "attributes": map[string]string{},
+		},
+		"subscription": "projects/" + project + "/subscriptions/" + subscription,
+	})
+	return b
 }

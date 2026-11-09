@@ -31,6 +31,10 @@ var ErrExists = errors.New("already exists in Compute Engine")
 // ErrInUse means a disk is attached to an instance.
 var ErrInUse = errors.New("in use in Compute Engine")
 
+// ErrFingerprint means a change named a fingerprint, such as a resource's
+// labels', that's no longer the resource's.
+var ErrFingerprint = errors.New("fingerprint no longer current in Compute Engine")
+
 // CapacityError means Compute Engine couldn't make a machine where it was
 // asked for: the zone has no capacity for it (a stockout), or the project's
 // quota is used up. Another machine type or zone may succeed.
@@ -124,8 +128,24 @@ type Image struct {
 	Family       string
 	Status       string
 	Architecture string
-	Labels       map[string]string
-	Created      time.Time
+	// DiskSizeGB is the size of the disk it was made from, the least a
+	// disk made from it may be.
+	DiskSizeGB int64
+	// SourceDisk is the disk it was made from, by name.
+	SourceDisk       string
+	Labels           map[string]string
+	LabelFingerprint string
+	Created          time.Time
+}
+
+// ImageSpec is an image to make from a disk.
+type ImageSpec struct {
+	Name string
+	// SourceZone and SourceDisk are the disk it's made from, which must be
+	// attached to no running instance.
+	SourceZone string
+	SourceDisk string
+	Labels     map[string]string
 }
 
 // InstanceSpec is a machine to make.
@@ -145,6 +165,9 @@ type InstanceSpec struct {
 	ServiceAccount string
 	Scopes         []string
 	Network        string
+	// Subnetwork is the subnetwork the machine joins, in its zone's
+	// region.
+	Subnetwork string
 	// MaxRunDuration is when Compute Engine itself stops the machine.
 	MaxRunDuration time.Duration
 }
@@ -176,6 +199,12 @@ type API interface {
 	CreateDisk(ctx context.Context, zone string, spec DiskSpec, requestID string) error
 	DeleteDisk(ctx context.Context, zone, name, requestID string) error
 	Images(ctx context.Context) ([]Image, error)
+	Image(ctx context.Context, name string) (Image, error)
+	CreateImage(ctx context.Context, spec ImageSpec, requestID string) error
+	DeleteImage(ctx context.Context, name, requestID string) error
+	// SetImageLabels replaces an image's labels, if they're still those
+	// fingerprint names.
+	SetImageLabels(ctx context.Context, name string, labels map[string]string, fingerprint string) error
 	// SerialOutput is an instance's serial console output, up to limit
 	// bytes from its start.
 	SerialOutput(ctx context.Context, zone, name string, limit int) (string, error)
@@ -239,6 +268,8 @@ func classify(err error) error {
 		return &CapacityError{Stockout: true, Message: ge.Message}
 	case reason == "resourceInUseByAnotherResource":
 		return fmt.Errorf("%w: %s", ErrInUse, ge.Message)
+	case ge.Code == http.StatusPreconditionFailed || reason == "conditionNotMet":
+		return fmt.Errorf("%w: %s", ErrFingerprint, ge.Message)
 	case ge.Code == http.StatusTooManyRequests || ge.Code >= 500 || reason == "rateLimitExceeded" || reason == "resourceNotReady":
 		return &Unavailable{Err: err}
 	case ge.Code >= 400 && ge.Code < 500:
@@ -420,6 +451,9 @@ func (c *Client) CreateInstance(ctx context.Context, zone string, s InstanceSpec
 		ServiceAccounts: []*gce.ServiceAccount{{Email: s.ServiceAccount, Scopes: s.Scopes}},
 		Scheduling:      sch,
 	}
+	if s.Subnetwork != "" {
+		inst.NetworkInterfaces[0].Subnetwork = "projects/" + c.project + "/regions/" + Region(zone) + "/subnetworks/" + s.Subnetwork
+	}
 	return c.change(ctx, zone, func() (*gce.Operation, error) {
 		return c.svc.Instances.Insert(c.project, zone, inst).RequestId(requestID).Context(ctx).Do()
 	})
@@ -500,13 +534,21 @@ func (c *Client) DeleteDisk(ctx context.Context, zone, name, requestID string) e
 	})
 }
 
+// Region is a zone's region.
+func Region(zone string) string { return zone[:max(strings.LastIndex(zone, "-"), 0)] }
+
+func imageOf(i *gce.Image) Image {
+	return Image{Name: i.Name, ID: i.Id, Family: i.Family, Status: i.Status, Architecture: i.Architecture,
+		DiskSizeGB: i.DiskSizeGb, SourceDisk: last(i.SourceDisk), Labels: i.Labels, LabelFingerprint: i.LabelFingerprint,
+		Created: parseTime(i.CreationTimestamp)}
+}
+
 // Images implements API.
 func (c *Client) Images(ctx context.Context) ([]Image, error) {
 	var out []Image
 	err := c.svc.Images.List(c.project).Context(ctx).Pages(ctx, func(l *gce.ImageList) error {
 		for _, i := range l.Items {
-			out = append(out, Image{Name: i.Name, ID: i.Id, Family: i.Family, Status: i.Status, Architecture: i.Architecture,
-				Labels: i.Labels, Created: parseTime(i.CreationTimestamp)})
+			out = append(out, imageOf(i))
 		}
 		return nil
 	})
@@ -514,6 +556,41 @@ func (c *Client) Images(ctx context.Context) ([]Image, error) {
 		return nil, classify(err)
 	}
 	return out, nil
+}
+
+// Image implements API.
+func (c *Client) Image(ctx context.Context, name string) (Image, error) {
+	i, err := c.svc.Images.Get(c.project, name).Context(ctx).Do()
+	if err != nil {
+		return Image{}, classify(err)
+	}
+	return imageOf(i), nil
+}
+
+// CreateImage implements API. It waits for the image to be made, as long as
+// ctx allows.
+func (c *Client) CreateImage(ctx context.Context, s ImageSpec, requestID string) error {
+	im := &gce.Image{Name: s.Name, Labels: s.Labels, SourceDisk: c.zonePath(s.SourceZone) + "/disks/" + s.SourceDisk}
+	return c.change(ctx, "", func() (*gce.Operation, error) {
+		return c.svc.Images.Insert(c.project, im).RequestId(requestID).Context(ctx).Do()
+	})
+}
+
+// DeleteImage implements API.
+func (c *Client) DeleteImage(ctx context.Context, name, requestID string) error {
+	return c.change(ctx, "", func() (*gce.Operation, error) {
+		return c.svc.Images.Delete(c.project, name).RequestId(requestID).Context(ctx).Do()
+	})
+}
+
+// SetImageLabels implements API. A fingerprint that's no longer the
+// image's is ErrFingerprint. Compute Engine takes no request ID for it; the
+// fingerprint makes a repeated request harmless instead.
+func (c *Client) SetImageLabels(ctx context.Context, name string, labels map[string]string, fingerprint string) error {
+	req := &gce.GlobalSetLabelsRequest{Labels: labels, LabelFingerprint: fingerprint}
+	return c.change(ctx, "", func() (*gce.Operation, error) {
+		return c.svc.Images.SetLabels(c.project, name, req).Context(ctx).Do()
+	})
 }
 
 // SerialOutput implements API.

@@ -60,10 +60,12 @@ type WorkflowRun struct {
 }
 
 // PullRequest is a pull request. HeadRepositoryID is 0 once the head
-// repository is deleted.
+// repository is deleted. ClosedAt is when it was last closed, zero while
+// it's open.
 type PullRequest struct {
 	Number           int
 	State            string
+	ClosedAt         time.Time
 	BaseRepositoryID int64
 	HeadRepositoryID int64
 	HeadSHA          string
@@ -296,6 +298,7 @@ func pullOf(p *gh.PullRequest) PullRequest {
 	return PullRequest{
 		Number:           p.GetNumber(),
 		State:            p.GetState(),
+		ClosedAt:         p.GetClosedAt().Time,
 		BaseRepositoryID: p.GetBase().GetRepo().GetID(),
 		HeadRepositoryID: p.GetHead().GetRepo().GetID(),
 		HeadSHA:          p.GetHead().GetSHA(),

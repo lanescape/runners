@@ -117,6 +117,10 @@ func TestPullRequests(t *testing.T) {
 	if _, err := e.c.PullRequest(ctx, repo, 99); !errors.Is(err, github.ErrNotFound) {
 		t.Fatalf("missing pull request: %v", err)
 	}
+	e.emu.ClosePull(p)
+	if got, err := e.c.PullRequest(ctx, repo, p.Number); err != nil || got.State != "closed" || got.ClosedAt.IsZero() {
+		t.Fatalf("closed pull request = %+v, %v", got, err)
+	}
 }
 
 func TestOpenPullRequestsPages(t *testing.T) {

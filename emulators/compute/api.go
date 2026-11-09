@@ -98,6 +98,7 @@ func (e *Emulator) routes() http.Handler {
 	mux.HandleFunc("POST "+p+"/global/images", e.global(e.mutating(e.insertImage)))
 	mux.HandleFunc("GET "+p+"/global/images/{name}", e.global(e.getImage))
 	mux.HandleFunc("DELETE "+p+"/global/images/{name}", e.global(e.mutating(e.deleteImage)))
+	mux.HandleFunc("POST "+p+"/global/images/{name}/setLabels", e.global(e.mutating(e.setImageLabels)))
 	mux.HandleFunc("GET "+p+"/global/images/family/{family}", e.global(e.getImageFromFamily))
 	mux.HandleFunc("GET "+p+"/global/operations/{op}", e.global(e.getOperation))
 	mux.HandleFunc("POST "+p+"/global/operations/{op}/wait", e.global(e.waitOperation))
@@ -571,10 +572,16 @@ func (e *Emulator) insertInstance(r *http.Request, zone string) (*operation, *ap
 			return nil, invalid("The service account '%s' isn't one of the project's.", sa)
 		}
 	}
-	network, external := "default", false
+	network, subnetwork, external := "default", "", false
 	if len(body.NetworkInterfaces) > 0 {
-		network = last(body.NetworkInterfaces[0].Network)
-		external = len(body.NetworkInterfaces[0].AccessConfigs) > 0
+		ni := body.NetworkInterfaces[0]
+		network, external = last(ni.Network), len(ni.AccessConfigs) > 0
+		if ni.Subnetwork != "" {
+			if !strings.Contains(ni.Subnetwork, "/regions/"+region(zone)+"/subnetworks/") {
+				return nil, invalid("Invalid value for field 'resource.networkInterfaces[0].subnetwork': '%s'. The subnetwork must be in the instance's region.", ni.Subnetwork)
+			}
+			subnetwork = last(ni.Subnetwork)
+		}
 	}
 
 	// Quota is checked as the request arrives; capacity once it's accepted.
@@ -610,7 +617,7 @@ func (e *Emulator) insertInstance(r *http.Request, zone string) (*operation, *ap
 	}
 	now := e.clock.Now()
 	in := &instance{id: newID(), name: body.Name, zone: zone, machineType: mt, status: "PROVISIONING", created: now,
-		readyAt: time.Now().Add(e.opDelay), labels: body.Labels, metadata: items, network: network, externalIP: external,
+		readyAt: time.Now().Add(e.opDelay), labels: body.Labels, metadata: items, network: network, subnetwork: subnetwork, externalIP: external,
 		serviceAccount: sa, scopes: scopes, provisioning: prov, termination: sch.InstanceTerminationAction, maxRun: maxRun,
 		hostMaint: sch.OnHostMaintenance, guest: map[string]string{}}
 	op.op.TargetId = in.id
@@ -920,8 +927,8 @@ func (e *Emulator) deleteDisk(r *http.Request, zone string) (*operation, *apiErr
 
 func (e *Emulator) imageJSON(im *image) *gce.Image {
 	return &gce.Image{Kind: "compute#image", Id: im.id, Name: im.name, Family: im.family, Status: im.status,
-		Architecture: im.arch, Labels: im.labels, CreationTimestamp: im.created.Format(timeFormat), SourceDisk: im.sourceDisk,
-		DiskSizeGb: im.sizeGB, SelfLink: e.imageURL(im)}
+		Architecture: im.arch, Labels: im.labels, LabelFingerprint: fingerprint(im.labelFP), CreationTimestamp: im.created.Format(timeFormat),
+		SourceDisk: im.sourceDisk, DiskSizeGb: im.sizeGB, SelfLink: e.imageURL(im)}
 }
 
 func (e *Emulator) listImages(w http.ResponseWriter, r *http.Request, _ string) {
@@ -991,7 +998,30 @@ func (e *Emulator) insertImage(r *http.Request, _ string) (*operation, *apiError
 	im := &image{id: newID(), name: body.Name, family: body.Family, status: "READY", arch: d.arch, labels: body.Labels,
 		created: e.clock.Now(), sourceDisk: e.diskURL(d), sizeGB: d.sizeGB}
 	op := e.newOp("", "insert", e.imageURL(im), im.id)
+	if code, ok := e.failing("images.insert"); ok {
+		return op.fail(http.StatusInternalServerError, code, "The operation failed."), nil
+	}
 	e.images[im.name] = im
+	return op, nil
+}
+
+func (e *Emulator) setImageLabels(r *http.Request, _ string) (*operation, *apiError) {
+	im := e.images[r.PathValue("name")]
+	if im == nil {
+		return nil, notFound("projects/" + e.Project + "/global/images/" + r.PathValue("name"))
+	}
+	var body gce.GlobalSetLabelsRequest
+	if err := decode(r, &body); err != nil {
+		return nil, err
+	}
+	if body.LabelFingerprint != fingerprint(im.labelFP) {
+		return nil, &apiError{http.StatusPreconditionFailed, "conditionNotMet", "Labels fingerprint either invalid or resource labels have changed"}
+	}
+	if err := checkLabels(body.Labels); err != nil {
+		return nil, err
+	}
+	op := e.newOp("", "setLabels", e.imageURL(im), im.id)
+	im.labels, im.labelFP = body.Labels, im.labelFP+1
 	return op, nil
 }
 

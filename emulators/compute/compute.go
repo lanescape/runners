@@ -18,6 +18,7 @@ package compute
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"net/http/httptest"
 	"regexp"
@@ -103,6 +104,7 @@ type instance struct {
 	metaFP         int64
 	disks          []*attached
 	network        string
+	subnetwork     string
 	externalIP     bool
 	serviceAccount string
 	scopes         []string
@@ -141,6 +143,7 @@ type image struct {
 	created    time.Time
 	sourceDisk string
 	sizeGB     int64
+	labelFP    int64
 }
 
 // Option configures an Emulator.
@@ -256,8 +259,8 @@ func (e *Emulator) RefuseForCapacity(zone, machineType string, spot bool) {
 	e.refusing[capacityKey{zone, machineType, spot}] = true
 }
 
-// FailNextOperation makes the next operation of a kind, "instances.delete"
-// or "disks.insert", finish with an error of code, such as INTERNAL_ERROR or
+// FailNextOperation makes the next operation of a kind, "instances.delete",
+// "disks.insert" or "images.insert", finish with an error of code, such as INTERNAL_ERROR or
 // RESOURCE_NOT_READY, having done nothing, as Compute Engine sometimes does
 // after accepting a request.
 func (e *Emulator) FailNextOperation(kind, code string) {
@@ -421,6 +424,37 @@ func (e *Emulator) Shutdown(zone, name string) {
 	}
 }
 
+// LogEntry is the Cloud Logging entry Compute Engine writes to the
+// project's system event audit log for an instance, as a log sink publishes
+// it: method is compute.instances.preempted or
+// compute.instances.guestTerminate. It reports false if there's no such
+// instance.
+func (e *Emulator) LogEntry(zone, name, method string) ([]byte, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	in := e.instances[zone+"/"+name]
+	if in == nil {
+		return nil, false
+	}
+	b, _ := json.Marshal(map[string]any{
+		"protoPayload": map[string]any{
+			"@type": "type.googleapis.com/google.cloud.audit.AuditLog", "serviceName": "compute.googleapis.com",
+			"methodName":         method,
+			"resourceName":       "projects/" + e.Project + "/zones/" + zone + "/instances/" + name,
+			"authenticationInfo": map[string]any{"principalEmail": "system@google.com"},
+		},
+		"insertId": fmt.Sprintf("%x", newID()),
+		"resource": map[string]any{"type": "gce_instance", "labels": map[string]string{
+			"instance_id": strconv.FormatUint(in.id, 10), "project_id": e.Project, "zone": zone}},
+		"timestamp":        e.clock.Now().UTC().Format(time.RFC3339Nano),
+		"severity":         "INFO",
+		"logName":          "projects/" + e.Project + "/logs/cloudaudit.googleapis.com%2Fsystem_event",
+		"operation":        map[string]any{"id": fmt.Sprintf("systemevent-%d", in.id), "producer": "compute.googleapis.com", "first": true, "last": true},
+		"receiveTimestamp": e.clock.Now().UTC().Format(time.RFC3339Nano),
+	})
+	return b, true
+}
+
 // WriteSerial adds to an instance's serial console output.
 func (e *Emulator) WriteSerial(zone, name, text string) {
 	e.mu.Lock()
@@ -441,6 +475,7 @@ type InstanceState struct {
 	Scopes         []string
 	MaxRun         time.Duration
 	Network        string
+	Subnetwork     string
 	ExternalIP     bool
 	Created        time.Time
 }
@@ -457,7 +492,7 @@ func (e *Emulator) instanceState(in *instance) InstanceState {
 	s := InstanceState{Name: in.name, Zone: in.zone, MachineType: in.machineType, Status: in.status, Provisioning: in.provisioning,
 		Termination: in.termination, ID: in.id, Labels: map[string]string{}, Metadata: map[string]string{}, Disks: map[string]string{},
 		ServiceAccount: in.serviceAccount, Scopes: slices.Clone(in.scopes), MaxRun: in.maxRun, Network: in.network,
-		ExternalIP: in.externalIP, Created: in.created}
+		Subnetwork: in.subnetwork, ExternalIP: in.externalIP, Created: in.created}
 	for k, v := range in.labels {
 		s.Labels[k] = v
 	}
@@ -513,6 +548,38 @@ func (e *Emulator) Disks() []DiskState {
 	}
 	slices.SortFunc(out, func(a, b DiskState) int { return strings.Compare(a.Zone+"/"+a.Name, b.Zone+"/"+b.Name) })
 	return out
+}
+
+// ImageState is what tests see of an image.
+type ImageState struct {
+	Name, Status, Architecture, SourceDisk string
+	SizeGB                                 int64
+	Labels                                 map[string]string
+	Created                                time.Time
+}
+
+// Images returns every image's state, by name.
+func (e *Emulator) Images() []ImageState {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var out []ImageState
+	for _, im := range e.images {
+		s := ImageState{Name: im.name, Status: im.status, Architecture: im.arch, SourceDisk: last(im.sourceDisk), SizeGB: im.sizeGB,
+			Labels: map[string]string{}, Created: im.created}
+		for k, v := range im.labels {
+			s.Labels[k] = v
+		}
+		out = append(out, s)
+	}
+	slices.SortFunc(out, func(a, b ImageState) int { return strings.Compare(a.Name, b.Name) })
+	return out
+}
+
+// DeleteImageNow deletes an image at once, as someone else might.
+func (e *Emulator) DeleteImageNow(name string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.images, name)
 }
 
 // AddDisk adds an unattached disk, as one left behind would be.

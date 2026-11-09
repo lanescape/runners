@@ -270,10 +270,77 @@ func TestSerialOutput(t *testing.T) {
 }
 
 func TestImages(t *testing.T) {
-	_, c := setup(t)
-	ims, err := c.Images(context.Background())
+	ctx := context.Background()
+	emu, c := setup(t)
+	ims, err := c.Images(ctx)
 	if err != nil || len(ims) != 2 || ims[0].Name != "lsr-base-amd64-1" || ims[0].Status != "READY" || ims[0].Architecture != "X86_64" {
 		t.Fatalf("images = %+v, %v", ims, err)
+	}
+	if err := c.CreateInstance(ctx, zoneA, spec("lsr-5001-aaaaaaaa", "n4-highcpu-2", false), compute.RequestID("i")); err != nil {
+		t.Fatal(err)
+	}
+	ds := compute.DiskSpec{Name: "lsr-5001-aaaaaaaa-work", SizeGB: 50, DiskType: "hyperdisk-balanced", ProvisionedIOPS: 3000, ProvisionedThroughput: 400}
+	if err := c.CreateDisk(ctx, zoneA, ds, compute.RequestID("d")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.AttachDisk(ctx, zoneA, "lsr-5001-aaaaaaaa", ds.Name, "work", compute.RequestID("att")); err != nil {
+		t.Fatal(err)
+	}
+	is := compute.ImageSpec{Name: "lsr-5001-0123456789abcdef0123-1", SourceZone: zoneA, SourceDisk: ds.Name, Labels: map[string]string{"lsr-repository": "5001"}}
+	if err := c.CreateImage(ctx, is, compute.RequestID("im")); err == nil || compute.IsUnavailable(err) {
+		t.Fatalf("an image of a running machine's disk: %v, want a confirmed refusal", err)
+	}
+	if err := c.StopInstance(ctx, zoneA, "lsr-5001-aaaaaaaa", compute.RequestID("stop")); err != nil {
+		t.Fatal(err)
+	}
+	// Its first answer is lost after the work is done; the retry with the
+	// same ID gets the same operation.
+	emu.LoseResponse(http.MethodPost, "/global/images", 1)
+	if err := c.CreateImage(ctx, is, compute.RequestID("im2")); err != nil {
+		t.Fatal(err)
+	}
+	im, err := c.Image(ctx, is.Name)
+	if err != nil || im.Status != "READY" || im.DiskSizeGB != 50 || im.SourceDisk != ds.Name || im.Labels["lsr-repository"] != "5001" || im.LabelFingerprint == "" {
+		t.Fatalf("image = %+v, %v", im, err)
+	}
+	if err := c.SetImageLabels(ctx, is.Name, map[string]string{"lsr-repository": "5001", "lsr-last-used": "2026-11-08"}, im.LabelFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetImageLabels(ctx, is.Name, map[string]string{}, im.LabelFingerprint); !errors.Is(err, compute.ErrFingerprint) {
+		t.Fatalf("labels with a stale fingerprint: %v, want ErrFingerprint", err)
+	}
+	if got, _ := c.Image(ctx, is.Name); got.Labels["lsr-last-used"] != "2026-11-08" {
+		t.Fatalf("labels = %v", got.Labels)
+	}
+	emu.FailNextOperation("images.insert", "INTERNAL_ERROR")
+	var f *compute.Failed
+	if err := c.CreateImage(ctx, compute.ImageSpec{Name: "lsr-5001-0123456789abcdef0123-2", SourceZone: zoneA, SourceDisk: ds.Name},
+		compute.RequestID("im3")); !errors.As(err, &f) {
+		t.Fatalf("a failed operation: %v, want Failed", err)
+	}
+	if err := c.DeleteImage(ctx, is.Name, compute.RequestID("del")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Image(ctx, is.Name); !errors.Is(err, compute.ErrNotFound) {
+		t.Fatalf("deleted: %v", err)
+	}
+	if err := c.DeleteImage(ctx, is.Name, compute.RequestID("del2")); !errors.Is(err, compute.ErrNotFound) {
+		t.Fatalf("deleting it again: %v", err)
+	}
+}
+
+func TestSubnetwork(t *testing.T) {
+	emu, c := setup(t)
+	s := spec("lsr-5001-aaaaaaaa", "n4-highcpu-2", false)
+	s.Subnetwork = "lanescape-runners"
+	if err := c.CreateInstance(context.Background(), zoneB, s, compute.RequestID("1")); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := emu.Instance(zoneB, s.Name); st.Network != "lanescape-runners" || st.Subnetwork != "lanescape-runners" {
+		t.Fatalf("instance = %+v", st)
+	}
+	if compute.Region(zoneB) != "northamerica-northeast1" {
+		t.Fatalf("region = %s", compute.Region(zoneB))
 	}
 }
 

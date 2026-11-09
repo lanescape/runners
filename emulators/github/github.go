@@ -104,6 +104,7 @@ type Pull struct {
 	HeadSHA  string
 	Author   *Account
 	Created  time.Time
+	Closed   time.Time
 	mergeSHA string
 }
 
@@ -318,11 +319,18 @@ func (e *Emulator) Sync(p *Pull) {
 	p.mergeSHA = ""
 }
 
-// Close closes a pull request.
+// ClosePull closes a pull request.
 func (e *Emulator) ClosePull(p *Pull) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	p.State = "closed"
+	p.State, p.Closed = "closed", e.clock.Now()
+}
+
+// ReopenPull reopens a closed pull request.
+func (e *Emulator) ReopenPull(p *Pull) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	p.State, p.Closed = "open", time.Time{}
 }
 
 // mergeCommit is the commit GitHub makes at refs/pull/<n>/merge.

@@ -235,6 +235,16 @@ func (e *Emulator) CompleteJob(j *WorkflowJob, conclusion string) {
 	e.notify()
 }
 
+// CompleteJobByID finishes a job, by its ID, as CompleteJob does.
+func (e *Emulator) CompleteJobByID(id int64, conclusion string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if j := e.jobs[id]; j != nil {
+		e.complete(j, conclusion)
+	}
+	e.notify()
+}
+
 // complete finishes a job; an ephemeral runner that ran it is removed, as
 // GitHub removes one once its job is done. The caller holds e.mu.
 func (e *Emulator) complete(j *WorkflowJob, conclusion string) {
@@ -439,6 +449,7 @@ func (e *Emulator) actionsRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /repos/{owner}/{repo}/actions/runs/{id}/approvals", e.authed(e.repo(e.listApprovals)))
 	mux.HandleFunc("POST /repos/{owner}/{repo}/actions/runs/{id}/cancel", e.authed(e.repo(e.cancelRun)))
 	mux.HandleFunc("POST /repos/{owner}/{repo}/actions/runs/{id}/force-cancel", e.authed(e.repo(e.forceCancelRun)))
+	mux.HandleFunc("POST /repos/{owner}/{repo}/actions/runs/{id}/rerun-failed-jobs", e.authed(e.repo(e.rerunFailedJobs)))
 	mux.HandleFunc("GET /repos/{owner}/{repo}/actions/jobs/{id}", e.authed(e.repo(e.getJob)))
 
 	mux.HandleFunc("POST /_runner/connect", e.standIn(e.runnerConnect))
@@ -960,6 +971,67 @@ func (e *Emulator) forceCancelRun(w http.ResponseWriter, r *http.Request, rp *Re
 	run.Status, run.Conclusion = "completed", "cancelled"
 	e.notify()
 	writeJSON(w, http.StatusAccepted, map[string]any{})
+}
+
+// failedConclusions are the conclusions of jobs that rerunning a run's failed
+// jobs runs again.
+var failedConclusions = map[string]bool{"failure": true, "cancelled": true, "timed_out": true, "startup_failure": true}
+
+// rerunFailedJobs starts a finished run's next attempt, as GitHub does: its
+// failed jobs are queued again, with new IDs, and the rest are carried into
+// the attempt with their results. The emulator knows no job's needs, so no
+// dependent job is rerun with them.
+func (e *Emulator) rerunFailedJobs(w http.ResponseWriter, r *http.Request, rp *Repo) {
+	e.tick()
+	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	run := e.runs[id]
+	if run == nil || run.Repo != rp {
+		writeError(w, http.StatusNotFound, "Not Found")
+		return
+	}
+	if run.Status != "completed" {
+		writeError(w, http.StatusForbidden, "This workflow run is not completed.")
+		return
+	}
+	var last []*WorkflowJob
+	failed := false
+	for _, j := range run.Jobs {
+		if j.Attempt == run.Attempt {
+			last = append(last, j)
+			failed = failed || failedConclusions[j.Conclusion]
+		}
+	}
+	if !failed {
+		writeError(w, http.StatusForbidden, "This workflow run has no failed jobs to rerun.")
+		return
+	}
+	run.Attempt++
+	run.Status, run.Conclusion = "in_progress", ""
+	for _, j := range last {
+		n := &WorkflowJob{ID: e.id(), Run: run, Attempt: run.Attempt, Name: j.Name, Labels: slices.Clone(j.Labels),
+			Environment: j.Environment, Env: j.Env, Steps: j.Steps, Status: "queued", Created: e.clock.Now()}
+		if !failedConclusions[j.Conclusion] {
+			n.Status, n.Conclusion, n.Started, n.Completed = "completed", j.Conclusion, j.Started, j.Completed
+		}
+		e.jobs[n.ID] = n
+		run.Jobs = append(run.Jobs, n)
+	}
+	e.notify()
+	writeJSON(w, http.StatusCreated, map[string]any{})
+}
+
+// RunJobs returns the jobs of a run's attempt, for tests to inspect.
+func (e *Emulator) RunJobs(r *Run, attempt int) []WorkflowJob {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.tick()
+	var out []WorkflowJob
+	for _, j := range r.Jobs {
+		if j.Attempt == attempt {
+			out = append(out, *j)
+		}
+	}
+	return out
 }
 
 // The runner stand-in's own endpoints, in place of the runner's protocol
