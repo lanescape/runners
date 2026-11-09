@@ -37,8 +37,14 @@ func newer(x, y *entry) bool {
 	return x.committedAt.After(y.committedAt) || (x.committedAt.Equal(y.committedAt) && x.id > y.id)
 }
 
-// used marks an entry used, as a restore that hands it out does.
+func day(t time.Time) string { return t.UTC().Format("2006-01-02") }
+
+// used marks an entry used, as a restore that hands it out does: at most
+// once a day.
 func (e *Emulator) used(en *entry) {
+	if day(en.lastUsed) == day(e.now()) {
+		return
+	}
 	en.lastUsed = e.now()
 	if lasting(en.scope) {
 		e.familyUsed[en.lineage()] = e.now()
@@ -50,6 +56,15 @@ func (e *Emulator) used(en *entry) {
 // or on its own: what an unfinished run's choice names stays, and a
 // finished run's choices go. The caller holds e.mu.
 func (e *Emulator) retain() {
+	// A pull request seen closed now, whose entries or most recent choices
+	// are held, is recorded as closed now: what a run bound up to now
+	// saves is retired, even once it's reopened.
+	for _, en := range e.entries {
+		e.seenClosed(en.repo, en.scope)
+	}
+	for k := range e.recents {
+		e.seenClosed(e.recentScope(k))
+	}
 	named := map[string]bool{}
 	for k, c := range e.choices {
 		if rn := e.runs[c.run]; rn.due || e.runInProgress(rn) {
@@ -119,7 +134,8 @@ func (e *Emulator) retain() {
 	for id, en := range e.entries {
 		// A pending entry whose job GitHub doesn't show finished within 5
 		// days goes.
-		if en.state == "pending" && e.now().Sub(en.committedAt) >= PendingFor {
+		// It's kept while GitHub can't confirm its job's state.
+		if en.state == "pending" && e.now().Sub(en.committedAt) >= PendingFor && !e.unavailable {
 			if en.object != "" {
 				delete(e.objects, en.object)
 			}
@@ -147,6 +163,17 @@ func (e *Emulator) retain() {
 			}
 			delete(e.entries, id)
 		}
+	}
+}
+
+// seenClosed records a pull request scope's pull request as closed now,
+// if it is.
+func (e *Emulator) seenClosed(repo int64, scope string) {
+	if !strings.HasPrefix(scope, "pr") {
+		return
+	}
+	if p := e.pullOf(repo, scope); p == nil || !p.open {
+		e.closures[closureKey(repo, scope)] = e.now()
 	}
 }
 

@@ -499,6 +499,8 @@ func (w *World) Unavailable(on bool) {
 }
 
 // Advance implements service.World: the service's clock moves on by d.
+// Cloud Storage's emulator, and the signing of URLs, keep real time, so a
+// test that moves time on doesn't rely on a URL's expiry across it.
 func (w *World) Advance(d time.Duration) {
 	w.T.Helper()
 	switch c := w.clock.(type) {

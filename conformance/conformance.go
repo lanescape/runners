@@ -71,6 +71,7 @@ func Cases() []Case {
 		both("a maintainer's rerun picks again", rerun),
 		both("only a successful job's entries are restored", successGating),
 		both("a pending entry goes after 5 days", pendingFor),
+		both("a closed pull request's run saves nothing it reopens to", closedRun),
 		both("a pull request keeps one entry of each family", oneOfEachFamily),
 		both("main keeps its two newest keys", twoNewestKeys),
 		both("read runs restore main's and save nothing", readRuns),
@@ -893,6 +894,13 @@ func pendingFor(t T, w *world) {
 		t.Fatalf("a pending entry went before 5 days")
 	}
 	w.Advance(time.Hour)
+	// Kept while GitHub can't confirm its job's state.
+	w.Unavailable(true)
+	w.Pass()
+	w.Unavailable(false)
+	if len(w.Entries(repo)) != 1 {
+		t.Fatalf("a pending entry went while GitHub couldn't confirm its job")
+	}
 	w.Pass()
 	if es := w.Entries(repo); len(es) != 0 {
 		t.Fatalf("a pending entry stayed past 5 days: %+v", es)
@@ -902,4 +910,28 @@ func pendingFor(t T, w *world) {
 	next := w.Push(repo, "main")
 	w.bound(next, "main")
 	w.restore(next, linux, key1, "", nil)
+}
+
+func closedRun(t T, w *world) {
+	repo := w.Repository("app")
+	main1 := data("main1")
+	w.mainSaves(repo, linux, key1, main1)
+	pr := w.PullRequest(repo, "main", "fix")
+	run := w.PullRequestRun(pr)
+	w.ClosePullRequest(pr)
+	// The run is bound after the closing, and commits while it's closed.
+	w.bound(run, fmt.Sprintf("pr%d", pr.Number))
+	j, tok := w.job(run)
+	payload := data("from a closed pull request")
+	id, _ := w.reserve(tok, linux, "build", key1, payload)
+	if a := w.c.Commit(tok, id, int64(len(payload)), Sum(payload)); a.Status != http.StatusOK {
+		t.Fatalf("commit answered %d: %s", a.Status, a.Reason)
+	}
+	w.Pass()
+	w.ReopenPullRequest(pr)
+	w.FinishJob(j, "success")
+	// Reopened, it starts again from its base.
+	next := w.PullRequestRun(pr)
+	w.bound(next, fmt.Sprintf("pr%d", pr.Number))
+	w.restore(next, linux, key1, "main_exact", main1)
 }
