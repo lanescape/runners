@@ -448,6 +448,11 @@ func (s *Service) touch(ctx context.Context, repo int64, image string) error {
 			return fmt.Errorf("image %s is no longer ready", image)
 		}
 		rec.TouchedAt = s.now()
+		// Choosing a saved disk is using it, at most once a day, in the
+		// same write: expiry reads it.
+		if rec.Kind == KindSaved && day(rec.LastUsed) != day(s.now()) {
+			rec.LastUsed = s.now()
+		}
 		if _, err := replaceJSON(ctx, s.Objects, imageKey(repo, image), rec, gen); err == nil {
 			return nil
 		} else if !errors.Is(err, store.ErrPrecondition) {

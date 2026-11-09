@@ -297,7 +297,9 @@ func (s *Service) rerun(ctx context.Context, st *state, repoID, runID int64, rs 
 	case rerr == nil && err == nil:
 		err = fmt.Errorf("GitHub accepted the rerun but still shows attempt %d", wr.Attempt)
 		fallthrough
-	case rerr == nil:
+	case rerr == nil, err != nil && !github.IsUnavailable(err):
+		// GitHub's attempt didn't move on, or GitHub confirmed its
+		// refusal: not a rerun of the service's.
 		rec.Started = slices.DeleteFunc(rec.Started, func(a int) bool { return a == rs.attempt })
 		if g, werr := replaceJSON(ctx, s.Objects, key, rec, gen); werr == nil {
 			st.reruns[key] = record[Rerun]{rec, g}
@@ -654,8 +656,10 @@ func (s *Service) tidy(ctx context.Context, st *state) {
 	for _, r := range st.records {
 		present[imageKey(r.v.RepositoryID, r.v.Image)] = true
 	}
+	// A claim goes once its image is gone from both the bucket and
+	// Compute Engine: one that keeps an orphaned image stays with it.
 	for key, r := range st.claims {
-		if !present[imageKey(r.v.RepositoryID, r.v.Image)] {
+		if _, there := st.images[r.v.Image]; !present[imageKey(r.v.RepositoryID, r.v.Image)] && !there && st.imagesRead {
 			_ = s.Objects.Delete(ctx, key, r.gen)
 		}
 	}

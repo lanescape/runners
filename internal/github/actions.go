@@ -288,9 +288,17 @@ func (c *Client) ForceCancelRun(ctx context.Context, repo Repository, runID int6
 	return accepted(err)
 }
 
-// RerunFailedJobs implements Actions. GitHub answers 201 Created.
+// RerunFailedJobs implements Actions. GitHub answers 201 Created, and a
+// plain 403 when it won't rerun the run, such as one still running, which
+// is a confirmed refusal, ErrRefused; its rate limits are Unavailable.
 func (c *Client) RerunFailedJobs(ctx context.Context, repo Repository, runID int64) error {
 	_, err := c.gh.Actions.RerunFailedJobsByID(ctx, repo.Owner, repo.Name, runID)
+	var er *gh.ErrorResponse
+	var rl *gh.RateLimitError
+	var al *gh.AbuseRateLimitError
+	if errors.As(err, &er) && er.Response != nil && er.Response.StatusCode == http.StatusForbidden && !errors.As(err, &rl) && !errors.As(err, &al) {
+		return fmt.Errorf("%w: %s", ErrRefused, er.Message)
+	}
 	return accepted(err)
 }
 

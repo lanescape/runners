@@ -302,3 +302,30 @@ func TestAnOrphanAChoiceNamesIsKept(t *testing.T) {
 		t.Fatal("an image an unfinished run's choice names was deleted as an orphan")
 	}
 }
+
+// A resume image with no record that a claim holds keeps its claim, and so
+// is kept, pass after pass, until its day is over.
+func TestAClaimedOrphanKeepsItsClaim(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{"lanescape-2vcpu-linux-amd64-spot-main"}})
+	jb.preempt()
+	e.pass()
+	resume := disks.ResumeName(repoID, jb.in.ID)
+	again := e.admit(run, e.rerunJob(run, 2, "build"))
+	if again.source() != resume {
+		t.Fatal("no resume")
+	}
+	key := "images/5001/" + resume + ".json"
+	if err := e.objects.Delete(context.Background(), key, mustGen(t, e, key)); err != nil {
+		t.Fatal(err)
+	}
+	e.pass()
+	e.pass()
+	if !e.has(resume) {
+		t.Fatal("a claimed image with no record was deleted")
+	}
+	if _, ok := e.record("claims/5001/" + resume + ".json"); !ok {
+		t.Fatal("the claim keeping an image was removed")
+	}
+}

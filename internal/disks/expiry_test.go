@@ -76,6 +76,10 @@ func TestUsingADiskKeepsIt(t *testing.T) {
 	if got := e.images()[img].Labels[disks.LabelLastUsed]; got != e.clock.Now().UTC().Format("2006-01-02") {
 		t.Fatalf("last-used label %q", got)
 	}
+	rec, _ := e.record("images/5001/" + img + ".json")
+	if at, _ := time.Parse(time.RFC3339Nano, rec["last_used"].(string)); e.clock.Now().Sub(at) > time.Minute {
+		t.Fatalf("last used %s in the record; the restore didn't mark it", at)
+	}
 	used.finish(false)
 	e.clock.Advance(10 * 24 * time.Hour)
 	e.pass()

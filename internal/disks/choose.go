@@ -297,23 +297,17 @@ func candidates(recs map[string]record[Image], sel selector.Selector) []Image {
 	return out
 }
 
-// used marks a saved disk used, at most once a day: in its record, which
-// expiry reads, and in its last-used label. It's best effort: a failure
-// leaves the mark to the next use.
+// used labels a saved disk used, at most once a day. Its record, which
+// expiry reads, was marked used when it was chosen, under the disks' lease,
+// in the same write as the choice's touch; the label is best effort.
 func (s *Service) used(ctx context.Context, rec Image) {
 	if day(rec.LastUsed) == day(s.now()) {
 		return
 	}
-	key := imageKey(rec.RepositoryID, rec.Image)
-	cur, gen, ok, err := getJSON[Image](ctx, s.Objects, key)
-	if err != nil || !ok || cur.State != ImageReady {
-		return
-	}
+	// The record was marked used as it was chosen, under the lease; the
+	// label follows, best effort.
+	cur := rec
 	cur.LastUsed = s.now()
-	if _, err := replaceJSON(ctx, s.Objects, key, cur, gen); err != nil {
-		s.log().Warn("marking a saved disk used", "image", rec.Image, "err", err.Error())
-		return
-	}
 	im, err := s.Compute.Image(ctx, rec.Image)
 	if err != nil {
 		return

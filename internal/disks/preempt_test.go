@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -566,5 +567,47 @@ func TestARunningSpotMachinePastTheAgeLimitStopsWithoutTheRecords(t *testing.T) 
 	}
 	if _, ok := e.record("preemptions/5001/" + strconv.FormatInt(run.ID, 10) + "/" + strconv.FormatUint(jb.in.ID, 10) + ".json"); !ok {
 		t.Fatal("not recorded")
+	}
+}
+
+// A rerun GitHub refused, whose run then can't be read back, isn't the
+// service's: a maintainer's rerun after it picks again.
+func TestARefusedRerunWithNoReadBack(t *testing.T) {
+	e := setup(t)
+	old := e.saveMain(key1)
+	run := e.mainRun()
+	label := "lanescape-2vcpu-linux-amd64-spot-disk-build-" + key1 + "-main"
+	lost := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{label}})
+	if lost.source() != old {
+		t.Fatal("no restore")
+	}
+	e.clock.Advance(time.Minute)
+	newer := e.saveMain(key1)
+	lost.preempt()
+	runPath := "/repos/lanescape/app/actions/runs/" + strconv.FormatInt(run.ID, 10)
+	e.gh.ServerError(runPath+"/rerun-failed-jobs", http.StatusForbidden, 1)
+	// The read-back after the refusal fails; the pass's own reads before
+	// it don't.
+	var refused atomic.Bool
+	e.gh.Faults().Add(fault.Rule{Method: http.MethodGet, Times: 0,
+		Match: func(r *http.Request) bool {
+			if r.URL.Path == runPath+"/rerun-failed-jobs" {
+				refused.Store(true)
+			}
+			return refused.Load() && r.URL.Path == runPath
+		},
+		Respond: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusBadGateway) }})
+	e.pass()
+	e.gh.Faults().Reset()
+	if e.attempt(run) != 1 {
+		t.Fatal("rerun despite GitHub's refusal")
+	}
+	rr, _ := e.record("reruns/5001/" + strconv.FormatInt(run.ID, 10) + ".json")
+	if started, _ := rr["started"].([]any); len(started) != 0 {
+		t.Fatalf("rerun record = %v; a refused rerun is recorded as the service's", rr)
+	}
+	e.gh.Rerun(run)
+	if src := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{label}}).source(); src != newer {
+		t.Fatalf("a maintainer's rerun started from %q, want the newest %s", src, newer)
 	}
 }
