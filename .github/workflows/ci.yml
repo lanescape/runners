@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go
+    # The organization's own pull requests run on Blacksmith. A fork's runs
+    # on GitHub's runners, since nothing in CI needs anything of ours.
+    runs-on: ${{ github.repository_owner_id == '303994381' && github.event.pull_request.head.repo.full_name == github.repository && 'blacksmith-2vcpu-ubuntu-2604' || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: go vet
+        run: go vet ./...
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files aren't formatted with gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: go test
+        run: go test -race ./...
+
+  terraform:
+    name: Terraform
+    runs-on: ${{ github.repository_owner_id == '303994381' && github.event.pull_request.head.repo.full_name == github.repository && 'blacksmith-2vcpu-ubuntu-2604' || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Terraform
+        # The latest release, and Infrastructure Manager's newest, which
+        # applies infra/. Checksums from HashiCorp's signed SHA256SUMS.
+        run: |
+          set -euo pipefail
+          install() {
+            local version=$1 sha256=$2 dir="$RUNNER_TEMP/terraform-$1"
+            curl -fsSLo "$RUNNER_TEMP/terraform.zip" "https://releases.hashicorp.com/terraform/$version/terraform_${version}_linux_amd64.zip"
+            echo "$sha256  $RUNNER_TEMP/terraform.zip" | sha256sum -c -
+            mkdir -p "$dir"
+            unzip -q -o "$RUNNER_TEMP/terraform.zip" -d "$dir"
+            rm "$RUNNER_TEMP/terraform.zip"
+          }
+          install 1.17.1 4638628058e71a55212b1c563712eac03b902128f40740f3dc8174df12135061
+          install 1.5.7 c0ed7bc32ee52ae255af9982c8c88a7a4c610485cf1d55feeb037eab75fa082c
+      - name: Refuse what infra/ and bootstrap/ may not hold
+        run: infra/check.sh
+      - name: terraform fmt
+        run: '"$RUNNER_TEMP/terraform-1.17.1/terraform" fmt -check -diff -recursive infra bootstrap'
+      - name: terraform validate
+        run: |
+          set -euo pipefail
+          validate() {
+            local tf="$RUNNER_TEMP/terraform-$1/terraform" dir=$2
+            echo "Terraform $1, $dir/"
+            rm -rf "$dir/.terraform"
+            "$tf" -chdir="$dir" init -backend=false -input=false -lockfile=readonly
+            "$tf" -chdir="$dir" validate
+          }
+          validate 1.17.1 bootstrap
+          validate 1.17.1 infra
+          validate 1.5.7 infra
