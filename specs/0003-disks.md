@@ -1,14 +1,14 @@
-# Images and saved disks
+# Base images and saved disks
 
-Every machine boots the service's own base image. What a consumer's jobs need beyond it lives on their work disks, which a job can save when it finishes, so that later jobs start from it. A saved disk serves the run's scope and no other (specs/0002-machines.md): main's disks are saved only by pushes to the default branch, a long-lived branch's only by pushes to it, a pull request's only by its own runs, and nothing of a pull request's ever reaches main, a long-lived branch or another pull request.
+Every machine boots the service's own base image, or a consumer's image built on it (specs/0006-images.md). What a consumer's jobs need beyond that lives on their work disks, which a job can save when it finishes, so that later jobs start from it. A saved disk serves the run's scope and no other (specs/0002-machines.md): main's disks are saved only by pushes to the default branch, a long-lived branch's only by pushes to it, a pull request's only by its own runs, and nothing of a pull request's ever reaches main, a long-lived branch or another pull request.
 
 ## Base images
 
-The service's own images, one per architecture, `lsr-base-<amd64|arm64>-<key>`: Ubuntu 26.04's current image; the GitHub runner at the version in `config/runner.yaml`, checked against its published SHA-256, which runs as the runner's user, `runner`, who has passwordless sudo, as on GitHub's runners (specs/0002-machines.md); the supervisor and the job-started hook; the directory `/var/lib/lanescape-runners`, which the runner's user may write (specs/0005-interface.md); and git, curl, jq, python3, zstd, pigz and Go at the version this repository's `go.mod` names. The key covers the Ubuntu image's name, the runner version, the Go version, the text of what installs them, and the digest of every program of the service's baked into the image, so a change to the supervisor or the hook alone makes a new image. When a deploy changes the key, the service makes the new one itself, on a builder machine that runs only the service's own script, and machines keep booting the previous one until it's ready. No consumer's code ever runs on a base image's builder, and no consumer can make or change a base image.
+The service's own images, one per architecture, `lsr-base-<amd64|arm64>-<key>`: Ubuntu 26.04's current image; the GitHub runner at the version in `config/runner.yaml`, checked against its published SHA-256, which runs as the runner's user, `runner`, who has passwordless sudo, as on GitHub's runners (specs/0002-machines.md); the supervisor and the job-started hook; the directory `/var/lib/lanescape-runners`, which the runner's user may write (specs/0005-interface.md); and git, curl, jq, python3, zstd, pigz and Go at the version this repository's `go.mod` names. The key covers the Ubuntu image's name, the runner version, the Go version, the text of what installs them, and the digest of every program of the service's baked into the image, so a change to the supervisor or the hook alone makes a new image. When a deploy changes the key, the service makes the new one itself, on a builder machine that runs only the service's own script, and machines keep booting the previous one until it's ready. No consumer's code ever runs on a base image's builder, and no consumer can make or change a base image. Consumers' own images are built on top of the base images (specs/0006-images.md), and a new base image gives each of them a new version.
 
 ## Saved disks
 
-A selector's `-disk-<family>-<key>` asks for a work disk made from a saved one. The service picks the first that exists of:
+A selector's `-disk-<family>` asks for a work disk made from a saved one of that family, with the family's key for the run (Keys, below). The service picks the first that exists of:
 
 1. a disk saved in the first scope of the run's restore chain (specs/0002-machines.md, Scope) for that family and key;
 2. the newest disk saved in that scope for that family, whatever its key;
@@ -23,11 +23,21 @@ A job asks to save its work disk, through the `save-disk` action (specs/0005-int
 
 - the job succeeded, by GitHub's conclusion for it;
 - the run's scope saves: main's for a push to the default branch, a long-lived branch's for a push to it, a pull request's for that pull request's runs, never `read`;
-- the job's selector names a family and key.
+- the job's selector names a family.
 
 It makes an image of the stopped machine's work disk, `lsr-<repository ID>-<series>-<save time>-<machine>`: the series is the first 20 hex digits of the SHA-256 of the scope, the architecture, the family and the key, joined by NUL characters, so that each architecture's family is a series of its own; the save time is in Unix seconds; and the machine is the random part of the machine's name, since two jobs can save the same series in one second. It's labelled `lsr-kind` `saved`, with the repository ID, the architecture, and hashes of the scope, family and key, since Compute Engine labels are short and allow few characters, and with `lsr-saved` and `lsr-last-used` dates. Saving again for the same scope, architecture, family and key makes a new version, which later restore choices pick; what a new version replaces goes as Expiry says. Only the work disk is saved, as the job left it. The runner's directory, with its checkouts and any credentials tools left beside them, is on the boot disk, which is never saved.
 
 **Resume images** are the same kind of image, made from a preempted Spot machine's work disk, `lsr-<repository ID>-resume-<instance ID>`, labelled `lsr-kind` `resume` with the run and hashes of the selector and the job's name, the full values being in the bucket's record of the preemption, and used only to resume that one job (specs/0002-machines.md). They're never a scope's saved disk, so a disk left mid-write by a preemption is never what a later run starts from.
+
+## Keys
+
+A family's **key** says what its disk's contents depend on, so that a run whose dependencies moved saves beside the disk it restored rather than over it. The service makes it, for each run and family, from the run's commit (specs/0002-machines.md, Binding a run), never from anything a job says. The consumer declares each family its selectors name in `.github/runners.json` at that commit, under `"disks"`, with `"from"`, the files its contents depend on, such as a list of dependency versions and a toolchain file:
+
+```json
+{"disks": {"build": {"from": ["deps/versions.json", "rust-toolchain.toml"]}}}
+```
+
+The key is the first 20 hex digits of the SHA-256 of these parts, in this order: the family, then each listed path and its contents, in the order listed. Each part is written as its length in bytes, an unsigned 64-bit big-endian number, followed by its bytes: the family and paths in UTF-8, and contents exactly as the file's bytes at that commit. For example, family `build`, `deps/versions.json` holding `café 1.0` and a newline, and an empty `rust-toolchain.toml`, give the key `be05417a720fa890bf52`. So the key changes when a listed file's contents do, and also when the family, the paths or their order do. A listed path is relative to the repository's root, with no leading or trailing slash, no `.`, `..` or empty segment and no backslash, and is listed once. A family declared without `"from"`, as `{}`, has one key, `00000000000000000000`: a save makes a newer version of that disk, and later runs restore the newest, which is enough for a job that redoes only what's out of date. The service reads the file and the listed files with the App, at the run's commit, once per run, and records the keys it made with the run's choices. A family the file doesn't declare, a listed file that doesn't exist, or a file that isn't valid fails the job that names it, saying why (specs/0002-machines.md, Failing a job).
 
 ## What reads what
 
