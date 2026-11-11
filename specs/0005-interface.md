@@ -69,7 +69,7 @@ Once the answer is `ready`, the machine mounts the disk at `/work`, on the host,
 
 ## The machines
 
-Jobs on the service's machines run as the runner's user, with passwordless sudo and Docker, as on GitHub's runners, and find their work disk at `/work` once their `disk` step has asked for it (specs/0002-machines.md). A job the service can't serve is stopped before its first step and before its containers start, with the reason in its log, and its run is cancelled; none of its steps run, whatever their conditions (specs/0002-machines.md, Failing a job). Some of what this relies on is to be confirmed on real GitHub at the first deploy (specs/0002-machines.md, To confirm on real GitHub).
+Jobs on the service's machines run as the runner's user, UID 1001, with passwordless sudo and Docker, as on GitHub's runners, and find their work disk at `/work` once their `disk` step has asked for it (specs/0002-machines.md). A container job's steps run as its image's user, without the host's sudo; one that uses the work disk, whose root belongs to UID 1001, runs as root, with `--user 0` in `container.options` if its image's user isn't root, or as UID 1001 (specs/0002-machines.md, The work disk). A job the service can't serve is stopped before its first step and before its containers start, with the reason in its log, and its run is cancelled; none of its steps run, whatever their conditions (specs/0002-machines.md, Failing a job). Some of what this relies on is to be confirmed on real GitHub at the first deploy (specs/0002-machines.md, To confirm on real GitHub).
 
 ## Testing against the emulator
 
