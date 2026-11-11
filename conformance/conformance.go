@@ -56,6 +56,7 @@ func Cases() []Case {
 		one("disk requests from a run's own machine only", diskRequests),
 		one("work disks kept to their repository", ownRepository),
 		one("a work disk in the run's own scope from each step of the restore order", restoreOrder),
+		one("a new key's save replaces the old key's disk once no unfinished run chose it", newKey),
 		one("one work disk per job", oneWorkDisk),
 		one("saves asked for", saves),
 		one("refusals and retries", refusals),
@@ -436,6 +437,38 @@ func restoreOrder(t T, w *world) {
 
 	// A read run reads main's.
 	w.restored(w.start(w.Event(repo, "workflow_dispatch", "main"), Small), "build", service.StepMainExact)
+}
+
+func newKey(t T, w *world) {
+	repo := w.consumer("app")
+	j := w.start(w.Push(repo, "main"), Small)
+	w.restored(j, "build", service.StepNone)
+	w.save(j, true)
+	w.FinishJob(j, "success")
+	// A pull request of main's key starts from main's, and holds it while
+	// its run is unfinished.
+	w.Commit(repo, "old", map[string]string{"deps.txt": "1\n"})
+	held := w.start(w.PullRequestRun(w.PullRequest(repo, "main", "old")), Small)
+	w.restored(held, "build", service.StepMainExact)
+	// Main moves its key and saves: its disk of the old key is replaced, but
+	// kept while the pull request's run is unfinished, so another of the
+	// old key still starts from it.
+	w.Commit(repo, "main", map[string]string{"deps.txt": "2\n"})
+	j = w.start(w.Push(repo, "main"), Small)
+	w.restored(j, "build", service.StepMainNewest)
+	w.save(j, true)
+	w.FinishJob(j, "success")
+	w.Commit(repo, "older", map[string]string{"deps.txt": "1\n"})
+	older := w.PullRequest(repo, "main", "older")
+	also := w.start(w.PullRequestRun(older), Small)
+	w.restored(also, "build", service.StepMainExact)
+	// Once both runs have finished, the old key's disk is gone: neither a
+	// new run of the old key nor a maintainer's rerun of one that chose it
+	// starts from it.
+	w.FinishJob(held, "success")
+	w.FinishJob(also, "success")
+	w.restored(w.start(w.PullRequestRun(older), Small), "build", service.StepMainNewest)
+	w.restored(w.start(w.Rerun(held.Run), Small), "build", service.StepMainNewest)
 }
 
 func oneWorkDisk(t T, w *world) {

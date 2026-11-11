@@ -303,13 +303,13 @@ func TestImages(t *testing.T) {
 	if err != nil || im.Status != "READY" || im.DiskSizeGB != 50 || im.SourceDisk != ds.Name || im.Labels["lsr-repository"] != "5001" || im.LabelFingerprint == "" {
 		t.Fatalf("image = %+v, %v", im, err)
 	}
-	if err := c.SetImageLabels(ctx, is.Name, map[string]string{"lsr-repository": "5001", "lsr-last-used": "2026-11-08"}, im.LabelFingerprint); err != nil {
+	if err := c.SetImageLabels(ctx, is.Name, map[string]string{"lsr-repository": "5001", "lsr-note": "2026-11-08"}, im.LabelFingerprint); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.SetImageLabels(ctx, is.Name, map[string]string{}, im.LabelFingerprint); !errors.Is(err, compute.ErrFingerprint) {
 		t.Fatalf("labels with a stale fingerprint: %v, want ErrFingerprint", err)
 	}
-	if got, _ := c.Image(ctx, is.Name); got.Labels["lsr-last-used"] != "2026-11-08" {
+	if got, _ := c.Image(ctx, is.Name); got.Labels["lsr-note"] != "2026-11-08" {
 		t.Fatalf("labels = %v", got.Labels)
 	}
 	emu.FailNextOperation("images.insert", "INTERNAL_ERROR")

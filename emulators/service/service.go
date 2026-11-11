@@ -13,9 +13,10 @@
 // server that mints them.
 //
 // What it doesn't model: a machine's age limit, Spot preemption and resume
-// images, the expiry of saved disks beyond a pull request's one disk of
-// each family and a closed pull request's, and the mounting of a work disk,
-// which is the test's to arrange.
+// images, the deletion of saved disks beyond a scope's one disk of each
+// family and architecture and a closed pull request's, such as a family's
+// once its declaration is removed, which the service does at its next
+// pass, and the mounting of a work disk, which is the test's to arrange.
 //
 // Consumers test their actions against it, at a pinned version of this
 // module; the conformance suite in package conformance holds it to the

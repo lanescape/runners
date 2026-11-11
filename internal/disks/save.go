@@ -21,8 +21,8 @@ import (
 // (specs/0003-disks.md, Saved disks). The machines' part has checked that
 // the job succeeded, asked, and that its scope saves; this checks the scope
 // and selector again, and deletes what the new disk replaces that no
-// unfinished run's choice names: older versions of its series, and in a
-// pull request's scope, the pull request's other disks of the family. It
+// unfinished run's choice names: its scope's older disks of the family on
+// its architecture, whatever their key. It
 // implements machines.Saver, and is called again until it returns nil.
 func (s *Service) Save(ctx context.Context, m machines.Machine, a machines.Admission) error {
 	sel := m.Selector
@@ -78,7 +78,7 @@ func (s *Service) Save(ctx context.Context, m machines.Machine, a machines.Admis
 		rec = Image{Image: sv.Image, RepositoryID: m.RepositoryID, Kind: KindSaved, State: ImageMaking, Scope: sel.Scope.String(),
 			Arch: sel.Arch, Family: sel.Family, Key: sel.Key, Machine: m.Name, Zone: m.Zone, InstanceID: m.ID, JobID: a.JobID,
 			JobName: a.JobName, RunID: a.RunID, RunAttempt: a.RunAttempt, Selector: a.Selector, SizeGB: sv.SizeGB,
-			SavedAt: sv.At, LastUsed: sv.At, BoundAt: bound}
+			SavedAt: sv.At, BoundAt: bound}
 		if rec, rgen, err = createOnce(ctx, s.Objects, key, rec); err != nil {
 			return err
 		}
@@ -264,16 +264,13 @@ func (s *Service) deleteMarked(ctx context.Context, rec Image) error {
 }
 
 // replaces reports whether a ready saved disk, older than a newly saved one,
-// is one the new one replaces: an older version of its series, or in a pull
-// request's scope, any of the pull request's disks of the family, whatever
-// its key, since a pull request keeps one disk of each family.
+// is one the new one replaces: any of its scope's disks of the family on its
+// architecture, an older version of its key or of any other, since a scope
+// keeps one disk of each family and architecture, its newest save
+// (specs/0003-disks.md, Deletion).
 func replaces(newer, v Image) bool {
-	if v.Kind != KindSaved || v.State != ImageReady || v.Image == newer.Image || v.Scope != newer.Scope || v.Arch != newer.Arch ||
-		v.Family != newer.Family || !olderThan(v, newer) {
-		return false
-	}
-	_, pr := isPullRequest(newer.Scope)
-	return pr || v.Key == newer.Key
+	return v.Kind == KindSaved && v.State == ImageReady && v.Image != newer.Image && v.Scope == newer.Scope && v.Arch == newer.Arch &&
+		v.Family == newer.Family && olderThan(v, newer)
 }
 
 // olderThan orders saved disks by when they were saved, then by name.

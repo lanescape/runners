@@ -3,7 +3,6 @@ package disks
 import (
 	"cmp"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -15,7 +14,6 @@ import (
 	"github.com/lanescape/runners/internal/machines"
 	"github.com/lanescape/runners/internal/scope"
 	"github.com/lanescape/runners/internal/selector"
-	"github.com/lanescape/runners/internal/store"
 )
 
 // Choose picks what a job's work disk of a family starts from
@@ -45,7 +43,6 @@ func (s *Service) Choose(ctx context.Context, m machines.Machine, a machines.Adm
 		s.log().Info("work disk starts empty: no saved disk to restore", "machine", m.Name, "run_id", a.RunID, "family", m.Selector.Family)
 		return "", sizeGB, step, nil
 	}
-	s.used(ctx, *im)
 	s.log().Info("work disk restored", "machine", m.Name, "run_id", a.RunID, "family", m.Selector.Family, "image", im.Image, "scope", im.Scope,
 		"key", im.Key, "step", step)
 	return im.Image, max(sizeGB, im.SizeGB), step, nil
@@ -263,21 +260,6 @@ func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Ad
 		if pick != nil {
 			choice.Image = pick.Image
 		}
-		// A pull request's most recent choice for the family outlives its
-		// run's, so main keeps the key it names while the pull request is
-		// open. It's written before the image is touched: a pass that read
-		// the image's record before the touch, and would mark it, fails its
-		// precondition, and one that read it after reads this too.
-		if _, isPR := sel.Scope.PullRequestNumber(); isPR {
-			rec := Recent{RepositoryID: repo, Scope: sel.Scope.String(), Arch: sel.Arch, Family: sel.Family, Step: step,
-				RunID: a.RunID, At: s.now()}
-			if pick != nil {
-				rec.Image, rec.ImageScope, rec.Key = pick.Image, pick.Scope, pick.Key
-			}
-			if err := s.putJSON(ctx, recentKey(rec.RepositoryID, rec.Scope, rec.Arch, rec.Family), rec); err != nil {
-				return err
-			}
-		}
 		if ok {
 			_, err = replaceJSON(ctx, s.Objects, key, choice, gen)
 		} else {
@@ -303,30 +285,6 @@ func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Ad
 		return nil
 	})
 	return out, outStep, err
-}
-
-// putJSON writes a record, replacing whatever is there.
-func (s *Service) putJSON(ctx context.Context, key string, rec any) error {
-	data, err := json.Marshal(rec)
-	if err != nil {
-		return err
-	}
-	for range 3 {
-		_, gen, err := s.Objects.Get(ctx, key)
-		found := err == nil
-		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			return err
-		}
-		if found {
-			_, err = s.Objects.Replace(ctx, key, data, gen)
-		} else {
-			_, err = s.Objects.Create(ctx, key, data)
-		}
-		if !errors.Is(err, store.ErrPrecondition) {
-			return err
-		}
-	}
-	return fmt.Errorf("record %s kept changing", key)
 }
 
 // rerunBySomeoneElse reports whether any attempt of a run after from, up to
@@ -417,31 +375,6 @@ func candidates(recs map[string]record[Image], sel selector.Selector, chain []sc
 type candidate struct {
 	Image Image
 	step  string
-}
-
-// used labels a saved disk used, at most once a day. Its record, which
-// expiry reads, was marked used when it was chosen, under the disks' lease,
-// in the same write as the choice's touch; the label is best effort.
-func (s *Service) used(ctx context.Context, rec Image) {
-	if day(rec.LastUsed) == day(s.now()) {
-		return
-	}
-	// The record was marked used as it was chosen, under the lease; the
-	// label follows, best effort.
-	cur := rec
-	cur.LastUsed = s.now()
-	im, err := s.Compute.Image(ctx, rec.Image)
-	if err != nil {
-		return
-	}
-	l := map[string]string{}
-	for k, v := range im.Labels {
-		l[k] = v
-	}
-	l[LabelLastUsed] = day(cur.LastUsed)
-	if err := s.Compute.SetImageLabels(ctx, rec.Image, l, im.LabelFingerprint); err != nil && !errors.Is(err, compute.ErrFingerprint) {
-		s.log().Warn("labelling a saved disk used", "image", rec.Image, "err", err.Error())
-	}
 }
 
 // isUnavailable reports whether an error confirms nothing.

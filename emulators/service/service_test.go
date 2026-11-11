@@ -163,9 +163,45 @@ func TestPullRequestDisks(t *testing.T) {
 	saveOne(service.StepPullRequestExact)
 }
 
+// Main keeps one disk of each family too: a save under a new key replaces
+// its disk of the old key, so a pull request still of the old key starts
+// from main's newest.
+func TestANewKeysSaveReplacesTheOldKeys(t *testing.T) {
+	e, _, c := onGitHub(t)
+	repo := e.Repository("app")
+	e.Commit(repo, "main", conformance.Files)
+	e.Commit(repo, "old", map[string]string{"x": "1"})
+	saveMain := func(want string) {
+		t.Helper()
+		j, err := e.StartJob(e.Push(repo, "main"), conformance.Small)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, d := c.Disk(e.Token(j), "build"); d.Restored != want {
+			t.Fatalf("restored %s, want %s", d.Restored, want)
+		}
+		c.Save(e.Token(j))
+		e.FinishJob(j, "success")
+	}
+	saveMain(service.StepNone)
+	e.Commit(repo, "main", map[string]string{"deps.txt": "2\n"})
+	saveMain(service.StepMainNewest)
+	saved := e.SavedDisks(repo)
+	if len(saved) != 1 || saved[0].Scope != "main" {
+		t.Fatalf("main's disks of one family after a new key's save: %+v", saved)
+	}
+	j, err := e.StartJob(e.PullRequestRun(e.PullRequest(repo, "main", "old")), conformance.Small)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, d := c.Disk(e.Token(j), "build"); d.Restored != service.StepMainNewest {
+		t.Fatalf("a pull request of the old key restored %s, want %s", d.Restored, service.StepMainNewest)
+	}
+}
+
 // A save from a run bound before its pull request was closed, finishing
 // after the reopened pull request saved again, replaces nothing: the newer
-// disk is the one later runs start from (specs/0003-disks.md, Expiry).
+// disk is the one later runs start from (specs/0003-disks.md, Deletion).
 func TestALateSaveFromBeforeAClosureReplacesNothing(t *testing.T) {
 	e, gh, c := onGitHub(t)
 	repo := e.Repository("app")

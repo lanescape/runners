@@ -21,6 +21,11 @@ import (
 // Any error that isn't Unavailable is a confirmed answer of some kind.
 var ErrNotFound = errors.New("not found on GitHub")
 
+// ErrDirectory is GitHub's answer that a path File asked for is a
+// directory. It's ErrNotFound too, since there's no such file, but a caller
+// that deletes on a file's absence tells the two apart.
+var ErrDirectory = errors.New("a directory")
+
 // Unavailable wraps every other failure: GitHub couldn't be reached, timed
 // out, limited the service's requests, or answered in a way that confirms
 // nothing. A caller must not decide anything from it.
@@ -428,19 +433,30 @@ const MaxFile = 10 << 20
 // File implements API.
 func (c *Client) File(ctx context.Context, repo Repository, path, commit string) ([]byte, error) {
 	f, _, _, err := c.gh.Repositories.GetContents(ctx, repo.Owner, repo.Name, path, &gh.RepositoryContentGetOptions{Ref: commit})
+	var er *gh.ErrorResponse
+	if errors.As(err, &er) && er.Response != nil && er.Response.StatusCode == http.StatusNotFound && strings.HasPrefix(er.Message, "No commit found") {
+		// GitHub has no such commit, which says nothing of the file.
+		return nil, &Unavailable{Err: fmt.Errorf("reading %s: %s", path, er.Message)}
+	}
 	if err != nil {
 		return nil, classify(err)
 	}
 	if f == nil {
 		// A directory: there's no such file.
-		return nil, fmt.Errorf("%w: %s is a directory", ErrNotFound, path)
+		return nil, fmt.Errorf("%w: %s is %w", ErrNotFound, path, ErrDirectory)
 	}
 	if f.GetSize() > MaxFile {
 		return nil, fmt.Errorf("%s is larger than %d bytes", path, MaxFile)
 	}
 	if f.GetEncoding() == "none" || (f.GetSize() > 0 && f.Content == nil) {
 		// Too large for the contents API: GitHub gives its blob instead.
-		return c.Blob(ctx, repo, f.GetSHA())
+		// The file is there, so a blob GitHub says isn't confirms nothing,
+		// least of all that the file is absent.
+		b, err := c.Blob(ctx, repo, f.GetSHA())
+		if errors.Is(err, ErrNotFound) {
+			return nil, &Unavailable{Err: fmt.Errorf("%s's blob %s wasn't found: %s", path, f.GetSHA(), err.Error())}
+		}
+		return b, err
 	}
 	s, err := f.GetContent()
 	if err != nil {

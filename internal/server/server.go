@@ -176,7 +176,7 @@ type webhookHeader struct {
 
 // webhookEvents are the events that start a pass, and for each, the
 // actions that do, or nil for every action: a pull request's closing, merged
-// or not, deletes its scope's disks at once (specs/0003-disks.md, Expiry).
+// or not, deletes its scope's disks at once (specs/0003-disks.md, Deletion).
 var webhookEvents = map[string]map[string]bool{"workflow_job": nil, "workflow_run": nil, "pull_request": {"closed": true}}
 
 func (s *server) webhook(w http.ResponseWriter, r *http.Request) {

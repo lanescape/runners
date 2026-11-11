@@ -78,8 +78,8 @@ type savedDisk struct {
 	// boundAt is when the run that saved it was bound, which a later
 	// closing of its pull request retires it by.
 	boundAt time.Time
-	// replaced is set once a pull request's later save of the family
-	// replaces it.
+	// replaced is set once its scope's later save of the family, on its
+	// architecture, replaces it, whatever its key.
 	replaced bool
 }
 
@@ -87,6 +87,7 @@ type savedDisk struct {
 // first time one of its jobs asks, made for every job of the run that asks
 // in that attempt (specs/0003-disks.md, Saved disks).
 type choice struct {
+	run     int64
 	attempt int
 	disk    *savedDisk
 	step    string
@@ -114,11 +115,13 @@ func (e *Emulator) WorkDisk(j Job) (WorkDisk, bool) {
 // SavedDisks are a repository's saved disks that a restore may still
 // choose, oldest first.
 func (e *Emulator) SavedDisks(repo Repository) []SavedDisk {
+	unfinished := e.unfinished(repo.ID)
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	held := e.held(unfinished)
 	var out []SavedDisk
 	for _, d := range e.dsk.saved {
-		if d.repo == repo.ID && !d.replaced && !e.retired(d) {
+		if d.repo == repo.ID && (!d.replaced || held[d]) && !e.retired(d) {
 			out = append(out, d.SavedDisk)
 		}
 	}
@@ -218,6 +221,7 @@ func (e *Emulator) choose(rq request, family, key string) *workDisk {
 			}
 		}
 	})
+	unfinished := e.unfinished(rq.repo.ID)
 	now := e.clock.Now()
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -235,10 +239,11 @@ func (e *Emulator) choose(rq request, family, key string) *workDisk {
 	// Every rerun the emulator sees is a maintainer's, which picks again,
 	// as a new run would.
 	if c == nil || c.attempt < m.attempt {
-		c = &choice{attempt: m.attempt, step: StepNone}
+		c = &choice{run: m.run, attempt: m.attempt, step: StepNone}
+		held := e.held(unfinished)
 		var pool []*savedDisk
 		for _, d := range e.dsk.saved {
-			if d.repo == rq.repo.ID && d.Family == family && d.Architecture == m.selector.Arch && !d.replaced && !e.retired(d) {
+			if d.repo == rq.repo.ID && d.Family == family && d.Architecture == m.selector.Arch && (!d.replaced || held[d]) && !e.retired(d) {
 				pool = append(pool, d)
 			}
 		}
@@ -265,6 +270,36 @@ func (e *Emulator) choose(rq request, family, key string) *workDisk {
 		Restored: c.step}, scope: rq.bd.Scope}
 	e.dsk.work[m.name] = d
 	return d
+}
+
+// unfinished are a repository's runs that GitHub doesn't show completed,
+// with the attempt each is in.
+func (e *Emulator) unfinished(repo int64) map[int64]int {
+	out := map[int64]int{}
+	e.gh.Read(func(s *ghemu.State) {
+		for _, r := range s.Runs() {
+			if r.Repo != nil && r.Repo.ID == repo && r.Status != "completed" {
+				out[r.ID] = r.Attempt
+			}
+		}
+	})
+	return out
+}
+
+// held are the saved disks that an unfinished run's choice names, picked
+// in the attempt it's in: the service deletes none of them, even once a
+// later save replaces them, until the run has finished, so a restore may
+// still choose one. A choice of an earlier attempt holds nothing: every
+// rerun the emulator sees is a maintainer's, which picks again, and the
+// service drops a finished run's choices. The caller holds e.mu.
+func (e *Emulator) held(unfinished map[int64]int) map[*savedDisk]bool {
+	out := map[*savedDisk]bool{}
+	for _, c := range e.dsk.choices {
+		if attempt, ok := unfinished[c.run]; ok && c.disk != nil && c.attempt == attempt {
+			out[c.disk] = true
+		}
+	}
+	return out
 }
 
 // retired reports whether a saved disk's pull request was seen closed
@@ -307,8 +342,8 @@ func (e *Emulator) save(w http.ResponseWriter, r *http.Request) {
 }
 
 // saveDisk saves a finished job's work disk, if it was attached, its job
-// asked, and its scope saves. A pull request keeps one disk of each family
-// and architecture. The caller holds e.mu.
+// asked, and its scope saves. Each scope keeps one disk of each family and
+// architecture, its newest save, whatever its key. The caller holds e.mu.
 func (e *Emulator) saveDisk(m *machine) {
 	d := e.dsk.work[m.name]
 	if d == nil || !d.Ready || !d.Save || !d.scope.Saves() {
@@ -322,8 +357,8 @@ func (e *Emulator) saveDisk(m *machine) {
 		repo: m.repo, boundAt: boundAt}
 	// A disk saved by a run bound before its pull request was last seen
 	// closed is never chosen, and replaces none of the pull request's
-	// other disks (specs/0003-disks.md, Expiry).
-	if _, ok := d.scope.PullRequestNumber(); ok && !e.retired(saved) {
+	// other disks (specs/0003-disks.md, Deletion).
+	if !e.retired(saved) {
 		for _, o := range e.dsk.saved {
 			if o.repo == m.repo && o.Scope == d.Scope && o.Family == d.Family && o.Architecture == d.Architecture {
 				o.replaced = true

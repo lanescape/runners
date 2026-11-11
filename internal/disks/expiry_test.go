@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,7 +14,6 @@ import (
 
 	ghemu "github.com/lanescape/runners/emulators/github"
 	"github.com/lanescape/runners/internal/disks"
-	"github.com/lanescape/runners/internal/selector"
 )
 
 func tools(key, scope string) string {
@@ -33,29 +31,27 @@ func (e *env) savePull(p *ghemu.Pull, label string) string {
 
 func (e *env) has(image string) bool { _, ok := e.images()[image]; return ok }
 
-func TestAPullRequestsDisksExpire(t *testing.T) {
+// Nothing goes for want of use or for its age: an open pull request's disk,
+// main's and a long-lived branch's stay, however long no one uses them.
+func TestNothingGoesForWantOfUseOrAge(t *testing.T) {
 	e := setup(t)
+	e.listV1()
+	m := e.saveMain(key1)
+	b := e.saveBranch(key1)
 	p, _ := e.pull()
-	pr := "pr" + strconv.Itoa(p.Number)
-	unused := e.savePull(p, sel(key1, pr))
-	e.clock.Advance(disks.PullRequestUnused - time.Hour)
+	pr := e.savePull(p, sel(key1, "pr"+strconv.Itoa(p.Number)))
+	e.clock.Advance(1000 * 24 * time.Hour)
 	e.pass()
-	if !e.has(unused) {
-		t.Fatal("a pull request's disk went before 14 days unused")
+	if !e.has(m) || !e.has(b) || !e.has(pr) {
+		t.Fatalf("main's %v, the branch's %v, the open pull request's %v; want every one kept", e.has(m), e.has(b), e.has(pr))
 	}
-	e.clock.Advance(time.Hour)
-	e.pass()
-	if e.has(unused) {
-		t.Fatal("a pull request's disk outlived 14 days unused")
-	}
-	if _, ok := e.record("images/5001/" + unused + ".json"); ok {
-		t.Fatal("a deleted image's record was kept")
+	if _, ok := e.images()[m].Labels["lsr-last-used"]; ok {
+		t.Fatal("a saved disk labelled with its last use")
 	}
 }
 
 // A pull request that closes, merged or not, has its whole scope deleted
-// at once, and its most recent choices with it; reopened, it starts again
-// from main.
+// at once; reopened, it starts again from main.
 func TestAClosedPullRequestsDisksGoAtOnce(t *testing.T) {
 	e := setup(t)
 	m := e.saveMain(key1)
@@ -68,17 +64,10 @@ func TestAClosedPullRequestsDisksGoAtOnce(t *testing.T) {
 	jb.finish(false)
 	closed := e.savePull(p, sel(key2, pr))
 	other := e.savePull(p, tools(key2, pr))
-	recent := "recent/5001/" + pr + "/" + selector.Hash("amd64\x00build") + ".json"
-	if _, ok := e.record(recent); !ok {
-		t.Fatal("no record of the pull request's most recent choice")
-	}
 	e.gh.ClosePull(p)
 	e.pass()
 	if e.has(closed) || e.has(other) {
 		t.Fatal("a closed pull request's disks outlived it")
-	}
-	if _, ok := e.record(recent); ok {
-		t.Fatal("a closed pull request's most recent choice was kept")
 	}
 	if !e.has(m) {
 		t.Fatal("main's disk went with the pull request")
@@ -108,53 +97,36 @@ func TestAPullRequestKeepsOneDiskOfEachFamily(t *testing.T) {
 	}
 }
 
-func TestUsingADiskKeepsIt(t *testing.T) {
-	e := setup(t)
-	p, _ := e.pull()
-	pr := "pr" + strconv.Itoa(p.Number)
-	img := e.savePull(p, sel(key1, pr))
-	e.clock.Advance(10 * 24 * time.Hour)
-	used := e.start(e.pullRun(p), ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, pr)}})
-	if used.source() != img {
-		t.Fatalf("restored %s, want %s", used.source(), img)
-	}
-	if got := e.images()[img].Labels[disks.LabelLastUsed]; got != e.clock.Now().UTC().Format("2006-01-02") {
-		t.Fatalf("last-used label %q", got)
-	}
-	rec, _ := e.record("images/5001/" + img + ".json")
-	if at, _ := time.Parse(time.RFC3339Nano, rec["last_used"].(string)); e.clock.Now().Sub(at) > time.Minute {
-		t.Fatalf("last used %s in the record; the restore didn't mark it", at)
-	}
-	used.finish(false)
-	e.clock.Advance(10 * 24 * time.Hour)
-	e.pass()
-	if !e.has(img) {
-		t.Fatal("a disk used 10 days ago went")
-	}
-}
-
-// Main keeps the two newest keys of each family, and the versions of
-// neither older one.
-func TestMainKeepsItsTwoNewestKeys(t *testing.T) {
+// A save under a new key replaces main's disks of the family's older keys,
+// as it replaces older versions of its own, and no other family's
+// (specs/0003-disks.md, Deletion).
+func TestANewKeysSaveReplacesTheOldKeys(t *testing.T) {
 	e := setup(t)
 	k1 := e.saveMain(key1)
 	tool := e.saveMainLabel(tools(key1, "main"))
 	e.clock.Advance(time.Minute)
-	k2 := e.saveMain(key2)
-	e.clock.Advance(time.Minute)
-	if !e.has(k1) || !e.has(k2) {
-		t.Fatal("main lost one of its family's two newest keys")
+	again := e.saveMain(key1)
+	if e.has(k1) || !e.has(again) {
+		t.Fatal("a newer version of a key didn't replace the older")
 	}
-	k3 := e.saveMain(key3)
-	if e.has(k1) || !e.has(k2) || !e.has(k3) || !e.has(tool) {
-		t.Fatalf("key1 %v, key2 %v, key3 %v, tools %v; want only the oldest key of build deleted", e.has(k1), e.has(k2), e.has(k3), e.has(tool))
+	e.clock.Advance(time.Minute)
+	k2 := e.saveMain(key2)
+	e.pass()
+	if e.has(again) || !e.has(k2) || !e.has(tool) {
+		t.Fatalf("key1 %v, key2 %v, tools %v; want the old key's disk replaced, and no other family's", e.has(again), e.has(k2), e.has(tool))
+	}
+	// A pull request still of the old key starts from main's newest.
+	p, run := e.pull()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "pr"+strconv.Itoa(p.Number))}})
+	if src := jb.source(); src != k2 {
+		t.Fatalf("a pull request of the old key restored %q, want main's newest %s", src, k2)
 	}
 }
 
-// An older key of main's stays while an open pull request's most recent
-// choice names it, after the run that chose it has finished, and goes once
-// the pull request closes.
-func TestMainKeepsAKeyAnOpenPullRequestChose(t *testing.T) {
+// An open pull request that chose main's disk of an older key keeps it only
+// while its run is unfinished: once a newer key's save replaces it, it goes
+// as soon as that run has finished, the pull request still open.
+func TestAnOpenPullRequestKeepsNoOlderKeyOfMains(t *testing.T) {
 	e := setup(t)
 	k1 := e.saveMain(key1)
 	p, run := e.pull()
@@ -162,44 +134,16 @@ func TestMainKeepsAKeyAnOpenPullRequestChose(t *testing.T) {
 	if jb.source() != k1 {
 		t.Fatal("no restore")
 	}
-	jb.finish(false)
-	e.eventually("the run is finished", func() bool { s, _ := e.gh.RunState(run); return s == "completed" })
 	e.clock.Advance(time.Minute)
 	e.saveMain(key2)
-	e.clock.Advance(time.Minute)
-	e.saveMain(key3)
-	e.pass()
 	if !e.has(k1) {
-		t.Fatal("main's key that an open pull request's most recent choice names was deleted")
+		t.Fatal("a newer key's save deleted the disk an unfinished run's choice names")
 	}
-	e.gh.ClosePull(p)
+	jb.finish(false)
+	e.eventually("the run is finished", func() bool { s, _ := e.gh.RunState(run); return s == "completed" })
 	e.pass()
 	if e.has(k1) {
-		t.Fatal("main's older key outlived the pull request that chose it")
-	}
-}
-
-// A family of main's that no one has used for 90 days goes, newest
-// included; one in use stays.
-func TestARetiredFamilyGoes(t *testing.T) {
-	e := setup(t)
-	old := e.saveMain(key1)
-	e.clock.Advance(time.Minute)
-	newest := e.saveMain(key2)
-	tool := e.saveMainLabel(tools(key1, "main"))
-	e.clock.Advance(disks.MainUnused - 24*time.Hour)
-	used := e.start(e.mainRun(), ghemu.JobSpec{Name: "build", Labels: []string{tools(key1, "main")}})
-	if used.source() != tool {
-		t.Fatal("no restore")
-	}
-	used.finish(false)
-	e.clock.Advance(2 * 24 * time.Hour)
-	e.pass()
-	if e.has(old) || e.has(newest) {
-		t.Fatal("a family unused for 90 days was kept")
-	}
-	if !e.has(tool) {
-		t.Fatal("a family in use went")
+		t.Fatal("main's older key outlived the run that chose it, kept for its open pull request")
 	}
 }
 
@@ -237,16 +181,14 @@ func TestAPreemptedJobThatSucceededLetsItsRunsChoiceGo(t *testing.T) {
 // A run that lost a Spot job may be due a rerun that needs its choices,
 // even before a pass has recorded the stopped machine: a sibling's save in
 // the same pass, whichever machine it comes to first, doesn't delete what
-// the run chose, even once it's no longer among its family's newest keys.
+// the run chose, even though the save, of a newer key, replaces it.
 func TestASaveDoesntDeleteWhatARunDueARerunChose(t *testing.T) {
 	e := setup(t)
 	m1 := e.saveMain(key1)
 	e.clock.Advance(time.Minute)
-	e.saveMain(key3)
-	e.clock.Advance(time.Minute)
 	run := e.mainRun()
-	// Another push saves the family's newest key; this run's lost job
-	// chose the oldest.
+	// Another push saves the family's new key; this run's lost job chose
+	// the old.
 	saver := e.start(e.mainRun(), ghemu.JobSpec{Name: "build", Labels: []string{sel(key2, "main")}})
 	lost := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{"lanescape-2vcpu-linux-amd64-spot-disk-build-" + key1 + "-main"}})
 	if lost.source() != m1 {
@@ -262,26 +204,6 @@ func TestASaveDoesntDeleteWhatARunDueARerunChose(t *testing.T) {
 	}
 	if e.attempt(run) != 2 {
 		t.Fatal("the run wasn't rerun")
-	}
-}
-
-// A closed pull request's most recent choice goes even when its consumer
-// has no saved disks at all.
-func TestAClosedPullRequestsChoiceGoesWithNoImages(t *testing.T) {
-	e := setup(t)
-	p, run := e.pull()
-	pr := "pr" + strconv.Itoa(p.Number)
-	if src := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, pr)}}).source(); src != "" {
-		t.Fatalf("restored %q from nothing", src)
-	}
-	recent := "recent/5001/" + pr + "/" + selector.Hash("amd64\x00build") + ".json"
-	if rec, ok := e.record(recent); !ok || rec["step"] != disks.StepNone {
-		t.Fatalf("recent choice = %v", rec)
-	}
-	e.gh.ClosePull(p)
-	e.pass()
-	if _, ok := e.record(recent); ok {
-		t.Fatal("a closed pull request's most recent choice was kept")
 	}
 }
 
@@ -314,9 +236,10 @@ func TestAReopenedPullRequestNeverRestoresWhatItsEarlierRunsSaved(t *testing.T) 
 	}
 }
 
-// A family of main's counts as used when any version of it was, even one
-// that's since been deleted as superseded.
-func TestAFamilysUseOutlivesTheVersionUsed(t *testing.T) {
+// A superseded version stays while an unfinished run's choice names it,
+// and goes once that run has finished; the newer one stays however long
+// it goes unused.
+func TestASupersededVersionGoesOnceNoChoiceNamesIt(t *testing.T) {
 	e := setup(t)
 	old := e.saveMain(key1)
 	run := e.mainRun()
@@ -340,15 +263,10 @@ func TestAFamilysUseOutlivesTheVersionUsed(t *testing.T) {
 	if e.has(old) {
 		t.Fatal("a superseded version outlived the choice that named it")
 	}
-	e.clock.Advance(31 * 24 * time.Hour)
+	e.clock.Advance(1000 * 24 * time.Hour)
 	e.pass()
 	if !e.has(newer) {
-		t.Fatal("a family used 31 days ago was deleted as retired")
-	}
-	e.clock.Advance(60 * 24 * time.Hour)
-	e.pass()
-	if e.has(newer) {
-		t.Fatal("a family unused for 90 days was kept")
+		t.Fatal("a family's newest disk went for want of use")
 	}
 }
 
@@ -413,33 +331,6 @@ func TestAClosingIsRecordedFromItsDelivery(t *testing.T) {
 	}
 	if e.has(img) {
 		t.Fatal("a disk saved before its pull request's closing outlived it")
-	}
-}
-
-// A family's retirement is decided again under the lease: a use of one of
-// its keys during a pass keeps every key of it.
-func TestAFamilyUsedDuringAPassIsKept(t *testing.T) {
-	e := setup(t)
-	k1 := e.saveMain(key1)
-	e.clock.Advance(time.Minute)
-	k2 := e.saveMain(key2)
-	e.clock.Advance(disks.MainUnused + time.Hour)
-	family := "families/5001/" + selector.Hash("main\x00amd64\x00build") + ".json"
-	var once sync.Once
-	e.gcs.Faults().Add(fault.Rule{Method: http.MethodPost, Match: func(r *http.Request) bool {
-		if strings.HasPrefix(r.URL.Query().Get("name"), "leases/disks/") {
-			// A job chooses key1 after the pass has read the family's
-			// records, and before it marks anything.
-			once.Do(func() {
-				b, _ := json.Marshal(disks.Family{RepositoryID: repoID, Scope: "main", Arch: "amd64", Family: "build", LastUsed: e.clock.Now().UTC()})
-				e.gcs.Put("state", family, b)
-			})
-		}
-		return false
-	}})
-	e.pass()
-	if !e.has(k1) || !e.has(k2) {
-		t.Fatalf("key1 %v, key2 %v; a family used during the pass was retired", e.has(k1), e.has(k2))
 	}
 }
 

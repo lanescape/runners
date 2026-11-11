@@ -10,11 +10,16 @@ import (
 	"github.com/lanescape/runners/internal/disks"
 )
 
+// listsV1 is a .github/runners.json that lists support/v1 as the
+// long-lived branch v1, and declares the tests' families.
+const listsV1 = `{"branches": {"support/v1": "v1"}, "disks": {"build": {}, "tools": {}, "other": {}}}`
+
 // listV1 lists support/v1 as the long-lived branch v1 on the default
-// branch, and gives support/v1 a commit of its own.
+// branch, and gives support/v1 a commit of its own, which declares the
+// same families.
 func (e *env) listV1() {
 	e.t.Helper()
-	e.repo.Commit("main", map[string]string{consumer.RunnersFile: `{"branches": {"support/v1": "v1"}}`})
+	e.repo.Commit("main", map[string]string{consumer.RunnersFile: listsV1})
 	e.repo.Commit("support/v1", map[string]string{"v1": "1"})
 }
 
@@ -58,13 +63,14 @@ func TestALongLivedBranchsRestoreOrder(t *testing.T) {
 		t.Fatalf("a branch's first push restored %q", src)
 	}
 	first.finish(true)
-	e.clock.Advance(time.Minute)
-	v1 := e.saveBranch(key2)
 	run = e.branchRun()
-	if src := e.start(run, ghemu.JobSpec{Name: "b", Labels: []string{sel(key1, "branch-v1")}}).source(); src == main1 ||
-		e.step(run, sel(key1, "branch-v1")) != disks.StepBranchExact {
+	b := e.start(run, ghemu.JobSpec{Name: "b", Labels: []string{sel(key1, "branch-v1")}})
+	if src := b.source(); src == main1 || e.step(run, sel(key1, "branch-v1")) != disks.StepBranchExact {
 		t.Fatalf("the branch's own for the key: %q, step %s", src, e.step(run, sel(key1, "branch-v1")))
 	}
+	b.finish(false)
+	e.clock.Advance(time.Minute)
+	v1 := e.saveBranch(key2)
 	// A run has one key per family: another key is another run's.
 	run = e.branchRun()
 	if src := e.start(run, ghemu.JobSpec{Name: "c", Labels: []string{sel(zero, "branch-v1")}}).source(); src != v1 ||
@@ -87,24 +93,22 @@ func TestALongLivedBranchsRestoreOrder(t *testing.T) {
 	}
 }
 
-// A long-lived branch keeps its two newest keys, as main does, and all of
-// its disks go once it's no longer listed.
-func TestALongLivedBranchsDisksExpire(t *testing.T) {
+// A long-lived branch keeps one disk of each family, its newest save, as
+// main does, and all of its disks go once it's no longer listed.
+func TestALongLivedBranchsDisksGoWhenItsDelisted(t *testing.T) {
 	e := setup(t)
 	e.listV1()
 	k1 := e.saveBranch(key1)
 	e.clock.Advance(time.Minute)
 	k2 := e.saveBranch(key2)
-	e.clock.Advance(time.Minute)
-	k3 := e.saveBranch(key3)
-	if e.has(k1) || !e.has(k2) || !e.has(k3) {
-		t.Fatalf("key1 %v, key2 %v, key3 %v; want the branch's two newest keys", e.has(k1), e.has(k2), e.has(k3))
+	if e.has(k1) || !e.has(k2) {
+		t.Fatalf("key1 %v, key2 %v; want the branch's newest save alone", e.has(k1), e.has(k2))
 	}
 	main1 := e.saveMain(key1)
-	e.repo.Commit("main", map[string]string{consumer.RunnersFile: `{}`})
+	e.repo.Commit("main", map[string]string{consumer.RunnersFile: declares})
 	e.pass()
-	if e.has(k2) || e.has(k3) || !e.has(main1) {
-		t.Fatalf("after the branch was delisted: key2 %v, key3 %v, main %v", e.has(k2), e.has(k3), e.has(main1))
+	if e.has(k2) || !e.has(main1) {
+		t.Fatalf("after the branch was delisted: the branch's %v, main's %v", e.has(k2), e.has(main1))
 	}
 }
 

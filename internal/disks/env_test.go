@@ -26,6 +26,7 @@ import (
 	"github.com/lanescape/runners/internal/auth"
 	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/compute"
+	"github.com/lanescape/runners/internal/consumer"
 	"github.com/lanescape/runners/internal/disks"
 	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/lease"
@@ -44,6 +45,11 @@ const (
 	key3     = "00112233445566778899"
 	zero     = "00000000000000000000"
 )
+
+// declares is a .github/runners.json that declares every family the tests'
+// jobs ask for, which keeps their disks in main's scope and, on a
+// long-lived branch, in its scope.
+const declares = `{"disks": {"build": {}, "tools": {}, "other": {}}}`
 
 // sel is the 2-vCPU amd64 shape with a work disk of family build, whose key
 // for the run is key, in the run's scope: a test's shorthand, which start
@@ -168,7 +174,7 @@ func setup(t *testing.T) *env {
 	app := gh.NewApp(77)
 	gh.Install(app, org)
 	repo := gh.Repo(org, repoID, "app")
-	repo.Commit("main", map[string]string{"README": "app"})
+	repo.Commit("main", map[string]string{"README": "app", consumer.RunnersFile: declares})
 
 	cfg, err := config.Default()
 	if err != nil {
