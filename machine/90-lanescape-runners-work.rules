@@ -1,0 +1,8 @@
+# The work disk: Compute Engine's disk attached as the device named work
+# (specs/0002-machines.md, The work disk). It's matched by the link
+# /dev/disk/by-id/google-work, which the guest environment's earlier rules
+# make from the device name for a SCSI disk and an NVMe one alike, whose
+# serials differ; only the whole disk has that link, not its partitions.
+# udev doesn't mount it itself: it asks systemd to start the service that
+# does.
+ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", SYMLINK=="disk/by-id/google-work", TAG+="systemd", ENV{SYSTEMD_WANTS}+="lanescape-runners-work-disk.service"

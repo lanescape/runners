@@ -138,6 +138,15 @@ func (e *Emulator) defaultGroup(org *Account) *RunnerGroup {
 	return g
 }
 
+// AddDefaultLabels makes just-in-time runners get GitHub's default labels,
+// self-hosted, the OS's and the architecture's, besides those asked for, as
+// GitHub might.
+func (e *Emulator) AddDefaultLabels(on bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.defaultLabels = on
+}
+
 // SetForkApproval sets the organization's setting for which outside
 // contributors' fork pull request workflows need approval.
 func (e *Emulator) SetForkApproval(org *Account, policy string) {
@@ -326,6 +335,31 @@ func (e *Emulator) HideAssignment(j *WorkflowJob, n int) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	j.hidden = n
+}
+
+// EventPayload is what GitHub writes to GITHUB_EVENT_PATH for a run's jobs,
+// as far as the service reads it: a pull request's number, head commit and
+// head repository.
+func EventPayload(r *Run) map[string]any {
+	p := r.EventPull
+	if p == nil {
+		return map[string]any{}
+	}
+	return map[string]any{"pull_request": map[string]any{"number": p.Number,
+		"head": map[string]any{"sha": p.HeadSHA, "repo": map[string]any{"id": p.HeadRepositoryID}}}}
+}
+
+// JobOnRunner is the job in progress on a runner, by its name, and its run.
+func (e *Emulator) JobOnRunner(name string) (WorkflowJob, *Run, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.tick()
+	for _, j := range e.jobs {
+		if j.Runner != nil && strings.EqualFold(j.Runner.Name, name) && j.Status == "in_progress" {
+			return *j, j.Run, true
+		}
+	}
+	return WorkflowJob{}, nil, false
 }
 
 // Job returns a job's current state, for tests to inspect.
@@ -759,7 +793,11 @@ func (e *Emulator) generateJIT(w http.ResponseWriter, r *http.Request, org *Acco
 	if work == "" {
 		work = "_work"
 	}
-	rn := &Runner{ID: e.id(), Name: body.Name, Group: g, Labels: slices.Clone(body.Labels), Ephemeral: true,
+	labels := slices.Clone(body.Labels)
+	if e.defaultLabels {
+		labels = append(labels, "self-hosted", "Linux", "X64")
+	}
+	rn := &Runner{ID: e.id(), Name: body.Name, Group: g, Labels: labels, Ephemeral: true,
 		WorkDir: work, token: hex.EncodeToString(tok[:])}
 	e.runners[rn.ID] = rn
 	cfg, _ := json.Marshal(jitConfig{URL: e.URL, RunnerID: rn.ID, Name: rn.Name, Token: rn.token, WorkDir: work})
@@ -1129,6 +1167,7 @@ func (e *Emulator) jobEnv(j *WorkflowJob) map[string]string {
 		"GITHUB_REPOSITORY_OWNER_ID": strconv.FormatInt(run.Repo.Owner.ID, 10),
 		"GITHUB_EVENT_NAME":          run.Event,
 		"GITHUB_REF":                 run.Ref,
+		"GITHUB_REF_TYPE":            run.RefType,
 		"GITHUB_SHA":                 run.SHA,
 		"RUNNER_NAME":                j.Runner.Name,
 		"RUNNER_OS":                  "Linux",
@@ -1157,7 +1196,7 @@ func (e *Emulator) runnerAcquire(w http.ResponseWriter, r *http.Request, rn *Run
 			j.delivered = true
 			body := map[string]any{
 				"id": j.ID, "run_id": j.Run.ID, "attempt": j.Attempt, "name": j.Name,
-				"repository": j.Run.Repo.FullName(), "env": e.jobEnv(j), "steps": j.Steps,
+				"repository": j.Run.Repo.FullName(), "env": e.jobEnv(j), "steps": j.Steps, "event": EventPayload(j.Run),
 			}
 			e.notify()
 			e.mu.Unlock()

@@ -24,6 +24,7 @@ import (
 
 	"github.com/lanescape/runners/config"
 	gceemu "github.com/lanescape/runners/emulators/compute"
+	"github.com/lanescape/runners/emulators/fault"
 	ghemu "github.com/lanescape/runners/emulators/github"
 	"github.com/lanescape/runners/emulators/google"
 	gcsemu "github.com/lanescape/runners/emulators/storage"
@@ -33,24 +34,36 @@ import (
 	"github.com/lanescape/runners/internal/disks"
 	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/lease"
+	"github.com/lanescape/runners/internal/logging"
 	"github.com/lanescape/runners/internal/machines"
 	"github.com/lanescape/runners/internal/pass"
 	"github.com/lanescape/runners/internal/server"
 	"github.com/lanescape/runners/internal/store"
+	"github.com/lanescape/runners/machine"
 )
 
 // These tests run the real service against the emulators, with each machine
-// it makes booting the real supervisor, which runs the runner stand-in,
-// which runs the real job-started hook.
+// it makes booting the real supervisor, built from its embedded source,
+// which runs the runner stand-in, which runs the real job-started hook's
+// script and program. A job's steps ask for its work disk and its save as
+// the actions do. The base image's rule that mounts the disk is played by
+// the test once Compute Engine shows the disk attached: the mount program
+// mounts as root, so its own tests, in mountwork, hold it to what it does.
 
 const (
 	orgID     = 303994381
+	repoID    = 5001
 	scheduler = "scheduler@lanescape-dev.iam.gserviceaccount.com"
 	pusher    = "lanescape-runners-push@lanescape-dev.iam.gserviceaccount.com"
-	bootstrap = "lanescape/app/.github/workflows/bootstrap.yml@refs/heads/main"
-	sel       = "lanescape-2vcpu-linux-amd64-main"
-	diskSel   = "lanescape-2vcpu-linux-amd64-disk-build-0123456789abcdef0123-main"
+	small     = "lanescape-2vcpu-linux-amd64"
 )
+
+// files are the consumer's: one family of work disks, build, with no key
+// files, and a setup script, which a job runs in its own steps.
+var files = map[string]string{
+	".github/runners.json": `{"disks": {"build": {}}}`,
+	"ci/init.sh":           "echo setting up the machine\n",
+}
 
 type lockedBuffer struct {
 	mu sync.Mutex
@@ -79,35 +92,46 @@ type world struct {
 	repo        *ghemu.Repo
 	fork        *ghemu.Repo
 	contributor *ghemu.Account
+	maintainer  *ghemu.Account
 	client      *github.Client
-	disks       *disks.Service
+	objects     store.Objects
 	act         action
 	url         string
 	logs        *lockedBuffer
-	fake        string
 	supervisor  string
+	hook        string
 	standIn     string
 
 	mu       sync.Mutex
 	machines map[string]*booted
+	// holding makes machines wait to boot until the test releases them;
+	// gates are the waiting ones, released those let go before they were
+	// waiting, and ended stops any boot once the test is over.
+	holding  bool
+	gates    map[string]chan struct{}
+	released map[string]bool
+	ended    bool
 }
 
-// booted is a machine's guest: its supervisor and everything under it.
+// booted is a machine's guest: its supervisor and everything under it, and
+// its console, which holds its job's log.
 type booted struct {
-	dir  string
-	cmd  *exec.Cmd
-	done chan struct{}
+	dir     string
+	cmd     *exec.Cmd
+	done    chan struct{}
+	console *lockedBuffer
+	tasks   sync.WaitGroup
 }
 
 func newWorld(t *testing.T) *world {
 	t.Helper()
-	supervisor, standIn := build(t)
+	programs, standIn := build(t)
 	ctx := context.Background()
 	gh := ghemu.New()
 	t.Cleanup(gh.Close)
 	gcp := gceemu.New()
 	t.Cleanup(gcp.Close)
-	gcp.AddImage("lsr-base-amd64-1", "", "X86_64")
+	gcp.AddImage("lsr-base-amd64-0123456789abcdef0123", "", "X86_64")
 	gcs := gcsemu.New()
 	t.Cleanup(gcs.Close)
 	gcs.CreateBucket("state")
@@ -118,8 +142,8 @@ func newWorld(t *testing.T) *world {
 	gh.SetForkApproval(org, ghemu.ApproveAllExternalContributors)
 	app := gh.NewApp(77)
 	gh.Install(app, org)
-	repo := gh.Repo(org, 5001, "app")
-	repo.Commit("main", map[string]string{binding.RunnersFile: `{"bootstrap": "` + bootstrap + `"}`})
+	repo := gh.Repo(org, repoID, "app")
+	repo.Commit("main", files)
 	gh.ProtectEnvironment(repo, machines.ContributionEnvironment)
 	contributor := gh.User(9001, "contributor")
 	fork := gh.Fork(repo, contributor, 7001)
@@ -149,16 +173,12 @@ func newWorld(t *testing.T) *world {
 	audience := srv.URL
 
 	account := machines.MachineAccountOf(gcp.Project)
-	tokens, err := auth.NewMachines(auth.Options{Issuer: auth.Issuer{URL: gcp.Identity.URL, JWKSURL: gcp.Identity.JWKSURL}, Audience: audience},
+	verifier, err := auth.NewMachines(auth.Options{Issuer: auth.Issuer{URL: gcp.Identity.URL, JWKSURL: gcp.Identity.JWKSURL}, Audience: audience},
 		gcp.Project, account)
 	if err != nil {
 		t.Fatal(err)
 	}
 	callers, err := auth.NewGoogle(auth.Options{Issuer: auth.Issuer{URL: gg.URL, JWKSURL: gg.JWKSURL}, Audience: audience}, []string{scheduler, pusher})
-	if err != nil {
-		t.Fatal(err)
-	}
-	actions, err := auth.NewActions(auth.Options{Issuer: auth.Issuer{URL: gh.Actions.URL, JWKSURL: gh.Actions.JWKSURL}, Audience: audience}, orgID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,9 +192,17 @@ func newWorld(t *testing.T) *world {
 	clock := clockwork.NewRealClock()
 	binder := &binding.Binder{GitHub: ghc, Objects: objects, OrganizationID: orgID, Clock: clock, Logger: log}
 	dks := &disks.Service{Config: cfg, Project: gcp.Project, GitHub: ghc, Compute: gcec, Objects: objects, Clock: clock, Logger: log}
+	// A check that GitHub can't answer is answered sooner than in
+	// production, so a test sees the hook ask again without a long wait.
 	svc := &machines.Service{Config: cfg, Project: gcp.Project, ServiceURL: audience, MachineAccount: account,
-		GitHub: ghc, Compute: gcec, Objects: objects, Binder: binder, Machines: tokens, Clock: clock, Logger: log,
-		Disks: dks, Saves: dks, Preemptions: dks}
+		GitHub: ghc, Compute: gcec, Objects: objects, Binder: binder, Machines: verifier, Clock: clock, Logger: log,
+		Disks: dks, Saves: dks, Preemptions: dks, FailStopDelay: time.Second, AssignmentWait: 3 * time.Second,
+		AssignmentRetry: 100 * time.Millisecond}
+	bootLogs, err := logging.New(ctx, gcp.Project, logging.View, gcp.LoggingOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.BootLogs = bootLogs
 	passes := &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log}
 	body := pass.All(svc.Pass, dks.Pass)
 	// A report can arrive as the test ends: no pass starts once cleanup
@@ -199,14 +227,17 @@ func newWorld(t *testing.T) *world {
 		Logger: log, OrganizationID: orgID, WebhookSecret: []byte("secret"), Publisher: nopPublisher{},
 		ReconcileCallers: callers,
 		Passes:           passes,
-		Reconciler:       reconciler(body), Events: dks, Actions: actions, Binder: binder,
+		Reconciler:       reconciler(body), Events: dks,
 		JobStarted: svc.JobStarted(), JobFinished: svc.JobFinished(),
+		Disks: svc.DiskRequest(), Save: svc.SaveRequest(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := &world{t: t, gh: gh, gce: gcp, gcs: gcs, gg: gg, org: org, repo: repo, fork: fork, contributor: contributor, client: ghc,
-		disks: dks, act: action{t: t, service: srv.URL}, url: srv.URL, logs: logs, fake: fakeBin(t), supervisor: supervisor, standIn: standIn, machines: map[string]*booted{}}
+	w := &world{t: t, gh: gh, gce: gcp, gcs: gcs, gg: gg, org: org, repo: repo, fork: fork, contributor: contributor,
+		maintainer: gh.User(42, "maintainer"), client: ghc, objects: objects, act: action{t: t, service: srv.URL}, url: srv.URL,
+		logs: logs, supervisor: programs["supervisor"], hook: programs["hook"], standIn: standIn,
+		machines: map[string]*booted{}, gates: map[string]chan struct{}{}, released: map[string]bool{}}
 	gcp.OnBoot(w.boot)
 	gcp.OnStop(w.halt)
 	t.Cleanup(w.haltAll)
@@ -224,28 +255,70 @@ func (nopPublisher) Publish(context.Context, server.Delivery) error {
 	return errors.New("no Pub/Sub here")
 }
 
+// holdBoots makes every machine wait to boot until the test releases it,
+// so that a test chooses which runner is listening when GitHub hands out a
+// job.
+func (w *world) holdBoots() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.holding = true
+}
+
+// release lets a held machine boot, whether or not it's waiting yet.
+func (w *world) release(name string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.released[name] = true
+	if g := w.gates[name]; g != nil {
+		close(g)
+		delete(w.gates, name)
+	}
+}
+
+// gate is what a booting machine waits on, if the test holds it.
+func (w *world) gate(name string) chan struct{} {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.holding || w.released[name] || w.ended {
+		return nil
+	}
+	g := make(chan struct{})
+	w.gates[name] = g
+	return g
+}
+
 // boot starts a machine's guest: the supervisor, with the base image's
 // settings pointed at the emulators, writing to the machine's serial
-// console.
+// console; the hook's script, which runs the hook's program; an empty
+// /work; and the base image's rule that mounts a work disk there.
 func (w *world) boot(m gceemu.Machine) {
+	if g := w.gate(m.Name); g != nil {
+		<-g
+	}
 	dir, err := os.MkdirTemp("", "lsr-machine-")
 	if err != nil {
 		return
 	}
-	device := filepath.Join(dir, "google-work")
-	_ = os.WriteFile(device, nil, 0o644)
 	settings := filepath.Join(dir, "job-started.conf")
-	_ = os.WriteFile(settings, []byte(fmt.Sprintf("metadata=%s\ndevice=%s\nmountpoint=%s\n", m.MetadataURL, device, filepath.Join(dir, "work"))), 0o644)
-	hook, _ := filepath.Abs("job-started.sh")
-	wrapper := filepath.Join(dir, "job-started")
-	_ = os.WriteFile(wrapper, []byte("#!/bin/bash\nexec bash "+hook+" "+settings+"\n"), 0o755)
+	_ = os.WriteFile(settings, []byte(fmt.Sprintf("metadata=%s\nask_every=500ms\nretry_every=200ms\n", m.MetadataURL)), 0o644)
+	// The base image's script, running the program from where the test
+	// built it, with the test's settings.
+	script := strings.ReplaceAll(string(machine.Files()["job-started.sh"]), `"$@"`, settings)
+	script = strings.ReplaceAll(script, machine.HookProgramPath, w.hook)
+	hook := filepath.Join(dir, "job-started.sh")
+	_ = os.WriteFile(hook, []byte(script), 0o755)
 	runner := filepath.Join(dir, "runner")
 	_ = os.MkdirAll(runner, 0o755)
+	// /work is there, empty, before any job asks for a disk.
+	_ = os.MkdirAll(filepath.Join(dir, "work"), 0o755)
 	cfg := map[string]any{
 		"metadata": m.MetadataURL, "runner": []string{w.standIn}, "runner_dir": runner, "runner_user": "",
-		"env": []string{"PATH=" + w.fake + ":" + os.Getenv("PATH"), "SUDO_LOG=" + filepath.Join(dir, "sudo.log"),
-			"LSR_TEST_SAVE=" + filepath.Join(dir, "save")},
-		"hook": wrapper, "save_marker": filepath.Join(dir, "save"),
+		// A job's steps find the metadata server and /work where these
+		// say, and the machine's own directory, where a test leaves
+		// what a step waits for.
+		"env": []string{"PATH=" + os.Getenv("PATH"), "LSR_TEST_METADATA=" + m.MetadataURL, "LSR_TEST_WORK=" + filepath.Join(dir, "work"),
+			"LSR_TEST_DIR=" + dir},
+		"hook":         hook,
 		"poweroff":     []string{"curl", "-fsS", "-X", "POST", m.MetadataURL + "/_emulator/poweroff"},
 		"metadata_for": "10s", "report_for": "30s",
 	}
@@ -256,21 +329,54 @@ func (w *world) boot(m gceemu.Machine) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	out, _ := cmd.StdoutPipe()
 	cmd.Stderr = cmd.Stdout
-	if err := cmd.Start(); err != nil {
+	bt := &booted{dir: dir, cmd: cmd, done: make(chan struct{}), console: &lockedBuffer{}}
+	w.mu.Lock()
+	if w.ended {
+		w.mu.Unlock()
+		os.RemoveAll(dir)
 		return
 	}
-	bt := &booted{dir: dir, cmd: cmd, done: make(chan struct{})}
-	w.mu.Lock()
+	if err := cmd.Start(); err != nil {
+		w.mu.Unlock()
+		return
+	}
 	w.machines[m.Name] = bt
 	w.mu.Unlock()
+	bt.tasks.Go(func() { w.mountWork(m, bt) })
 	go func() {
 		sc := bufio.NewScanner(out)
 		for sc.Scan() {
+			bt.console.Write([]byte(sc.Text() + "\n"))
 			w.gce.WriteSerial(m.Zone, m.Name, sc.Text()+"\n")
 		}
 		_ = cmd.Wait()
 		close(bt.done)
 	}()
+}
+
+// mountWork plays the base image's rule for the device named work: once
+// Compute Engine shows the job's work disk attached, outside the job, it
+// marks /work as the mounted disk, as a step that waits for the disk sees
+// it, and records that it did, in work-disk.log.
+func (w *world) mountWork(m gceemu.Machine, bt *booted) {
+	for {
+		select {
+		case <-bt.done:
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+		in, ok := w.gce.Instance(m.Zone, m.Name)
+		if !ok {
+			return
+		}
+		disk := in.Disks[machines.WorkDevice]
+		if disk == "" {
+			continue
+		}
+		_ = os.WriteFile(filepath.Join(bt.dir, "work-disk.log"), []byte("mounted "+disk+"\n"), 0o644)
+		_ = os.WriteFile(filepath.Join(bt.dir, "work", ".disk"), []byte(disk), 0o644)
+		return
+	}
 }
 
 // halt kills a stopped machine's guest, all of it.
@@ -286,9 +392,15 @@ func (w *world) halt(m gceemu.Machine) {
 func (w *world) haltAll() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.ended = true
+	for name, g := range w.gates {
+		close(g)
+		delete(w.gates, name)
+	}
 	for _, bt := range w.machines {
 		_ = syscall.Kill(-bt.cmd.Process.Pid, syscall.SIGKILL)
 		<-bt.done
+		bt.tasks.Wait()
 		os.RemoveAll(bt.dir)
 	}
 }
@@ -297,6 +409,28 @@ func (w *world) guest(name string) *booted {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.machines[name]
+}
+
+// console is everything a machine's guest wrote to its console: its
+// supervisor's lines, and its job's log.
+func (w *world) console(name string) string {
+	if bt := w.guest(name); bt != nil {
+		return bt.console.String()
+	}
+	return ""
+}
+
+// diskAnswer is where the work disk a job's steps asked for on a machine
+// came from, by the service's ready answer.
+func (w *world) diskAnswer(name string) string {
+	w.t.Helper()
+	for _, a := range w.act.stepAnswers(w.console(name)) {
+		if a.Path == "/v1/disks" && a.Code == http.StatusOK && a.Body["state"] == "ready" {
+			return a.Body["restored"].(string)
+		}
+	}
+	w.t.Fatalf("the job on %s never had its work disk:\n%s", name, w.console(name))
+	return ""
 }
 
 func (w *world) post(path, token string, body any) (int, map[string]any) {
@@ -314,20 +448,21 @@ func (w *world) post(path, token string, body any) (int, map[string]any) {
 	return resp.StatusCode, out
 }
 
-// bind is the runners action binding a run, from its first job, through
-// the interface for actions.
-func (w *world) bind(run *ghemu.Run, job ghemu.Job, req binding.Request) string {
-	w.t.Helper()
-	job.Audience = w.act.service
-	var ev *bindEvent
-	if req != (binding.Request{}) {
-		ev = &bindEvent{PullRequest: req.PullRequest, HeadRepositoryID: req.HeadRepositoryID, HeadSHA: req.HeadSHA}
+// scope is a run's bound scope, as the bucket records it, or "".
+func (w *world) scope(run *ghemu.Run) string {
+	data, _, ok := w.gcs.Object("state", binding.Key(run.Repo.ID, run.ID))
+	if !ok {
+		return ""
 	}
-	a := w.act.bind(w.gh.ActionsToken(run, job, nil), ev)
-	if a.Status != http.StatusOK {
-		w.t.Fatalf("bind: %d %s", a.Status, a.Reason)
-	}
-	return a.Scope
+	var bd binding.Binding
+	_ = json.Unmarshal(data, &bd)
+	return bd.Scope.String()
+}
+
+// token is a machine's identity token for the service, as its metadata
+// server mints it.
+func (w *world) token(in gceemu.InstanceState) string {
+	return w.gce.Identity.Mint(w.gce.IdentityClaims(in.Zone, in.Name, w.url, true))
 }
 
 // pass is the scheduler calling the reconcile endpoint. A pass that a
@@ -366,6 +501,28 @@ func (w *world) ours() []gceemu.InstanceState {
 	return out
 }
 
+// madeFor is the machine made for a job.
+func (w *world) madeFor(j *ghemu.WorkflowJob) gceemu.InstanceState {
+	w.t.Helper()
+	for _, in := range w.ours() {
+		if in.Labels[machines.LabelJob] == strconv.FormatInt(j.ID, 10) {
+			return in
+		}
+	}
+	w.t.Fatalf("no machine made for job %d", j.ID)
+	return gceemu.InstanceState{}
+}
+
+// gone reports whether a machine has been deleted.
+func (w *world) gone(name string) bool {
+	for _, in := range w.ours() {
+		if in.Name == name {
+			return false
+		}
+	}
+	return true
+}
+
 // saved are the saved disks and resume images there are, by name.
 func (w *world) saved() map[string]gceemu.ImageState {
 	out := map[string]gceemu.ImageState{}
@@ -393,50 +550,90 @@ func (w *world) push(subscription string, data []byte) int {
 
 func (w *world) done(j *ghemu.WorkflowJob) bool { return w.gh.Job(j.ID).Status == "completed" }
 
-func (w *world) noCredentials() {
+// runnerOf is the machine whose runner GitHub handed a job to, or "".
+func (w *world) runnerOf(j *ghemu.WorkflowJob) string {
+	if r := w.gh.Job(j.ID).Runner; r != nil {
+		return r.Name
+	}
+	return ""
+}
+
+// noCredentials checks that nothing the service logged, nor any machine's
+// console, holds a credential: a just-in-time configuration, something
+// like an identity token, an access token, or any of the secrets given.
+func (w *world) noCredentials(secrets ...string) {
 	w.t.Helper()
 	logs := w.logs.String()
+	w.mu.Lock()
+	for _, bt := range w.machines {
+		logs += bt.console.String()
+	}
+	w.mu.Unlock()
 	for _, in := range w.gce.Instances() {
 		if jit := in.Metadata[machines.MetaJITConfig]; jit != "" && strings.Contains(logs, jit) {
 			w.t.Fatal("a just-in-time configuration was logged")
 		}
 	}
-	if strings.Contains(logs, "eyJ") {
+	if strings.Contains(logs, "eyJ") || strings.Contains(logs, "ya29.") {
 		w.t.Fatal("something like a token was logged")
+	}
+	for _, s := range secrets {
+		if s != "" && strings.Contains(logs, s) {
+			w.t.Fatal("a token was logged")
+		}
 	}
 }
 
+// specs/0002-machines.md, A machine's life: a job runs on a machine of its
+// selector, its check binds its run, it asks for its work disk and its save
+// in its steps, and its supervisor's report starts the machine's cleanup,
+// which saves the disk and the boot log.
 func TestAJobRunsOnItsMachine(t *testing.T) {
 	w := newWorld(t)
 	run := w.gh.PushRun(w.repo, "main")
-	if scope := w.bind(run, ghemu.Job{}, binding.Request{}); scope != "main" {
-		t.Fatalf("scope %s", scope)
-	}
-	j := w.gh.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{diskSel},
-		Steps: `[ -d "$(dirname "$LSR_TEST_SAVE")/work" ] && ` + w.act.saveStep()})
+	// Nothing binds the run before its first job's check, and nothing is
+	// attached before the job asks.
+	j := w.gh.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{w.act.selector(small, false)},
+		Steps: w.act.steps(w.act.noDiskYetStep(), w.act.diskStep("build"), w.act.saveStep())})
 	w.pass()
 	ms := w.ours()
 	if len(ms) != 1 {
 		t.Fatalf("%d machines, want 1", len(ms))
 	}
 	m := ms[0]
+	if len(m.Disks) != 1 {
+		t.Fatalf("the machine was made with disks %v; a work disk comes only when its job asks", m.Disks)
+	}
 	w.eventually("the job is done", 60*time.Second, func() bool { return w.done(j) })
 	if got := w.gh.Job(j.ID); got.Conclusion != "success" {
-		t.Fatalf("job %s; the hook should have let it run, with /work", got.Conclusion)
+		t.Fatalf("job %s; its steps should have had their work disk and save:\n%s", got.Conclusion, w.console(m.Name))
 	}
-	// The report starts a pass at once, which deletes its record with the
-	// machine, so what it said is read from the service's log.
+	if s := w.scope(run); s != "main" {
+		t.Fatalf("the job's check bound the run %q, want main", s)
+	}
+	if got := w.diskAnswer(m.Name); got != "none" {
+		t.Fatalf("main's first work disk was restored from %q, want none", got)
+	}
+	var saves []stepAnswer
+	for _, a := range w.act.stepAnswers(w.console(m.Name)) {
+		if a.Path == "/v1/disks/save" {
+			saves = append(saves, a)
+		}
+	}
+	if len(saves) != 1 || saves[0].Code != http.StatusOK || saves[0].Body["saves"] != true {
+		t.Fatalf("save answers = %+v", saves)
+	}
+	// The report starts a pass at once, which deletes the machine and its
+	// records, so what the report did is read from the service's log.
 	w.eventually("the supervisor reports", 30*time.Second, func() bool {
-		return strings.Contains(w.logs.String(), `msg="machine reported" machine=`+m.Name+" save=true")
+		return strings.Contains(w.logs.String(), `msg="machine reported" machine=`+m.Name)
 	})
-	// The report starts a pass at once, which deletes the machine.
-	w.eventually("the reported machine is deleted", 30*time.Second, func() bool {
-		_, ok := w.gce.Instance(m.Zone, m.Name)
-		return !ok
-	})
-	sudo, _ := os.ReadFile(filepath.Join(w.guest(m.Name).dir, "sudo.log"))
-	if !strings.Contains(string(sudo), "mkfs.ext4") || !strings.Contains(string(sudo), "mount -o discard,noatime") {
-		t.Fatalf("the hook did %q", sudo)
+	w.eventually("the reported machine is deleted", 30*time.Second, func() bool { return w.gone(m.Name) })
+	// The base image's rule mounted the disk the job asked for, outside
+	// the job, and only once Compute Engine had attached it.
+	did, _ := os.ReadFile(filepath.Join(w.guest(m.Name).dir, "work-disk.log"))
+	if !strings.HasPrefix(string(did), "mounted ") || !strings.Contains(string(did), machines.WorkDisk(m.Name)) {
+		t.Fatalf("the work disk's rule did %q", did)
 	}
 	if n := len(w.gce.Disks()); n != 0 {
 		t.Fatalf("%d disks left", n)
@@ -444,113 +641,257 @@ func TestAJobRunsOnItsMachine(t *testing.T) {
 	if !strings.Contains(w.logs.String(), `msg="work disk saved" machine=`+m.Name) || len(w.saved()) != 1 {
 		t.Fatalf("the save the job asked for wasn't made: images %v", w.saved())
 	}
-	log, _, ok := w.gcs.Object("state", "logs/"+m.Name+"-"+m.Labels[machines.LabelCreated]+".txt")
-	if !ok || !strings.Contains(string(log), "the runner exited") || !strings.Contains(string(log), "Running job: build") {
+	// Its boot log is read from Cloud Logging once the machine has gone.
+	var log []byte
+	w.eventually("the boot log is saved", 30*time.Second, func() bool {
+		w.pass()
+		var ok bool
+		log, _, ok = w.gcs.Object("state", "logs/"+m.Name+"-"+m.Labels[machines.LabelCreated]+".txt")
+		return ok
+	})
+	if !strings.Contains(string(log), "the runner exited") || !strings.Contains(string(log), "Running job: build") {
 		t.Fatalf("boot log = %q", log)
 	}
 	w.noCredentials()
 }
 
-func TestAForksJobHandedToAMachine(t *testing.T) {
+// specs/0002-machines.md, Failing a job: a job the service can't serve is
+// stopped at its check, with the reason in its log, none of its steps run,
+// and its run is cancelled.
+func TestAJobFailedWithItsReason(t *testing.T) {
 	w := newWorld(t)
-	main := w.gh.PushRun(w.repo, "main")
-	w.bind(main, ghemu.Job{}, binding.Request{})
-	// A fork's pull request names main's selector, and a maintainer
-	// approved its run; its jobs are queued first, so GitHub hands one out
-	// first, to the machine made for main's job.
-	w.fork.Commit("evil", map[string]string{"x": "1"})
-	p := w.gh.PullRequest(w.repo, "main", w.fork, "evil", w.contributor)
-	forkRun := w.gh.PullRequestRun(p)
-	if scope := w.bind(forkRun, ghemu.Job{}, binding.Request{}); scope != "read" {
-		t.Fatalf("a fork's run bound %s", scope)
-	}
-	stray := w.gh.Queue(forkRun, ghemu.JobSpec{Name: "steal", Labels: []string{sel}, Steps: "touch /tmp/should-never-run-$$"})
-	second := w.gh.Queue(forkRun, ghemu.JobSpec{Name: "steal-too", Labels: []string{sel}})
-	meant := w.gh.Queue(main, ghemu.JobSpec{Name: "build", Labels: []string{sel}})
+	w.fork.Commit("feature", map[string]string{"src.go": "package app"})
+	p := w.gh.PullRequest(w.repo, "main", w.fork, "feature", w.contributor)
+	run := w.gh.PullRequestTargetRun(p)
+	// A contribution's run that no maintainer has approved may have only
+	// the smallest shape, standard; this job asks for Spot. It's given a
+	// machine like any queued job, and its check fails it.
+	j := w.gh.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{w.act.selector(small, true)},
+		Steps: `touch "$LSR_TEST_DIR/a-step-ran"`})
 	w.pass()
-	ms := w.ours()
-	if len(ms) != 1 {
-		t.Fatalf("%d machines; only main's job gets one", len(ms))
-	}
-	first := ms[0]
-	w.eventually("the refused machine stops", 60*time.Second, func() bool {
-		in, ok := w.gce.Instance(first.Zone, first.Name)
-		return ok && in.Status == "TERMINATED"
+	m := w.madeFor(j)
+	w.eventually("the hook prints why in the job's log", 60*time.Second, func() bool {
+		return strings.Contains(w.console(m.Name), "this job can't run: the contribution's run isn't approved")
 	})
-	adm, _, _ := w.gcs.Object("state", "machines/"+first.Name+"/admission.json")
-	if !strings.Contains(string(adm), `"allowed":false`) || !strings.Contains(string(adm), strconv.FormatInt(stray.ID, 10)) {
-		t.Fatalf("admission = %s", adm)
+	w.eventually("the failed job's machine stops", 60*time.Second, func() bool {
+		in, ok := w.gce.Instance(m.Zone, m.Name)
+		return !ok || in.Status == "TERMINATED"
+	})
+	// The service stops the machine before it records the refusal and
+	// cancels the run, so the record can come just after the stop.
+	w.eventually("the run is cancelled, saying why", 60*time.Second, func() bool {
+		rf, _, ok := w.gcs.Object("state", "refusals/5001/"+strconv.FormatInt(run.ID, 10)+"-1.json")
+		var rec machines.Refusal
+		return ok && json.Unmarshal(rf, &rec) == nil && strings.Contains(rec.Reason, "isn't approved") && !rec.CancelledAt.IsZero()
+	})
+	if c := w.gh.Job(j.ID).Conclusion; c == "success" {
+		t.Fatal("a failed job succeeded")
 	}
-	if in, _ := w.gce.Instance(first.Zone, first.Name); len(in.Disks) != 1 {
-		t.Fatalf("a refused job's machine has disks %v", in.Disks)
+	if _, err := os.Stat(filepath.Join(w.guest(m.Name).dir, "a-step-ran")); err == nil {
+		t.Fatal("a failed job's step ran")
 	}
-	if _, _, ok := w.gcs.Object("state", "machines/"+first.Name+"/report.json"); ok {
-		t.Fatal("a refused machine's supervisor reported")
-	}
-	w.eventually("the fork's run is cancelled", 30*time.Second, func() bool { return w.gh.Job(second.ID).Conclusion == "cancelled" })
-	// Until GitHub shows the run finished, no machine for its selector.
-	w.pass()
-	if n := len(w.ours()); n != 0 {
-		t.Fatalf("%d machines while the fork's run is unfinished", n)
-	}
-	// Its refused job's runner is gone, so it takes force; here, sooner
-	// than the service would.
-	repo, _ := w.client.RepositoryByID(context.Background(), w.repo.ID)
-	if err := w.client.ForceCancelRun(context.Background(), repo, forkRun.ID); err != nil {
-		t.Fatal(err)
-	}
-	w.pass()
-	w.pass()
-	w.eventually("main's job runs on a machine of its own", 60*time.Second, func() bool { return w.done(meant) })
-	if c := w.gh.Job(meant.ID).Conclusion; c != "success" {
-		t.Fatalf("main's job: %s", c)
+	if s := w.scope(run); s != "" {
+		t.Fatalf("an unapproved contribution's run was bound %q", s)
 	}
 	w.noCredentials()
 }
 
+// specs/0002-machines.md, A machine's life: machines are general, so a job
+// may take a machine made for another run's job, and is admitted, bound and
+// given its work disk for its own run.
+func TestAJobTakesAMachineMadeForAnotherRunsJob(t *testing.T) {
+	w := newWorld(t)
+	w.holdBoots()
+	main := w.gh.PushRun(w.repo, "main")
+	w.repo.Commit("feature", map[string]string{"f": "1"})
+	p := w.gh.PullRequest(w.repo, "main", w.repo, "feature", w.maintainer)
+	pr := w.gh.PullRequestRun(p)
+	steps := w.act.steps(w.act.diskStep("build"))
+	first := w.gh.Queue(main, ghemu.JobSpec{Name: "build", Labels: []string{small}, Steps: steps})
+	second := w.gh.Queue(pr, ghemu.JobSpec{Name: "build", Labels: []string{small}, Steps: steps})
+	w.pass()
+	forFirst, forSecond := w.madeFor(first).Name, w.madeFor(second).Name
+	// The machine made for the pull request's job boots first, and GitHub
+	// hands its runner the oldest queued job of its selector, main's.
+	w.release(forSecond)
+	w.eventually("main's job is on the pull request's job's machine", 60*time.Second, func() bool {
+		return w.runnerOf(first) == forSecond
+	})
+	w.release(forFirst)
+	w.eventually("both jobs are done", 60*time.Second, func() bool { return w.done(first) && w.done(second) })
+	for _, j := range []*ghemu.WorkflowJob{first, second} {
+		if c := w.gh.Job(j.ID).Conclusion; c != "success" {
+			t.Fatalf("job %d: %s", j.ID, c)
+		}
+	}
+	if w.runnerOf(second) != forFirst {
+		t.Fatalf("the pull request's job ran on %s, want %s", w.runnerOf(second), forFirst)
+	}
+	if s := w.scope(main); s != "main" {
+		t.Fatalf("main's run bound %q", s)
+	}
+	if s := w.scope(pr); s != "pr"+strconv.Itoa(p.Number) {
+		t.Fatalf("the pull request's run bound %q", s)
+	}
+	// Each job was admitted, and its work disk chosen, for its own run.
+	logs := w.logs.String()
+	for _, c := range []struct {
+		machine string
+		run     *ghemu.Run
+	}{{forSecond, main}, {forFirst, pr}} {
+		for _, msg := range []string{`msg="job admitted"`, `msg="work disk starts empty: no saved disk to restore"`} {
+			if !strings.Contains(logs, msg+" machine="+c.machine+" repository_id=5001 run_id="+strconv.FormatInt(c.run.ID, 10)) &&
+				!strings.Contains(logs, msg+" machine="+c.machine+" run_id="+strconv.FormatInt(c.run.ID, 10)) {
+				t.Fatalf("no %s for run %d on %s", msg, c.run.ID, c.machine)
+			}
+		}
+	}
+	w.noCredentials()
+}
+
+// specs/0002-machines.md, The job-started check: a fork's job that GitHub
+// hands to a machine made for another job is refused at its check, before
+// any step, the machine stops, and the fork's run is cancelled.
+func TestAForksJobHandedToAMachine(t *testing.T) {
+	w := newWorld(t)
+	w.holdBoots()
+	main := w.gh.PushRun(w.repo, "main")
+	sel := w.act.selector(small, false)
+	// A fork's pull request names the service's selector, and a maintainer
+	// approved its run; its jobs are queued first. GitHub won't cancel
+	// runs for now, so they stay queued after the pass that refuses the
+	// fork's run, and GitHub hands one of them to the machine made for
+	// main's job.
+	w.fork.Commit("evil", map[string]string{"x": "1"})
+	p := w.gh.PullRequest(w.repo, "main", w.fork, "evil", w.contributor)
+	forkRun := w.gh.PullRequestRun(p)
+	stray := w.gh.Queue(forkRun, ghemu.JobSpec{Name: "steal", Labels: []string{sel}, Steps: `touch "$LSR_TEST_DIR/a-fork-ran"`})
+	second := w.gh.Queue(forkRun, ghemu.JobSpec{Name: "steal-too", Labels: []string{sel}})
+	meant := w.gh.Queue(main, ghemu.JobSpec{Name: "build", Labels: []string{sel}})
+	w.gh.Faults().Add(fault.Rule{Method: http.MethodPost, Match: func(r *http.Request) bool {
+		return strings.HasSuffix(r.URL.Path, "/cancel") || strings.HasSuffix(r.URL.Path, "/force-cancel")
+	}, Respond: fault.Status(http.StatusBadGateway, nil, `{"message": "Bad Gateway"}`)})
+	w.pass()
+	ms := w.ours()
+	if len(ms) != 1 || ms[0].Labels[machines.LabelJob] != strconv.FormatInt(meant.ID, 10) {
+		t.Fatalf("machines %v; only main's job gets one", ms)
+	}
+	w.release(ms[0].Name)
+	w.eventually("a fork's job is on main's job's machine", 60*time.Second, func() bool {
+		return w.runnerOf(stray) == ms[0].Name || w.runnerOf(second) == ms[0].Name
+	})
+	w.eventually("the machine is stopped", 60*time.Second, func() bool {
+		in, ok := w.gce.Instance(ms[0].Zone, ms[0].Name)
+		return !ok || in.Status == "TERMINATED" || in.Status == "STOPPED"
+	})
+	if _, err := os.Stat(filepath.Join(w.guest(ms[0].Name).dir, "a-fork-ran")); err == nil {
+		t.Fatal("a fork's job's step ran")
+	}
+	if !strings.Contains(w.logs.String(), `msg="job refused" machine=`+ms[0].Name) {
+		t.Fatal("the fork's job wasn't refused at its check")
+	}
+	// Once GitHub cancels again, the fork's run is cancelled, and main's job
+	// runs on a machine of its own.
+	w.gh.Faults().Reset()
+	for _, n := range w.ours() {
+		w.release(n.Name)
+	}
+	w.pass()
+	if !strings.Contains(w.logs.String(), `msg="refused run cancelled" repository_id=5001 run_id=`+strconv.FormatInt(forkRun.ID, 10)) {
+		t.Fatal("the refused run wasn't cancelled once GitHub would")
+	}
+	// Its refused job's runner is gone, so it takes force; here, sooner
+	// than the service would.
+	repo, _ := w.client.RepositoryByID(context.Background(), w.repo.ID)
+	if st, _ := w.gh.RunState(forkRun); st != "completed" {
+		if err := w.client.ForceCancelRun(context.Background(), repo, forkRun.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, j := range []*ghemu.WorkflowJob{stray, second} {
+		if c := w.gh.Job(j.ID).Conclusion; c == "success" {
+			t.Fatalf("a fork's job %s", c)
+		}
+	}
+	if w.scope(forkRun) != "" {
+		t.Fatal("a fork's pull request's run was bound")
+	}
+	w.eventually("main's job runs on a machine of its own", 60*time.Second, func() bool {
+		w.pass()
+		for _, n := range w.ours() {
+			w.release(n.Name)
+		}
+		return w.done(meant)
+	})
+	if c := w.gh.Job(meant.ID).Conclusion; c != "success" {
+		t.Fatalf("main's job: %s", c)
+	}
+	if strings.Contains(w.logs.String(), `msg="job admitted"`+" machine="+ms[0].Name) {
+		t.Fatal("a fork's job was admitted")
+	}
+	w.noCredentials()
+}
+
+// specs/0002-machines.md, Binding a run: an approved contribution's run is
+// bound by its contribution job's check, and its next job works in its pull
+// request's scope.
 func TestAnApprovedContribution(t *testing.T) {
 	w := newWorld(t)
 	w.fork.Commit("feature", map[string]string{"src.go": "package app"})
 	p := w.gh.PullRequest(w.repo, "main", w.fork, "feature", w.contributor)
 	run := w.gh.PullRequestTargetRun(p)
-	ev := binding.Request{PullRequest: p.Number, HeadRepositoryID: run.EventPull.HeadRepositoryID, HeadSHA: run.EventPull.HeadSHA}
-	scope := w.bind(run, ghemu.Job{WorkflowRef: bootstrap}, ev)
-	if scope != "pr"+strconv.Itoa(p.Number) {
-		t.Fatalf("the contribution bound %s", scope)
-	}
-	j := w.gh.Queue(run, ghemu.JobSpec{Name: "test", Labels: []string{"lanescape-2vcpu-linux-amd64-" + scope},
+	// The contribution job names the environment, so GitHub holds it until
+	// a maintainer approves; its check binds the run.
+	j := w.gh.Queue(run, ghemu.JobSpec{Name: "contribution", Labels: []string{w.act.selector(small, false)},
 		Environment: machines.ContributionEnvironment})
 	w.pass()
 	if n := len(w.ours()); n != 0 {
 		t.Fatal("a machine for a contribution that's waiting for approval")
 	}
-	w.gh.Approve(run, machines.ContributionEnvironment, w.gh.User(42, "maintainer"))
+	w.gh.Approve(run, machines.ContributionEnvironment, w.maintainer)
 	w.pass()
-	w.eventually("the contribution's job runs", 60*time.Second, func() bool { return w.done(j) })
+	w.eventually("the contribution job runs", 60*time.Second, func() bool { return w.done(j) })
 	if c := w.gh.Job(j.ID).Conclusion; c != "success" {
-		t.Fatalf("contribution's job: %s", c)
+		t.Fatalf("the contribution job: %s", c)
 	}
+	if s := w.scope(run); s != "pr"+strconv.Itoa(p.Number) {
+		t.Fatalf("the approved contribution bound %q", s)
+	}
+	// Its next job asks for a work disk, in the pull request's scope.
+	next := w.gh.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{w.act.selector(small, false)},
+		Steps: w.act.steps(w.act.diskStep("build"), w.act.saveStep())})
+	w.pass()
+	w.eventually("the contribution's build runs", 60*time.Second, func() bool { return w.done(next) })
+	if c := w.gh.Job(next.ID).Conclusion; c != "success" {
+		t.Fatalf("the contribution's build: %s", c)
+	}
+	if got := w.diskAnswer(w.runnerOf(next)); got != "none" {
+		t.Fatalf("the contribution's disk was restored from %q, want none", got)
+	}
+	w.noCredentials()
 }
 
+// specs/0002-machines.md, A machine's life: the hook waits for the
+// service's answer, and its job's steps don't run until it has one.
 func TestTheHookWaitsForAnAnswer(t *testing.T) {
 	w := newWorld(t)
 	run := w.gh.PushRun(w.repo, "main")
-	w.bind(run, ghemu.Job{}, binding.Request{})
 	// GitHub can't say which job is on the runner for a while.
 	w.gh.ServerError("/repos/lanescape/app/actions/runs/", http.StatusBadGateway, 0)
-	j := w.gh.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{sel}})
+	j := w.gh.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{w.act.selector(small, false)}})
 	// The pass reads the queue before GitHub fails.
 	w.gh.Faults().Reset()
 	w.pass()
 	w.gh.ServerError("/repos/lanescape/app/actions/", http.StatusBadGateway, 0)
 	m := w.ours()[0]
-	w.eventually("the job is on the machine's runner", 30*time.Second, func() bool { return w.gh.Job(j.ID).Status == "in_progress" })
-	time.Sleep(3 * time.Second)
+	w.eventually("the hook is told to ask again", 60*time.Second, func() bool {
+		return strings.Contains(w.logs.String(), `msg="job-started check not answered" machine=`+m.Name)
+	})
 	if w.done(j) {
 		t.Fatal("the job ran with no answer from the service")
 	}
 	if in, _ := w.gce.Instance(m.Zone, m.Name); len(in.Disks) != 1 {
-		t.Fatal("a work disk with no answer")
+		t.Fatal("a disk attached with no answer")
 	}
 	w.gh.Faults().Reset()
 	w.eventually("the job runs once GitHub answers", 90*time.Second, func() bool { return w.done(j) })
@@ -573,43 +914,35 @@ func (w *world) restored(machine string) string {
 }
 
 // runJob queues a job, gives it a machine, and waits for it to finish
-// successfully, returning its machine's name.
+// successfully and its machine to go, returning the machine it ran on.
 func (w *world) runJob(run *ghemu.Run, spec ghemu.JobSpec) string {
 	w.t.Helper()
 	j := w.gh.Queue(run, spec)
 	w.pass()
-	var name string
-	for _, m := range w.ours() {
-		if m.Labels[machines.LabelJob] == strconv.FormatInt(j.ID, 10) {
-			name = m.Name
-		}
-	}
-	if name == "" {
-		w.t.Fatal("no machine for the job")
-	}
 	w.eventually("the job is done", 60*time.Second, func() bool { return w.done(j) })
+	name := w.runnerOf(j)
 	if c := w.gh.Job(j.ID).Conclusion; c != "success" {
-		w.t.Fatalf("job %s", c)
+		w.t.Fatalf("job %s:\n%s", c, w.console(name))
 	}
-	w.eventually("its machine is deleted", 60*time.Second, func() bool {
-		for _, m := range w.ours() {
-			if m.Name == name {
-				return false
-			}
-		}
-		return true
-	})
+	w.eventually("its machine is deleted", 60*time.Second, func() bool { return w.gone(name) })
 	return name
 }
 
+// specs/0003-disks.md, Saved disks: a pull request's run is bound from
+// GitHub's records, its job's work disk starts from main's saved disk, its
+// save is its own, and its next run starts from it, while main's goes on
+// from main's.
 func TestAPullRequestsRunThroughToItsSaves(t *testing.T) {
 	w := newWorld(t)
-	const key = "3f9c2e7a10b4d5e6f708"
-	shape := "lanescape-2vcpu-linux-amd64"
+	build := func(run *ghemu.Run) ghemu.JobSpec {
+		return ghemu.JobSpec{Name: "build", Labels: []string{w.act.selector(small, false)},
+			Steps: w.act.steps(w.act.diskStep("build"), w.act.saveStep())}
+	}
 	// Main saves first.
 	main := w.gh.PushRun(w.repo, "main")
-	scope := w.bind(main, ghemu.Job{}, binding.Request{})
-	w.runJob(main, ghemu.JobSpec{Name: "build", Labels: []string{w.act.selector(shape, false, "build", key, scope)}, Steps: w.act.saveStep()})
+	if got := w.diskAnswer(w.runJob(main, build(main))); got != "none" {
+		t.Fatalf("main's first disk was restored from %q", got)
+	}
 	mains := w.saved()
 	if len(mains) != 1 {
 		t.Fatalf("images %v, want main's", mains)
@@ -621,16 +954,14 @@ func TestAPullRequestsRunThroughToItsSaves(t *testing.T) {
 
 	// A pull request starts from main's, and saves its own.
 	w.repo.Commit("feature", map[string]string{"x": "1"})
-	p := w.gh.PullRequest(w.repo, "main", w.repo, "feature", w.gh.User(42, "maintainer"))
+	p := w.gh.PullRequest(w.repo, "main", w.repo, "feature", w.maintainer)
 	run := w.gh.PullRequestRun(p)
-	scope = w.bind(run, ghemu.Job{}, binding.Request{})
-	if scope != "pr"+strconv.Itoa(p.Number) {
-		t.Fatalf("the pull request's run bound %s", scope)
+	m := w.runJob(run, build(run))
+	if s := w.scope(run); s != "pr"+strconv.Itoa(p.Number) {
+		t.Fatalf("the pull request's run bound %s", s)
 	}
-	label := w.act.selector(shape, false, "build", key, scope)
-	m := w.runJob(run, ghemu.JobSpec{Name: "build", Labels: []string{label}, Steps: w.act.saveStep()})
-	if got := w.restored(m); got != mainImage {
-		t.Fatalf("the pull request's job restored %q, want main's %s", got, mainImage)
+	if got, img := w.diskAnswer(m), w.restored(m); got != "main_exact" || img != mainImage {
+		t.Fatalf("the pull request's job restored %q from %q, want main's %s", got, img, mainImage)
 	}
 	var prImage string
 	for n := range w.saved() {
@@ -644,36 +975,38 @@ func TestAPullRequestsRunThroughToItsSaves(t *testing.T) {
 
 	// Its next run starts from its own; main's next run from main's.
 	next := w.gh.PullRequestRun(p)
-	if s := w.bind(next, ghemu.Job{}, binding.Request{}); s != scope {
-		t.Fatalf("bound %s", s)
-	}
-	if got := w.restored(w.runJob(next, ghemu.JobSpec{Name: "build", Labels: []string{label}})); got != prImage {
-		t.Fatalf("the pull request's next run restored %q, want %s", got, prImage)
+	if m := w.runJob(next, build(next)); w.diskAnswer(m) != "pull_request_exact" || w.restored(m) != prImage {
+		t.Fatalf("the pull request's next run restored %q from %q, want %s", w.diskAnswer(m), w.restored(m), prImage)
 	}
 	again := w.gh.PushRun(w.repo, "main")
-	scope = w.bind(again, ghemu.Job{}, binding.Request{})
-	if got := w.restored(w.runJob(again, ghemu.JobSpec{Name: "build", Labels: []string{w.act.selector(shape, false, "build", key, scope)}})); got != mainImage {
-		t.Fatalf("main restored %q, want its own %s", got, mainImage)
+	if m := w.runJob(again, build(again)); w.diskAnswer(m) != "main_exact" || w.restored(m) != mainImage {
+		t.Fatalf("main restored %q from %q, want its own %s", w.diskAnswer(m), w.restored(m), mainImage)
 	}
 	w.noCredentials()
 }
 
+// specs/0002-machines.md, Preemption: a Spot machine preempted mid-job
+// leaves a resume image of its work disk, its run is rerun, and the rerun's
+// job's disk request is answered from the resume image.
 func TestASpotMachinePreemptedMidJobAndItsRunResumed(t *testing.T) {
 	w := newWorld(t)
 	run := w.gh.PushRun(w.repo, "main")
-	scope := w.bind(run, ghemu.Job{}, binding.Request{})
-	label := w.act.selector("lanescape-2vcpu-linux-amd64", true, "build", "0123456789abcdef0123", scope)
+	label := w.act.selector(small, true)
 	// The first attempt runs until it's preempted; its rerun finishes.
 	j := w.gh.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{label},
-		Steps: `if [ "$GITHUB_RUN_ATTEMPT" = 1 ]; then sleep 600; fi`})
+		Steps: w.act.steps(w.act.diskStep("build"), `if [ "$GITHUB_RUN_ATTEMPT" = 1 ]; then sleep 600; fi`)})
 	w.pass()
 	m := w.ours()[0]
 	if m.Provisioning != "SPOT" {
 		t.Fatalf("machine is %s", m.Provisioning)
 	}
 	w.eventually("the job runs with its work disk", 60*time.Second, func() bool {
-		in, _ := w.gce.Instance(m.Zone, m.Name)
-		return w.gh.Job(j.ID).Status == "in_progress" && in.Disks[machines.WorkDevice] != ""
+		bt := w.guest(m.Name)
+		if bt == nil {
+			return false
+		}
+		_, err := os.Stat(filepath.Join(bt.dir, "work", ".disk"))
+		return w.gh.Job(j.ID).Status == "in_progress" && err == nil
 	})
 	if err := w.gce.Preempt(m.Zone, m.Name); err != nil {
 		t.Fatal(err)
@@ -690,18 +1023,16 @@ func TestASpotMachinePreemptedMidJobAndItsRunResumed(t *testing.T) {
 	}
 	// GitHub fails the job whose runner it lost.
 	w.gh.CompleteJobByID(j.ID, "failure")
-	w.pass()
-	resume := disks.ResumeName(5001, m.ID)
-	if _, ok := w.saved()[resume]; !ok {
-		t.Fatalf("no resume image: %v", w.saved())
-	}
+	resume := disks.ResumeName(repoID, m.ID)
+	w.eventually("the run is rerun, with a resume image", 60*time.Second, func() bool {
+		w.pass()
+		_, ok := w.saved()[resume]
+		status, _ := w.gh.RunState(run)
+		return ok && status == "in_progress"
+	})
 	rec, _, ok := w.gcs.Object("state", "preemptions/5001/"+strconv.FormatInt(run.ID, 10)+"/"+strconv.FormatUint(m.ID, 10)+".json")
 	if !ok || !strings.Contains(string(rec), `"preempted":"yes"`) {
 		t.Fatalf("preemption record = %s", rec)
-	}
-	status, _ := w.gh.RunState(run)
-	if status != "in_progress" {
-		t.Fatal("the run wasn't rerun")
 	}
 	var rerun *ghemu.WorkflowJob
 	for _, j := range w.gh.RunJobs(run, 2) {
@@ -713,20 +1044,15 @@ func TestASpotMachinePreemptedMidJobAndItsRunResumed(t *testing.T) {
 		t.Fatal("no rerun job")
 	}
 	w.pass()
-	var second string
-	for _, in := range w.ours() {
-		if in.Labels[machines.LabelJob] == strconv.FormatInt(rerun.ID, 10) {
-			second = in.Name
-		}
-	}
 	w.eventually("the rerun's job is done", 60*time.Second, func() bool { return w.done(rerun) })
+	second := w.runnerOf(rerun)
 	if c := w.gh.Job(rerun.ID).Conclusion; c != "success" {
 		t.Fatalf("the rerun's job: %s", c)
 	}
-	if got := w.restored(second); got != resume {
-		t.Fatalf("the rerun's job started from %q, want its resume image %s", got, resume)
+	if got, img := w.diskAnswer(second), w.restored(second); got != "resume" || img != resume {
+		t.Fatalf("the rerun's job started from %q, %q, want its resume image %s", got, img, resume)
 	}
-	w.eventually("the resume image goes once its job has finished", 60*time.Second, func() bool {
+	w.eventually("the resume image goes once its job has started from it", 60*time.Second, func() bool {
 		w.pass()
 		_, ok := w.saved()[resume]
 		return !ok
@@ -734,23 +1060,16 @@ func TestASpotMachinePreemptedMidJobAndItsRunResumed(t *testing.T) {
 	w.noCredentials()
 }
 
-// An action binding a run while GitHub can't confirm it gets a retryable
-// answer, and binds once it can.
+// A run's first job's check, while GitHub can't confirm what its runner
+// said, answers the hook to ask again, and binds once GitHub can.
 func TestBindingWhileGitHubIsDown(t *testing.T) {
 	w := newWorld(t)
 	run := w.gh.PushRun(w.repo, "main")
-	tok := w.gh.ActionsToken(run, ghemu.Job{Audience: w.act.service}, nil)
-	w.gh.ServerError("/repos/lanescape/app/compare/", http.StatusBadGateway, 1)
-	if a := w.act.bind(tok, nil); a.Status != http.StatusServiceUnavailable {
-		t.Fatalf("bind with GitHub down: %d", a.Status)
-	}
-	if a := w.act.bind(tok, nil); a.Status != http.StatusOK || a.Scope != "main" {
-		t.Fatalf("bind once GitHub is back: %+v", a)
-	}
-	// A finished run isn't one the service binds.
-	done := w.gh.PushRun(w.repo, "main")
-	w.gh.SetRunStatus(done, "completed")
-	if a := w.act.bind(w.gh.ActionsToken(done, ghemu.Job{Audience: w.act.service}, nil), nil); a.Status != http.StatusForbidden {
-		t.Fatalf("bind of a finished run: %+v", a)
+	w.gh.ServerError("/repos/lanescape/app/compare/", http.StatusBadGateway, 2)
+	j := w.gh.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{w.act.selector(small, false)}})
+	w.pass()
+	w.eventually("the job runs once GitHub confirms its run", 90*time.Second, func() bool { return w.done(j) })
+	if c := w.gh.Job(j.ID).Conclusion; c != "success" || w.scope(run) != "main" {
+		t.Fatalf("job %s, scope %q", c, w.scope(run))
 	}
 }

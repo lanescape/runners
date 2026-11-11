@@ -1,8 +1,8 @@
 // Package auth authenticates the service's callers (specs/0001-architecture.md,
 // Endpoints): GitHub's webhook deliveries by their HMAC signature, Google's
-// signed calls from the scheduler and push subscriptions, GitHub Actions
-// jobs by their OIDC tokens, and the service's machines by their Compute
-// Engine identity tokens.
+// signed calls from the scheduler and push subscriptions, and the
+// service's machines by their Compute Engine identity tokens.
+// No endpoint takes a GitHub token.
 //
 // Errors say why a caller was refused, never with the token itself.
 package auth
@@ -86,8 +86,7 @@ type Issuer struct {
 
 // The production issuers.
 var (
-	GoogleIssuer  = Issuer{URL: "https://accounts.google.com", JWKSURL: "https://www.googleapis.com/oauth2/v3/certs"}
-	ActionsIssuer = Issuer{URL: "https://token.actions.githubusercontent.com", JWKSURL: "https://token.actions.githubusercontent.com/.well-known/jwks"}
+	GoogleIssuer = Issuer{URL: "https://accounts.google.com", JWKSURL: "https://www.googleapis.com/oauth2/v3/certs"}
 )
 
 // Options are what every verifier needs.
@@ -181,94 +180,6 @@ func (g *Google) Verify(ctx context.Context, raw string) (string, error) {
 		return "", fmt.Errorf("%w: email isn't an allowed account", ErrForbidden)
 	}
 	return c.Email, nil
-}
-
-// ActionsClaims are what the service uses of a GitHub Actions job's token.
-type ActionsClaims struct {
-	Repository        string
-	RepositoryID      int64
-	RepositoryOwnerID int64
-	RunID             int64
-	RunAttempt        int64
-	EventName         string
-	Ref               string
-	RefType           string
-	SHA               string
-	JobWorkflowRef    string
-}
-
-// Actions verifies GitHub Actions OIDC tokens for the service, from the
-// organization's repositories.
-type Actions struct {
-	v     *oidc.IDTokenVerifier
-	orgID int64
-}
-
-// NewActions returns a verifier of tokens from the organization's jobs.
-func NewActions(o Options, organizationID int64) (*Actions, error) {
-	if organizationID <= 0 {
-		return nil, errors.New("auth: organization ID required")
-	}
-	v, err := o.verifier()
-	if err != nil {
-		return nil, err
-	}
-	return &Actions{v: v, orgID: organizationID}, nil
-}
-
-// id reads one of GitHub's numeric claims, which it signs as decimal
-// strings.
-func id(name, s string) (int64, error) {
-	n, err := strconv.ParseInt(s, 10, 64)
-	if err != nil || n <= 0 || strconv.FormatInt(n, 10) != s {
-		return 0, fmt.Errorf("%w: %s isn't a numeric ID", ErrUnauthenticated, name)
-	}
-	return n, nil
-}
-
-// Verify checks a token: its signature against the issuer's published keys,
-// its issuer, audience and expiry, and that its repository's owner is the
-// organization, by ID.
-func (a *Actions) Verify(ctx context.Context, raw string) (*ActionsClaims, error) {
-	var c struct {
-		Repository        string `json:"repository"`
-		RepositoryID      string `json:"repository_id"`
-		RepositoryOwnerID string `json:"repository_owner_id"`
-		RunID             string `json:"run_id"`
-		RunAttempt        string `json:"run_attempt"`
-		EventName         string `json:"event_name"`
-		Ref               string `json:"ref"`
-		RefType           string `json:"ref_type"`
-		SHA               string `json:"sha"`
-		JobWorkflowRef    string `json:"job_workflow_ref"`
-	}
-	if err := verify(ctx, a.v, raw, &c); err != nil {
-		return nil, err
-	}
-	owner, err := id("repository_owner_id", c.RepositoryOwnerID)
-	if err != nil {
-		return nil, err
-	}
-	if owner != a.orgID {
-		return nil, fmt.Errorf("%w: repository_owner_id isn't the organization's", ErrForbidden)
-	}
-	out := &ActionsClaims{
-		Repository: c.Repository, RepositoryOwnerID: owner, EventName: c.EventName,
-		Ref: c.Ref, RefType: c.RefType, SHA: c.SHA, JobWorkflowRef: c.JobWorkflowRef,
-	}
-	if out.RepositoryID, err = id("repository_id", c.RepositoryID); err != nil {
-		return nil, err
-	}
-	if out.RunID, err = id("run_id", c.RunID); err != nil {
-		return nil, err
-	}
-	if out.RunAttempt, err = id("run_attempt", c.RunAttempt); err != nil {
-		return nil, err
-	}
-	if c.EventName == "" || c.Ref == "" || c.Repository == "" {
-		return nil, fmt.Errorf("%w: event_name, ref and repository are required", ErrUnauthenticated)
-	}
-	return out, nil
 }
 
 // MachineClaims identify a machine, from its Compute Engine identity token

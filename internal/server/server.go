@@ -11,10 +11,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"time"
 
 	"github.com/lanescape/runners/internal/auth"
-	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/pass"
 )
 
@@ -22,9 +20,10 @@ import (
 const (
 	WebhookPath     = "/v1/webhook"
 	ReconcilePath   = "/v1/reconcile"
-	BindPath        = "/v1/bind"
 	JobStartedPath  = "/v1/jobs/started"
 	JobFinishedPath = "/v1/jobs/finished"
+	DisksPath       = "/v1/disks"
+	SavePath        = "/v1/disks/save"
 )
 
 // Limits on what the service reads from callers.
@@ -33,8 +32,6 @@ const (
 	// tens of kilobytes; anything near this is not one of them.
 	DefaultWebhookLimit = 1 << 20
 	pushLimit           = 1 << 20
-	bindLimit           = 4 << 10
-	bindTimeout         = 30 * time.Second
 )
 
 // Delivery is a webhook delivery whose signature has been checked.
@@ -80,14 +77,16 @@ type Config struct {
 	// nothing is.
 	Events EventRecorder
 
-	Actions *auth.Actions
-	Binder  *binding.Binder
-
 	// JobStarted and JobFinished are the machines' endpoints, which check
 	// a Compute Engine identity token themselves; unset, they aren't
 	// served.
 	JobStarted  http.Handler
 	JobFinished http.Handler
+	// Disks and Save are a job's requests for its work disk and its save,
+	// which check a Compute Engine identity token themselves; unset, they
+	// aren't served.
+	Disks http.Handler
+	Save  http.Handler
 }
 
 type server struct {
@@ -98,7 +97,7 @@ type server struct {
 // New returns the service's handler.
 func New(c Config) (http.Handler, error) {
 	if c.OrganizationID <= 0 || len(c.WebhookSecret) == 0 || c.Publisher == nil ||
-		c.ReconcileCallers == nil || c.Passes == nil || c.Reconciler == nil || c.Actions == nil || c.Binder == nil {
+		c.ReconcileCallers == nil || c.Passes == nil || c.Reconciler == nil {
 		return nil, errors.New("server: incomplete configuration")
 	}
 	if c.WebhookLimit == 0 {
@@ -111,12 +110,17 @@ func New(c Config) (http.Handler, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+WebhookPath, s.webhook)
 	mux.HandleFunc("POST "+ReconcilePath, s.reconcile)
-	mux.HandleFunc("POST "+BindPath, s.bind)
 	if c.JobStarted != nil {
 		mux.Handle("POST "+JobStartedPath, c.JobStarted)
 	}
 	if c.JobFinished != nil {
 		mux.Handle("POST "+JobFinishedPath, c.JobFinished)
+	}
+	if c.Disks != nil {
+		mux.Handle("POST "+DisksPath, c.Disks)
+	}
+	if c.Save != nil {
+		mux.Handle("POST "+SavePath, c.Save)
 	}
 	return mux, nil
 }
@@ -132,7 +136,7 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 }
 
 // retryLater answers with a retryable error, which Pub/Sub redelivers with
-// backoff and the runners action tries again.
+// backoff.
 func retryLater(w http.ResponseWriter, msg string) {
 	w.Header().Set("Retry-After", "5")
 	writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": msg, "retryable": true})
@@ -252,11 +256,6 @@ func (s *server) reconcile(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// bind is POST /v1/bind, which answers exactly as specs/0005-interface.md
-// says: 200 with the run's scope; 403, with a reason, when the token or its
-// run isn't one the service binds, or the body isn't a binding request; or
-// 503 when GitHub or the bucket couldn't confirm an answer, which the caller
-// retries with backoff. The reason never holds the token.
 // push is a Pub/Sub push subscription's request body.
 type push struct {
 	Message *struct {
@@ -275,57 +274,4 @@ func pushData(body []byte) ([]byte, map[string]string, bool) {
 		return nil, nil, false
 	}
 	return p.Message.Data, p.Message.Attributes, true
-}
-
-func (s *server) bind(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), bindTimeout)
-	defer cancel()
-	refuse := func(reason string) {
-		s.log.Warn("run binding refused", "reason", reason)
-		writeJSON(w, http.StatusForbidden, map[string]any{"error": http.StatusText(http.StatusForbidden), "reason": reason})
-	}
-	tok, err := auth.Bearer(r)
-	var claims *auth.ActionsClaims
-	if err == nil {
-		claims, err = s.Actions.Verify(ctx, tok)
-	}
-	if errors.Is(err, auth.ErrUnavailable) {
-		s.log.Warn("run binding not made: GitHub's keys couldn't be read", "err", err.Error())
-		retryLater(w, "GitHub's keys couldn't be read; try again")
-		return
-	}
-	if err != nil {
-		refuse("the token isn't one the service binds: " + err.Error())
-		return
-	}
-	var req binding.Request
-	body, err := io.ReadAll(io.LimitReader(r.Body, bindLimit+1))
-	if err != nil || len(body) > bindLimit {
-		refuse("the body is unreadable or too large")
-		return
-	}
-	if trimmed := bytes.TrimSpace(body); len(trimmed) > 0 {
-		// A request is an object: not null, nor anything else.
-		if trimmed[0] != '{' {
-			refuse("the body isn't a binding request")
-			return
-		}
-		dec := json.NewDecoder(bytes.NewReader(body))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&req); err != nil || dec.Decode(&struct{}{}) != io.EOF {
-			refuse("the body isn't a binding request")
-			return
-		}
-	}
-	bd, err := s.Binder.Bind(ctx, claims, req)
-	switch {
-	case errors.Is(err, binding.ErrRefused):
-		s.log.Warn("run binding refused", "repository_id", claims.RepositoryID, "run_id", claims.RunID, "reason", err.Error())
-		writeJSON(w, http.StatusForbidden, map[string]any{"error": http.StatusText(http.StatusForbidden), "reason": err.Error()})
-	case err != nil:
-		s.log.Warn("run binding not made", "repository_id", claims.RepositoryID, "run_id", claims.RunID, "err", err.Error())
-		retryLater(w, "GitHub couldn't confirm the run; try again")
-	default:
-		writeJSON(w, http.StatusOK, map[string]string{"scope": bd.Scope.String()})
-	}
 }

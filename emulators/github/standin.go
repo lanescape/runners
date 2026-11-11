@@ -74,6 +74,7 @@ type standInJob struct {
 	Name  string            `json:"name"`
 	Env   map[string]string `json:"env"`
 	Steps string            `json:"steps"`
+	Event json.RawMessage   `json:"event"`
 }
 
 // Run registers, takes one job, runs it and reports it. It returns once the
@@ -177,6 +178,18 @@ func (s StandIn) Run(ctx context.Context) error {
 	if err := os.MkdirAll(work, 0o755); err != nil {
 		return err
 	}
+	// The runner writes the event's payload where GITHUB_EVENT_PATH says.
+	event := filepath.Join(s.Dir, "_temp", "_github_workflow", "event.json")
+	if err := os.MkdirAll(filepath.Dir(event), 0o755); err != nil {
+		return err
+	}
+	if len(job.Event) == 0 {
+		job.Event = []byte("{}")
+	}
+	if err := os.WriteFile(event, job.Event, 0o644); err != nil {
+		return err
+	}
+	env = append(env, "GITHUB_EVENT_PATH="+event)
 	runBash := func(args ...string) error {
 		cmd := exec.CommandContext(jctx, "bash", args...)
 		cmd.Env, cmd.Dir, cmd.Stdout, cmd.Stderr = env, work, s.Stdout, s.Stderr

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -47,7 +48,7 @@ func (l *lockedBuffer) String() string {
 type service struct {
 	mu      sync.Mutex
 	codes   []int
-	reports []map[string]bool
+	reports []string
 	tokens  []string
 }
 
@@ -58,9 +59,8 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	var body map[string]bool
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	s.reports = append(s.reports, body)
+	body, _ := io.ReadAll(r.Body)
+	s.reports = append(s.reports, string(body))
 	s.tokens = append(s.tokens, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
 	code := http.StatusNoContent
 	if len(s.codes) > 0 {
@@ -120,8 +120,7 @@ func setup(t *testing.T, jitConfig, steps string) *env {
 	cfg.RunnerDir = dir
 	cfg.RunnerUser = ""
 	cfg.Env = []string{"PATH=" + os.Getenv("PATH")}
-	cfg.Hook = "/usr/local/lib/lanescape-runners/job-started.sh"
-	cfg.SaveMarker = filepath.Join(dir, "save")
+	cfg.Hook = "/opt/lanescape-runners/job-started.sh"
 	cfg.PowerOff = []string{"curl", "-fsS", "-X", "POST", md + "/_emulator/poweroff"}
 	cfg.MetadataFor = duration(time.Second)
 	cfg.ReportFor = duration(10 * time.Second)
@@ -155,13 +154,12 @@ func (e *env) runnerEnv() map[string]string {
 	return out
 }
 
-func TestAJobThatAsksToSave(t *testing.T) {
+// The report says only that the job is done: an empty object, signed with
+// the machine's identity token. Whether the disk is saved is the job's to
+// ask from its steps (specs/0005-interface.md, Work disks).
+func TestAJobsReport(t *testing.T) {
 	t.Setenv("SUPERVISOR_SECRET", "not for the runner")
 	e := setup(t, jit, `echo '{"save": true}' > "$PWD/save"`)
-	// A stale request from before the job doesn't count; the job's does.
-	if err := os.WriteFile(e.cfg.SaveMarker, []byte(`{"save": true}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	e.supervise()
 	env := e.runnerEnv()
 	if env["ACTIONS_RUNNER_INPUT_JITCONFIG"] != jit || env["ACTIONS_RUNNER_HOOK_JOB_STARTED"] != e.cfg.Hook {
@@ -170,8 +168,8 @@ func TestAJobThatAsksToSave(t *testing.T) {
 	if _, ok := env["SUPERVISOR_SECRET"]; ok {
 		t.Fatal("the supervisor's own environment reached the runner")
 	}
-	if len(e.svc.reports) != 1 || !e.svc.reports[0]["save"] {
-		t.Fatalf("reports = %v", e.svc.reports)
+	if len(e.svc.reports) != 1 || e.svc.reports[0] != "{}" {
+		t.Fatalf("reports = %q, want one empty object", e.svc.reports)
 	}
 	if !e.poweredOff() {
 		t.Fatal("the machine wasn't powered off")
@@ -207,56 +205,14 @@ func (e *env) guest() (string, bool) {
 	return ga.VariableValue, true
 }
 
-func TestAJobThatDoesntAsk(t *testing.T) {
+func TestAFailedJobIsReported(t *testing.T) {
 	e := setup(t, jit, "exit 3")
 	e.supervise()
-	if len(e.svc.reports) != 1 || e.svc.reports[0]["save"] {
-		t.Fatalf("reports = %v", e.svc.reports)
+	if len(e.svc.reports) != 1 || e.svc.reports[0] != "{}" {
+		t.Fatalf("reports = %q", e.svc.reports)
 	}
 	if !e.poweredOff() {
 		t.Fatal("not powered off")
-	}
-}
-
-func TestOnlyARegularFileIsAMarker(t *testing.T) {
-	e := setup(t, jit, `echo '{"save": true}' > "$PWD/elsewhere"; ln -s "$PWD/elsewhere" "$PWD/save"`)
-	e.supervise()
-	if len(e.svc.reports) != 1 || e.svc.reports[0]["save"] {
-		t.Fatalf("reports = %v; a link isn't a request to save", e.svc.reports)
-	}
-}
-
-// specs/0005-interface.md: anything but {"save": true} in the file, or none
-// at all, asks for no save.
-func TestOnlyASaveRequestAsksToSave(t *testing.T) {
-	dir := t.TempDir()
-	for content, want := range map[string]bool{
-		`{"save": true}`:               true,
-		" {\"save\":true}\n":           true,
-		``:                             false,
-		`{"save": false}`:              false,
-		`{"save": "true"}`:             false,
-		`{"save": true, "x": 1}`:       false,
-		`{"SAVE": true}`:               false,
-		`{"Save": true}`:               false,
-		`{"save": true, "save": true}`: false,
-		`[{"save": true}]`:             false,
-		`{"save": true} {}`:            false,
-		`true`:                         false,
-		`{}`:                           false,
-		`save`:                         false,
-		`{"save": true}` + strings.Repeat(" ", 2000): false,
-	} {
-		path := filepath.Join(dir, "save")
-		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if got := asked(path); got != want {
-			t.Errorf("asked(%q) = %v, want %v", content, got, want)
-		}
-	}
-	if asked(filepath.Join(dir, "absent")) {
-		t.Error("no file asked to save")
 	}
 }
 
@@ -284,14 +240,20 @@ func TestNoRunnerConfiguration(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(e.dir, "env")); err == nil {
 		t.Fatal("a runner ran with no configuration")
 	}
-	if len(e.svc.reports) != 1 || e.svc.reports[0]["save"] || !e.poweredOff() {
-		t.Fatalf("reports = %v; want one, with no save, and the machine powered off", e.svc.reports)
+	if len(e.svc.reports) != 1 || e.svc.reports[0] != "{}" || !e.poweredOff() {
+		t.Fatalf("reports = %q; want one, and the machine powered off", e.svc.reports)
 	}
 }
 
 func TestSettings(t *testing.T) {
 	var c Config
-	if err := json.Unmarshal([]byte(`{"report_for": "90s", "runner": ["x"]}`), &c); err != nil || time.Duration(c.ReportFor) != 90*time.Second {
+	if err := json.Unmarshal([]byte(`{"report_for": "90s", "runner": ["x"]}`), &c); err != nil ||
+		time.Duration(c.ReportFor) != 90*time.Second || len(c.Runner) != 1 {
 		t.Fatalf("settings = %+v, %v", c, err)
+	}
+	// The hook the runner calls is the service's own, in its own
+	// directory (specs/0002-machines.md, A machine's life).
+	if d := Defaults(); !strings.HasPrefix(d.Hook, "/opt/lanescape-runners/") {
+		t.Fatalf("the base image's hook is %s", d.Hook)
 	}
 }

@@ -18,7 +18,6 @@ import (
 	"github.com/lanescape/runners/emulators/google"
 	gcsemu "github.com/lanescape/runners/emulators/storage"
 	"github.com/lanescape/runners/internal/auth"
-	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/disks"
 	"github.com/lanescape/runners/internal/lease"
 	"github.com/lanescape/runners/internal/pass"
@@ -116,17 +115,12 @@ func TestAClosingReachesTheRecorder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actions, err := auth.NewActions(auth.Options{Issuer: auth.Issuer{URL: gh.Actions.URL, JWKSURL: gh.Actions.JWKSURL}, Audience: audience}, orgID)
-	if err != nil {
-		t.Fatal(err)
-	}
 	clock := clockwork.NewRealClock()
 	secret := []byte("webhook secret")
 	h, err := server.New(server.Config{
 		OrganizationID: orgID, WebhookSecret: secret, Publisher: pub, ReconcileCallers: callers,
 		Passes:     &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock},
 		Reconciler: nothing{}, Events: &disks.Service{Config: cfg, Objects: objects, Clock: clock},
-		Actions: actions, Binder: &binding.Binder{Objects: objects, OrganizationID: orgID, Clock: clock},
 	})
 	if err != nil {
 		t.Fatal(err)

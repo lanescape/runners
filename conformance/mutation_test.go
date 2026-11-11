@@ -3,6 +3,7 @@ package conformance_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -88,141 +89,113 @@ func newDiverging(t *testing.T, m mutation) service.World {
 // the suite's cases pass against the emulator, and each of these changes to
 // its answers makes at least one fail.
 func TestADivergenceFailsTheSuite(t *testing.T) {
-	mutations := map[string]mutation{
-		"a pull request's run bound read": func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
-			if s, _ := b["scope"].(string); strings.HasPrefix(s, "pr") {
-				b["scope"] = "read"
+	mutations := map[string]func() mutation{
+		"a work disk in another scope's restore chain": func() mutation {
+			return func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
+				if p == "/v1/disks" && b["restored"] == "none" {
+					b["restored"] = "main_exact"
+				}
+				return c, b
 			}
-			return c, b
 		},
-		"a long-lived branch's push bound main": func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
-			if b["scope"] == "branch-v1" {
-				b["scope"] = "main"
+		"a work disk from a pull request's own disk answered as main's": func() mutation {
+			return func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
+				if p == "/v1/disks" && b["restored"] == "pull_request_exact" {
+					b["restored"] = "main_exact"
+				}
+				return c, b
 			}
-			return c, b
 		},
-		"a read run bound main": func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
-			if b["scope"] == "read" {
-				b["scope"] = "main"
+		"a work disk from another step of the restore order": func() mutation {
+			return func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
+				if p == "/v1/disks" && b["restored"] == "main_exact" {
+					b["restored"] = "main_newest"
+				}
+				return c, b
 			}
-			return c, b
 		},
-		"a refusal answered as retryable": func(p string, c int, b map[string]any, h http.Header) (int, map[string]any) {
-			if c == http.StatusForbidden {
-				h.Set("Retry-After", "5")
-				return http.StatusServiceUnavailable, map[string]any{"retryable": true}
+		"a work disk refused answered": func() mutation {
+			return func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
+				if p == "/v1/disks" && c == http.StatusForbidden {
+					return http.StatusOK, map[string]any{"state": "ready", "restored": "none"}
+				}
+				return c, b
 			}
-			return c, b
 		},
-		"a 503 without a Retry-After": func(p string, c int, b map[string]any, h http.Header) (int, map[string]any) {
-			h.Del("Retry-After")
-			return c, b
+		"a disk being made answered ready": func() mutation {
+			return func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
+				if p == "/v1/disks" && b["state"] == "making" {
+					b["state"] = "ready"
+				}
+				return c, b
+			}
+		},
+		"a save in a scope that saves nothing answered as saving": func() mutation {
+			return func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
+				if p == "/v1/disks/save" && b["saves"] == false {
+					return c, map[string]any{"saves": true}
+				}
+				return c, b
+			}
+		},
+		"a save without a work disk answered": func() mutation {
+			return func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
+				if p == "/v1/disks/save" && c == http.StatusForbidden {
+					return http.StatusOK, map[string]any{"saves": true}
+				}
+				return c, b
+			}
+		},
+		"an answer with a field the interface doesn't give": func() mutation {
+			return func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
+				if c == http.StatusOK {
+					b["scope"] = "main"
+				}
+				return c, b
+			}
+		},
+		"a refusal answered as retryable": func() mutation {
+			return func(p string, c int, b map[string]any, h http.Header) (int, map[string]any) {
+				if c == http.StatusForbidden {
+					h.Set("Retry-After", "5")
+					return http.StatusServiceUnavailable, map[string]any{"retryable": true}
+				}
+				return c, b
+			}
+		},
+		"a refusal without its reason": func() mutation {
+			return func(p string, c int, b map[string]any, h http.Header) (int, map[string]any) {
+				if c == http.StatusForbidden {
+					delete(b, "reason")
+				}
+				return c, b
+			}
+		},
+		"a 503 without a Retry-After": func() mutation {
+			return func(p string, c int, b map[string]any, h http.Header) (int, map[string]any) {
+				h.Del("Retry-After")
+				return c, b
+			}
 		},
 	}
 	for name, m := range mutations {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			var failed []string
-			for _, c := range conformance.Cases() {
-				r := &recorder{}
-				done := make(chan struct{})
-				go func() {
-					defer close(done)
-					c.Run(r, newDiverging(t, m))
-				}()
-				<-done
-				if r.failed {
-					failed = append(failed, c.Name)
-				}
-			}
-			if len(failed) == 0 {
-				t.Fatal("the suite passed against a diverging emulator")
-			}
-			t.Logf("failed %d cases: %s", len(failed), strings.Join(failed, "; "))
+			failsSomeCase(t, func(t *testing.T) service.World { return newDiverging(t, m()) })
 		})
 	}
 }
 
-// heads is the emulator behind a proxy that binds a bootstrap's run read
-// unless its event's head commit is its pull request's head now, as the
-// emulator once did, where specs/0002-machines.md asks only that it be one
-// of the pull request's commits.
-type heads struct {
-	service.World
-	url   string
-	mu    sync.Mutex
-	heads map[int]string
-}
-
-func (h *heads) URL() string { return h.url }
-
-func (h *heads) record(pr service.PullRequest) service.PullRequest {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.heads[pr.Number] = pr.HeadSHA
-	return pr
-}
-
-func (h *heads) PullRequest(r service.Repository, base, head string) service.PullRequest {
-	return h.record(h.World.PullRequest(r, base, head))
-}
-
-func (h *heads) ForkPullRequest(r service.Repository, base string) service.PullRequest {
-	return h.record(h.World.ForkPullRequest(r, base))
-}
-
-func (h *heads) PushPullRequest(pr service.PullRequest) service.PullRequest {
-	return h.record(h.World.PushPullRequest(pr))
-}
-
-func newHeads(t *testing.T) service.World {
-	e := service.New()
-	t.Cleanup(e.Close)
-	h := &heads{World: e, heads: map[int]string{}}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		req, _ := http.NewRequestWithContext(r.Context(), r.Method, e.URL()+r.URL.RequestURI(), bytes.NewReader(body))
-		req.Header = r.Header.Clone()
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		defer resp.Body.Close()
-		raw, _ := io.ReadAll(resp.Body)
-		var ev conformance.PullRequestEvent
-		var answer map[string]any
-		if r.URL.Path == "/v1/bind" && json.Unmarshal(body, &ev) == nil && ev.HeadSHA != "" && json.Unmarshal(raw, &answer) == nil {
-			h.mu.Lock()
-			now := h.heads[ev.PullRequest]
-			h.mu.Unlock()
-			if s, _ := answer["scope"].(string); strings.HasPrefix(s, "pr") && now != ev.HeadSHA {
-				answer["scope"] = "read"
-				raw, _ = json.Marshal(answer)
-			}
-		}
-		for k, vs := range resp.Header {
-			w.Header()[k] = vs
-		}
-		w.Header().Set("Content-Length", strconv.Itoa(len(raw)))
-		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(raw)
-	}))
-	t.Cleanup(srv.Close)
-	h.url = srv.URL
-	return h
-}
-
-// The suite fails an emulator that binds a bootstrap's run only for its
-// pull request's head now.
-func TestABootstrapHeldToItsPullRequestsHeadFailsTheSuite(t *testing.T) {
+// failsSomeCase checks that at least one of the suite's cases fails against
+// the worlds newWorld makes.
+func failsSomeCase(t *testing.T, newWorld func(t *testing.T) service.World) {
 	var failed []string
 	for _, c := range conformance.Cases() {
 		r := &recorder{}
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			c.Run(r, newHeads(t))
+			c.Run(r, newWorld(t))
 		}()
 		<-done
 		if r.failed {
@@ -230,7 +203,99 @@ func TestABootstrapHeldToItsPullRequestsHeadFailsTheSuite(t *testing.T) {
 		}
 	}
 	if len(failed) == 0 {
-		t.Fatal("the suite passed against an emulator that binds read for a pull request pushed to after its approval")
+		t.Fatal("the suite passed against a diverging emulator")
 	}
 	t.Logf("failed %d cases: %s", len(failed), strings.Join(failed, "; "))
+}
+
+// binds is the emulator with its bindings changed in one way, as a
+// divergence of its binding rules would.
+type binds struct {
+	service.World
+	change func(scope string) string
+}
+
+func (b binds) Binding(r service.Run) (string, bool) {
+	s, ok := b.World.Binding(r)
+	if ok {
+		s = b.change(s)
+	}
+	return s, ok
+}
+
+// forks is the emulator giving a fork's pull_request run a machine.
+type forks struct{ service.World }
+
+func (f forks) StartJob(r service.Run, selector string) (service.Job, error) {
+	j, err := f.World.StartJob(r, selector)
+	var refused *service.Refused
+	if r.Event == "pull_request" && errors.As(err, &refused) {
+		return service.Job{Run: r}, nil
+	}
+	return j, err
+}
+
+// failing is the emulator giving a job it should fail a machine.
+type failing struct{ service.World }
+
+func (f failing) StartJob(r service.Run, selector string) (service.Job, error) {
+	j, err := f.World.StartJob(r, selector)
+	var refused *service.Refused
+	if errors.As(err, &refused) && !strings.Contains(refused.Reason, "fork") {
+		return service.Job{Run: r}, nil
+	}
+	return j, err
+}
+
+// unsaved is the emulator never saving a finished job's work disk.
+type unsaved struct{ service.World }
+
+func (u unsaved) FinishJob(j service.Job, conclusion string) { u.World.FinishJob(j, "failure") }
+
+// Every deliberate divergence of the binding rules, or of what a job's end
+// saves, fails the suite.
+func TestABindingDivergenceFailsTheSuite(t *testing.T) {
+	for name, change := range map[string]func(string) string{
+		"a pull request's run bound read": func(s string) string {
+			if strings.HasPrefix(s, "pr") {
+				return "read"
+			}
+			return s
+		},
+		"a long-lived branch's push bound main": func(s string) string {
+			if s == "branch-v1" {
+				return "main"
+			}
+			return s
+		},
+		"a read run bound main": func(s string) string {
+			if s == "read" {
+				return "main"
+			}
+			return s
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			failsSomeCase(t, func(t *testing.T) service.World {
+				e := service.New()
+				t.Cleanup(e.Close)
+				return binds{World: e, change: change}
+			})
+		})
+	}
+	for name, wrap := range map[string]func(service.World) service.World{
+		"a fork's pull request's job given a machine": func(w service.World) service.World { return forks{w} },
+		"a job the service fails given a machine":     func(w service.World) service.World { return failing{w} },
+		"a finished job's work disk never saved":      func(w service.World) service.World { return unsaved{w} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			failsSomeCase(t, func(t *testing.T) service.World {
+				e := service.New()
+				t.Cleanup(e.Close)
+				return wrap(e)
+			})
+		})
+	}
 }

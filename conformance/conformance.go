@@ -1,21 +1,24 @@
 // Package conformance is the interface's test suite (specs/0005-interface.md):
 // one set of cases that this repository runs, in CI, against both its
 // service emulator, emulators/service, and the real service wired to its
-// emulators of GitHub, Google's issuers, Pub/Sub and Cloud Storage. The two
-// must answer every case alike, so a consumer that tests against the
-// emulator, at a pinned version of this module, tests against what the
-// service does. It's public so that consumers can read what the emulator is
-// held to.
+// emulators of GitHub, Compute Engine, Google's issuers, Pub/Sub and Cloud
+// Storage. The two must answer every case alike, so a
+// consumer that tests against the emulator, at a pinned version of this
+// module, tests against what the service does. It's public so that
+// consumers can read what the emulator is held to.
 package conformance
 
 import (
-	"fmt"
+	"errors"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lanescape/runners/emulators/service"
+	"github.com/lanescape/runners/internal/consumer"
 )
 
 // Case is one case of the suite.
@@ -24,7 +27,6 @@ type Case struct {
 	Run  func(t T, w service.World)
 }
 
-// one is a case.
 func one(name string, run func(t T, w *world)) []Case {
 	return []Case{{Name: name, Run: func(t T, sw service.World) { run(t, with(t, sw)) }}}
 }
@@ -43,13 +45,38 @@ func Run(t *testing.T, newWorld func(t *testing.T) service.World) {
 func Cases() []Case {
 	return slices.Concat(
 		one("scopes", scopes),
-		one("a run is bound once", boundOnce),
-		one("bind's refusals and retries", bindErrors),
-		one("forks and contributions", contributions),
+		one("a run is bound once, and kept by a maintainer's rerun", boundOnce),
+		one("a tag named like a branch", tagLikeABranch),
+		one("selectors name only a shape", selectors),
+		one("forks and approved contributions", contributions),
 		one("a contribution pushed to after its approval", pushedContribution),
-		one("a pull request's binding and its commits", pullCommits),
-		one("a contribution's token can't widen its scope", noWidening),
+		one("a contribution bound to its own pull request only", ownPullRequest),
+		one("a run not approved left unbound and refused disks and saves", unapproved),
+		one("a job on a machine made for another run's job", anotherRunsMachine),
+		one("disk requests from a run's own machine only", diskRequests),
+		one("work disks kept to their repository", ownRepository),
+		one("a work disk in the run's own scope from each step of the restore order", restoreOrder),
+		one("one work disk per job", oneWorkDisk),
+		one("saves asked for", saves),
+		one("refusals and retries", refusals),
 	)
+}
+
+// The shapes the suite's jobs name.
+const (
+	// Small is the smallest shape, which most of the suite's jobs name.
+	Small = "lanescape-2vcpu-linux-amd64"
+	// Arm is a shape of the other architecture.
+	Arm = "lanescape-16vcpu-linux-arm64"
+)
+
+// Files are a consumer's files, which the suite's cases commit: a
+// long-lived branch, support/v1, and two families of work disks, build,
+// keyed by deps.txt, and cache, with one key.
+var Files = map[string]string{
+	consumer.RunnersFile: `{"branches": {"support/v1": "v1"},
+ "disks": {"build": {"from": ["deps.txt"]}, "cache": {}}}`,
+	"deps.txt": "1\n",
 }
 
 // world is a case's world, with a client for its service.
@@ -63,319 +90,445 @@ func with(t T, w service.World) *world {
 	return &world{World: w, t: t, c: &Client{T: t, URL: w.URL()}}
 }
 
-// bound binds a run with a new job, as the runners action does, and checks
-// the scope.
+// consumer is a repository with the suite's files on its default branch.
+func (w *world) consumer(name string) service.Repository {
+	repo := w.Repository(name)
+	w.Commit(repo, "main", Files)
+	return repo
+}
+
+// start starts a job that must get a machine.
+func (w *world) start(run service.Run, selector string) service.Job {
+	w.t.Helper()
+	j, err := w.StartJob(run, selector)
+	if err != nil {
+		w.t.Fatalf("a job of run %d (%s) naming %s: %v", run.ID, run.Event, selector, err)
+	}
+	return j
+}
+
+// refused starts a job that the service must refuse, saying why.
+func (w *world) refused(run service.Run, selector string) string {
+	w.t.Helper()
+	_, err := w.StartJob(run, selector)
+	var r *service.Refused
+	if !errors.As(err, &r) || r.Reason == "" {
+		w.t.Fatalf("a job of run %d (%s) naming %s: %v; want a refusal with a reason", run.ID, run.Event, selector, err)
+	}
+	return r.Reason
+}
+
+// bound checks a run's binding.
 func (w *world) bound(run service.Run, want string) {
 	w.t.Helper()
-	j := w.StartJob(run, "")
-	if a := w.c.Bind(w.Token(j, nil), nil); a.Status != http.StatusOK || a.Scope() != want {
-		w.t.Fatalf("bound %d %q (%s), want %s", a.Status, a.Scope(), a.Reason, want)
+	got, ok := w.Binding(run)
+	if want == "" {
+		if ok {
+			w.t.Fatalf("run %d (%s) is bound %s; want it unbound", run.ID, run.Event, got)
+		}
+		return
+	}
+	if !ok || got != want {
+		w.t.Fatalf("run %d (%s) is bound %q (%v); want %s", run.ID, run.Event, got, ok, want)
 	}
 }
 
-// bootstrap binds a pull_request_target run with a job of its bootstrap,
-// which sends what ev says, and checks the scope.
-func (w *world) bootstrap(repo service.Repository, run service.Run, ev *PullRequestEvent, want string) {
+// status checks a request's status.
+func (w *world) status(what string, a Answer, want int) {
 	w.t.Helper()
-	j := w.StartJob(run, w.Bootstrap(repo))
-	if a := w.c.Bind(w.Token(j, nil), ev); a.Status != http.StatusOK || a.Scope() != want {
-		w.t.Fatalf("the bootstrap bound %d %q (%s), want %s", a.Status, a.Scope(), a.Reason, want)
+	if a.Status != want {
+		w.t.Fatalf("%s answered %d %q; want %d", what, a.Status, a.Reason, want)
 	}
 }
 
-// eventOf is what a bootstrap sends of a pull request from its event.
-func eventOf(pr service.PullRequest) *PullRequestEvent {
-	return &PullRequestEvent{PullRequest: pr.Number, HeadRepositoryID: pr.HeadRepositoryID, HeadSHA: pr.HeadSHA}
+// disk asks for a job's work disk of a family, again while it's being
+// made, as the disk action does, until it's ready, and returns where it
+// came from.
+func (w *world) disk(j service.Job, family string) string {
+	w.t.Helper()
+	restored := ""
+	for end := time.Now().Add(30 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		a, d := w.c.Disk(w.Token(j), family)
+		w.status("job "+strconv.FormatInt(j.ID, 10)+"'s work disk of "+family, a, http.StatusOK)
+		if restored != "" && d.Restored != restored {
+			w.t.Fatalf("job %d's work disk came from %s, then %s", j.ID, restored, d.Restored)
+		}
+		restored = d.Restored
+		if d.State == "ready" {
+			return restored
+		}
+		if time.Now().After(end) {
+			w.t.Fatalf("job %d's work disk of %s was never ready", j.ID, family)
+		}
+	}
+}
+
+// restored checks where a job's work disk of a family came from.
+func (w *world) restored(j service.Job, family, want string) {
+	w.t.Helper()
+	if got := w.disk(j, family); got != want {
+		w.t.Fatalf("job %d (run %d, %s) has a work disk of %s from %s; want %s", j.ID, j.Run.ID, j.Run.Event, family, got, want)
+	}
+}
+
+// save asks for a job's work disk to be saved, which must be answered.
+func (w *world) save(j service.Job, saves bool) {
+	w.t.Helper()
+	a, s := w.c.Save(w.Token(j))
+	w.status("job "+strconv.FormatInt(j.ID, 10)+"'s save", a, http.StatusOK)
+	if s.Saves != saves {
+		w.t.Fatalf("job %d (run %d, %s) asked to save: %+v; want saves %v", j.ID, j.Run.ID, j.Run.Event, s, saves)
+	}
 }
 
 func scopes(t T, w *world) {
 	repo := w.Repository("app")
-	w.SetRunners(repo, fmt.Sprintf(`{"bootstrap": %q, "branches": {"support/v1": "v1"}}`, w.Bootstrap(repo)))
-	w.Branch(repo, "support/v1")
-	w.Branch(repo, "feature")
-	w.bound(w.Push(repo, "main"), "main")
-	w.bound(w.Push(repo, "support/v1"), "branch-v1")
-	// A listed branch that's gone binds nothing of its own.
-	w.Branch(repo, "support/v2")
-	w.SetRunners(repo, fmt.Sprintf(`{"bootstrap": %q, "branches": {"support/v1": "v1", "support/v2": "v2"}}`, w.Bootstrap(repo)))
-	gone := w.Push(repo, "support/v2")
-	w.DeleteBranch(repo, "support/v2")
-	w.bound(gone, "read")
-	// Nor does one made again from the default branch, for a commit of
-	// the branch that went.
-	old := w.Push(repo, "support/v1")
-	w.DeleteBranch(repo, "support/v1")
-	w.Branch(repo, "support/v1")
-	w.bound(old, "read")
-	w.bound(w.Push(repo, "support/v1"), "branch-v1")
-	w.bound(w.Push(repo, "feature"), "read")
-	w.bound(w.Tag(repo, "v1"), "read")
-	w.bound(w.Event(repo, "workflow_dispatch", "main"), "read")
-	pr := w.PullRequest(repo, "main", "fix")
-	w.bound(w.PullRequestRun(pr), fmt.Sprintf("pr%d", pr.Number))
-	into := w.PullRequest(repo, "support/v1", "backport")
-	w.bound(w.PullRequestRun(into), fmt.Sprintf("pr%d", into.Number))
-	fork := w.ForkPullRequest(repo, "main")
-	w.bound(w.PullRequestRun(fork), "read")
+	w.Commit(repo, "main", map[string]string{consumer.RunnersFile: `{"branches": {"support/v1": "v1"}}`})
+	main := w.Push(repo, "main")
+	w.start(main, Small)
+	w.bound(main, "main")
 
-	// A pull_request_target run is a pull request's only from its
-	// bootstrap, with what its event says.
-	run := w.PullRequestTargetRun(fork)
-	j := w.StartJob(run, w.Bootstrap(repo))
-	ev := &PullRequestEvent{PullRequest: fork.Number, HeadRepositoryID: fork.HeadRepositoryID, HeadSHA: fork.HeadSHA}
-	if a := w.c.Bind(w.Token(j, nil), ev); a.Status != http.StatusOK || a.Scope() != fmt.Sprintf("pr%d", fork.Number) {
-		t.Fatalf("the bootstrap bound %d %q (%s)", a.Status, a.Scope(), a.Reason)
-	}
-	other := w.PullRequestTargetRun(fork)
-	j = w.StartJob(other, w.Bootstrap(repo))
-	bad := *ev
-	bad.HeadSHA = strings.Repeat("a", 40)
-	if a := w.c.Bind(w.Token(j, nil), &bad); a.Status != http.StatusOK || a.Scope() != "read" {
-		t.Fatalf("a bootstrap naming another head commit bound %d %q", a.Status, a.Scope())
-	}
-	// A push to main signed as another event binds read.
-	run = w.Push(repo, "main")
-	j = w.StartJob(run, "")
-	if a := w.c.Bind(w.Token(j, map[string]any{"event_name": "workflow_dispatch"}), nil); a.Status != http.StatusOK || a.Scope() != "read" {
-		t.Fatalf("a token whose event isn't the run's bound %d %q", a.Status, a.Scope())
-	}
-	if s, ok := w.Binding(run); !ok || s != "read" {
-		t.Fatalf("the binding the service keeps is %q, %v", s, ok)
-	}
+	w.Branch(repo, "support/v1")
+	branch := w.Push(repo, "support/v1")
+	w.start(branch, Small)
+	w.bound(branch, "branch-v1")
+
+	w.Branch(repo, "feature")
+	other := w.Push(repo, "feature")
+	w.start(other, Small)
+	w.bound(other, "read")
+
+	dispatch := w.Event(repo, "workflow_dispatch", "main")
+	w.start(dispatch, Small)
+	w.bound(dispatch, "read")
+
+	pr := w.PullRequest(repo, "main", "fix")
+	run := w.PullRequestRun(pr)
+	w.start(run, Small)
+	w.bound(run, "pr"+strconv.Itoa(pr.Number))
+
+	// A pull request into a listed branch.
+	into := w.PullRequest(repo, "support/v1", "backport")
+	intoRun := w.PullRequestRun(into)
+	w.start(intoRun, Small)
+	w.bound(intoRun, "pr"+strconv.Itoa(into.Number))
+
+	// A head that's the head of two open pull requests binds read, and its
+	// run's jobs are failed, saying why.
+	w.PullRequest(repo, "main", "twice")
+	again := w.PullRequest(repo, "support/v1", "twice")
+	twice := w.PullRequestRun(again)
+	w.refused(twice, Small)
+	w.bound(twice, "read")
+
+	fork := w.ForkPullRequest(repo, "main")
+	forkRun := w.PullRequestRun(fork)
+	w.refused(forkRun, Small)
+	w.bound(forkRun, "")
 }
 
 func boundOnce(t T, w *world) {
 	repo := w.Repository("app")
-	w.SetRunners(repo, fmt.Sprintf(`{"bootstrap": %q}`, w.Bootstrap(repo)))
 	run := w.Push(repo, "main")
+	j := w.start(run, Small)
 	w.bound(run, "main")
-	// Every later call, from any of the run's jobs, gets the same.
-	j := w.StartJob(run, "")
-	if a := w.c.Bind(w.Token(j, map[string]any{"ref": "refs/heads/feature"}), nil); a.Scope() != "main" {
-		t.Fatalf("a later call got %q", a.Scope())
+	w.FinishJob(j, "failure")
+	run = w.Rerun(run)
+	if run.Attempt != 2 {
+		t.Fatalf("a rerun's attempt is %d", run.Attempt)
 	}
-	// A contribution's run whose first call isn't its bootstrap's is read
-	// for good: the bootstrap's later call gets read too.
-	fork := w.ForkPullRequest(repo, "main")
-	prt := w.PullRequestTargetRun(fork)
-	w.bound(prt, "read")
-	j = w.StartJob(prt, w.Bootstrap(repo))
-	ev := &PullRequestEvent{PullRequest: fork.Number, HeadRepositoryID: fork.HeadRepositoryID, HeadSHA: fork.HeadSHA}
-	if a := w.c.Bind(w.Token(j, nil), ev); a.Status != http.StatusOK || a.Scope() != "read" {
-		t.Fatalf("a bootstrap after another call bound %d %q", a.Status, a.Scope())
-	}
-	// A maintainer's rerun of a finished run keeps its binding: GitHub
-	// shows the run in progress again, and its new attempt's jobs get the
-	// same.
-	done := w.Push(repo, "main")
-	j = w.StartJob(done, "")
-	if a := w.c.Bind(w.Token(j, nil), nil); a.Scope() != "main" {
-		t.Fatalf("bound %q (%s)", a.Scope(), a.Reason)
-	}
-	w.FinishJob(j, "success")
-	again := w.Rerun(done)
-	if again.Attempt != 2 {
-		t.Fatalf("the rerun is attempt %d", again.Attempt)
-	}
-	j = w.StartJob(again, "")
-	if a := w.c.Bind(w.Token(j, map[string]any{"ref": "refs/heads/feature"}), nil); a.Status != http.StatusOK || a.Scope() != "main" {
-		t.Fatalf("a rerun's job bound %d %q (%s)", a.Status, a.Scope(), a.Reason)
-	}
+	w.start(run, Small)
+	w.bound(run, "main")
 }
 
-func bindErrors(t T, w *world) {
+func tagLikeABranch(t T, w *world) {
 	repo := w.Repository("app")
-	run := w.Push(repo, "main")
-	j := w.StartJob(run, "")
-	for name, a := range map[string]Answer{
-		"no token":           w.c.BindRaw("", nil),
-		"another audience":   w.c.Bind(w.Token(j, map[string]any{"aud": "https://example.com"}), nil),
-		"another owner":      w.c.Bind(w.Token(j, map[string]any{"repository_owner_id": "1"}), nil),
-		"a body of null":     w.c.BindRaw(w.Token(j, nil), []byte("null")),
-		"a body of a list":   w.c.BindRaw(w.Token(j, nil), []byte("[]")),
-		"an unknown field":   w.c.BindRaw(w.Token(j, nil), []byte(`{"scope": "main"}`)),
-		"two objects":        w.c.BindRaw(w.Token(j, nil), []byte(`{} {}`)),
-		"no such run":        w.c.Bind(w.Token(j, map[string]any{"run_id": "1"}), nil),
-		"a run of elsewhere": w.c.Bind(w.Token(j, map[string]any{"repository_id": "2"}), nil),
-	} {
-		if a.Status != http.StatusForbidden {
-			t.Errorf("%s: bind answered %d", name, a.Status)
+	run := w.Tag(repo, "main")
+	w.start(run, Small)
+	w.bound(run, "read")
+}
+
+func selectors(t T, w *world) {
+	repo := w.Repository("app")
+	// A label that claims to be a selector and isn't one the service
+	// offers gets no machine.
+	for _, label := range []string{"lanescape-3vcpu-linux-amd64", Small + "-run-1", Small + "-image-build", "lanescape-2vcpu-linux-riscv"} {
+		w.refused(w.Push(repo, "main"), label)
+	}
+	// Every offered shape, standard or Spot, gets one.
+	for _, sel := range []string{Small, Small + "-spot", Arm, Arm + "-spot"} {
+		run := w.Push(repo, "main")
+		j := w.start(run, sel)
+		if j.Selector != sel {
+			t.Fatalf("a job naming %s got a machine of %s", sel, j.Selector)
 		}
-	}
-	if _, ok := w.Binding(run); ok {
-		t.Fatalf("a refused call bound the run")
-	}
-	w.Unavailable(true)
-	a := w.c.Bind(w.Token(j, nil), nil)
-	w.Unavailable(false)
-	if a.Status != http.StatusServiceUnavailable {
-		t.Fatalf("bind with GitHub unavailable answered %d", a.Status)
-	}
-	if _, ok := w.Binding(run); ok {
-		t.Fatalf("an unconfirmed call bound the run")
-	}
-	w.bound(run, "main")
-	// A finished run binds nothing.
-	done := w.Push(repo, "main")
-	j = w.StartJob(done, "")
-	w.FinishJob(j, "success")
-	if a := w.c.Bind(w.Token(j, nil), nil); a.Status != http.StatusForbidden {
-		t.Fatalf("a finished run's bind answered %d", a.Status)
+		w.bound(run, "main")
 	}
 }
 
 func contributions(t T, w *world) {
-	repo := w.Repository("app")
-	w.SetRunners(repo, fmt.Sprintf(`{"bootstrap": %q}`, w.Bootstrap(repo)))
-	fork := w.ForkPullRequest(repo, "main")
-	want := fmt.Sprintf("pr%d", fork.Number)
-	// A fork's pull_request run gets nothing of its pull request's.
-	w.bound(w.PullRequestRun(fork), "read")
-	// A contribution's run gets its pull request's scope from its
-	// bootstrap, and each later run gets it again from its own.
-	for range 2 {
-		prt := w.PullRequestTargetRun(fork)
-		w.bootstrap(repo, prt, eventOf(fork), want)
-		// The run's other jobs get the same.
-		w.bound(prt, want)
-	}
-	// A pull_request_target run's own workflow, rather than its bootstrap,
-	// binds read, whatever it sends.
-	prt := w.PullRequestTargetRun(fork)
-	j := w.StartJob(prt, "")
-	if a := w.c.Bind(w.Token(j, nil), eventOf(fork)); a.Status != http.StatusOK || a.Scope() != "read" {
-		t.Fatalf("a contribution's own workflow bound %d %q", a.Status, a.Scope())
-	}
-	// A bootstrap naming another fork's head for the pull request, or a
-	// pull request that isn't there, binds read.
-	bad := eventOf(w.ForkPullRequest(repo, "main"))
-	bad.PullRequest = fork.Number
-	w.bootstrap(repo, w.PullRequestTargetRun(fork), bad, "read")
-	bad = eventOf(fork)
-	bad.PullRequest = 999
-	w.bootstrap(repo, w.PullRequestTargetRun(fork), bad, "read")
+	repo := w.consumer("app")
+	pr := w.ForkPullRequest(repo, "main")
+	run := w.PullRequestTargetRun(pr)
+	// Before a maintainer approves it, only the smallest shape, standard,
+	// and the run stays unbound; any other of its jobs is failed.
+	w.start(run, Small)
+	w.bound(run, "")
+	w.refused(run, "lanescape-80vcpu-linux-amd64")
+	w.refused(w.PullRequestTargetRun(pr), Small+"-spot")
+	w.bound(run, "")
+
+	approved := w.PullRequestTargetRun(pr)
+	w.Approve(approved)
+	j := w.start(approved, Small)
+	w.bound(approved, "pr"+strconv.Itoa(pr.Number))
+	// An approved contribution's run saves in its pull request's scope,
+	// which its next run restores, and starts from main's.
+	w.restored(j, "build", service.StepNone)
+	w.save(j, true)
+	w.FinishJob(j, "success")
+	next := w.PullRequestTargetRun(pr)
+	w.Approve(next)
+	w.restored(w.start(next, "lanescape-80vcpu-linux-amd64"), "build", service.StepPullRequestExact)
+	// Main never sees it.
+	w.restored(w.start(w.Push(repo, "main"), Small), "build", service.StepNone)
 }
 
-// pushedContribution is an approved contribution whose contributor pushed
-// again after its run was approved: the run's bootstrap names the head its
-// event has, which is still one of the pull request's commits, and binds
-// the pull request's scope, as specs/0002-machines.md says.
 func pushedContribution(t T, w *world) {
 	repo := w.Repository("app")
-	w.SetRunners(repo, fmt.Sprintf(`{"bootstrap": %q}`, w.Bootstrap(repo)))
-	fork := w.ForkPullRequest(repo, "main")
-	prt := w.PullRequestTargetRun(fork)
-	pushed := w.PushPullRequest(fork)
-	if pushed.HeadSHA == fork.HeadSHA || pushed.Number != fork.Number || pushed.HeadRepositoryID != fork.HeadRepositoryID {
-		t.Fatalf("the push didn't move the pull request's head")
-	}
-	want := fmt.Sprintf("pr%d", fork.Number)
-	w.bootstrap(repo, prt, eventOf(fork), want)
-	if s, ok := w.Binding(prt); !ok || s != want {
-		t.Fatalf("the binding the service keeps is %q, %v", s, ok)
-	}
-	// The next run's bootstrap names the new head, and gets the same
-	// scope.
-	w.bootstrap(repo, w.PullRequestTargetRun(pushed), eventOf(pushed), want)
+	pr := w.ForkPullRequest(repo, "main")
+	run := w.PullRequestTargetRun(pr)
+	w.Approve(run)
+	w.PushPullRequest(pr, nil)
+	w.start(run, Small)
+	w.bound(run, "pr"+strconv.Itoa(pr.Number))
 }
 
-// pullCommits holds a pull request's binding to its commits: a
-// pull_request run's head must still be its pull request's when it binds,
-// and a bootstrap's head must be one of its pull request's commits.
-func pullCommits(t T, w *world) {
+func ownPullRequest(t T, w *world) {
 	repo := w.Repository("app")
-	w.SetRunners(repo, fmt.Sprintf(`{"bootstrap": %q}`, w.Bootstrap(repo)))
-	pr := w.PullRequest(repo, "main", "fix")
-	other := w.PullRequest(repo, "main", "other")
-	want := fmt.Sprintf("pr%d", pr.Number)
-	// A pull_request run made before a push binds read: its head is no
-	// longer its pull request's.
-	early := w.PullRequestRun(pr)
-	pushed := w.PushPullRequest(pr)
-	w.bound(early, "read")
-	w.bound(w.PullRequestRun(pushed), want)
-	// A bootstrap naming its pull request's earlier head, or its head now,
-	// binds the pull request's scope.
-	for _, head := range []string{pr.HeadSHA, pushed.HeadSHA} {
-		run := w.PullRequestTargetRun(pushed)
-		j := w.StartJob(run, w.Bootstrap(repo))
-		ev := &PullRequestEvent{PullRequest: pr.Number, HeadRepositoryID: repo.ID, HeadSHA: head}
-		if a := w.c.Bind(w.Token(j, nil), ev); a.Status != http.StatusOK || a.Scope() != want {
-			t.Fatalf("a bootstrap naming one of its pull request's commits bound %d %q (%s)", a.Status, a.Scope(), a.Reason)
+	a := w.ForkPullRequest(repo, "main")
+	b := w.ForkPullRequest(repo, "main")
+	ra, rb := w.PullRequestTargetRun(a), w.PullRequestTargetRun(b)
+	w.Approve(ra)
+	w.Approve(rb)
+	w.start(rb, Small)
+	w.start(ra, Small)
+	w.bound(ra, "pr"+strconv.Itoa(a.Number))
+	w.bound(rb, "pr"+strconv.Itoa(b.Number))
+}
+
+func unapproved(t T, w *world) {
+	repo := w.consumer("app")
+	pr := w.ForkPullRequest(repo, "main")
+	run := w.PullRequestTargetRun(pr)
+	j := w.start(run, Small)
+	w.bound(run, "")
+	// Nothing that needs a scope: no work disk, no save.
+	a, _ := w.c.Disk(w.Token(j), "build")
+	w.status("an unbound run's work disk request", a, http.StatusForbidden)
+	a, _ = w.c.Save(w.Token(j))
+	w.status("an unbound run's save", a, http.StatusForbidden)
+	w.bound(run, "")
+}
+
+func anotherRunsMachine(t T, w *world) {
+	repo := w.consumer("app")
+	// A machine made for a push to main takes a read run's job instead:
+	// the job is answered for its own run, whatever the machine was made
+	// for.
+	madeFor := w.Push(repo, "main")
+	run := w.Event(repo, "workflow_dispatch", "main")
+	j, err := w.StartJobOn(run, Small, madeFor)
+	if err != nil {
+		t.Fatalf("a job on a machine made for another run's job: %v", err)
+	}
+	w.bound(run, "read")
+	w.bound(madeFor, "")
+	w.restored(j, "build", service.StepNone)
+	w.save(j, false)
+}
+
+func diskRequests(t T, w *world) {
+	repo := w.consumer("app")
+	run := w.Push(repo, "main")
+	j := w.start(run, Small)
+	j2 := w.start(run, Small)
+	w.restored(j, "build", service.StepNone)
+	// A request with no token, or one that isn't a machine's, is refused.
+	a, _ := w.c.Disk("", "build")
+	if a.Status != http.StatusUnauthorized {
+		t.Fatalf("a work disk request with no token answered %d", a.Status)
+	}
+	a, _ = w.c.Disk("not.a.token", "build")
+	if a.Status != http.StatusUnauthorized {
+		t.Fatalf("a work disk request with a token that isn't one answered %d", a.Status)
+	}
+	// A machine whose job has finished can ask for nothing.
+	w.FinishJob(j, "success")
+	a, _ = w.c.Disk(w.Token(j), "build")
+	w.status("a finished job's work disk request", a, http.StatusForbidden)
+	a, _ = w.c.Save(w.Token(j))
+	w.status("a finished job's save", a, http.StatusForbidden)
+	// The run's other jobs still can, each with a disk of its own.
+	w.restored(j2, "build", service.StepNone)
+	w.save(j2, true)
+}
+
+func ownRepository(t T, w *world) {
+	a, b := w.consumer("one"), w.consumer("two")
+	ja := w.start(w.Push(a, "main"), Small)
+	w.restored(ja, "build", service.StepNone)
+	w.save(ja, true)
+	w.FinishJob(ja, "success")
+	w.restored(w.start(w.Push(a, "main"), Small), "build", service.StepMainExact)
+	// Another repository's main, of the same family and key, starts empty.
+	w.restored(w.start(w.Push(b, "main"), Small), "build", service.StepNone)
+}
+
+func restoreOrder(t T, w *world) {
+	repo := w.consumer("app")
+	// Nothing saved yet: the disk starts empty; main saves it.
+	j := w.start(w.Push(repo, "main"), Small)
+	w.restored(j, "build", service.StepNone)
+	w.save(j, true)
+	w.FinishJob(j, "success")
+	// Main's next run starts from it; a machine of the other architecture
+	// starts empty.
+	m2 := w.Push(repo, "main")
+	w.restored(w.start(m2, Small), "build", service.StepMainExact)
+	w.restored(w.start(m2, Arm), "build", service.StepNone)
+
+	// A pull request of main's key starts from main's, and saves its own.
+	// The run's other jobs start from the same choice while it runs; its
+	// next run, and a maintainer's rerun once it has finished, from the
+	// pull request's own.
+	pa := w.PullRequest(repo, "main", "a")
+	ra := w.PullRequestRun(pa)
+	j = w.start(ra, Small)
+	other := w.start(ra, Small)
+	w.restored(j, "build", service.StepMainExact)
+	w.save(j, true)
+	w.FinishJob(j, "success")
+	w.restored(other, "build", service.StepMainExact)
+	w.FinishJob(other, "success")
+	w.restored(w.start(w.PullRequestRun(pa), Small), "build", service.StepPullRequestExact)
+	w.restored(w.start(w.Rerun(ra), Small), "build", service.StepPullRequestExact)
+	// A push that moves its key starts from its newest.
+	pa = w.PushPullRequest(pa, map[string]string{"deps.txt": "2\n"})
+	w.restored(w.start(w.PullRequestRun(pa), Small), "build", service.StepPullRequestNewest)
+	// Another pull request never sees it: of that key, it starts from
+	// main's newest.
+	w.Commit(repo, "b", map[string]string{"deps.txt": "2\n"})
+	w.restored(w.start(w.PullRequestRun(w.PullRequest(repo, "main", "b")), Small), "build", service.StepMainNewest)
+
+	// A listed branch with nothing of its own starts from main's, and
+	// saves its own, which its later pushes, and pull requests into it,
+	// start from.
+	w.Branch(repo, "support/v1")
+	j = w.start(w.Push(repo, "support/v1"), Small)
+	w.restored(j, "build", service.StepMainExact)
+	w.save(j, true)
+	w.FinishJob(j, "success")
+	w.restored(w.start(w.Push(repo, "support/v1"), Small), "build", service.StepBranchExact)
+	w.restored(w.start(w.PullRequestRun(w.PullRequest(repo, "support/v1", "c")), Small), "build", service.StepBranchExact)
+	w.Commit(repo, "support/v1", map[string]string{"deps.txt": "3\n"})
+	w.restored(w.start(w.Push(repo, "support/v1"), Small), "build", service.StepBranchNewest)
+
+	// A read run reads main's.
+	w.restored(w.start(w.Event(repo, "workflow_dispatch", "main"), Small), "build", service.StepMainExact)
+}
+
+func oneWorkDisk(t T, w *world) {
+	repo := w.consumer("app")
+	run := w.Push(repo, "main")
+	j := w.start(run, Small)
+	// While it's being made, a repeated request is answered about the same
+	// disk, and another family is refused.
+	w.HoldDisks(true)
+	for range 2 {
+		a, d := w.c.Disk(w.Token(j), "build")
+		if a.Status != http.StatusOK || d.State != "making" || d.Restored != service.StepNone {
+			t.Fatalf("a held work disk: %d %+v", a.Status, d)
 		}
 	}
-	// One naming a commit of the repository that was never one of its
-	// pull request's binds read: another pull request's head.
-	run := w.PullRequestTargetRun(pushed)
-	j := w.StartJob(run, w.Bootstrap(repo))
-	ev := &PullRequestEvent{PullRequest: pr.Number, HeadRepositoryID: repo.ID, HeadSHA: other.HeadSHA}
-	if a := w.c.Bind(w.Token(j, nil), ev); a.Status != http.StatusOK || a.Scope() != "read" {
-		t.Fatalf("a bootstrap naming another pull request's head bound %d %q", a.Status, a.Scope())
-	}
-	// A commit its head branch had before the pull request was opened is
-	// one of its commits too, unless its base has it.
-	w.Branch(repo, "release")
-	first := w.PullRequest(repo, "main", "feature")
-	second := w.PullRequest(repo, "release", "feature")
-	run = w.PullRequestTargetRun(second)
-	j = w.StartJob(run, w.Bootstrap(repo))
-	ev = &PullRequestEvent{PullRequest: second.Number, HeadRepositoryID: repo.ID, HeadSHA: first.HeadSHA}
-	if a := w.c.Bind(w.Token(j, nil), ev); a.Status != http.StatusOK || a.Scope() != fmt.Sprintf("pr%d", second.Number) {
-		t.Fatalf("a bootstrap naming its head branch's earlier commit bound %d %q (%s)", a.Status, a.Scope(), a.Reason)
-	}
-	// Nor does a fork's earlier head, for another pull request.
-	fork := w.ForkPullRequest(repo, "main")
-	w.PushPullRequest(fork)
-	run = w.PullRequestTargetRun(other)
-	j = w.StartJob(run, w.Bootstrap(repo))
-	ev = &PullRequestEvent{PullRequest: other.Number, HeadRepositoryID: fork.HeadRepositoryID, HeadSHA: fork.HeadSHA}
-	if a := w.c.Bind(w.Token(j, nil), ev); a.Status != http.StatusOK || a.Scope() != "read" {
-		t.Fatalf("a bootstrap naming a fork's commit for another pull request bound %d %q", a.Status, a.Scope())
+	a, _ := w.c.Disk(w.Token(j), "cache")
+	w.status("a second family while the first is made", a, http.StatusForbidden)
+	w.HoldDisks(false)
+	w.restored(j, "build", service.StepNone)
+	w.restored(j, "build", service.StepNone)
+	a, _ = w.c.Disk(w.Token(j), "cache")
+	w.status("a second family", a, http.StatusForbidden)
+	// Another job of the run may have the other family.
+	w.restored(w.start(run, Small), "cache", service.StepNone)
+}
+
+func saves(t T, w *world) {
+	repo := w.consumer("app")
+	j := w.start(w.Push(repo, "main"), Small)
+	a, _ := w.c.Save(w.Token(j))
+	w.status("a save without a work disk", a, http.StatusForbidden)
+	w.disk(j, "build")
+	w.save(j, true)
+	w.save(j, true)
+	// A job that fails saves nothing.
+	w.FinishJob(j, "failure")
+	j = w.start(w.Push(repo, "main"), Small)
+	w.restored(j, "build", service.StepNone)
+	// Nor does one that didn't ask.
+	w.FinishJob(j, "success")
+	j = w.start(w.Push(repo, "main"), Small)
+	w.restored(j, "build", service.StepNone)
+	w.save(j, true)
+	w.FinishJob(j, "success")
+	w.restored(w.start(w.Push(repo, "main"), Small), "build", service.StepMainExact)
+
+	// A scope that saves nothing says so.
+	for _, run := range []service.Run{w.Event(repo, "workflow_dispatch", "main"), w.Tag(repo, "v1")} {
+		j = w.start(run, Small)
+		w.restored(j, "build", service.StepMainExact)
+		a, s := w.c.Save(w.Token(j))
+		if a.Status != http.StatusOK || s.Saves || s.Reason == "" {
+			t.Fatalf("a save in a scope that saves nothing: %d %+v", a.Status, s)
+		}
+		w.FinishJob(j, "success")
 	}
 }
 
-// noWidening holds a contribution's job, whose token the contributor's code
-// can mint while it runs, to what its run already has (specs/0001-architecture.md,
-// Forks and contributions): /v1/bind is the only request a GitHub token is
-// good for, and it answers the run's binding, never another. A
-// pull_request_target run's token names the default branch's ref, which
-// binds nothing of main's.
-func noWidening(t T, w *world) {
-	repo := w.Repository("app")
-	w.SetRunners(repo, fmt.Sprintf(`{"bootstrap": %q}`, w.Bootstrap(repo)))
-	fork := w.ForkPullRequest(repo, "main")
-	want := fmt.Sprintf("pr%d", fork.Number)
-	bodies := [][]byte{nil, []byte(`{}`), marshal(eventOf(fork)),
-		[]byte(`{"pull_request": 1, "head_repository_id": 1, "head_sha": "` + strings.Repeat("b", 40) + `"}`)}
-	// The contributor's job's token, whatever it sends, gets the binding
-	// its run's bootstrap made, never another.
-	prt := w.PullRequestTargetRun(fork)
-	w.bootstrap(repo, prt, eventOf(fork), want)
-	cj := w.StartJob(prt, "")
-	for _, body := range bodies {
-		if a := w.c.BindRaw(w.Token(cj, nil), body); a.Status != http.StatusOK || a.Scope() != want {
-			t.Fatalf("a contribution's call bound %d %q", a.Status, a.Scope())
-		}
+func refusals(t T, w *world) {
+	repo := w.consumer("app")
+	j := w.start(w.Push(repo, "main"), Small)
+	for _, name := range []string{"other", "Build", "", "build-", strings.Repeat("a", 33)} {
+		a, _ := w.c.Disk(w.Token(j), name)
+		w.status("a request for the family "+strconv.Quote(name), a, http.StatusForbidden)
 	}
-	// Nor does what its token says of its ref or event change that.
-	for _, o := range []map[string]any{{"ref": "refs/heads/main"}, {"ref": "refs/heads/main", "event_name": "push"}} {
-		if a := w.c.Bind(w.Token(cj, o), nil); a.Status != http.StatusOK || a.Scope() != want {
-			t.Fatalf("a contribution's call claiming %v bound %d %q", o, a.Status, a.Scope())
-		}
+
+	// A family's listed file that doesn't exist, and a .github/runners.json
+	// that isn't valid, an "images" field included.
+	w.Commit(repo, "main", map[string]string{"deps.txt": ""})
+	gone := w.start(w.Push(repo, "main"), Small)
+	a, _ := w.c.Disk(w.Token(gone), "build")
+	if a.Status != http.StatusForbidden || !strings.Contains(a.Reason, "deps.txt") {
+		t.Fatalf("a family whose listed file doesn't exist: %d %q", a.Status, a.Reason)
 	}
-	// A contribution's job that calls before its run's bootstrap, as one
-	// that doesn't wait for the bootstrap could, binds its run read, never
-	// main's, though its token's ref is the default branch's; and the
-	// bootstrap can't change that afterwards.
-	early := w.PullRequestTargetRun(fork)
-	ej := w.StartJob(early, "")
-	for _, body := range bodies {
-		if a := w.c.BindRaw(w.Token(ej, nil), body); a.Status != http.StatusOK || a.Scope() != "read" {
-			t.Fatalf("a contribution's call before its bootstrap bound %d %q", a.Status, a.Scope())
-		}
+	for _, file := range []string{`{"disks": {"cache": {}}, "images": {"build": ".github/images/build"}}`, `{"disks": {"cache": {"from": "x"}}}`, `[]`} {
+		w.Commit(repo, "main", map[string]string{consumer.RunnersFile: file})
+		invalid := w.start(w.Push(repo, "main"), Small)
+		a, _ = w.c.Disk(w.Token(invalid), "cache")
+		w.status("a family of a .github/runners.json that isn't valid, "+file, a, http.StatusForbidden)
 	}
-	w.bootstrap(repo, early, eventOf(fork), "read")
-	if s, _ := w.Binding(prt); s != want {
-		t.Fatalf("the run's binding became %q", s)
+
+	// GitHub unavailable: the service confirms nothing, and the caller
+	// asks again.
+	w.Unavailable(true)
+	a, _ = w.c.Disk(w.Token(j), "cache")
+	w.status("a work disk request with GitHub unavailable", a, http.StatusServiceUnavailable)
+	a, _ = w.c.Save(w.Token(j))
+	w.status("a save with GitHub unavailable", a, http.StatusServiceUnavailable)
+	_, err := w.StartJob(w.Push(repo, "main"), Small)
+	w.Unavailable(false)
+	if !errors.Is(err, service.ErrUnavailable) {
+		t.Fatalf("a job's check with GitHub unavailable: %v", err)
 	}
+	w.restored(j, "cache", service.StepNone)
+	w.save(j, true)
 }

@@ -56,7 +56,11 @@ type WorkflowRun struct {
 	HeadBranch       string
 	HeadSHA          string
 	HeadRepositoryID int64
-	CreatedAt        time.Time
+	// PullRequests are the numbers of the pull requests GitHub's record of
+	// the run lists: for a same-repository pull request's run, those whose
+	// head is the run's. GitHub lists none for a fork's.
+	PullRequests []int
+	CreatedAt    time.Time
 }
 
 // PullRequest is a pull request. HeadRepositoryID is 0 once the head
@@ -90,8 +94,10 @@ type API interface {
 	// Compare is GitHub's comparison of two commits: identical, ahead,
 	// behind or diverged.
 	Compare(ctx context.Context, repo Repository, base, head string) (string, error)
-	// File reads a file at a commit.
+	// File reads a file at a commit, of at most MaxFile bytes.
 	File(ctx context.Context, repo Repository, path, commit string) ([]byte, error)
+	// Blob reads a blob by its SHA, of at most MaxFile bytes.
+	Blob(ctx context.Context, repo Repository, sha string) ([]byte, error)
 
 	Actions
 }
@@ -306,8 +312,17 @@ func runOf(r *gh.WorkflowRun) WorkflowRun {
 		HeadBranch:       r.GetHeadBranch(),
 		HeadSHA:          r.GetHeadSHA(),
 		HeadRepositoryID: r.GetHeadRepository().GetID(),
+		PullRequests:     pullNumbers(r.PullRequests),
 		CreatedAt:        r.GetCreatedAt().Time,
 	}
+}
+
+func pullNumbers(ps []*gh.PullRequest) []int {
+	var out []int
+	for _, p := range ps {
+		out = append(out, p.GetNumber())
+	}
+	return out
 }
 
 // WorkflowRun implements API.
@@ -406,8 +421,9 @@ func (c *Client) Compare(ctx context.Context, repo Repository, base, head string
 	}
 }
 
-// maxFile bounds what File reads; configuration files are small.
-const maxFile = 64 << 10
+// MaxFile bounds what File and Blob read: .github/runners.json and the
+// files a family's key lists.
+const MaxFile = 10 << 20
 
 // File implements API.
 func (c *Client) File(ctx context.Context, repo Repository, path, commit string) ([]byte, error) {
@@ -419,12 +435,28 @@ func (c *Client) File(ctx context.Context, repo Repository, path, commit string)
 		// A directory: there's no such file.
 		return nil, fmt.Errorf("%w: %s is a directory", ErrNotFound, path)
 	}
-	if f.GetSize() > maxFile {
-		return nil, fmt.Errorf("%s is larger than %d bytes", path, maxFile)
+	if f.GetSize() > MaxFile {
+		return nil, fmt.Errorf("%s is larger than %d bytes", path, MaxFile)
+	}
+	if f.GetEncoding() == "none" || (f.GetSize() > 0 && f.Content == nil) {
+		// Too large for the contents API: GitHub gives its blob instead.
+		return c.Blob(ctx, repo, f.GetSHA())
 	}
 	s, err := f.GetContent()
 	if err != nil {
 		return nil, &Unavailable{Err: err}
 	}
 	return []byte(s), nil
+}
+
+// Blob implements API.
+func (c *Client) Blob(ctx context.Context, repo Repository, sha string) ([]byte, error) {
+	b, _, err := c.gh.Git.GetBlobRaw(ctx, repo.Owner, repo.Name, sha)
+	if err != nil {
+		return nil, classify(err)
+	}
+	if len(b) > MaxFile {
+		return nil, fmt.Errorf("blob %s is larger than %d bytes", sha, MaxFile)
+	}
+	return b, nil
 }

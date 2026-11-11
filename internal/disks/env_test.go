@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +31,7 @@ import (
 	"github.com/lanescape/runners/internal/lease"
 	"github.com/lanescape/runners/internal/machines"
 	"github.com/lanescape/runners/internal/pass"
+	"github.com/lanescape/runners/internal/selector"
 	"github.com/lanescape/runners/internal/store"
 )
 
@@ -42,10 +45,62 @@ const (
 	zero     = "00000000000000000000"
 )
 
-// sel is a selector for the 2-vCPU amd64 shape, with a saved disk of family
-// build and key, in scope.
+// sel is the 2-vCPU amd64 shape with a work disk of family build, whose key
+// for the run is key, in the run's scope: a test's shorthand, which start
+// and take make into the job's selector, the shape alone, recording the key
+// as the run's, and the family as what the job's disk action asks for.
 func sel(key, scope string) string {
 	return "lanescape-2vcpu-linux-amd64-disk-build-" + key + "-" + scope
+}
+
+var oldLabel = regexp.MustCompile(`^(lanescape-[0-9]+vcpu-linux-[a-z0-9]+(?:-spot)?)(?:-disk-([a-z][a-z0-9-]*?)-([0-9a-f]{20}))?-(main|read|pr[0-9]+|branch-[a-z0-9]+)$`)
+
+// newLabel is a test's label as the job's selector: its shape alone.
+func newLabel(label string) string {
+	if m := oldLabel.FindStringSubmatch(label); m != nil {
+		return m[1]
+	}
+	return label
+}
+
+// familyOf is the family a test's label has its job's disk action ask for,
+// or "".
+func familyOf(labels []string) string {
+	for _, l := range labels {
+		if m := oldLabel.FindStringSubmatch(l); m != nil && m[2] != "" {
+			return m[2]
+		}
+	}
+	return ""
+}
+
+// keys records the keys a test's labels give their families as the run's,
+// as the service would have made them from the run's commit.
+func (e *env) keys(run *ghemu.Run, labels []string) {
+	e.t.Helper()
+	name := "runs/5001/" + strconv.FormatInt(run.ID, 10) + "/files.json"
+	var rf machines.RunFiles
+	if data, _, ok := e.gcs.Object("state", name); ok {
+		_ = json.Unmarshal(data, &rf)
+	} else {
+		rf = machines.RunFiles{RepositoryID: repoID, RunID: run.ID, Commit: run.HeadSHA, Families: map[string]machines.FamilyKey{}}
+	}
+	changed := false
+	for _, l := range labels {
+		m := oldLabel.FindStringSubmatch(l)
+		if m == nil || m[2] == "" {
+			continue
+		}
+		if had, ok := rf.Families[m[2]]; ok && had.Key != m[3] {
+			e.t.Fatalf("run %d's family %s has the key %s already, not %s: one key per family and run", run.ID, m[2], had.Key, m[3])
+		}
+		rf.Families[m[2]] = machines.FamilyKey{Key: m[3]}
+		changed = true
+	}
+	if changed {
+		b, _ := json.Marshal(rf)
+		e.gcs.Put("state", name, b)
+	}
 }
 
 type lockedBuffer struct {
@@ -78,7 +133,7 @@ type env struct {
 	disks   *disks.Service
 	objects store.Objects
 	binder  *binding.Binder
-	actions *auth.Actions
+	ghc     *github.Client
 	runner  *pass.Runner
 	url     string
 	logs    *lockedBuffer
@@ -87,6 +142,9 @@ type env struct {
 	stops     []context.CancelFunc
 	byMachine map[string]context.CancelFunc
 	used      map[string]bool
+	// families are what each job's disk action asks for, by its run and
+	// name, so that a rerun's job asks as its first attempt's did.
+	families map[string]string
 }
 
 func setup(t *testing.T) *env {
@@ -135,10 +193,6 @@ func setup(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actions, err := auth.NewActions(auth.Options{Issuer: auth.Issuer{URL: gh.Actions.URL, JWKSURL: gh.Actions.JWKSURL}, Audience: audience}, orgID)
-	if err != nil {
-		t.Fatal(err)
-	}
 	logs := &lockedBuffer{}
 	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	t.Cleanup(func() {
@@ -151,14 +205,16 @@ func setup(t *testing.T) *env {
 		StepDeadline: time.Second}
 	svc := &machines.Service{Config: cfg, Project: gce.Project, ServiceURL: audience, MachineAccount: account,
 		GitHub: ghc, Compute: gcec, Objects: objects, Binder: binder, Machines: verifier, Clock: clock, Logger: log,
-		AssignmentWait: 3 * time.Second, AssignmentRetry: 50 * time.Millisecond, Disks: dks, Saves: dks, Preemptions: dks}
+		AssignmentWait: 3 * time.Second, AssignmentRetry: 50 * time.Millisecond, FailStopDelay: 100 * time.Millisecond, Disks: dks, Saves: dks, Preemptions: dks}
 	mux := http.NewServeMux()
 	mux.Handle("POST /v1/jobs/started", svc.JobStarted())
 	mux.Handle("POST /v1/jobs/finished", svc.JobFinished())
+	mux.Handle("POST /v1/disks", svc.DiskRequest())
+	mux.Handle("POST /v1/disks/save", svc.SaveRequest())
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	e := &env{t: t, clock: clock, gh: gh, gce: gce, gcs: gcs, org: org, repo: repo, cfg: cfg, svc: svc, disks: dks, objects: objects,
-		binder: binder, actions: actions, url: srv.URL, logs: logs, byMachine: map[string]context.CancelFunc{}, used: map[string]bool{},
+		binder: binder, ghc: ghc, url: srv.URL, logs: logs, byMachine: map[string]context.CancelFunc{}, used: map[string]bool{}, families: map[string]string{},
 		runner: &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log}}
 	gce.OnStop(func(m gceemu.Machine) {
 		e.mu.Lock()
@@ -186,13 +242,29 @@ func (e *env) pass() {
 	}
 }
 
+// facts are what GitHub tells a run's jobs' runners, as the hook reports
+// them.
+func facts(run *ghemu.Run) binding.Facts {
+	f := binding.Facts{Event: run.Event, Ref: run.Ref, RefType: run.RefType, SHA: run.SHA}
+	if p := run.EventPull; p != nil {
+		f.PullRequest, f.HeadRepositoryID, f.HeadSHA = p.Number, p.HeadRepositoryID, p.HeadSHA
+	}
+	return f
+}
+
+// bind binds a run as its first job's check on a base-image machine would.
 func (e *env) bind(run *ghemu.Run) string {
 	e.t.Helper()
-	c, err := e.actions.Verify(context.Background(), e.gh.ActionsToken(run, ghemu.Job{Audience: audience}, nil))
+	ctx := context.Background()
+	repo, err := e.ghc.RepositoryByID(ctx, run.Repo.ID)
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	b, err := e.binder.Bind(context.Background(), c, binding.Request{})
+	wr, err := e.ghc.WorkflowRun(ctx, repo, run.ID)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	b, err := e.binder.Bind(ctx, repo, wr, facts(run))
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -236,24 +308,100 @@ type job struct {
 	in   gceemu.InstanceState
 	gate string
 	done chan error
+	// checked says the job-started check has allowed it.
+	checked bool
 }
 
 // start queues a job and plays it to its admission, which it expects to
 // succeed.
 func (e *env) start(run *ghemu.Run, spec ghemu.JobSpec) *job {
 	e.t.Helper()
-	j := e.gh.Queue(run, spec)
+	j := e.queueJob(run, spec)
 	return e.admit(run, j)
 }
 
-// admit gives a queued job a machine and plays it to its admission.
+// queueJob queues a job, its labels made selectors of its run, with their
+// families' keys recorded as the run's.
+func (e *env) queueJob(run *ghemu.Run, spec ghemu.JobSpec) *ghemu.WorkflowJob {
+	e.t.Helper()
+	e.keys(run, spec.Labels)
+	family := familyOf(spec.Labels)
+	labels := make([]string, len(spec.Labels))
+	for i, l := range spec.Labels {
+		labels[i] = newLabel(l)
+	}
+	spec.Labels = labels
+	e.families[fmt.Sprint(run.ID, "/", spec.Name)] = family
+	return e.gh.Queue(run, spec)
+}
+
+// admit gives a queued job a machine and plays it to its admission, then,
+// if its label asks for a work disk, to its disk action's request.
 func (e *env) admit(run *ghemu.Run, j *ghemu.WorkflowJob) *job {
 	e.t.Helper()
 	jb := e.take(run, j)
 	if code := jb.started(); code != http.StatusOK {
 		e.t.Fatalf("job-started check: %d", code)
 	}
+	jb.checked = true
+	if f := e.familyOf(j.ID); f != "" {
+		jb.disk(f)
+	}
 	return jb
+}
+
+// call sends a request from the job's machine, signed with its identity
+// token, and decodes the answer into out, if it's given.
+func (jb *job) call(path string, body, out any) int {
+	jb.e.t.Helper()
+	tok := jb.e.gce.Identity.Mint(jb.e.gce.IdentityClaims(jb.in.Zone, jb.in.Name, audience, true))
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest(http.MethodPost, jb.e.url+path, bytes.NewReader(b))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		jb.e.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if out != nil {
+		_ = json.NewDecoder(resp.Body).Decode(out)
+	}
+	return resp.StatusCode
+}
+
+// askDisk is the job's check, if it hasn't had one, and then one request
+// for its work disk, of its label's family, played until the disk is ready
+// if it's answered 200. It returns the request's status.
+func (jb *job) askDisk() int {
+	jb.e.t.Helper()
+	if !jb.checked {
+		if code := jb.started(); code != http.StatusOK {
+			jb.e.t.Fatalf("job-started check: %d", code)
+		}
+		jb.checked = true
+	}
+	family := jb.e.familyOf(jb.j.ID)
+	code := jb.call("/v1/disks", map[string]string{"family": family}, nil)
+	if code == http.StatusOK {
+		jb.disk(family)
+	}
+	return code
+}
+
+// disk asks for the job's work disk, as its disk action does, until it's
+// ready, and returns where it came from.
+func (jb *job) disk(family string) string {
+	jb.e.t.Helper()
+	var ans machines.DiskAnswer
+	jb.e.eventually("the work disk is ready", func() bool {
+		ans = machines.DiskAnswer{}
+		code := jb.call("/v1/disks", map[string]string{"family": family}, &ans)
+		if code != http.StatusOK && code != http.StatusServiceUnavailable {
+			jb.e.t.Fatalf("work disk request: %d", code)
+		}
+		return ans.State == machines.DiskStateReady
+	})
+	return ans.Restored
 }
 
 // take makes a machine for a queued job and lets it take the job, short of
@@ -295,7 +443,7 @@ func (e *env) take(run *ghemu.Run, j *ghemu.WorkflowJob) *job {
 func (jb *job) started() int {
 	jb.e.t.Helper()
 	tok := jb.e.gce.Identity.Mint(jb.e.gce.IdentityClaims(jb.in.Zone, jb.in.Name, audience, true))
-	b, _ := json.Marshal(machines.StartedRequest{RunID: jb.run.ID})
+	b, _ := json.Marshal(machines.StartedRequest{RunID: jb.run.ID, Facts: facts(jb.run)})
 	req, _ := http.NewRequest(http.MethodPost, jb.e.url+"/v1/jobs/started", bytes.NewReader(b))
 	req.Header.Set("Authorization", "Bearer "+tok)
 	resp, err := http.DefaultClient.Do(req)
@@ -306,11 +454,17 @@ func (jb *job) started() int {
 	return resp.StatusCode
 }
 
-// finish lets the job's steps run, waits for its runner to exit, and sends
+// finish asks to save the job's work disk, if save, as its save-disk action
+// does, lets the job's steps run, waits for its runner to exit, and sends
 // the supervisor's report, then powers the machine off, as the supervisor
 // does, and runs a pass.
 func (jb *job) finish(save bool) {
 	jb.e.t.Helper()
+	if save && jb.e.familyOf(jb.j.ID) != "" {
+		if code := jb.call("/v1/disks/save", map[string]bool{"save": true}, nil); code != http.StatusOK {
+			jb.e.t.Fatalf("save request: %d", code)
+		}
+	}
 	_ = os.WriteFile(jb.gate, []byte("ok"), 0o644)
 	select {
 	case err := <-jb.done:
@@ -321,7 +475,7 @@ func (jb *job) finish(save bool) {
 		jb.e.t.Fatal("the runner never finished")
 	}
 	tok := jb.e.gce.Identity.Mint(jb.e.gce.IdentityClaims(jb.in.Zone, jb.in.Name, audience, true))
-	b, _ := json.Marshal(machines.FinishedRequest{Save: save})
+	b, _ := json.Marshal(machines.FinishedRequest{})
 	req, _ := http.NewRequest(http.MethodPost, jb.e.url+"/v1/jobs/finished", bytes.NewReader(b))
 	req.Header.Set("Authorization", "Bearer "+tok)
 	resp, err := http.DefaultClient.Do(req)
@@ -404,3 +558,19 @@ func (e *env) record(name string) (map[string]any, bool) {
 }
 
 func (e *env) logged(s string) bool { return strings.Contains(e.logs.String(), s) }
+
+// choiceHash names a run's restore choice for a test's label's family and
+// architecture.
+func choiceHash(label string) string {
+	m := oldLabel.FindStringSubmatch(label)
+	if m == nil {
+		return ""
+	}
+	return selector.Hash(m[2] + "\x00" + m[1][strings.LastIndex(m[1], "-")+1:])
+}
+
+// familyOf is the family a job's disk action asks for, by its run and name.
+func (e *env) familyOf(jobID int64) string {
+	j := e.gh.Job(jobID)
+	return e.families[fmt.Sprint(j.Run.ID, "/", j.Name)]
+}

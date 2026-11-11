@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -21,8 +20,6 @@ import (
 	"github.com/lanescape/runners/emulators/google"
 	gcsemu "github.com/lanescape/runners/emulators/storage"
 	"github.com/lanescape/runners/internal/auth"
-	"github.com/lanescape/runners/internal/binding"
-	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/lease"
 	"github.com/lanescape/runners/internal/pass"
 	"github.com/lanescape/runners/internal/server"
@@ -152,22 +149,13 @@ func setupPass(t *testing.T, deadline time.Duration) *env {
 	app := gh.NewApp(77)
 	inst := gh.Install(app, org)
 	repo := gh.Repo(org, 5001, "app")
-	repo.Commit("main", map[string]string{binding.RunnersFile: `{"bootstrap": "` + bootstrap + `"}`})
 
-	client, err := github.NewAppClient(github.Options{BaseURL: gh.URL, AppID: app.ID, PrivateKey: app.PrivateKeyPEM(), OrganizationID: orgID})
-	if err != nil {
-		t.Fatal(err)
-	}
 	objects, err := store.NewGCS(ctx, "state", gcs.ClientOptions()...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { objects.Close() })
 	callers, err := auth.NewGoogle(auth.Options{Issuer: auth.Issuer{URL: gg.URL, JWKSURL: gg.JWKSURL}, Audience: audience}, []string{scheduler, pusher})
-	if err != nil {
-		t.Fatal(err)
-	}
-	actions, err := auth.NewActions(auth.Options{Issuer: auth.Issuer{URL: gh.Actions.URL, JWKSURL: gh.Actions.JWKSURL}, Audience: audience}, orgID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,8 +175,6 @@ func setupPass(t *testing.T, deadline time.Duration) *env {
 		ReconcileCallers: callers,
 		Passes:           &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log, Deadline: deadline},
 		Reconciler:       rec,
-		Actions:          actions,
-		Binder:           &binding.Binder{GitHub: client, Objects: objects, OrganizationID: orgID, Clock: clock, Logger: log},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -387,89 +373,14 @@ func TestReconcile(t *testing.T) {
 	})
 }
 
-func TestBind(t *testing.T) {
+func TestThereIsNoBindEndpoint(t *testing.T) {
 	e := setup(t)
-	user := e.gh.User(9001, "contributor")
-	fork := e.gh.Fork(e.repo, user, 7001)
-	fork.Commit("feature", map[string]string{"x": "1"})
-	p := e.gh.PullRequest(e.repo, "main", fork, "feature", user)
-	prt := e.gh.PullRequestTargetRun(p)
-	boot := e.gh.ActionsToken(prt, ghemu.Job{Audience: audience, WorkflowRef: bootstrap}, nil)
-
-	ev := fmt.Sprintf(`{"pull_request": 1, "head_repository_id": %d, "head_sha": %q}`, fork.ID, prt.EventPull.HeadSHA)
-	code, body := e.post(server.BindPath, boot, ev)
-	if code != http.StatusOK || body["scope"] != "pr1" {
-		t.Fatalf("bootstrap: %d %v", code, body)
+	// Runs are bound at their first job's check: no endpoint takes a
+	// GitHub token.
+	tok := e.gh.ActionsToken(e.gh.PushRun(e.repo, "main"), ghemu.Job{Audience: audience}, nil)
+	if code, _ := e.post("/v1/bind", tok, ""); code != http.StatusNotFound && code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST /v1/bind: %d", code)
 	}
-	// Any later job of the run gets the same answer, whatever it says.
-	contributor := e.gh.ActionsToken(prt, ghemu.Job{Audience: audience}, nil)
-	if code, body := e.post(server.BindPath, contributor, `{"pull_request": 2}`); code != http.StatusOK || body["scope"] != "pr1" {
-		t.Fatalf("later job: %d %v", code, body)
-	}
-
-	push := e.gh.PushRun(e.repo, "main")
-	if code, body := e.post(server.BindPath, e.gh.ActionsToken(push, ghemu.Job{Audience: audience}, nil), ""); code != http.StatusOK || body["scope"] != "main" {
-		t.Fatalf("push: %d %v", code, body)
-	}
-
-	other := e.gh.PushRun(e.repo, "main")
-	tok := e.gh.ActionsToken(other, ghemu.Job{Audience: audience}, nil)
-	for _, tc := range []struct {
-		name, token, body string
-		status            int
-	}{
-		{"no token", "", "", http.StatusForbidden},
-		{"wrong audience", e.gh.ActionsToken(other, ghemu.Job{}, nil), "", http.StatusForbidden},
-		{"another organization", e.gh.ActionsToken(other, ghemu.Job{Audience: audience}, map[string]any{"repository_owner_id": "1234"}), "", http.StatusForbidden},
-		{"a Google token", e.gg.Token(scheduler, audience), "", http.StatusForbidden},
-		{"unknown field", tok, `{"scope": "main"}`, http.StatusForbidden},
-		{"not JSON", tok, `pr1`, http.StatusForbidden},
-		{"two objects", tok, `{} {}`, http.StatusForbidden},
-		{"a stray bracket", tok, `{}]`, http.StatusForbidden},
-		{"null", tok, `null`, http.StatusForbidden},
-		{"an array", tok, `[]`, http.StatusForbidden},
-		{"a stray brace", tok, `{}}`, http.StatusForbidden},
-		{"trailing text", tok, `{} x`, http.StatusForbidden},
-		{"too large", tok, `{"pull_request": 1` + strings.Repeat(" ", 5000) + `}`, http.StatusForbidden},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			code, body := e.post(server.BindPath, tc.token, tc.body)
-			if code != tc.status {
-				t.Fatalf("status = %d, want %d", code, tc.status)
-			}
-			// specs/0005-interface.md: a 403 comes with a reason.
-			if reason, _ := body["reason"].(string); reason == "" {
-				t.Fatalf("a refusal with no reason: %v", body)
-			}
-			e.noSecrets(tc.token)
-		})
-	}
-
-	t.Run("finished run", func(t *testing.T) {
-		done := e.gh.PushRun(e.repo, "main")
-		e.gh.SetRunStatus(done, "completed")
-		code, body := e.post(server.BindPath, e.gh.ActionsToken(done, ghemu.Job{Audience: audience}, nil), "")
-		if reason, _ := body["reason"].(string); code != http.StatusForbidden || !strings.Contains(reason, "not in progress") {
-			t.Fatalf("finished run: %d %v, want 403 with a reason", code, body)
-		}
-	})
-	t.Run("GitHub down", func(t *testing.T) {
-		run := e.gh.PushRun(e.repo, "main")
-		e.gh.ServerError("/repos/lanescape/app/compare/", http.StatusBadGateway, 1)
-		code, body := e.post(server.BindPath, e.gh.ActionsToken(run, ghemu.Job{Audience: audience}, nil), "")
-		if code != http.StatusServiceUnavailable || body["retryable"] != true {
-			t.Fatalf("GitHub down: %d %v, want a retryable 503", code, body)
-		}
-		if code, body := e.post(server.BindPath, e.gh.ActionsToken(run, ghemu.Job{Audience: audience}, nil), ""); code != http.StatusOK || body["scope"] != "main" {
-			t.Fatalf("retry: %d %v", code, body)
-		}
-	})
-	t.Run("machine endpoints aren't served yet", func(t *testing.T) {
-		if code, _ := e.post(server.JobStartedPath, tok, ""); code != http.StatusNotFound {
-			t.Fatalf("job-started: %d", code)
-		}
-	})
-	e.noSecrets(boot, contributor, tok)
 }
 
 func TestPushedEventsAreRecordedBeforeTheyreAcknowledged(t *testing.T) {

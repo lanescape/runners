@@ -29,25 +29,25 @@ func TestAChoiceWaitsForTheLease(t *testing.T) {
 	img := e.saveMain(key1)
 	release := e.hold()
 	run := e.mainRun()
-	jb := e.take(run, e.gh.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}}))
-	if code := jb.started(); code != http.StatusServiceUnavailable {
-		t.Fatalf("a check while the disks' lease is held: %d, want a retryable 503", code)
+	jb := e.take(run, e.queueJob(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}}))
+	if code := jb.askDisk(); code != http.StatusServiceUnavailable {
+		t.Fatalf("a disk request while the disks' lease is held: %d, want a retryable 503", code)
 	}
 	release()
-	if code := jb.started(); code != http.StatusOK {
-		t.Fatalf("the check once the lease is free: %d", code)
+	if code := jb.askDisk(); code != http.StatusOK {
+		t.Fatalf("the disk request once the lease is free: %d", code)
 	}
 	if jb.source() != img {
 		t.Fatalf("restored %q, want %s", jb.source(), img)
 	}
 	// The run's next job reuses its choice, under the lease too.
 	release = e.hold()
-	next := e.take(run, e.gh.Queue(run, ghemu.JobSpec{Name: "test", Labels: []string{sel(key1, "main")}}))
-	if code := next.started(); code != http.StatusServiceUnavailable {
+	next := e.take(run, e.queueJob(run, ghemu.JobSpec{Name: "test", Labels: []string{sel(key1, "main")}}))
+	if code := next.askDisk(); code != http.StatusServiceUnavailable {
 		t.Fatalf("reusing a choice while the disks' lease is held: %d, want a retryable 503", code)
 	}
 	release()
-	if code := next.started(); code != http.StatusOK || next.source() != img {
+	if code := next.askDisk(); code != http.StatusOK || next.source() != img {
 		t.Fatalf("reusing the choice: %d, %q", code, next.source())
 	}
 }
@@ -243,18 +243,18 @@ func TestATransferredRepositoryGetsNoDisk(t *testing.T) {
 	e.saveMain(key1)
 	release := e.hold()
 	run := e.mainRun()
-	jb := e.take(run, e.gh.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}}))
-	if code := jb.started(); code != http.StatusServiceUnavailable {
+	jb := e.take(run, e.queueJob(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}}))
+	if code := jb.askDisk(); code != http.StatusServiceUnavailable {
 		t.Fatalf("while the lease is held: %d", code)
 	}
 	e.gh.Transfer(e.repo, e.gh.Org(1234, "elsewhere"))
 	release()
-	if code := jb.started(); code != http.StatusForbidden {
-		t.Fatalf("a transferred repository's check: %d, want 403", code)
+	if code := jb.askDisk(); code != http.StatusForbidden {
+		t.Fatalf("a transferred repository's disk request: %d, want 403", code)
 	}
 	in, _ := e.gce.Instance(jb.in.Zone, jb.in.Name)
-	if in.Status != "TERMINATED" || in.Disks[machines.WorkDevice] != "" {
-		t.Fatalf("machine %s with disks %v; want it stopped, with no work disk", in.Status, in.Disks)
+	if in.Disks[machines.WorkDevice] != "" {
+		t.Fatalf("machine with disks %v; want no work disk", in.Disks)
 	}
 }
 
@@ -262,8 +262,11 @@ func TestATransferredRepositoryGetsNoDisk(t *testing.T) {
 func TestATransferredRepositoryDoesntSave(t *testing.T) {
 	e := setup(t)
 	jb := e.start(e.mainRun(), ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}})
+	if code := jb.call("/v1/disks/save", map[string]bool{"save": true}, nil); code != http.StatusOK {
+		t.Fatalf("save request: %d", code)
+	}
 	e.gh.Transfer(e.repo, e.gh.Org(1234, "elsewhere"))
-	jb.finish(true)
+	jb.finish(false)
 	if len(e.images()) != 0 {
 		t.Fatalf("images %v; a transferred repository saved", e.images())
 	}
@@ -309,7 +312,7 @@ func TestAnOrphanAChoiceNamesIsKept(t *testing.T) {
 func TestAClaimedOrphanKeepsItsClaim(t *testing.T) {
 	e := setup(t)
 	run := e.mainRun()
-	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{"lanescape-2vcpu-linux-amd64-spot-main"}})
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
 	jb.preempt()
 	e.pass()
 	resume := disks.ResumeName(repoID, jb.in.ID)
@@ -340,7 +343,7 @@ func TestAClaimedOrphanKeepsItsClaim(t *testing.T) {
 func TestAClaimedOrphanGoesWithItsJob(t *testing.T) {
 	e := setup(t)
 	run := e.mainRun()
-	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{"lanescape-2vcpu-linux-amd64-spot-main"}})
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
 	jb.preempt()
 	e.pass()
 	resume := disks.ResumeName(repoID, jb.in.ID)

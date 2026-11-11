@@ -66,6 +66,17 @@ type Emulator struct {
 	onBoot    func(Machine)
 	onStop    func(Machine)
 	booted    map[uint64]bool
+	// logged is each instance's serial console as Cloud Logging keeps it,
+	// by instance ID, line by line, after the instance is gone too.
+	logged map[uint64][]logLine
+	// LogDelay holds back each line from Cloud Logging for that long after
+	// it was written, as Cloud Logging's delivery does.
+	logDelay time.Duration
+}
+
+type logLine struct {
+	text string
+	at   time.Time
 }
 
 type capacityKey struct {
@@ -197,6 +208,12 @@ func (e *Emulator) Faults() *fault.Injector { return &e.faults }
 // the emulator instead of Google.
 func (e *Emulator) ClientOptions() []option.ClientOption {
 	return []option.ClientOption{option.WithEndpoint(e.URL + "/compute/v1/"), option.WithoutAuthentication()}
+}
+
+// LoggingOptions point a Cloud Logging client at the emulator, which serves
+// its instances' serial consoles as Cloud Logging does.
+func (e *Emulator) LoggingOptions() []option.ClientOption {
+	return []option.ClientOption{option.WithEndpoint(e.URL + "/"), option.WithoutAuthentication()}
 }
 
 // Zones are the project's zones.
@@ -354,7 +371,7 @@ func (e *Emulator) boot(in *instance) {
 // halt stops a running instance's guest, and runs OnStop. The caller holds
 // e.mu.
 func (e *Emulator) halt(in *instance, status string) {
-	was := in.status == "RUNNING"
+	was := in.status == "RUNNING" || in.status == "STOPPING"
 	if was {
 		in.stopped = e.clock.Now()
 	}
@@ -423,7 +440,7 @@ func (e *Emulator) Preempt(zone, name string) error {
 func (e *Emulator) Shutdown(zone, name string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if in := e.instances[zone+"/"+name]; in != nil && e.running(in) {
+	if in := e.instances[zone+"/"+name]; in != nil && (in.status == "STOPPING" || e.running(in)) {
 		e.systemOp(in, "compute.instances.guestTerminate")
 		e.halt(in, "TERMINATED")
 	}
@@ -465,8 +482,40 @@ func (e *Emulator) WriteSerial(zone, name, text string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if in := e.instances[zone+"/"+name]; in != nil {
-		in.serial.WriteString(text)
+		e.writeSerial(in, text)
 	}
+}
+
+// writeSerial adds to an instance's console, and to Cloud Logging's copy
+// of it, line by line. The caller holds e.mu.
+func (e *Emulator) writeSerial(in *instance, text string) {
+	in.serial.WriteString(text)
+	if e.logged == nil {
+		e.logged = map[uint64][]logLine{}
+	}
+	for _, l := range strings.SplitAfter(text, "\n") {
+		if l != "" {
+			e.logged[in.id] = append(e.logged[in.id], logLine{text: strings.TrimSuffix(l, "\n"), at: e.clock.Now()})
+		}
+	}
+}
+
+// Serial is an instance's serial console output so far.
+func (e *Emulator) Serial(zone, name string) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if in := e.instances[zone+"/"+name]; in != nil {
+		return in.serial.String()
+	}
+	return ""
+}
+
+// SetLogDelay holds back serial console lines from Cloud Logging for d
+// after they're written.
+func (e *Emulator) SetLogDelay(d time.Duration) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.logDelay = d
 }
 
 // InstanceState is what tests see of an instance.

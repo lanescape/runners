@@ -53,6 +53,10 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 	age := s.now().Sub(m.CreatedAt)
 	a, admitted := inv.admissions[m.Name]
 	rep, reported := inv.reports[m.Name]
+	// A failed job's machine waits until its hook has read its reason.
+	if admitted && s.answering(inv, a) {
+		return
+	}
 	// A refused machine that's running is stopped before anything else,
 	// whatever the rest of the records or its boot log hold up.
 	if admitted && !a.Allowed && !m.Stopped() {
@@ -80,7 +84,7 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 			}
 		}
 		if admitted && a.Allowed && m.Spot && s.Preemptions != nil {
-			if err := s.Preemptions.Stopped(ctx, m, a, s.preempted(ctx, m), false); err != nil {
+			if err := s.Preemptions.Stopped(ctx, a.Resolve(m, inv.disk(m.Name)), a, s.preempted(ctx, m), false); err != nil {
 				s.log().Warn("recording a stopped Spot machine past the age limit; it waits for its record", "machine", m.Name, "err", err.Error())
 				return
 			}
@@ -110,7 +114,7 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 			return
 		}
 		if errors.Is(err, github.ErrNotFound) || (job.Status == "completed" && s.now().Sub(job.CompletedAt) >= ReportWait) {
-			s.finish(ctx, inv, m, "its job finished "+ReportWait.String()+" ago with no report; going on as if it asked for no save", &Report{Machine: m.Name})
+			s.finish(ctx, inv, m, "its job finished "+ReportWait.String()+" ago with no report; going on without saving", nil)
 		}
 	case m.Stopped():
 		if s.retire(ctx, m, "it stopped before its job started") {
@@ -152,7 +156,7 @@ func (s *Service) retire(ctx context.Context, m Machine, why string) bool {
 func (s *Service) stoppedSpot(ctx context.Context, inv *inventory, m Machine, a Admission) {
 	preempted := s.preempted(ctx, m)
 	if s.Preemptions != nil {
-		if err := s.Preemptions.Stopped(ctx, m, a, preempted, true); err != nil {
+		if err := s.Preemptions.Stopped(ctx, a.Resolve(m, inv.disk(m.Name)), a, preempted, true); err != nil {
 			s.log().Warn("recording a stopped Spot machine", "machine", m.Name, "err", err.Error())
 			return
 		}
@@ -171,12 +175,13 @@ func (s *Service) preempted(ctx context.Context, m Machine) bool {
 	return err == nil && slices.Contains(ids, m.ID)
 }
 
-// finish ends a machine's life: it saves the work disk if the report asks
-// and the job and scope allow, saves the boot log, and deletes the machine
-// and its disks, then their records.
+// finish ends a machine's life: once its supervisor has reported, it saves
+// the work disk if the job asked and the job and scope allow; then it saves
+// the boot log, and deletes the machine and its disks, then their records.
+// No report means no save.
 func (s *Service) finish(ctx context.Context, inv *inventory, m Machine, why string, rep *Report) {
 	log := s.log().With("machine", m.Name, "repository_id", m.RepositoryID)
-	if rep != nil && rep.Save {
+	if _, asked := inv.saves[m.Name]; rep != nil && asked {
 		if save, err := s.saves(ctx, inv, m); err != nil {
 			log.Warn("deciding whether to save a work disk", "err", err.Error())
 			return
@@ -195,7 +200,7 @@ func (s *Service) finish(ctx context.Context, inv *inventory, m Machine, why str
 					}
 				}
 				a := inv.admissions[m.Name]
-				if err := s.Saves.Save(ctx, m, a); err != nil {
+				if err := s.Saves.Save(ctx, a.Resolve(m, inv.disk(m.Name)), a); err != nil {
 					log.Warn("saving a work disk", "err", err.Error())
 					return
 				}
@@ -247,8 +252,16 @@ func (s *Service) finish(ctx context.Context, inv *inventory, m Machine, why str
 	log.Info("machine deleted", "reason", why)
 }
 
-// saveBootLog saves a machine's serial console output to the bucket, once.
+// saveBootLog saves a machine's serial console output to the bucket, once:
+// from Cloud Logging, where Compute Engine sends it, once the machine has
+// gone, by a record a later pass follows; or, without Cloud Logging, from
+// Compute Engine before it goes.
 func (s *Service) saveBootLog(ctx context.Context, m Machine) error {
+	if s.BootLogs != nil {
+		_, _, err := createOnce(ctx, s.Objects, pendingLogKey(m), PendingLog{Machine: m.Name, InstanceID: m.ID, CreatedAt: m.CreatedAt,
+			DeletedAt: s.now()})
+		return err
+	}
 	out, err := s.Compute.SerialOutput(ctx, m.Zone, m.Name, bootLogLimit)
 	if errors.Is(err, compute.ErrNotFound) {
 		return nil
@@ -262,12 +275,16 @@ func (s *Service) saveBootLog(ctx context.Context, m Machine) error {
 	return nil
 }
 
-// saves reports whether a finished job's work disk is to be saved: the job
-// succeeded, by GitHub's conclusion, its scope saves, and its selector
-// names a family and key (specs/0003-disks.md).
+// saves reports whether a finished job's work disk is to be saved, once it
+// asked: the job succeeded, by GitHub's conclusion, its scope saves, and it
+// has a work disk, of a family, which its disk action asked for
+// (specs/0003-disks.md).
 func (s *Service) saves(ctx context.Context, inv *inventory, m Machine) (bool, error) {
 	a, ok := inv.admissions[m.Name]
-	if !ok || !a.Allowed || !m.Selector.Scope.Saves() || !m.Selector.HasDisk() {
+	if !ok || !a.Allowed || a.Unbound || !a.Scope.Saves() {
+		return false, nil
+	}
+	if sr := inv.saves[m.Name]; sr.JobID != a.JobID || !a.Resolve(m, inv.disk(m.Name)).Selector.HasDisk() {
 		return false, nil
 	}
 	repo, err := s.repository(ctx, inv, m.RepositoryID)
@@ -361,6 +378,18 @@ func (s *Service) tidyRunners(ctx context.Context, inv *inventory) {
 			continue
 		}
 		for _, r := range rs {
+			if m, ok := inv.machines[r.Name]; ok && machineName.MatchString(r.Name) && !onlyLabel(r.Labels, m.Selector.String()) {
+				// GitHub's record shows a label besides the selector: the
+				// runner and its machine go.
+				s.log().Error("a runner has labels besides its selector; removing it and its machine", "runner", r.Name, "labels", r.Labels)
+				if err := s.GitHub.DeleteRunner(ctx, r.ID); err != nil && !errors.Is(err, github.ErrNotFound) {
+					s.log().Warn("removing a runner with other labels", "runner", r.Name, "err", err.Error())
+				}
+				if err := s.Compute.StopInstance(ctx, m.Zone, m.Name, s.requestID("stop", m.Name)); err != nil && !errors.Is(err, compute.ErrNotFound) {
+					s.log().Warn("stopping a machine whose runner has other labels", "machine", m.Name, "err", err.Error())
+				}
+				continue
+			}
 			if !machineName.MatchString(r.Name) || r.Status != "offline" || r.Busy || !inv.gone(r.Name) {
 				continue
 			}
@@ -407,5 +436,47 @@ func (s *Service) tidyRecords(ctx context.Context, inv *inventory) {
 		if !r.v.FinishedAt.IsZero() && s.now().Sub(r.v.FinishedAt) >= recordsKept {
 			_ = s.Objects.Delete(ctx, key, r.gen)
 		}
+	}
+}
+
+// followBootLogs reads deleted machines' boot logs from Cloud Logging into
+// the bucket: once the supervisor's last line has arrived, or, waiting up to
+// BootLogWait for it, as they are, or as missing.
+func (s *Service) followBootLogs(ctx context.Context) {
+	if s.BootLogs == nil {
+		return
+	}
+	objs, err := s.Objects.List(ctx, "bootlogs/")
+	if err != nil {
+		s.log().Warn("listing boot logs to read", "err", err.Error())
+		return
+	}
+	for _, o := range objs {
+		if ctx.Err() != nil {
+			return
+		}
+		p, gen, ok, err := getJSON[PendingLog](ctx, s.Objects, o.Name)
+		if err != nil || !ok {
+			continue
+		}
+		text, err := s.BootLogs.Serial(ctx, p.InstanceID, bootLogLimit)
+		if err != nil {
+			s.log().Warn("reading a boot log from Cloud Logging", "machine", p.Machine, "err", err.Error())
+			continue
+		}
+		waited := s.now().Sub(p.DeletedAt) >= BootLogWait
+		if !strings.Contains(text, LastLine) && !waited {
+			continue
+		}
+		if text == "" {
+			text = "lanescape-runners: no boot log arrived from Cloud Logging within " + BootLogWait.String() + "\n"
+			s.log().Warn("a boot log is missing", "machine", p.Machine)
+		}
+		key := bootLogKey(Machine{Instance: compute.Instance{Name: p.Machine}, CreatedAt: p.CreatedAt})
+		if _, err := s.Objects.Create(ctx, key, []byte(text)); err != nil && !errors.Is(err, store.ErrPrecondition) {
+			s.log().Warn("saving a boot log", "machine", p.Machine, "err", err.Error())
+			continue
+		}
+		_ = s.Objects.Delete(ctx, o.Name, gen)
 	}
 }

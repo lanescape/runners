@@ -133,77 +133,16 @@ func unsigned(claims map[string]any) string {
 	return "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0." + parts[1] + "."
 }
 
-func TestActions(t *testing.T) {
-	ctx := context.Background()
-	emu := ghemu.New()
-	defer emu.Close()
-	org := emu.Org(orgID, "lanescape")
-	repo := emu.Repo(org, 5001, "app")
-	run := emu.PushRun(repo, "main")
-	v, err := auth.NewActions(auth.Options{Issuer: auth.Issuer{URL: emu.Actions.URL, JWKSURL: emu.Actions.JWKSURL}, Audience: audience}, orgID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	job := ghemu.Job{Audience: audience}
-	c, err := v.Verify(ctx, emu.ActionsToken(run, job, nil))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.RepositoryID != 5001 || c.RepositoryOwnerID != orgID || c.RunID != run.ID || c.RunAttempt != 1 ||
-		c.EventName != "push" || c.Ref != "refs/heads/main" || c.RefType != "branch" || c.SHA != run.SHA ||
-		c.Repository != "lanescape/app" || c.JobWorkflowRef != "lanescape/app/.github/workflows/ci.yml@refs/heads/main" {
-		t.Fatalf("claims = %+v", c)
-	}
-
-	for _, tc := range []struct {
-		name  string
-		token string
-		want  error
-	}{
-		{"another organization", emu.ActionsToken(run, job, map[string]any{"repository_owner_id": "1234"}), auth.ErrForbidden},
-		{"look-alike name, other ID", emu.ActionsToken(run, job, map[string]any{"repository_owner": "lanescape", "repository_owner_id": "303994382"}), auth.ErrForbidden},
-		{"no owner ID", emu.ActionsToken(run, job, map[string]any{"repository_owner_id": nil}), auth.ErrUnauthenticated},
-		{"padded owner ID", emu.ActionsToken(run, job, map[string]any{"repository_owner_id": "0303994381"}), auth.ErrUnauthenticated},
-		{"numeric owner ID", emu.ActionsToken(run, job, map[string]any{"repository_owner_id": orgID}), auth.ErrUnauthenticated},
-		{"no run ID", emu.ActionsToken(run, job, map[string]any{"run_id": nil}), auth.ErrUnauthenticated},
-		{"no repository ID", emu.ActionsToken(run, job, map[string]any{"repository_id": "x"}), auth.ErrUnauthenticated},
-		{"no event", emu.ActionsToken(run, job, map[string]any{"event_name": nil}), auth.ErrUnauthenticated},
-		{"default audience", emu.ActionsToken(run, ghemu.Job{}, nil), auth.ErrUnauthenticated},
-		{"wrong audience", emu.ActionsToken(run, ghemu.Job{Audience: "https://other.example.test"}, nil), auth.ErrUnauthenticated},
-		{"expired", emu.ActionsToken(run, job, map[string]any{"exp": time.Now().Add(-time.Second).Unix()}), auth.ErrUnauthenticated},
-		{"wrong issuer", emu.ActionsToken(run, job, map[string]any{"iss": "https://token.actions.githubusercontent.com"}), auth.ErrUnauthenticated},
-		{"unpublished key", emu.Actions.MintWith(oidc.NewKey(), emu.ActionsClaims(run, job)), auth.ErrUnauthenticated},
-		{"unsigned", unsigned(emu.ActionsClaims(run, job)), auth.ErrUnauthenticated},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if _, err := v.Verify(ctx, tc.token); !errors.Is(err, tc.want) {
-				t.Fatalf("error = %v, want %v", err, tc.want)
-			}
-		})
-	}
-
-	// A Google token is no use here, even for the same audience.
-	g := google.New()
-	defer g.Close()
-	if _, err := v.Verify(ctx, g.Token("scheduler@example.com", audience)); !errors.Is(err, auth.ErrUnauthenticated) {
-		t.Fatalf("Google token: %v", err)
-	}
-}
-
-// A token whose issuer's keys can't be read isn't refused: it can't be
-// checked yet, and the caller should try again.
 func TestKeysThatCantBeRead(t *testing.T) {
-	emu := ghemu.New()
-	defer emu.Close()
-	org := emu.Org(orgID, "lanescape")
-	run := emu.PushRun(emu.Repo(org, 5001, "app"), "main")
+	gg := google.New()
+	defer gg.Close()
 	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusBadGateway) }))
 	defer down.Close()
-	v, err := auth.NewActions(auth.Options{Issuer: auth.Issuer{URL: emu.Actions.URL, JWKSURL: down.URL}, Audience: audience}, orgID)
+	v, err := auth.NewGoogle(auth.Options{Issuer: auth.Issuer{URL: gg.URL, JWKSURL: down.URL}, Audience: audience}, []string{"scheduler@lanescape-dev.iam.gserviceaccount.com"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = v.Verify(context.Background(), emu.ActionsToken(run, ghemu.Job{Audience: audience}, nil))
+	_, err = v.Verify(context.Background(), gg.Token("scheduler@lanescape-dev.iam.gserviceaccount.com", audience))
 	if !errors.Is(err, auth.ErrUnavailable) || errors.Is(err, auth.ErrUnauthenticated) {
 		t.Fatalf("keys that can't be read: %v, want ErrUnavailable", err)
 	}

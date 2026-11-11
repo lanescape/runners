@@ -38,6 +38,27 @@ type Shapes struct {
 	DiskIOPS            int               `yaml:"disk_iops"`
 	DiskThroughputMiBps int               `yaml:"disk_throughput_mibps"`
 	Shapes              map[string]*Shape `yaml:"shapes"`
+	// Order is the shapes' names in the order shapes.yaml lists them: the
+	// first is the smallest shape (specs/0002-machines.md, Shapes).
+	Order []string `yaml:"-"`
+}
+
+// Smallest is the first shape listed, of any architecture.
+func (s *Shapes) Smallest() string {
+	if len(s.Order) == 0 {
+		return ""
+	}
+	return s.Order[0]
+}
+
+// SmallestOf is the first shape listed of an architecture, or "".
+func (s *Shapes) SmallestOf(arch string) string {
+	for _, n := range s.Order {
+		if sh := s.Shapes[n]; sh != nil && sh.Arch == arch {
+			return n
+		}
+	}
+	return ""
 }
 
 // Shape is one shape. Name, VCPUs and Arch come from the shape's name.
@@ -77,10 +98,40 @@ func Load(fsys fs.FS) (*Config, error) {
 			return nil, err
 		}
 	}
+	order, err := shapeOrder(fsys)
+	if err != nil {
+		return nil, err
+	}
+	c.Shapes.Order = order
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
 	return &c, nil
+}
+
+// shapeOrder is the order shapes.yaml lists its shapes in.
+func shapeOrder(fsys fs.FS) ([]string, error) {
+	data, err := fs.ReadFile(fsys, "shapes.yaml")
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil || len(doc.Content) == 0 {
+		return nil, fmt.Errorf("config: shapes.yaml: %v", err)
+	}
+	root := doc.Content[0]
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value != "shapes" {
+			continue
+		}
+		var out []string
+		m := root.Content[i+1]
+		for j := 0; j+1 < len(m.Content); j += 2 {
+			out = append(out, m.Content[j].Value)
+		}
+		return out, nil
+	}
+	return nil, nil
 }
 
 func decode(fsys fs.FS, name string, v any) error {

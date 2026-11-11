@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,7 +68,7 @@ func TestRepositoryAndRun(t *testing.T) {
 		t.Fatal("run has no creation time")
 	}
 	got.CreatedAt = time.Time{}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("run = %+v, want %+v", got, want)
 	}
 	if _, err := e.c.RepositoryByID(ctx, 999); !errors.Is(err, github.ErrNotFound) {
@@ -227,6 +229,18 @@ func TestFile(t *testing.T) {
 	}
 	if _, err := e.c.File(ctx, repo, ".github/absent.json", sha); !errors.Is(err, github.ErrNotFound) {
 		t.Fatalf("missing file: %v", err)
+	}
+}
+
+func TestALargeFileIsReadAsABlob(t *testing.T) {
+	ctx := context.Background()
+	e := setup(t)
+	big := strings.Repeat("0123456789abcdef", 1<<17) // 2 MiB, past the contents API's limit
+	sha := e.repo.Commit("main", map[string]string{"Cargo.lock": big})
+	repo, _ := e.c.RepositoryByID(ctx, 5001)
+	got, err := e.c.File(ctx, repo, "Cargo.lock", sha)
+	if err != nil || string(got) != big {
+		t.Fatalf("large file: %d bytes, %v", len(got), err)
 	}
 }
 

@@ -3,6 +3,7 @@ package selector_test
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -13,26 +14,13 @@ import (
 )
 
 func TestParse(t *testing.T) {
+	const amd = "lanescape-80vcpu-linux-amd64"
 	for in, want := range map[string]selector.Selector{
-		"lanescape-80vcpu-linux-amd64-main": {Shape: "lanescape-80vcpu-linux-amd64", VCPUs: 80, Arch: "amd64", Scope: scope.Main},
-		"lanescape-80vcpu-linux-amd64-spot-disk-build-3f9c2e7a10b4d5e6f708-pr42": {Shape: "lanescape-80vcpu-linux-amd64", VCPUs: 80,
-			Arch: "amd64", Spot: true, Family: "build", Key: "3f9c2e7a10b4d5e6f708", Scope: scope.PullRequest(42)},
-		"lanescape-16vcpu-linux-arm64-disk-tool-chain-0123456789abcdef0123-read": {Shape: "lanescape-16vcpu-linux-arm64", VCPUs: 16,
-			Arch: "arm64", Family: "tool-chain", Key: "0123456789abcdef0123", Scope: scope.Read},
-		"lanescape-2vcpu-linux-amd64-disk-build-0123456789abcdef0123-branch-v1": {Shape: "lanescape-2vcpu-linux-amd64", VCPUs: 2,
-			Arch: "amd64", Family: "build", Key: "0123456789abcdef0123", Scope: scope.Branch("v1")},
-		"lanescape-2vcpu-linux-amd64-branch-release2026": {Shape: "lanescape-2vcpu-linux-amd64", VCPUs: 2, Arch: "amd64",
-			Scope: scope.Branch("release2026")},
-		"LaneScape-2VCPU-Linux-AMD64-Spot-PR7": {Shape: "lanescape-2vcpu-linux-amd64", VCPUs: 2, Arch: "amd64", Spot: true, Scope: scope.PullRequest(7)},
-		// A family is letters, digits and hyphens, starting with a
-		// letter, up to 32 of them; hyphens anywhere after the first.
-		"lanescape-2vcpu-linux-amd64-disk-a--b--0123456789abcdef0123-main": {Shape: "lanescape-2vcpu-linux-amd64", VCPUs: 2,
-			Arch: "amd64", Family: "a--b-", Key: "0123456789abcdef0123", Scope: scope.Main},
-		"lanescape-2vcpu-linux-amd64-disk-" + strings.Repeat("a", 32) + "-0123456789abcdef0123-main": {Shape: "lanescape-2vcpu-linux-amd64", VCPUs: 2,
-			Arch: "amd64", Family: strings.Repeat("a", 32), Key: "0123456789abcdef0123", Scope: scope.Main},
-		// A family may be named like the parts around it.
-		"lanescape-2vcpu-linux-amd64-disk-spot-main-0123456789abcdef0123-main": {Shape: "lanescape-2vcpu-linux-amd64", VCPUs: 2,
-			Arch: "amd64", Family: "spot-main", Key: "0123456789abcdef0123", Scope: scope.Main},
+		amd:                                   {Shape: amd, VCPUs: 80, Arch: "amd64"},
+		amd + "-spot":                         {Shape: amd, VCPUs: 80, Arch: "amd64", Spot: true},
+		"lanescape-16vcpu-linux-arm64":        {Shape: "lanescape-16vcpu-linux-arm64", VCPUs: 16, Arch: "arm64"},
+		"LaneScape-2VCPU-Linux-AMD64-Spot":    {Shape: "lanescape-2vcpu-linux-amd64", VCPUs: 2, Arch: "amd64", Spot: true},
+		"lanescape-9999vcpu-linux-arm64-spot": {Shape: "lanescape-9999vcpu-linux-arm64", VCPUs: 9999, Arch: "arm64", Spot: true},
 	} {
 		got, err := selector.Parse(in)
 		if err != nil || got != want {
@@ -45,31 +33,19 @@ func TestParse(t *testing.T) {
 	}
 	for _, in := range []string{
 		"",
-		"lanescape-80vcpu-linux-amd64",                                       // no scope
-		"lanescape-80vcpu-linux-x86-main",                                    // architecture
-		"lanescape-80vcpu-windows-amd64-main",                                // OS
-		"lanescape-0vcpu-linux-amd64-main",                                   // no vCPUs
-		"lanescape-080vcpu-linux-amd64-main",                                 // leading zero
-		"lanescape-80vcpu-linux-amd64-pr0",                                   // pull request 0
-		"lanescape-80vcpu-linux-amd64-pr042",                                 // leading zero
-		"lanescape-80vcpu-linux-amd64-pr",                                    // no number
-		"lanescape-80vcpu-linux-amd64-feature",                               // not a scope
-		"lanescape-80vcpu-linux-amd64-branch-",                               // no branch name
-		"lanescape-80vcpu-linux-amd64-branch-v-1",                            // a hyphen in a branch name
-		"lanescape-80vcpu-linux-amd64-branch-1v",                             // a branch name starting with a digit
-		"lanescape-80vcpu-linux-amd64-branch-abcdefghijklmnopq",              // a branch name of 17
-		"lanescape-80vcpu-linux-amd64-main-spot",                             // out of order
-		"lanescape-80vcpu-linux-amd64-disk-build-main",                       // no key
-		"lanescape-80vcpu-linux-amd64-disk-build-3f9c2e7a10b4d5e6f70-main",   // key too short
-		"lanescape-80vcpu-linux-amd64-disk-build-3f9c2e7a10b4d5e6f7088-main", // key too long
-		"lanescape-80vcpu-linux-amd64-disk--3f9c2e7a10b4d5e6f708-main",       // empty family
-		"lanescape-80vcpu-linux-amd64-disk-b_d-3f9c2e7a10b4d5e6f708-main",    // underscore
-		"lanescape-80vcpu-linux-amd64-disk-1build-3f9c2e7a10b4d5e6f708-main", // starts with a digit
-		"lanescape-80vcpu-linux-amd64-disk--build-3f9c2e7a10b4d5e6f708-main", // starts with a hyphen
-		"lanescape-80vcpu-linux-amd64-disk-" + strings.Repeat("a", 33) + "-3f9c2e7a10b4d5e6f708-main",
-		" lanescape-80vcpu-linux-amd64-main",
-		"lanescape-80vcpu-linux-amd64-main\n",
-		"lanescape-80vcpu-linux-amd64-spot-spot-main",
+		amd + "-main",                      // a scope, which selectors don't carry
+		amd + "-run-42",                    // a run, which selectors no longer carry
+		amd + "-spot-run-42",               //
+		amd + "-image-build",               // an image, which a job asks for in a step
+		amd + "-disk-build",                // a disk, likewise
+		amd + "-spot-spot",                 //
+		"lanescape-80vcpu-linux-x86",       // architecture
+		"lanescape-0vcpu-linux-amd64",      // no vCPUs
+		"lanescape-080vcpu-linux-amd64",    // leading zero
+		"lanescape-10000vcpu-linux-amd64",  // too many digits
+		"lanescape-80vcpu-linux-amd64spot", //
+		" " + amd,
+		amd + "\n",
 	} {
 		if s, err := selector.Parse(in); err == nil {
 			t.Errorf("Parse(%q) = %+v, want an error", in, s)
@@ -77,49 +53,88 @@ func TestParse(t *testing.T) {
 	}
 }
 
+func TestValidName(t *testing.T) {
+	for _, n := range []string{"build", "a", "a-b", "a--b", "tool-chain2", "spot", "x-image", "disk-x", "a-run-b", strings.Repeat("x", 32)} {
+		if !selector.ValidName(n) {
+			t.Errorf("%q isn't valid", n)
+		}
+	}
+	for _, n := range []string{"", "1a", "-a", "a-", "A", strings.Repeat("x", 33), "a_b", "a/b", "a.b"} {
+		if selector.ValidName(n) {
+			t.Errorf("%q is valid", n)
+		}
+	}
+}
+
 func TestHash(t *testing.T) {
-	s, _ := selector.Parse("Lanescape-80vcpu-linux-amd64-Main")
-	sum := sha256.Sum256([]byte("lanescape-80vcpu-linux-amd64-main"))
+	s, _ := selector.Parse("Lanescape-80vcpu-linux-amd64-Spot")
+	sum := sha256.Sum256([]byte("lanescape-80vcpu-linux-amd64-spot"))
 	if s.Hash() != hex.EncodeToString(sum[:])[:20] {
 		t.Fatalf("hash = %s; it's of the lowercase selector", s.Hash())
+	}
+	// What's resolved isn't part of it.
+	r := s
+	r.Scope, r.Family, r.Key = scope.Main, "build", "0123456789abcdef0123"
+	if r.Hash() != s.Hash() || !r.Same(s) || r.String() != s.String() {
+		t.Fatal("a resolved scope, family or key changed the selector")
+	}
+	if s.HasDisk() || !r.HasDisk() {
+		t.Fatal("HasDisk isn't whether a family is resolved")
 	}
 }
 
 func TestOfJob(t *testing.T) {
-	sel := "lanescape-16vcpu-linux-arm64-main"
-	for _, ok := range [][]string{
-		{sel},
-		{strings.ToUpper(sel)},
-		{"self-hosted", sel},
-		{sel, "Linux", "ARM64", "self-hosted"},
-	} {
+	sel := "lanescape-16vcpu-linux-arm64"
+	for _, ok := range [][]string{{sel}, {strings.ToUpper(sel)}} {
 		if s, err := selector.OfJob(ok); err != nil || s.String() != sel {
 			t.Errorf("OfJob(%v) = %v, %v", ok, s, err)
 		}
 	}
-	for _, bad := range [][]string{
-		nil,
-		{"self-hosted"},
-		{"ubuntu-24.04"},
-		{sel, "x64"},
-		{sel, "gpu"},
-		{sel, "lanescape-16vcpu-linux-arm64-pr1"},
-		{"lanescape-16vcpu"},
-	} {
-		if s, err := selector.OfJob(bad); err == nil {
-			t.Errorf("OfJob(%v) = %v, want an error", bad, s)
+	for _, none := range [][]string{nil, {"self-hosted"}, {"ubuntu-24.04"}, {"self-hosted", "linux"}} {
+		if _, err := selector.OfJob(none); !errors.Is(err, selector.ErrNoSelector) {
+			t.Errorf("OfJob(%v) = %v, want no selector", none, err)
+		}
+	}
+	for _, other := range [][]string{{"self-hosted", sel}, {sel, "linux"}, {sel, "lanescape-16vcpu-linux-arm64-spot"}} {
+		if _, err := selector.OfJob(other); !errors.Is(err, selector.ErrOtherLabels) {
+			t.Errorf("OfJob(%v) = %v, want other labels", other, err)
+		}
+	}
+	for _, not := range [][]string{{"lanescape-16vcpu"}, {"lanescape-16vcpu-linux-arm64-run-4"}, {"Lanescape-runners"}} {
+		if _, err := selector.OfJob(not); !errors.Is(err, selector.ErrNotSelector) {
+			t.Errorf("OfJob(%v) = %v, want a label that isn't a selector", not, err)
 		}
 	}
 	m, _ := selector.Parse(sel)
-	if err := selector.MatchesMachine([]string{sel, "self-hosted"}, m); err != nil {
+	if err := selector.MatchesMachine([]string{sel}, m); err != nil {
 		t.Error(err)
 	}
-	other, _ := selector.Parse("lanescape-16vcpu-linux-arm64-read")
-	if err := selector.MatchesMachine([]string{sel}, other); err == nil {
-		t.Error("a job for main matched a machine made for read")
+	spot, _ := selector.Parse(sel + "-spot")
+	if err := selector.MatchesMachine([]string{sel}, spot); err == nil {
+		t.Error("a standard job matched a Spot machine")
 	}
-	if got := m.RunnerLabels(); !slices.Equal(got, []string{sel, "self-hosted", "linux", "arm64"}) {
+	if got := m.RunnerLabels(); !slices.Equal(got, []string{sel}) {
 		t.Errorf("runner labels = %v", got)
+	}
+}
+
+func TestPlain(t *testing.T) {
+	cfg, err := config.Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Shapes.Smallest() != "lanescape-2vcpu-linux-amd64" {
+		t.Fatalf("smallest = %s", cfg.Shapes.Smallest())
+	}
+	p, _ := selector.Parse("lanescape-2vcpu-linux-amd64")
+	if !p.Plain(cfg.Shapes.Smallest()) {
+		t.Fatal("the smallest shape, standard, isn't plain")
+	}
+	for _, l := range []string{"lanescape-2vcpu-linux-amd64-spot", "lanescape-80vcpu-linux-amd64", "lanescape-16vcpu-linux-arm64"} {
+		q, _ := selector.Parse(l)
+		if q.Plain(cfg.Shapes.Smallest()) {
+			t.Errorf("%s is plain", l)
+		}
 	}
 }
 

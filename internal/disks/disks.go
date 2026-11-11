@@ -335,6 +335,11 @@ type Preemption struct {
 	RunID        int64  `json:"run_id"`
 	RunAttempt   int    `json:"run_attempt"`
 	Selector     string `json:"selector"`
+	// Arch and Family are its work disk's, if its job asked for one: a
+	// resume image resumes only a job of the same name that asks for the
+	// same family on the same architecture.
+	Arch   string `json:"arch"`
+	Family string `json:"family,omitempty"`
 	// Preempted is yes, or unknown while there's no evidence.
 	Preempted string    `json:"preempted"`
 	StoppedAt time.Time `json:"stopped_at"`
@@ -377,8 +382,11 @@ type Save struct {
 
 func imageKey(repo int64, image string) string { return fmt.Sprintf("images/%d/%s.json", repo, image) }
 func choicePrefix(repo, run int64) string      { return fmt.Sprintf("choices/%d/%d/", repo, run) }
+
+// choiceKey is a run's restore choice for a family on an architecture: one
+// per run, family and architecture (specs/0003-disks.md).
 func choiceKey(repo, run int64, sel selector.Selector) string {
-	return choicePrefix(repo, run) + sel.Hash() + ".json"
+	return choicePrefix(repo, run) + selector.Hash(sel.Family+"\x00"+sel.Arch) + ".json"
 }
 func recentKey(repo int64, scope, arch, family string) string {
 	return fmt.Sprintf("recent/%d/%s/%s.json", repo, scope, selector.Hash(arch+"\x00"+family))
@@ -574,7 +582,7 @@ func labels(rec Image) map[string]string {
 		l[LabelLastUsed] = day(rec.LastUsed)
 	case KindResume:
 		l[LabelRun] = strconv.FormatInt(rec.RunID, 10)
-		l[LabelSelector] = selector.Hash(rec.Selector)
+		l[LabelFamily] = selector.Hash(rec.Family)
 		l[LabelJobName] = selector.Hash(rec.JobName)
 	}
 	return l
@@ -587,7 +595,7 @@ func matches(im compute.Image, rec Image) bool {
 		return false
 	}
 	want := labels(rec)
-	for _, k := range []string{LabelRepository, LabelKind, LabelArch, LabelScope, LabelFamily, LabelKey, LabelRun, LabelSelector, LabelJobName} {
+	for _, k := range []string{LabelRepository, LabelKind, LabelArch, LabelScope, LabelFamily, LabelKey, LabelRun, LabelJobName} {
 		if im.Labels[k] != want[k] {
 			return false
 		}

@@ -102,10 +102,63 @@ func (e *Emulator) routes() http.Handler {
 	mux.HandleFunc("GET "+p+"/global/images/family/{family}", e.global(e.getImageFromFamily))
 	mux.HandleFunc("GET "+p+"/global/operations/{op}", e.global(e.getOperation))
 	mux.HandleFunc("POST "+p+"/global/operations/{op}/wait", e.global(e.waitOperation))
+	mux.HandleFunc("POST /v2/entries:list", e.listLogEntries)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, &apiError{http.StatusNotFound, "notFound", "The requested URL " + r.URL.Path + " was not found."})
 	})
 	return mux
+}
+
+var serialFilter = regexp.MustCompile(`^resource\.type="gce_instance" AND resource\.labels\.instance_id="([0-9]+)" AND logName="projects/([^/]+)/logs/serialconsole\.googleapis\.com%2Fserial_port_1_output"$`)
+
+// listLogEntries serves Cloud Logging's entries.list for instances' serial
+// consoles, as the service reads them through its log view, a page at a
+// time.
+func (e *Emulator) listLogEntries(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ResourceNames []string `json:"resourceNames"`
+		Filter        string   `json:"filter"`
+		OrderBy       string   `json:"orderBy"`
+		PageSize      int      `json:"pageSize"`
+		PageToken     string   `json:"pageToken"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, &apiError{http.StatusBadRequest, "badRequest", "The request isn't one"})
+		return
+	}
+	m := serialFilter.FindStringSubmatch(req.Filter)
+	if m == nil || m[2] != e.Project || len(req.ResourceNames) != 1 ||
+		!strings.HasPrefix(req.ResourceNames[0], "projects/"+e.Project+"/locations/global/buckets/") || !strings.Contains(req.ResourceNames[0], "/views/") {
+		writeError(w, &apiError{http.StatusBadRequest, "badRequest", "The emulator serves only serial console entries through a view"})
+		return
+	}
+	id, _ := strconv.ParseUint(m[1], 10, 64)
+	start, _ := strconv.Atoi(req.PageToken)
+	size := req.PageSize
+	if size <= 0 || size > 1000 {
+		size = 1000
+	}
+	e.mu.Lock()
+	var lines []logLine
+	now := e.clock.Now()
+	for _, l := range e.logged[id] {
+		if now.Sub(l.at) >= e.logDelay {
+			lines = append(lines, l)
+		}
+	}
+	e.mu.Unlock()
+	var entries []map[string]any
+	end := min(start+size, len(lines))
+	for i := start; i < end; i++ {
+		entries = append(entries, map[string]any{"textPayload": lines[i].text, "timestamp": lines[i].at.UTC().Format(time.RFC3339Nano),
+			"logName":  "projects/" + e.Project + "/logs/serialconsole.googleapis.com%2Fserial_port_1_output",
+			"resource": map[string]any{"type": "gce_instance", "labels": map[string]string{"instance_id": m[1]}}})
+	}
+	out := map[string]any{"entries": entries}
+	if end < len(lines) {
+		out["nextPageToken"] = strconv.Itoa(end)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 type handler func(w http.ResponseWriter, r *http.Request, zone string)
@@ -993,7 +1046,7 @@ func (e *Emulator) insertImage(r *http.Request, _ string) (*operation, *apiError
 		return nil, notFound("projects/" + e.Project + "/zones/" + parts[1] + "/disks/" + parts[3])
 	}
 	for _, u := range d.users {
-		if u.status == "RUNNING" && r.URL.Query().Get("forceCreate") != "true" {
+		if (u.status == "RUNNING" || u.status == "STOPPING") && r.URL.Query().Get("forceCreate") != "true" {
 			return nil, &apiError{http.StatusBadRequest, "resourceInUseByAnotherResource",
 				fmt.Sprintf("The disk resource '%s' is already being used by '%s'", e.diskURL(d), e.instanceURL(u))}
 		}

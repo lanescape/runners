@@ -1,0 +1,11 @@
+# Mounts the work disk at /work once Compute Engine has attached it, outside
+# every job, in the machine's own mount namespace, where the runner and the
+# job's steps run (specs/0002-machines.md, The work disk). Only the rule for
+# the device named work starts it: udev itself runs in a mount namespace of
+# its own, where a mount would reach nothing, and kills what runs long.
+[Unit]
+Description=Lanescape Runners: the work disk at /work
+
+[Service]
+Type=oneshot
+ExecStart=/opt/lanescape-runners/mount-work

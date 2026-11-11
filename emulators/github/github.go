@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"maps"
+	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
@@ -37,6 +38,7 @@ type Emulator struct {
 	Actions *oidc.Issuer
 
 	srv    *httptest.Server
+	api    http.Handler
 	faults fault.Injector
 	clock  clockwork.Clock
 
@@ -47,6 +49,7 @@ type Emulator struct {
 	tokens        map[string]installationToken
 	repos         map[int64]*Repo
 	commits       map[string]*Commit
+	blobs         map[string]string
 	runs          map[int64]*Run
 	nextID        int64
 
@@ -54,8 +57,10 @@ type Emulator struct {
 	groups       map[int64]*RunnerGroup
 	runners      map[int64]*Runner
 	forkApproval map[int64]string
-	protected    map[string]bool
-	changed      chan struct{}
+	// defaultLabels gives just-in-time runners GitHub's default labels.
+	defaultLabels bool
+	protected     map[string]bool
+	changed       chan struct{}
 }
 
 // Account is a user or organization.
@@ -192,9 +197,34 @@ func New(opts ...Option) *Emulator {
 		o(e)
 	}
 	e.Actions = oidc.New(oidc.WithJWKSPath("/.well-known/jwks"), oidc.WithClock(e.clock))
-	e.srv = httptest.NewServer(e.faults.Wrap(e.routes()))
+	e.api = e.routes()
+	e.srv = httptest.NewServer(e.faults.Wrap(e.api))
 	e.URL = e.srv.URL
 	return e
+}
+
+// Transport serves requests to the emulator's API in-process, whatever
+// host they name, past the faults tests add with Faults: for something that
+// shares the emulator's state rather than calling GitHub, such as this
+// repository's service emulator, which takes its view of GitHub from a
+// GitHub emulator a test hands it.
+func (e *Emulator) Transport() http.RoundTripper { return inProcess{e.api} }
+
+type inProcess struct{ h http.Handler }
+
+func (p inProcess) RoundTrip(r *http.Request) (*http.Response, error) {
+	if err := r.Context().Err(); err != nil {
+		return nil, err
+	}
+	in := r.Clone(r.Context())
+	if in.Body == nil {
+		in.Body = http.NoBody
+	}
+	rec := httptest.NewRecorder()
+	p.h.ServeHTTP(rec, in)
+	resp := rec.Result()
+	resp.Request = r
+	return resp, nil
 }
 
 // Close stops the emulator.

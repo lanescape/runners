@@ -1,14 +1,15 @@
 package machines_test
 
 import (
+	"fmt"
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	ghemu "github.com/lanescape/runners/emulators/github"
-	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/machines"
 	"github.com/lanescape/runners/internal/selector"
 )
@@ -19,8 +20,8 @@ func TestAMachineForAQueuedJob(t *testing.T) {
 	j := e.queue(run, sel2)
 	e.pass()
 	m := e.one()
-	sel, _ := selector.Parse(sel2)
-	if m.Labels[machines.LabelRepository] != "5001" || m.Labels[machines.LabelSelector] != sel.Hash() ||
+	sel, _ := selector.Parse(e.gh.Job(j.ID).Labels[0])
+	if len(m.Labels) != 5 || m.Labels[machines.LabelRepository] != "5001" || m.Labels[machines.LabelSelector] != sel.Hash() ||
 		m.Labels[machines.LabelJob] != strconv.FormatInt(j.ID, 10) || m.Labels[machines.LabelContribution] != "false" ||
 		m.Labels[machines.LabelCreated] != strconv.FormatInt(e.clock.Now().Unix(), 10) {
 		t.Fatalf("labels = %v", m.Labels)
@@ -49,7 +50,7 @@ func TestAMachineForAQueuedJob(t *testing.T) {
 		t.Fatalf("runner group = %+v", g)
 	}
 	rs := e.gh.Runners()
-	if len(rs) != 1 || rs[0].Name != m.Name || rs[0].Group.ID != g.ID || !slices.Equal(rs[0].Labels, []string{sel2, "self-hosted", "linux", "x64"}) {
+	if len(rs) != 1 || rs[0].Name != m.Name || rs[0].Group.ID != g.ID || !slices.Equal(rs[0].Labels, []string{sel.String()}) {
 		t.Fatalf("runners = %+v", rs)
 	}
 	// A machine being made or idle counts against the queue.
@@ -65,24 +66,16 @@ func TestAMachineForAQueuedJob(t *testing.T) {
 
 func TestNoMachine(t *testing.T) {
 	for name, tc := range map[string]func(e *env){
-		"a run with no binding": func(e *env) { e.queue(e.gh.PushRun(e.repo, "main"), sel2) },
-		"a scope that isn't its run's": func(e *env) {
-			e.queue(e.mainRun(), "lanescape-2vcpu-linux-amd64-pr1")
-		},
-		"a fork's pull request": func(e *env) {
-			e.queue(e.forkPull(), "lanescape-2vcpu-linux-amd64-read")
-		},
-		"an unapproved contribution": func(e *env) {
-			run, p := e.contribution(false)
-			e.gh.Queue(run, ghemu.JobSpec{Labels: []string{"lanescape-2vcpu-linux-amd64-pr" + strconv.Itoa(p.Number)}})
-		},
-		"an unknown shape":     func(e *env) { e.queue(e.mainRun(), "lanescape-4vcpu-linux-amd64-main") },
-		"another label":        func(e *env) { e.queue(e.mainRun(), sel2, "gpu") },
-		"two selectors":        func(e *env) { e.queue(e.mainRun(), sel2, "lanescape-80vcpu-linux-amd64-main") },
-		"only self-hosted":     func(e *env) { e.queue(e.mainRun(), "self-hosted") },
-		"not a selector":       func(e *env) { e.queue(e.mainRun(), "lanescape-2vcpu-linux-amd64") },
-		"GitHub's own runners": func(e *env) { e.queue(e.mainRun(), "ubuntu-24.04") },
-		"another architecture": func(e *env) { e.queue(e.mainRun(), sel2, "arm64") },
+		"a fork's pull request":      func(e *env) { e.queue(e.forkPull(), sel2) },
+		"an unknown shape":           func(e *env) { e.queue(e.mainRun(), "lanescape-4vcpu-linux-amd64") },
+		"another label":              func(e *env) { e.queue(e.mainRun(), sel2, "gpu") },
+		"two selectors":              func(e *env) { e.queue(e.mainRun(), sel2, "lanescape-80vcpu-linux-amd64") },
+		"only self-hosted":           func(e *env) { e.queue(e.mainRun(), "self-hosted") },
+		"a selector naming a run":    func(e *env) { e.queue(e.mainRun(), sel2+"-run-1") },
+		"a selector naming an image": func(e *env) { e.queue(e.gh.PushRun(e.repo, "main"), sel2+"-image-build") },
+		"a selector naming a disk":   func(e *env) { e.queue(e.mainRun(), sel2+"-disk-build") },
+		"GitHub's own runners":       func(e *env) { e.queue(e.mainRun(), "ubuntu-24.04") },
+		"another architecture":       func(e *env) { e.queue(e.mainRun(), sel2, "arm64") },
 		"a job still in review": func(e *env) {
 			e.gh.Queue(e.mainRun(), ghemu.JobSpec{Labels: []string{sel2}, Environment: "contribution"})
 		},
@@ -96,11 +89,83 @@ func TestNoMachine(t *testing.T) {
 	}
 }
 
+func TestAnUnboundRunsJobGetsAMachineOfItsSelector(t *testing.T) {
+	e := setup(t)
+	run := e.gh.PushRun(e.repo, "main")
+	j := e.queue(run, "lanescape-80vcpu-linux-amd64-spot")
+	e.pass()
+	m := e.one()
+	if m.MachineType != "n4-highcpu-80" || m.Provisioning != "SPOT" {
+		t.Fatalf("machine = %+v; want one of the job's selector", m)
+	}
+	for _, d := range e.gce.Disks() {
+		if !strings.HasSuffix(d.SourceImage, "lsr-base-amd64-new") {
+			t.Fatalf("boot disk = %+v; every machine boots the base image", d)
+		}
+	}
+	// Its check binds the run.
+	b := e.boot(m)
+	b.taken(j)
+	if code := b.started(run.ID); code != http.StatusOK {
+		t.Fatalf("job-started check: %d", code)
+	}
+	if bd, ok := e.record("bindings/5001/" + strconv.FormatInt(run.ID, 10) + ".json"); !ok || bd["scope"] != "main" {
+		t.Fatalf("binding = %v", bd)
+	}
+}
+
+// A job the service will fail gets an ordinary machine of its own selector,
+// whose check answers it with the reason.
+func TestAFailedJobsMachineIsOfItsOwnSelector(t *testing.T) {
+	e := setup(t)
+	e.repo.Commit("feature", map[string]string{"f": "1"})
+	p := e.gh.PullRequest(e.repo, "main", e.repo, "feature", e.org)
+	e.repo.Branch("copy", e.repo.Head("feature"))
+	e.gh.PullRequest(e.repo, "main", e.repo, "copy", e.org)
+	run := e.gh.PullRequestRun(p)
+	if bd := e.bind(run); bd.Fail == "" {
+		t.Fatalf("binding = %+v; want one that fails its jobs", bd)
+	}
+	j := e.queue(run, "lanescape-16vcpu-linux-arm64")
+	e.pass()
+	in := e.one()
+	if in.MachineType != "c4a-highcpu-16" || in.Provisioning == "SPOT" || in.Metadata[machines.MetaSelector] != "lanescape-16vcpu-linux-arm64" {
+		t.Fatalf("machine = %+v; want an ordinary one of the job's selector", in)
+	}
+	m := e.boot(in)
+	m.taken(j)
+	m.failed(run.ID, "one open pull request")
+	// Until the run is shown finished, its jobs get no machines.
+	next := e.queue(run, "lanescape-16vcpu-linux-arm64")
+	e.pass()
+	for _, in := range e.ours() {
+		if in.Labels[machines.LabelJob] == strconv.FormatInt(next.ID, 10) {
+			t.Fatalf("machine %s was made for a job of a run being cancelled", in.Name)
+		}
+	}
+}
+
+func TestTheHeadOfTwoPullRequestsFailsItsJobs(t *testing.T) {
+	e := setup(t)
+	e.repo.Commit("feature", map[string]string{"f": "1"})
+	p := e.gh.PullRequest(e.repo, "main", e.repo, "feature", e.org)
+	e.repo.Branch("copy", e.repo.Head("feature"))
+	e.gh.PullRequest(e.repo, "main", e.repo, "copy", e.org)
+	run := e.gh.PullRequestRun(p)
+	j := e.queue(run, sel2)
+	e.pass()
+	m := e.boot(e.one())
+	m.taken(j)
+	// Its check binds the run read, and fails it, saying why.
+	m.failed(run.ID, "one open pull request")
+}
+
 func TestAnApprovedContribution(t *testing.T) {
 	e := setup(t)
 	run, p := e.contribution(true)
-	sel := "lanescape-2vcpu-linux-amd64-pr" + strconv.Itoa(p.Number)
-	e.gh.Queue(run, ghemu.JobSpec{Labels: []string{sel}, Environment: machines.ContributionEnvironment})
+	_ = p
+	e.bind(run)
+	e.gh.Queue(run, ghemu.JobSpec{Labels: []string{sel2}, Environment: machines.ContributionEnvironment})
 	e.pass()
 	if m := e.one(); m.Labels[machines.LabelContribution] != "true" {
 		t.Fatalf("labels = %v", m.Labels)
@@ -129,14 +194,14 @@ func TestOnePool(t *testing.T) {
 	for range 3 {
 		e.queue(run, sel2)
 	}
-	crun, p := e.contribution(true)
-	csel := "lanescape-2vcpu-linux-amd64-pr" + strconv.Itoa(p.Number)
+	crun, _ := e.contribution(true)
+	e.bind(crun)
 	for range 2 {
-		e.gh.Queue(crun, ghemu.JobSpec{Labels: []string{csel}, Environment: machines.ContributionEnvironment})
+		e.gh.Queue(crun, ghemu.JobSpec{Labels: []string{sel2}, Environment: machines.ContributionEnvironment})
 	}
 	other := e.gh.Repo(e.org, repoID+1, "other")
 	orun := e.gh.PushRun(other, "main")
-	e.bind(orun, ghemu.Job{}, binding.Request{})
+	e.bind(orun)
 	for range 2 {
 		e.queue(orun, sel2)
 	}
@@ -164,14 +229,14 @@ func TestOldestFirst(t *testing.T) {
 	e.gce.SetQuota("northamerica-northeast1", "C4_CPUS", 0)
 	other := e.gh.Repo(e.org, repoID+1, "other")
 	orun := e.gh.PushRun(other, "main")
-	e.bind(orun, ghemu.Job{}, binding.Request{})
+	e.bind(orun)
 	oldest := e.queue(orun, sel2)
 	// GitHub gives jobs' times to the second.
 	time.Sleep(1100 * time.Millisecond)
 	run := e.mainRun()
 	younger := e.queue(run, sel2)
 	youngest := e.queue(run, sel2)
-	arm := e.queue(run, "lanescape-16vcpu-linux-arm64-main")
+	arm := e.queue(run, "lanescape-16vcpu-linux-arm64")
 	e.pass()
 	ms := e.wantMachines(2)
 	byJob := map[string]bool{}
@@ -198,8 +263,8 @@ func TestOldestFirst(t *testing.T) {
 }
 
 func TestPlacement(t *testing.T) {
-	big := "lanescape-80vcpu-linux-amd64-main"
-	bigSpot := "lanescape-80vcpu-linux-amd64-spot-main"
+	big := "lanescape-80vcpu-linux-amd64"
+	bigSpot := "lanescape-80vcpu-linux-amd64-spot"
 	for _, tc := range []struct {
 		name       string
 		sel        string
@@ -259,14 +324,14 @@ func TestPlacement(t *testing.T) {
 
 func TestAnArmMachine(t *testing.T) {
 	e := setup(t)
-	e.queue(e.mainRun(), "lanescape-16vcpu-linux-arm64-main")
+	e.queue(e.mainRun(), "lanescape-16vcpu-linux-arm64")
 	e.pass()
 	m := e.one()
 	if m.MachineType != "c4a-highcpu-16" {
 		t.Fatalf("machine type %s", m.MachineType)
 	}
 	rs := e.gh.Runners()
-	if !slices.Equal(rs[0].Labels, []string{"lanescape-16vcpu-linux-arm64-main", "self-hosted", "linux", "arm64"}) {
+	if !slices.Equal(rs[0].Labels, []string{"lanescape-16vcpu-linux-arm64"}) {
 		t.Fatalf("runner labels = %v", rs[0].Labels)
 	}
 }
@@ -292,10 +357,10 @@ func TestASmallerJobWaitsForAnOlderLargerOne(t *testing.T) {
 	e := setup(t)
 	e.gce.SetQuota("northamerica-northeast1", "N4_CPUS", 2)
 	e.gce.SetQuota("northamerica-northeast1", "C4_CPUS", 0)
-	big := e.queue(e.mainRun(), "lanescape-80vcpu-linux-amd64-main")
+	big := e.queue(e.mainRun(), "lanescape-80vcpu-linux-amd64")
 	time.Sleep(1100 * time.Millisecond)
 	small := e.queue(e.mainRun(), sel2)
-	arm := e.queue(e.mainRun(), "lanescape-16vcpu-linux-arm64-main")
+	arm := e.queue(e.mainRun(), "lanescape-16vcpu-linux-arm64")
 	e.pass()
 	ms := e.wantMachines(1)
 	if ms[0].Labels[machines.LabelJob] != strconv.FormatInt(arm.ID, 10) {
@@ -316,12 +381,78 @@ func TestAYoungerSpotJobWaitsForAnOlderOne(t *testing.T) {
 	e.gce.SetQuota("northamerica-northeast1", "PREEMPTIBLE_CPUS", 16)
 	e.gce.SetQuota("northamerica-northeast1", "N4_CPUS", 0)
 	e.gce.SetQuota("northamerica-northeast1", "C4_CPUS", 0)
-	big := e.queue(e.mainRun(), "lanescape-80vcpu-linux-amd64-spot-main")
+	big := e.queue(e.mainRun(), "lanescape-80vcpu-linux-amd64-spot")
 	time.Sleep(1100 * time.Millisecond)
-	arm := e.queue(e.mainRun(), "lanescape-16vcpu-linux-arm64-spot-main")
+	arm := e.queue(e.mainRun(), "lanescape-16vcpu-linux-arm64-spot")
 	e.pass()
 	e.wantMachines(0)
 	if e.gh.Job(big.ID).Status != "queued" || e.gh.Job(arm.ID).Status != "queued" {
 		t.Fatal("a job held back by quota isn't queued")
+	}
+}
+
+func TestARunnerWithOtherLabelsGetsNoMachine(t *testing.T) {
+	e := setup(t)
+	e.gh.AddDefaultLabels(true)
+	e.queue(e.mainRun(), sel2)
+	e.pass()
+	e.wantMachines(0)
+	if n := len(e.gh.Runners()); n != 0 {
+		t.Fatalf("%d runner registrations left", n)
+	}
+	if !e.logged("not its selector alone") {
+		t.Fatal("why wasn't logged")
+	}
+}
+
+// A queued job that names a label no runner of the service's has gets no
+// machine: its run is cancelled, and why is logged, since nothing can print
+// it in the job's log.
+func TestARunIsCancelledForALabelNoRunnerHas(t *testing.T) {
+	for name, tc := range map[string]struct {
+		labels []string
+		reason string
+	}{
+		"a selector with other labels":     {[]string{sel2, "self-hosted"}, "with other labels"},
+		"a selector naming a run":          {[]string{sel2 + "-run-1"}, "isn't a selector"},
+		"a selector naming a disk":         {[]string{sel2 + "-disk-build"}, "isn't a selector"},
+		"a label that claims to be one":    {[]string{"Lanescape-runners"}, "isn't a selector"},
+		"a shape the service doesn't have": {[]string{"lanescape-4vcpu-linux-amd64-spot"}, "a shape the service doesn't offer"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := setup(t)
+			run := e.mainRun()
+			e.queue(run, tc.labels...)
+			e.pass()
+			e.wantMachines(0)
+			rec, ok := e.record("refusals/5001/" + strconv.FormatInt(run.ID, 10) + "-1.json")
+			if !ok || !strings.Contains(fmt.Sprint(rec["reason"]), tc.reason) || rec["cancelled_at"] == nil {
+				t.Fatalf("refusal = %v; want the run cancelled, saying %q", rec, tc.reason)
+			}
+			if !e.logged("refusing a run without a machine") || !e.logged(tc.reason) {
+				t.Fatal("why wasn't logged")
+			}
+			if st, c := e.gh.RunState(run); st != "completed" || c != "cancelled" {
+				t.Fatalf("run: %s %s", st, c)
+			}
+		})
+	}
+}
+
+// Refusals block runs, not selectors: a refused run's jobs get no machine,
+// and another run's job of the same selector does.
+func TestARefusedRunDoesntBlockAnotherRunsJob(t *testing.T) {
+	e := setup(t)
+	refused := e.mainRun()
+	// The run's job of the selector is older than the one that gets it
+	// refused, in the same pass.
+	e.queue(refused, sel2)
+	e.queue(refused, sel2, "gpu")
+	other := e.mainRun()
+	j := e.queue(other, sel2)
+	e.pass()
+	ms := e.wantMachines(1)
+	if ms[0].Labels[machines.LabelJob] != strconv.FormatInt(j.ID, 10) {
+		t.Fatalf("the machine is job %s's; want the other run's", ms[0].Labels[machines.LabelJob])
 	}
 }

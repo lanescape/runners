@@ -1,11 +1,13 @@
 package fault_test
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/lanescape/runners/emulators/fault"
 )
@@ -52,5 +54,28 @@ func TestRules(t *testing.T) {
 	in.Reset()
 	if get("/d") != 200 {
 		t.Fatal("rules remain after Reset")
+	}
+}
+
+// Refuse and Unavailable answer as the service does: 403 with a reason, and
+// 503, retryable, with a Retry-After of whole seconds.
+func TestServiceAnswers(t *testing.T) {
+	answer := func(h func(http.ResponseWriter, *http.Request)) (int, http.Header, map[string]any) {
+		rec := httptest.NewRecorder()
+		h(rec, httptest.NewRequest(http.MethodPost, "/v1/images", nil))
+		var body map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("the body isn't JSON: %q", rec.Body)
+		}
+		return rec.Code, rec.Header(), body
+	}
+	if code, _, body := answer(fault.Refuse("no")); code != http.StatusForbidden || body["reason"] != "no" {
+		t.Fatalf("Refuse answered %d %v", code, body)
+	}
+	for d, want := range map[time.Duration]string{0: "1", 1500 * time.Millisecond: "1", 7 * time.Second: "7"} {
+		code, h, body := answer(fault.Unavailable(d))
+		if code != http.StatusServiceUnavailable || body["retryable"] != true || h.Get("Retry-After") != want {
+			t.Fatalf("Unavailable(%v) answered %d %v, Retry-After %q", d, code, body, h.Get("Retry-After"))
+		}
 	}
 }

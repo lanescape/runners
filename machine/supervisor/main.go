@@ -2,9 +2,9 @@
 // (specs/0002-machines.md, A machine's life). It registers the machine's
 // one-job GitHub runner from the just-in-time configuration the service put
 // in the machine's metadata, starts it, and waits for it to exit. Then it
-// reads whether the job asked to save its work disk, from the marker the
-// save action leaves on the boot disk, reports to the service, and powers
-// the machine off.
+// reports to the service that the job is done, and powers the machine off.
+// The report says nothing else: a job asks for its own save, from its steps,
+// and the service decides it from GitHub's records.
 //
 // It runs outside every job, as its own user, with its own environment and
 // paths: nothing a job sets reaches it, and it acts only after the runner
@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -50,9 +51,6 @@ type Config struct {
 	Env []string `json:"env"`
 	// Hook is the job-started hook the runner runs.
 	Hook string `json:"hook"`
-	// SaveMarker is where the save action asks for the work disk to be
-	// saved, writing {"save": true}.
-	SaveMarker string `json:"save_marker"`
 	// PowerOff is the command that powers the machine off.
 	PowerOff []string `json:"poweroff"`
 	// MetadataFor and ReportFor are how long it keeps trying to read its
@@ -81,8 +79,7 @@ func Defaults() Config {
 		RunnerDir:   "/opt/actions-runner",
 		RunnerUser:  "runner",
 		Env:         []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C.UTF-8"},
-		Hook:        "/usr/local/lib/lanescape-runners/job-started.sh",
-		SaveMarker:  "/var/lib/lanescape-runners/save",
+		Hook:        "/opt/lanescape-runners/job-started.sh",
 		PowerOff:    []string{"systemctl", "poweroff"},
 		MetadataFor: duration(5 * time.Minute),
 		ReportFor:   duration(5 * time.Minute),
@@ -98,7 +95,7 @@ const (
 const finishedPath = "/v1/jobs/finished"
 
 func main() {
-	path := flag.String("config", "/etc/lanescape-runners/supervisor.json", "the supervisor's settings")
+	path := flag.String("config", "/opt/lanescape-runners/supervisor.json", "the supervisor's settings")
 	flag.Parse()
 	logger := log.New(os.Stdout, "lanescape-runners supervisor: ", 0)
 	cfg := Defaults()
@@ -128,7 +125,9 @@ func (m metadata) do(ctx context.Context, method, path string, body io.Reader) (
 	req.Header.Set("Metadata-Flavor", "Google")
 	resp, err := m.hc.Do(req)
 	if err != nil {
-		return "", err
+		// The error would name the request's address, whose query is
+		// harmless, but the reason alone is what's useful.
+		return "", unwrapURL(err)
 	}
 	defer resp.Body.Close()
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -173,6 +172,31 @@ func (m metadata) state(ctx context.Context, s string) {
 	_, _ = m.do(ctx, http.MethodPut, "instance/guest-attributes/lanescape-runners/state", strings.NewReader(s))
 }
 
+// unwrapURL drops every address from an HTTP client's error, so that
+// nothing a request was sent to, such as an upload session's address,
+// reaches a log through it. The client's own errors can quote an address,
+// such as a redirect's it couldn't parse, so only what's known to hold none
+// is kept: the network's error, which names a host and port at most, and
+// whether it timed out or was cancelled.
+func unwrapURL(err error) error {
+	var ue *url.Error
+	if !errors.As(err, &ue) {
+		return err
+	}
+	var op *net.OpError
+	switch {
+	case errors.Is(ue.Err, context.Canceled):
+		return fmt.Errorf("%s: %w", ue.Op, context.Canceled)
+	case errors.Is(ue.Err, context.DeadlineExceeded):
+		return fmt.Errorf("%s: %w", ue.Op, context.DeadlineExceeded)
+	case ue.Timeout():
+		return fmt.Errorf("%s: timed out", ue.Op)
+	case errors.As(ue.Err, &op):
+		return fmt.Errorf("%s: %s", ue.Op, op.Error())
+	}
+	return fmt.Errorf("%s: the request failed", ue.Op)
+}
+
 func sleep(ctx context.Context, d time.Duration) {
 	t := time.NewTimer(d)
 	defer t.Stop()
@@ -186,7 +210,7 @@ func sleep(ctx context.Context, d time.Duration) {
 // machine powers off however it goes.
 func supervise(ctx context.Context, cfg Config, logger *log.Logger, out io.Writer) {
 	defer powerOff(cfg, logger)
-	md := metadata{base: cfg.Metadata, hc: &http.Client{Timeout: 30 * time.Second}}
+	md := metadata{base: cfg.Metadata, hc: &http.Client{Timeout: 30 * time.Second, Transport: noProxy()}}
 	md.state(ctx, "starting")
 	service, err := md.attribute(ctx, metaService, time.Duration(cfg.MetadataFor))
 	if err != nil {
@@ -197,12 +221,8 @@ func supervise(ctx context.Context, cfg Config, logger *log.Logger, out io.Write
 	if err != nil {
 		logger.Printf("no runner configuration: %v", err)
 		md.state(ctx, "reporting")
-		report(ctx, md, service, false, cfg, logger)
+		report(ctx, md, service, cfg, logger)
 		return
-	}
-	// A request from before the job isn't the job's.
-	if err := os.Remove(cfg.SaveMarker); err != nil && !errors.Is(err, os.ErrNotExist) {
-		logger.Printf("removing a stale save request: %v", err)
 	}
 	md.state(ctx, "running")
 	logger.Printf("starting the runner")
@@ -211,10 +231,18 @@ func supervise(ctx context.Context, cfg Config, logger *log.Logger, out io.Write
 	} else {
 		logger.Printf("the runner exited")
 	}
-	save := asked(cfg.SaveMarker)
 	md.state(ctx, "reporting")
-	report(ctx, md, service, save, cfg, logger)
+	report(ctx, md, service, cfg, logger)
 	md.state(ctx, "done")
+}
+
+// noProxy is a transport that goes straight to its address: the metadata
+// server and the service are reached directly, whatever the environment
+// says.
+func noProxy() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.Proxy = nil
+	return t
 }
 
 // runnerEnv is the runner's environment: the base image's, and what the
@@ -256,54 +284,19 @@ func runRunner(ctx context.Context, cfg Config, jit string, out io.Writer) error
 	return cmd.Run()
 }
 
-// maxSaveRequest bounds what's read of the save request, which is a few
-// bytes.
-const maxSaveRequest = 1 << 10
-
-// asked reports whether the job asked to save its work disk: the file is a
-// regular one, not a link, holding the JSON object {"save": true}.
-// Anything else in it, or none at all, asks for no save.
-func asked(path string) bool {
-	fi, err := os.Lstat(path)
-	if err != nil || !fi.Mode().IsRegular() {
-		return false
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return false
-	}
-	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, maxSaveRequest+1))
-	if err != nil || len(data) > maxSaveRequest {
-		return false
-	}
-	// Exactly an object whose one member is "save": true, by its tokens:
-	// Go's struct decoding would take "SAVE" too, and a map would take a
-	// key given twice.
-	dec := json.NewDecoder(bytes.NewReader(data))
-	for _, want := range []any{json.Delim('{'), "save", true, json.Delim('}')} {
-		tok, err := dec.Token()
-		if err != nil || tok != want {
-			return false
-		}
-	}
-	_, err = dec.Token()
-	return err == io.EOF
-}
-
-// report tells the service the job is done, and whether it asked to save,
-// trying again while the service has no answer, for as long as the
-// settings allow.
-func report(ctx context.Context, md metadata, service string, save bool, cfg Config, logger *log.Logger) {
+// report tells the service the job is done, trying again while the service
+// has no answer, for as long as the settings allow. It says nothing more:
+// whether the work disk is saved is the job's to ask from its steps, and
+// the service's to decide (specs/0005-interface.md, Work disks).
+func report(ctx context.Context, md metadata, service string, cfg Config, logger *log.Logger) {
 	end := time.Now().Add(time.Duration(cfg.ReportFor))
-	body, _ := json.Marshal(map[string]bool{"save": save})
-	hc := &http.Client{Timeout: 30 * time.Second}
+	hc := &http.Client{Timeout: 30 * time.Second, Transport: noProxy()}
 	wait := time.Second
 	for {
-		code, err := send(ctx, md, hc, service, body)
+		code, err := send(ctx, md, hc, service)
 		switch {
 		case err == nil && code/100 == 2:
-			logger.Printf("reported, save %v", save)
+			logger.Printf("reported")
 			return
 		case err == nil && code/100 == 4 && code != http.StatusTooManyRequests:
 			logger.Printf("the service refused the report: %d", code)
@@ -322,12 +315,12 @@ func report(ctx context.Context, md metadata, service string, save bool, cfg Con
 	}
 }
 
-func send(ctx context.Context, md metadata, hc *http.Client, service string, body []byte) (int, error) {
+func send(ctx context.Context, md metadata, hc *http.Client, service string) (int, error) {
 	tok, err := md.identity(ctx, service)
 	if err != nil {
 		return 0, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(service, "/")+finishedPath, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(service, "/")+finishedPath, strings.NewReader("{}"))
 	if err != nil {
 		return 0, err
 	}
@@ -335,7 +328,7 @@ func send(ctx context.Context, md metadata, hc *http.Client, service string, bod
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := hc.Do(req)
 	if err != nil {
-		return 0, err
+		return 0, unwrapURL(err)
 	}
 	resp.Body.Close()
 	return resp.StatusCode, nil

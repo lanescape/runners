@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/compute"
 	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/pass"
@@ -50,7 +49,9 @@ type inventory struct {
 
 	recordsComplete bool
 	admissions      map[string]Admission
+	answered        map[string]time.Time
 	reports         map[string]Report
+	saves           map[string]SaveRequest
 	diskRecords     map[string]record[DiskRecord]
 	refusals        map[string]record[Refusal]
 	jobRecords      map[string]record[JobRecord]
@@ -58,12 +59,18 @@ type inventory struct {
 
 	// What this pass learns and does as it goes.
 	groups    map[string]github.RunnerGroup
-	checked   map[int64]github.RunnerGroup
+	checked   map[string]github.RunnerGroup
 	images    map[string]string
-	bindings  map[int64]*binding.Binding
-	approvals map[int64]bool
 	attempted map[string]bool
 	deleted   map[string]bool
+}
+
+// disk is a machine's work disk's record, if it has one.
+func (inv *inventory) disk(machine string) *DiskRecord {
+	if r, ok := inv.diskRecords[WorkDisk(machine)]; ok {
+		return &r.v
+	}
+	return nil
 }
 
 // Pass is the machines' part of a reconciler pass (specs/0001-architecture.md,
@@ -79,6 +86,7 @@ func (s *Service) Pass(p *pass.Pass) error {
 	s.followRefusals(ctx, inv)
 	s.give(ctx, inv)
 	s.cleanup(ctx, inv)
+	s.followBootLogs(ctx)
 	if p.Lost() {
 		return context.Cause(p.Context())
 	}
@@ -88,8 +96,7 @@ func (s *Service) Pass(p *pass.Pass) error {
 func (s *Service) inventory(p *pass.Pass) *inventory {
 	ctx := p.Context()
 	inv := &inventory{machines: map[string]Machine{}, repos: map[int64]github.Repository{}, groups: nil,
-		checked: map[int64]github.RunnerGroup{}, images: map[string]string{}, bindings: map[int64]*binding.Binding{},
-		approvals: map[int64]bool{}, attempted: map[string]bool{}, deleted: map[string]bool{}}
+		checked: map[string]github.RunnerGroup{}, images: map[string]string{}, attempted: map[string]bool{}, deleted: map[string]bool{}}
 
 	// Machines and disks first, then records.
 	inv.machinesComplete, inv.disksComplete = true, true
@@ -137,7 +144,8 @@ func (s *Service) inventory(p *pass.Pass) *inventory {
 
 func (s *Service) readRecords(ctx context.Context, inv *inventory) {
 	inv.recordsComplete = true
-	inv.admissions, inv.reports = map[string]Admission{}, map[string]Report{}
+	inv.admissions, inv.reports, inv.answered = map[string]Admission{}, map[string]Report{}, map[string]time.Time{}
+	inv.saves = map[string]SaveRequest{}
 	inv.diskRecords, inv.refusals, inv.jobRecords = map[string]record[DiskRecord]{}, map[string]record[Refusal]{}, map[string]record[JobRecord]{}
 	inv.machineKeys = map[string][]store.Object{}
 	list := func(prefix string, each func(o store.Object) error) {
@@ -180,11 +188,25 @@ func (s *Service) readRecords(ctx context.Context, inv *inventory) {
 					inv.admissions[parts[1]] = a
 				}
 			})
+		case "answered.json":
+			return read(o.Name, func(_ int64, dec func(any) error) {
+				var an Answered
+				if dec(&an) == nil {
+					inv.answered[parts[1]] = an.At
+				}
+			})
 		case "report.json":
 			return read(o.Name, func(_ int64, dec func(any) error) {
 				var r Report
 				if dec(&r) == nil {
 					inv.reports[parts[1]] = r
+				}
+			})
+		case "save-request.json":
+			return read(o.Name, func(_ int64, dec func(any) error) {
+				var r SaveRequest
+				if dec(&r) == nil {
+					inv.saves[parts[1]] = r
 				}
 			})
 		}
@@ -285,10 +307,10 @@ func (inv *inventory) activeRefusals(repoID int64) []Refusal {
 }
 
 // refusalRecorded reports whether a refused admission that cancels its run
-// has its run's refusal recorded, with its selector.
+// has its run attempt's refusal recorded.
 func (inv *inventory) refusalRecorded(a Admission) bool {
-	r, ok := inv.refusals[refusalKey(a.RepositoryID, a.RunID, a.RunAttempt)]
-	return ok && slices.Contains(r.v.Selectors, a.Selector)
+	_, ok := inv.refusals[refusalKey(a.RepositoryID, a.RunID, a.RunAttempt)]
+	return ok
 }
 
 // unrecorded reports whether a machine's refused admission is the only
@@ -299,25 +321,19 @@ func (inv *inventory) unrecorded(machine string) bool {
 	return ok && !a.Allowed && a.Cancel && !inv.refusalRecorded(a)
 }
 
-// blocked are the selectors no machine is made for: those of a consumer's
-// refused runs, recorded and still queued, until each run is shown finished,
-// and of refusals not yet recorded.
-func (inv *inventory) blocked(q *queue) map[string]bool {
-	out := map[string]bool{}
+// blocked are the runs no machine is made for: a consumer's refused runs,
+// recorded, until each is shown finished, and those of refusals not yet
+// recorded. A selector names no run, so runs are what's blocked: another
+// run's jobs of the same selector still get machines.
+func (inv *inventory) blocked(q *queue) map[int64]bool {
+	out := map[int64]bool{}
 	for _, a := range inv.admissions {
 		if a.RepositoryID == q.repo.ID && inv.unrecorded(a.Machine) {
-			out[a.Selector] = true
+			out[a.RunID] = true
 		}
 	}
 	for _, rf := range inv.activeRefusals(q.repo.ID) {
-		for _, sel := range rf.Selectors {
-			out[sel] = true
-		}
-		for _, j := range q.runJobs[rf.RunID] {
-			if sel, err := selector.OfJob(j.Labels); err == nil && j.Status != "completed" {
-				out[sel.String()] = true
-			}
-		}
+		out[rf.RunID] = true
 	}
 	return out
 }
@@ -328,7 +344,7 @@ func (inv *inventory) blocked(q *queue) map[string]bool {
 // stopped short, is recorded first.
 func (s *Service) followRefusals(ctx context.Context, inv *inventory) {
 	for _, a := range inv.admissions {
-		if a.Allowed || !a.Cancel {
+		if a.Allowed || !a.Cancel || s.answering(inv, a) {
 			continue
 		}
 		if inv.refusalRecorded(a) {
@@ -387,24 +403,22 @@ func (s *Service) repository(ctx context.Context, inv *inventory, id int64) (git
 	return r, nil
 }
 
-// lookup is a run's binding, read once a pass.
-func (s *Service) lookup(ctx context.Context, inv *inventory, repoID, runID int64) (binding.Binding, bool, error) {
-	if b, ok := inv.bindings[runID]; ok {
-		if b == nil {
-			return binding.Binding{}, false, nil
-		}
-		return *b, true, nil
+// answering reports whether a failed job's hook may still be reading its
+// reason: until FailStopDelay after it was answered, or, with no record of
+// the answer yet, AnswerWait after the decision, nothing cancels its run or
+// stops its machine.
+func (s *Service) answering(inv *inventory, a Admission) bool {
+	if a.Fail == "" {
+		return false
 	}
-	b, ok, err := s.Binder.Lookup(ctx, repoID, runID)
-	if err != nil {
-		return binding.Binding{}, false, err
+	delay := s.FailStopDelay
+	if delay == 0 {
+		delay = DefaultFailStopDelay
 	}
-	if ok {
-		inv.bindings[runID] = &b
-	} else {
-		inv.bindings[runID] = nil
+	if at, ok := inv.answered[a.Machine]; ok {
+		return s.now().Sub(at) < delay
 	}
-	return b, ok, nil
+	return s.now().Sub(a.At) < AnswerWait
 }
 
 // CheckForkApproval checks the organization's setting that outside
@@ -479,7 +493,7 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 				"job_id", w.job.ID, "selector", w.sel.String())
 			continue
 		}
-		err := s.make(ctx, inv, w.repo, w.sel, w.job, w.contribution)
+		err := s.make(ctx, inv, w)
 		if err == nil {
 			continue
 		}
@@ -500,7 +514,11 @@ const spotPool = "spot"
 // wants are a consumer's queued jobs that may have a machine and need a
 // new one: of each selector's jobs, those beyond the machines already
 // being made or idle for it, oldest first among those with no machine made
-// for them.
+// for them. Every job of an offered selector gets a machine of it, a job
+// the service will fail included, since the reason is decided for whichever
+// job takes the machine, at its check (specs/0002-machines.md, Failing a
+// job). A run whose job names a label no runner of the service's has, or
+// whose machines never started, is cancelled instead, and why is logged.
 func (s *Service) wants(ctx context.Context, inv *inventory, q *queue) []wanted {
 	repo := q.repo
 	idle := map[string][]Machine{}
@@ -513,74 +531,72 @@ func (s *Service) wants(ctx context.Context, inv *inventory, q *queue) []wanted 
 		}
 	}
 	blocked := inv.blocked(q)
-	refusedRuns := map[int64]bool{}
-	for _, rf := range inv.activeRefusals(repo.ID) {
-		refusedRuns[rf.RunID] = true
+	// A contribution's run is a pull_request_target run, whose own head is
+	// the base repository: only its binding, once a maintainer approved it,
+	// has its pull request's head.
+	contributions := map[int64]bool{}
+	contribution := func(run github.WorkflowRun) bool {
+		if run.Event != "pull_request_target" {
+			return false
+		}
+		if c, ok := contributions[run.ID]; ok {
+			return c
+		}
+		bd, bound, err := s.Binder.Lookup(ctx, repo.ID, run.ID)
+		if err != nil {
+			s.log().Warn("reading a run's binding", "repository_id", repo.ID, "run_id", run.ID, "err", err.Error())
+			return false
+		}
+		contributions[run.ID] = bound && bd.HeadRepositoryID != repo.ID
+		return contributions[run.ID]
 	}
 
 	bySel := map[string][]wanted{}
 	for _, job := range q.jobs {
+		log := s.log().With("repository_id", repo.ID, "run_id", job.RunID, "job_id", job.ID)
 		sel, err := selector.OfJob(job.Labels)
 		if errors.Is(err, selector.ErrNoSelector) {
 			continue
 		}
-		log := s.log().With("repository_id", repo.ID, "run_id", job.RunID, "job_id", job.ID)
-		if err != nil {
-			log.Info("no machine for a job whose labels aren't one selector", "reason", err.Error())
+		if blocked[job.RunID] {
+			log.Info("no machine for a job of a refused run until it's finished")
 			continue
 		}
-		if s.Config.Shapes.Shapes[sel.Shape] == nil {
-			log.Info("no machine for a job of an unknown shape", "selector", sel.String())
-			continue
+		// A run refused here is blocked for the rest of the pass too: none
+		// of its queued jobs gets a machine.
+		refuse := func(reason string) {
+			s.refuseRun(ctx, inv, repo, job, reason)
+			blocked[job.RunID] = true
 		}
-		if blocked[sel.String()] || refusedRuns[job.RunID] {
-			log.Info("no machine for a selector of a refused run until it's finished", "selector", sel.String())
+		switch {
+		case errors.Is(err, selector.ErrOtherLabels):
+			refuse("the job names one of the service's selectors with other labels, which no runner of the service's has")
+			continue
+		case err != nil:
+			refuse(fmt.Sprintf("the job names %s, which isn't a selector: lanescape-<vCPUs>vcpu-linux-<amd64|arm64>[-spot]",
+				firstClaim(job.Labels)))
+			continue
+		case s.Config.Shapes.Shapes[sel.Shape] == nil:
+			refuse(fmt.Sprintf("the job names %s, a shape the service doesn't offer", sel))
 			continue
 		}
 		run := q.runs[job.RunID]
-		bd, bound, err := s.lookup(ctx, inv, repo.ID, run.ID)
-		if err != nil {
-			log.Warn("reading a run's binding", "err", err.Error())
+		if run.Event != "pull_request_target" && run.HeadRepositoryID != repo.ID {
+			refuse("a fork's pull request's run gets none of the service's machines")
 			continue
-		}
-		if !bound {
-			log.Debug("no machine for a job of a run with no binding")
-			continue
-		}
-		if bd.Scope != sel.Scope {
-			log.Info("no machine for a job whose selector's scope isn't its run's", "selector", sel.String(), "binding", bd.Scope.String())
-			continue
-		}
-		contribution := false
-		if isFork(repo, run, bd, bound) {
-			if run.Event != "pull_request_target" {
-				log.Info("no machine for a fork's pull request's job")
-				continue
-			}
-			ok, cached := inv.approvals[run.ID]
-			if !cached {
-				ok, err = s.approved(ctx, repo, run.ID)
-				if err != nil {
-					log.Warn("reading a contribution's approvals", "err", err.Error())
-					continue
-				}
-				inv.approvals[run.ID] = ok
-			}
-			if !ok {
-				log.Info("no machine for a contribution that isn't approved")
-				continue
-			}
-			contribution = true
 		}
 		if jr, ok := s.jobRecord(ctx, inv, repo.ID, job.ID); ok && s.now().Sub(jr.FirstMachineAt) >= RetryLimit {
-			log.Warn("leaving a job queued: its first machine was made over an hour ago", "first_machine_at", jr.FirstMachineAt)
+			refuse(fmt.Sprintf("no machine made for job %d started its runner within %s of its first, made at %s",
+				job.ID, RetryLimit, jr.FirstMachineAt.Format(time.RFC3339)))
 			continue
 		}
-		bySel[sel.String()] = append(bySel[sel.String()], wanted{repo: repo, sel: sel, contribution: contribution, job: job})
+		w := wanted{repo: repo, sel: sel, job: job, contribution: contribution(run)}
+		bySel[sel.String()] = append(bySel[sel.String()], w)
 	}
 
 	var out []wanted
 	for k, jobs := range bySel {
+		jobs = slices.DeleteFunc(jobs, func(w wanted) bool { return blocked[w.job.RunID] })
 		have := idle[k]
 		madeFor := map[int64]bool{}
 		for _, m := range have {
@@ -594,6 +610,37 @@ func (s *Service) wants(ctx context.Context, inv *inventory, q *queue) []wanted 
 		out = append(out, jobs[:n]...)
 	}
 	return out
+}
+
+// firstClaim is the first of a job's labels that claims to be a selector.
+func firstClaim(labels []string) string {
+	for _, l := range labels {
+		if strings.HasPrefix(strings.ToLower(l), selector.Prefix) {
+			return l
+		}
+	}
+	return ""
+}
+
+// refuseRun records a queued job's run as refused, with its reason, and
+// cancels it, without making it a machine: a job that names a selector
+// with other labels, a label that isn't an offered selector, comes from a
+// fork's pull request, or whose machines never started within the hour.
+// Nothing can print the reason in its log, so it's logged here.
+func (s *Service) refuseRun(ctx context.Context, inv *inventory, repo github.Repository, job github.Job, reason string) {
+	key := refusalKey(repo.ID, job.RunID, job.RunAttempt)
+	if _, ok := inv.refusals[key]; ok {
+		return
+	}
+	s.log().Warn("refusing a run without a machine", "repository_id", repo.ID, "run_id", job.RunID, "job_id", job.ID, "reason", reason)
+	rf, gen, err := createOnce(ctx, s.Objects, key, Refusal{RepositoryID: repo.ID, RunID: job.RunID, RunAttempt: job.RunAttempt, Reason: reason,
+		RefusedAt: s.now()})
+	if err != nil {
+		s.log().Warn("recording a refused run", "run_id", job.RunID, "err", err.Error())
+		return
+	}
+	inv.refusals[key] = record[Refusal]{rf, gen}
+	s.cancel(ctx, repo, rf, gen)
 }
 
 // jobRecord is a job's confirmed first machine. A tentative record is
@@ -613,11 +660,14 @@ func (s *Service) jobRecord(ctx context.Context, inv *inventory, repoID, jobID i
 		return JobRecord{}, false
 	}
 	if !listed {
-		// A machine that's gone was made if its boot log was saved, as it
-		// is before every deletion.
-		_, _, err := s.Objects.Get(ctx, bootLogKey(Machine{Instance: compute.Instance{Name: r.v.Machine}, CreatedAt: r.v.FirstMachineAt}))
+		// A machine that's gone was made if its boot log was saved, or
+		// recorded to be read, as one is before every deletion.
+		gone := Machine{Instance: compute.Instance{Name: r.v.Machine}, CreatedAt: r.v.FirstMachineAt}
+		_, _, err := s.Objects.Get(ctx, bootLogKey(gone))
 		if err != nil {
-			return JobRecord{}, false
+			if _, _, perr := s.Objects.Get(ctx, pendingLogKey(gone)); perr != nil {
+				return JobRecord{}, false
+			}
 		}
 	}
 	// The machine shows the record's time was its first, whether or not
@@ -676,7 +726,8 @@ func boolInt(b bool) int {
 // group is a consumer's runner group, made on first use: limited to its
 // repository, which is checked and set right each pass.
 func (s *Service) group(ctx context.Context, inv *inventory, repo github.Repository) (github.RunnerGroup, error) {
-	if g, ok := inv.checked[repo.ID]; ok {
+	name := GroupName(repo.ID)
+	if g, ok := inv.checked[name]; ok {
 		return g, nil
 	}
 	if inv.groups == nil {
@@ -689,7 +740,6 @@ func (s *Service) group(ctx context.Context, inv *inventory, repo github.Reposit
 			inv.groups[g.Name] = g
 		}
 	}
-	name := GroupName(repo.ID)
 	g, ok := inv.groups[name]
 	if !ok {
 		made, err := s.GitHub.CreateRunnerGroup(ctx, name, repo.ID)
@@ -701,7 +751,7 @@ func (s *Service) group(ctx context.Context, inv *inventory, repo github.Reposit
 			return github.RunnerGroup{}, err
 		}
 		s.log().Info("runner group made", "repository_id", repo.ID, "group", name)
-		inv.groups[name], inv.checked[repo.ID] = made, made
+		inv.groups[name], inv.checked[name] = made, made
 		return made, nil
 	}
 	if g.Visibility != "selected" || g.RestrictedToWorkflows || g.Default {
@@ -717,7 +767,7 @@ func (s *Service) group(ctx context.Context, inv *inventory, repo github.Reposit
 		}
 		s.log().Warn("runner group limited to its repository again", "group", name, "had", ids)
 	}
-	inv.checked[repo.ID] = g
+	inv.checked[name] = g
 	return g, nil
 }
 
@@ -745,10 +795,11 @@ func (s *Service) baseImage(ctx context.Context, inv *inventory, arch string) (s
 }
 
 // make makes one machine for a job: a just-in-time runner for the selector
-// in the consumer's group, then the machine, in the first placement with
-// capacity. A Spot selector's machine is standard only if no Spot placement
-// had capacity.
-func (s *Service) make(ctx context.Context, inv *inventory, repo github.Repository, sel selector.Selector, job github.Job, contribution bool) error {
+// in its consumer's runner group, then the machine, booted from the base
+// image, in the first placement with capacity. A Spot selector's machine is
+// standard only if no Spot placement had capacity.
+func (s *Service) make(ctx context.Context, inv *inventory, w wanted) error {
+	repo, sel, job := w.repo, w.sel, w.job
 	shape := s.Config.Shapes.Shapes[sel.Shape]
 	g, err := s.group(ctx, inv, repo)
 	if err != nil {
@@ -758,11 +809,20 @@ func (s *Service) make(ctx context.Context, inv *inventory, repo github.Reposito
 	if err != nil {
 		return err
 	}
+	bootGB := int64(s.Config.Shapes.BootDiskGB)
 	name := newName(repo.ID)
 	inv.attempted[name] = true
 	runner, jit, err := s.GitHub.JITConfig(ctx, g.ID, name, sel.RunnerLabels())
 	if err != nil {
 		return fmt.Errorf("registering a runner: %w", err)
+	}
+	// A runner's only label is its selector: one GitHub gave any other is
+	// removed, and no machine is made for it.
+	if !onlyLabel(runner.Labels, sel.String()) {
+		if err := s.GitHub.DeleteRunner(ctx, runner.ID); err != nil && !errors.Is(err, github.ErrNotFound) {
+			s.log().Warn("removing a runner with other labels", "runner", name, "err", err.Error())
+		}
+		return fmt.Errorf("GitHub registered runner %s with labels %v, not its selector alone", name, runner.Labels)
 	}
 	created := s.now()
 	// The job's first machine is recorded before it's made: another is made
@@ -790,17 +850,18 @@ func (s *Service) make(ctx context.Context, inv *inventory, repo github.Reposito
 			delete(inv.jobRecords, jkey)
 		}
 	}
+	labels := map[string]string{
+		LabelRepository: strconv.FormatInt(repo.ID, 10), LabelSelector: sel.Hash(), LabelCreated: strconv.FormatInt(created.Unix(), 10),
+		LabelJob: strconv.FormatInt(job.ID, 10), LabelContribution: strconv.FormatBool(w.contribution),
+	}
+	metadata := map[string]string{
+		MetaSelector: sel.String(), MetaService: s.ServiceURL, MetaRunnerID: strconv.FormatInt(runner.ID, 10),
+		MetaJob: strconv.FormatInt(job.ID, 10), MetaJITConfig: jit, "enable-guest-attributes": "TRUE", "serial-port-logging-enable": "TRUE",
+	}
 	spec := compute.InstanceSpec{
-		Name: name, Image: image, BootDiskGB: int64(s.Config.Shapes.BootDiskGB), DiskType: DiskType,
+		Name: name, Image: image, BootDiskGB: bootGB, DiskType: DiskType,
 		ProvisionedIOPS: int64(s.Config.Shapes.DiskIOPS), ProvisionedThroughput: int64(s.Config.Shapes.DiskThroughputMiBps),
-		Labels: map[string]string{
-			LabelRepository: strconv.FormatInt(repo.ID, 10), LabelSelector: sel.Hash(), LabelCreated: strconv.FormatInt(created.Unix(), 10),
-			LabelJob: strconv.FormatInt(job.ID, 10), LabelContribution: strconv.FormatBool(contribution),
-		},
-		Metadata: map[string]string{
-			MetaSelector: sel.String(), MetaService: s.ServiceURL, MetaRunnerID: strconv.FormatInt(runner.ID, 10),
-			MetaJob: strconv.FormatInt(job.ID, 10), MetaJITConfig: jit, "enable-guest-attributes": "TRUE",
-		},
+		Labels: labels, Metadata: metadata,
 		ServiceAccount: s.MachineAccount, Scopes: scopes, Network: Network, Subnetwork: Subnetwork, MaxRunDuration: MaxRunDuration,
 	}
 	var last error
@@ -810,7 +871,7 @@ func (s *Service) make(ctx context.Context, inv *inventory, repo github.Reposito
 		if err == nil {
 			confirm()
 			s.log().Info("machine made", "machine", name, "repository_id", repo.ID, "job_id", job.ID, "selector", sel.String(),
-				"zone", pl.Zone, "machine_type", pl.MachineType, "spot", pl.Spot, "contribution", contribution)
+				"zone", pl.Zone, "machine_type", pl.MachineType, "spot", pl.Spot, "contribution", w.contribution, "image", image)
 			return nil
 		}
 		if compute.IsCapacity(err) {
@@ -831,4 +892,9 @@ func (s *Service) make(ctx context.Context, inv *inventory, repo github.Reposito
 		s.log().Warn("removing an unused runner registration", "runner", name, "err", err.Error())
 	}
 	return last
+}
+
+// onlyLabel reports whether a runner's labels are exactly its selector.
+func onlyLabel(labels []string, sel string) bool {
+	return len(labels) == 1 && strings.EqualFold(labels[0], sel)
 }

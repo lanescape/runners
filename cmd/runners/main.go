@@ -45,6 +45,7 @@ import (
 	"github.com/lanescape/runners/internal/disks"
 	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/lease"
+	"github.com/lanescape/runners/internal/logging"
 	"github.com/lanescape/runners/internal/machines"
 	"github.com/lanescape/runners/internal/pass"
 	"github.com/lanescape/runners/internal/pubsub"
@@ -172,10 +173,6 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 	if err != nil {
 		return err
 	}
-	actions, err := auth.NewActions(auth.Options{Issuer: auth.ActionsIssuer, Audience: endpoints.Service}, cfg.Organization.ID)
-	if err != nil {
-		return err
-	}
 	account := machines.MachineAccountOf(s.Project)
 	machineTokens, err := auth.NewMachines(auth.Options{Issuer: auth.GoogleIssuer, Audience: endpoints.Service}, s.Project, account)
 	if err != nil {
@@ -201,6 +198,11 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 	svc := &machines.Service{Config: cfg, Project: s.Project, ServiceURL: endpoints.Service, MachineAccount: account,
 		GitHub: gh, Compute: gce, Objects: objects, Binder: binder, Machines: machineTokens, Clock: clock, Logger: log,
 		Disks: dks, Saves: dks, Preemptions: dks}
+	bootLogs, err := logging.New(ctx, s.Project, logging.View)
+	if err != nil {
+		return err
+	}
+	svc.BootLogs = bootLogs
 	passes := &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log}
 	body := pass.All(svc.Pass, dks.Pass)
 	svc.Kick = kicker(ctx, passes, body, 15*time.Second, log)
@@ -213,10 +215,10 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 		Passes:           passes,
 		Reconciler:       reconciler(body),
 		Events:           dks,
-		Actions:          actions,
-		Binder:           binder,
 		JobStarted:       svc.JobStarted(),
 		JobFinished:      svc.JobFinished(),
+		Disks:            svc.DiskRequest(),
+		Save:             svc.SaveRequest(),
 	})
 	if err != nil {
 		return err

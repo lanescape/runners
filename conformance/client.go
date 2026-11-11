@@ -3,9 +3,11 @@ package conformance
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
-	"regexp"
 	"strconv"
+
+	"github.com/lanescape/runners/emulators/service"
 )
 
 // T is what a case needs of its test; *testing.T is one.
@@ -18,8 +20,8 @@ type T interface {
 
 // Client speaks the interface for actions (specs/0005-interface.md) as an
 // action does, and checks every answer's shape as it goes: 200 with the
-// endpoint's object, 403 with a reason, or 503, retryable, with a
-// Retry-After, and nothing else.
+// endpoint's object and nothing else in it, 403 with a reason, or 503,
+// retryable, with a Retry-After, and no other status.
 type Client struct {
 	T   T
 	URL string
@@ -36,7 +38,11 @@ type Answer struct {
 	Body      map[string]any
 }
 
-var scopePattern = regexp.MustCompile(`^(main|read|pr[1-9][0-9]*|branch-[a-z][a-z0-9]{0,15})$`)
+// Steps are where a work disk came from: the restore order's steps, or a
+// resume image.
+var Steps = map[string]bool{service.StepPullRequestExact: true, service.StepPullRequestNewest: true, service.StepMainExact: true,
+	service.StepMainNewest: true, service.StepBranchExact: true, service.StepBranchNewest: true, service.StepNone: true,
+	service.Resumed: true}
 
 func (c *Client) http() *http.Client {
 	if c.HTTP != nil {
@@ -45,82 +51,111 @@ func (c *Client) http() *http.Client {
 	return http.DefaultClient
 }
 
-// post sends a request to the service with the job's token, and checks the
-// answer's shape.
-func (c *Client) post(path, token string, body []byte) Answer {
+// do sends a request to the service signed with a machine's token, and
+// checks the answer's shape.
+func (c *Client) do(method, path, token string, body []byte) Answer {
 	c.T.Helper()
-	req, err := http.NewRequest(http.MethodPost, c.URL+path, bytes.NewReader(body))
+	var r io.Reader
+	if body != nil {
+		r = bytes.NewReader(body)
+	}
+	req, err := http.NewRequest(method, c.URL+path, r)
 	if err != nil {
 		c.T.Fatalf("%s: %v", path, err)
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	resp, err := c.http().Do(req)
 	if err != nil {
 		c.T.Fatalf("%s: %v", path, err)
 	}
 	defer resp.Body.Close()
-	var out map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		c.T.Fatalf("%s answered %d with a body that isn't a JSON object: %v", path, resp.StatusCode, err)
+	raw, _ := io.ReadAll(resp.Body)
+	a := Answer{Status: resp.StatusCode}
+	if err := json.Unmarshal(raw, &a.Body); (err != nil || a.Body == nil) && resp.StatusCode != http.StatusUnauthorized {
+		c.T.Fatalf("%s answered %d with a body that isn't a JSON object: %q", path, resp.StatusCode, raw)
 	}
-	a := Answer{Status: resp.StatusCode, Body: out}
-	a.Reason, _ = out["reason"].(string)
-	a.Retryable, _ = out["retryable"].(bool)
 	switch resp.StatusCode {
 	case http.StatusOK:
 	case http.StatusForbidden:
+		a.Reason, _ = a.Body["reason"].(string)
 		if a.Reason == "" {
-			c.T.Fatalf("%s answered 403 with no reason", path)
+			c.T.Fatalf("%s refused with no reason: %s", path, raw)
 		}
 	case http.StatusServiceUnavailable:
-		if n, err := strconv.Atoi(resp.Header.Get("Retry-After")); !a.Retryable || err != nil || n <= 0 {
-			c.T.Fatalf("%s answered 503 without retryable and a Retry-After: %v, %q", path, out, resp.Header.Get("Retry-After"))
+		a.Retryable, _ = a.Body["retryable"].(bool)
+		ra, err := strconv.Atoi(resp.Header.Get("Retry-After"))
+		if !a.Retryable || err != nil || ra < 1 {
+			c.T.Fatalf("%s answered 503 without retryable and a Retry-After: %s, %q", path, raw, resp.Header.Get("Retry-After"))
 		}
+	case http.StatusUnauthorized:
 	default:
-		c.T.Fatalf("%s answered %d, which the interface doesn't have", path, resp.StatusCode)
+		c.T.Fatalf("%s answered %d, which the interface doesn't: %s", path, resp.StatusCode, raw)
 	}
 	return a
 }
 
-func marshal(v any) []byte {
-	b, err := json.Marshal(v)
-	if err != nil {
-		panic(err)
-	}
-	return b
-}
-
-// Bind is POST /v1/bind, with what a bootstrap sends from its event, if
-// event isn't nil. A 200 holds a scope.
-func (c *Client) Bind(token string, event *PullRequestEvent) Answer {
+// only checks that an object has no field but those named.
+func (c *Client) only(what string, m map[string]any, fields ...string) {
 	c.T.Helper()
-	var body []byte
-	if event != nil {
-		body = marshal(event)
+	allowed := map[string]bool{}
+	for _, f := range fields {
+		allowed[f] = true
 	}
-	return c.BindRaw(token, body)
-}
-
-// BindRaw is POST /v1/bind with any body.
-func (c *Client) BindRaw(token string, body []byte) Answer {
-	c.T.Helper()
-	a := c.post("/v1/bind", token, body)
-	if a.Status == http.StatusOK {
-		if s, _ := a.Body["scope"].(string); !scopePattern.MatchString(s) {
-			c.T.Fatalf("bind answered 200 with scope %v", a.Body["scope"])
+	for k := range m {
+		if !allowed[k] {
+			c.T.Fatalf("%s has a field the interface doesn't give, %q: %v", what, k, m)
 		}
 	}
-	return a
 }
 
-// Scope is a 200 bind answer's scope.
-func (a Answer) Scope() string { s, _ := a.Body["scope"].(string); return s }
+// DiskAnswer is the answer to a work disk request.
+type DiskAnswer struct{ State, Restored string }
 
-// PullRequestEvent is what a bootstrap sends from its own event.
-type PullRequestEvent struct {
-	PullRequest      int    `json:"pull_request"`
-	HeadRepositoryID int64  `json:"head_repository_id"`
-	HeadSHA          string `json:"head_sha"`
+// Disk asks for the job's work disk of a family, as the disk action does,
+// once, and checks the answer.
+func (c *Client) Disk(token, family string) (Answer, DiskAnswer) {
+	c.T.Helper()
+	body, _ := json.Marshal(map[string]string{"family": family})
+	a := c.do(http.MethodPost, "/v1/disks", token, body)
+	if a.Status != http.StatusOK {
+		return a, DiskAnswer{}
+	}
+	c.only("a work disk's answer", a.Body, "state", "restored")
+	var d DiskAnswer
+	d.State, _ = a.Body["state"].(string)
+	d.Restored, _ = a.Body["restored"].(string)
+	if (d.State != "making" && d.State != "ready") || !Steps[d.Restored] {
+		c.T.Fatalf("a work disk's answer isn't one the interface gives: %v", a.Body)
+	}
+	return a, d
+}
+
+// SaveAnswer is the answer to a save request.
+type SaveAnswer struct {
+	Saves  bool
+	Reason string
+}
+
+// Save asks for the job's work disk to be saved when it finishes, as the
+// save-disk action does, and checks the answer.
+func (c *Client) Save(token string) (Answer, SaveAnswer) {
+	c.T.Helper()
+	a := c.do(http.MethodPost, "/v1/disks/save", token, []byte(`{"save": true}`))
+	if a.Status != http.StatusOK {
+		return a, SaveAnswer{}
+	}
+	c.only("a save's answer", a.Body, "saves", "reason")
+	var s SaveAnswer
+	var ok bool
+	s.Saves, ok = a.Body["saves"].(bool)
+	s.Reason, _ = a.Body["reason"].(string)
+	if !ok || s.Saves == (s.Reason != "") {
+		c.T.Fatalf("a save's answer isn't one the interface gives: %v", a.Body)
+	}
+	return a, s
 }

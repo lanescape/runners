@@ -2,6 +2,7 @@ package machines_test
 
 import (
 	"context"
+	"github.com/lanescape/runners/internal/logging"
 	"net/http"
 	"strconv"
 	"strings"
@@ -52,15 +53,16 @@ func TestAReportEndsTheMachine(t *testing.T) {
 	e.gce.WriteSerial(m.in.Zone, m.in.Name, "supervisor: runner exited\n")
 	m.release(true)
 	m.finished()
-	if code := m.report(false); code != http.StatusNoContent {
+	if code := m.report(); code != http.StatusNoContent {
 		t.Fatalf("report: %d", code)
 	}
-	if code := m.report(true); code != http.StatusNoContent {
+	rep, _ := e.record("machines/" + m.in.Name + "/report.json")
+	e.clock.Advance(time.Second)
+	if code := m.report(); code != http.StatusNoContent {
 		t.Fatalf("a repeated report: %d", code)
 	}
-	rep, _ := e.record("machines/" + m.in.Name + "/report.json")
-	if rep["save"] != false {
-		t.Fatalf("report = %v; the first one stands", rep)
+	if again, _ := e.record("machines/" + m.in.Name + "/report.json"); again["at"] != rep["at"] {
+		t.Fatalf("report = %v, was %v; the first one stands", again, rep)
 	}
 	e.pass()
 	if e.exists(m.in.Name) {
@@ -80,10 +82,15 @@ func TestAReportEndsTheMachine(t *testing.T) {
 
 func TestASaveIsntBuiltYet(t *testing.T) {
 	e := setup(t)
-	m, _ := e.admitted("lanescape-2vcpu-linux-amd64-disk-build-0123456789abcdef0123-main")
+	e.repo.Commit("main", map[string]string{".github/runners.json": declares})
+	m, _ := e.admitted(sel2)
+	m.diskReady("build")
+	if code, body := m.save(); code != http.StatusOK || body["saves"] != true {
+		t.Fatalf("save request: %d %v", code, body)
+	}
 	m.release(true)
 	m.finished()
-	m.report(true)
+	m.report()
 	e.pass()
 	if e.exists(m.in.Name) || !e.logged("saving isn't built yet") {
 		t.Fatal("a save that isn't built yet should be logged, and the machine deleted")
@@ -135,14 +142,21 @@ func TestAMachineThatStoppedBeforeItsJob(t *testing.T) {
 	if ms[0].Name == first.Name {
 		t.Fatal("the stopped machine is still there, and no other was made")
 	}
-	// An hour from the job's first machine, no more are made for it.
+	// An hour from the job's first machine, no more are made for it: its
+	// run is cancelled, and why is logged.
 	e.clock.Advance(machines.RetryLimit)
 	e.gce.Shutdown(ms[0].Zone, ms[0].Name)
 	e.pass()
 	e.wantMachines(0)
-	if !e.logged("leaving a job queued") {
-		t.Fatal("why the job was left queued wasn't logged")
+	rec, ok := e.record("refusals/5001/" + strconv.FormatInt(run.ID, 10) + "-1.json")
+	if !ok || rec["cancelled_at"] == nil || !strings.Contains(rec["reason"].(string), "within 1h0m0s") {
+		t.Fatalf("refusal = %v; want the run cancelled for its machines that never started", rec)
 	}
+	if !e.logged("refusing a run without a machine") {
+		t.Fatal("why wasn't logged")
+	}
+	e.pass()
+	e.wantMachines(0)
 }
 
 func TestAnIdleMachine(t *testing.T) {
@@ -183,7 +197,7 @@ func TestAStoppedSpotMachine(t *testing.T) {
 			e := setup(t)
 			p := &preemptions{calls: map[string]bool{}}
 			e.svc.Preemptions = p
-			m, _ := e.admitted("lanescape-2vcpu-linux-amd64-spot-main")
+			m, _ := e.admitted("lanescape-2vcpu-linux-amd64-spot")
 			if preempted {
 				if err := e.gce.Preempt(m.in.Zone, m.in.Name); err != nil {
 					t.Fatal(err)
@@ -205,7 +219,9 @@ func TestAStoppedSpotMachine(t *testing.T) {
 
 func TestOrphanedDisks(t *testing.T) {
 	e := setup(t)
+	e.repo.Commit("main", map[string]string{".github/runners.json": declares})
 	m, _ := e.admitted(sel2)
+	m.diskReady("build")
 	idle := e.mainRun()
 	e.queue(idle, sel2)
 	e.pass()
@@ -369,7 +385,7 @@ func TestABootLogThatCouldntBeSaved(t *testing.T) {
 	m, _ := e.admitted(sel2)
 	m.release(true)
 	m.finished()
-	m.report(false)
+	m.report()
 	e.gcs.Faults().Add(fault.Rule{Method: http.MethodPost, Times: 1,
 		Match: func(r *http.Request) bool {
 			return strings.Contains(r.URL.RawQuery, "logs") || strings.Contains(r.URL.Path, "logs")
@@ -472,7 +488,8 @@ func TestTheAgeLimitWinsOverConfirmation(t *testing.T) {
 
 func TestTheAgeLimitKeepsTheJobsHour(t *testing.T) {
 	e := setup(t)
-	e.queue(e.mainRun(), sel2)
+	run := e.mainRun()
+	e.queue(run, sel2)
 	writes := 0
 	rule := fault.Rule{Method: http.MethodPost,
 		Match: func(r *http.Request) bool {
@@ -489,10 +506,14 @@ func TestTheAgeLimitKeepsTheJobsHour(t *testing.T) {
 	e.pass()
 	e.wantMachines(0)
 	// Storage recovers; the job is still queued, and its first machine was
-	// made as long ago as the age limit.
+	// made as long ago as the age limit: no more are made, and its run is
+	// cancelled.
 	e.gcs.Faults().Reset()
 	e.pass()
 	e.wantMachines(0)
+	if _, ok := e.record("refusals/5001/" + strconv.FormatInt(run.ID, 10) + "-1.json"); !ok {
+		t.Fatal("the run wasn't cancelled")
+	}
 }
 
 func TestADeletionThatFailedIsAskedForAgain(t *testing.T) {
@@ -500,7 +521,7 @@ func TestADeletionThatFailedIsAskedForAgain(t *testing.T) {
 	m, _ := e.admitted(sel2)
 	m.release(true)
 	m.finished()
-	m.report(false)
+	m.report()
 	e.gce.FailNextOperation("instances.delete", "RESOURCE_NOT_READY")
 	e.pass()
 	if !e.exists(m.in.Name) {
@@ -510,4 +531,55 @@ func TestADeletionThatFailedIsAskedForAgain(t *testing.T) {
 	if e.exists(m.in.Name) {
 		t.Fatal("a deletion whose operation failed wasn't asked for again")
 	}
+}
+
+func TestABootLogIsReadFromCloudLogging(t *testing.T) {
+	e := setup(t)
+	logs, err := logging.New(context.Background(), e.gce.Project, logging.View, e.gce.LoggingOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.svc.BootLogs = logs
+	m, _ := e.admitted(sel2)
+	e.gce.WriteSerial(m.in.Zone, m.in.Name, "booting\n"+machines.LastLine+"\n")
+	m.release(true)
+	m.finished()
+	m.report()
+	e.pass()
+	if e.exists(m.in.Name) {
+		t.Fatal("the machine waited for its boot log")
+	}
+	log, ok := e.object("logs/" + m.in.Name + "-" + m.in.Labels[machines.LabelCreated] + ".txt")
+	if !ok || !strings.Contains(log, "booting") {
+		t.Fatalf("boot log = %q", log)
+	}
+}
+
+func TestABootLogThatNeverArrives(t *testing.T) {
+	e := setup(t)
+	logs, err := logging.New(context.Background(), e.gce.Project, logging.View, e.gce.LoggingOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.svc.BootLogs = logs
+	e.gce.SetLogDelay(24 * time.Hour)
+	m, _ := e.admitted(sel2)
+	m.release(true)
+	m.finished()
+	m.report()
+	e.pass()
+	name := "logs/" + m.in.Name + "-" + m.in.Labels[machines.LabelCreated] + ".txt"
+	if _, ok := e.object(name); ok {
+		t.Fatal("a boot log was saved before its last entries could arrive")
+	}
+	e.clock.Advance(machines.BootLogWait)
+	e.pass()
+	if log, ok := e.object(name); !ok || !strings.Contains(log, "no boot log arrived") {
+		t.Fatalf("boot log = %q, %v; want it recorded as missing", log, ok)
+	}
+}
+
+func (e *env) object(name string) (string, bool) {
+	data, _, ok := e.gcs.Object("state", name)
+	return string(data), ok
 }

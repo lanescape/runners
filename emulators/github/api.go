@@ -1,9 +1,12 @@
 package github
 
 import (
+	"crypto/sha1"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"slices"
@@ -29,6 +32,7 @@ func (e *Emulator) routes() http.Handler {
 	mux.HandleFunc("GET /repos/{owner}/{repo}/compare/{basehead...}", e.authed(e.repo(e.compare)))
 	mux.HandleFunc("GET /repos/{owner}/{repo}/git/ref/{ref...}", e.authed(e.repo(e.getRef)))
 	mux.HandleFunc("GET /repos/{owner}/{repo}/contents/{path...}", e.authed(e.repo(e.getContents)))
+	mux.HandleFunc("GET /repos/{owner}/{repo}/git/blobs/{sha}", e.authed(e.repo(e.getBlob)))
 	e.actionsRoutes(mux)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "Not Found")
@@ -432,6 +436,14 @@ func (e *Emulator) getContents(w http.ResponseWriter, r *http.Request, rp *Repo)
 		writeError(w, http.StatusNotFound, "Not Found")
 		return
 	}
+	name := path[strings.LastIndex(path, "/")+1:]
+	blob := e.blobSHA(data)
+	if len(data) > contentsLimit {
+		// GitHub gives a large file's metadata, but not its content.
+		writeJSON(w, http.StatusOK, map[string]any{"type": "file", "encoding": "none", "size": len(data), "name": name, "path": path,
+			"content": "", "sha": blob})
+		return
+	}
 	// GitHub wraps base64 content at 60 characters.
 	enc := base64.StdEncoding.EncodeToString([]byte(data))
 	var lines []string
@@ -440,7 +452,6 @@ func (e *Emulator) getContents(w http.ResponseWriter, r *http.Request, rp *Repo)
 		enc = enc[60:]
 	}
 	lines = append(lines, enc)
-	name := path[strings.LastIndex(path, "/")+1:]
 	writeJSON(w, http.StatusOK, map[string]any{
 		"type":     "file",
 		"encoding": "base64",
@@ -448,7 +459,7 @@ func (e *Emulator) getContents(w http.ResponseWriter, r *http.Request, rp *Repo)
 		"name":     name,
 		"path":     path,
 		"content":  strings.Join(lines, "\n") + "\n",
-		"sha":      newSHA(data),
+		"sha":      blob,
 		"url":      e.URL + "/repos/" + rp.FullName() + "/contents/" + url.PathEscape(path),
 	})
 }
@@ -501,4 +512,36 @@ func (e *Emulator) ServerError(path string, code, times int) {
 	e.faults.Add(on(path, times, func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, code, http.StatusText(code))
 	}))
+}
+
+// contentsLimit is the largest file whose content GitHub's contents API
+// returns; a larger one is read as a blob.
+const contentsLimit = 1 << 20
+
+// blobSHA is a file's blob, git's SHA-1 of it, which getBlob then serves.
+// The caller holds e.mu.
+func (e *Emulator) blobSHA(data string) string {
+	sum := sha1.Sum([]byte(fmt.Sprintf("blob %d\x00%s", len(data), data)))
+	s := hex.EncodeToString(sum[:])
+	if e.blobs == nil {
+		e.blobs = map[string]string{}
+	}
+	e.blobs[s] = data
+	return s
+}
+
+// getBlob serves a blob's raw bytes, or its base64 content as JSON.
+func (e *Emulator) getBlob(w http.ResponseWriter, r *http.Request, _ *Repo) {
+	data, ok := e.blobs[r.PathValue("sha")]
+	if !ok {
+		writeError(w, http.StatusNotFound, "Not Found")
+		return
+	}
+	if strings.Contains(r.Header.Get("Accept"), "raw") {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = io.WriteString(w, data)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sha": r.PathValue("sha"), "size": len(data), "encoding": "base64",
+		"content": base64.StdEncoding.EncodeToString([]byte(data))})
 }
