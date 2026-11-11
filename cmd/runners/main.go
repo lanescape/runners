@@ -40,6 +40,7 @@ import (
 	"github.com/lanescape/runners/config"
 	"github.com/lanescape/runners/endpoints"
 	"github.com/lanescape/runners/internal/auth"
+	"github.com/lanescape/runners/internal/bases"
 	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/compute"
 	"github.com/lanescape/runners/internal/disks"
@@ -203,6 +204,12 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 		return err
 	}
 	svc.BootLogs = bootLogs
+	images := &bases.Service{Config: cfg, Compute: gce, Objects: objects, Clock: clock, Logger: log,
+		Network: machines.Network, Subnetwork: machines.Subnetwork, DiskType: machines.DiskType, Keys: bases.Keys(cfg)}
+	svc.Bases = images
+	for _, arch := range config.Arches {
+		log.Info("base image", "arch", arch, "image", bases.ImageName(arch, images.Keys[arch]))
+	}
 	passes := &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log}
 	body := pass.All(svc.Pass, dks.Pass)
 	svc.Kick = kicker(ctx, passes, body, 15*time.Second, log)

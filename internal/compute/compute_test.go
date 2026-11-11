@@ -361,3 +361,45 @@ func TestOperationsAreWaitedFor(t *testing.T) {
 		t.Fatalf("an operation that outlives its context: %v, want Unavailable", err)
 	}
 }
+
+// TestAMachineWithNoAccountFromAPublicImage is a base image's builder: it
+// boots Debian's own image from its project, has no account, so no
+// identity, and is deleted at its maximum run duration.
+func TestAMachineWithNoAccountFromAPublicImage(t *testing.T) {
+	ctx := context.Background()
+	clock := clockwork.NewFakeClockAt(time.Now())
+	emu, c := setup(t, gceemu.WithClock(clock))
+	emu.AddPublicImage("debian-cloud", "debian-13-trixie-v20261109", "X86_64")
+	s := compute.InstanceSpec{
+		Name: "lsr-build-amd64-0123456789abcdef0123", MachineType: "n4-standard-2", Image: "debian-13-trixie-v20261109",
+		ImageProject: "debian-cloud", BootDiskGB: 10, DiskType: "hyperdisk-balanced", Network: "lanescape-runners",
+		Subnetwork: "lanescape-runners", MaxRunDuration: 90 * time.Minute, DeleteAtMaxRun: true,
+		Metadata: map[string]string{"startup-script": "#!/bin/bash\n"},
+	}
+	if err := c.CreateInstance(ctx, zoneA, s, compute.RequestID("builder")); err != nil {
+		t.Fatal(err)
+	}
+	st, ok := emu.Instance(zoneA, s.Name)
+	if !ok || st.ServiceAccount != "" || len(st.Scopes) != 0 || st.Termination != "DELETE" || st.Provisioning != "STANDARD" {
+		t.Fatalf("builder = %+v", st)
+	}
+	for _, d := range emu.Disks() {
+		if d.Name == s.Name && d.SourceImage != emu.URL+"/compute/v1/projects/debian-cloud/global/images/debian-13-trixie-v20261109" {
+			t.Errorf("boot disk from %s", d.SourceImage)
+		}
+	}
+	// Another project's image that isn't there, or the project's own by
+	// the other project's name, isn't found.
+	s.Name, s.Image = "lsr-build-amd64-other", "debian-13-trixie-v20200101"
+	if err := c.CreateInstance(ctx, zoneA, s, compute.RequestID("missing")); !errors.Is(err, compute.ErrNotFound) {
+		t.Fatalf("from a missing public image: %v", err)
+	}
+	s.Image = "lsr-base-amd64-1"
+	if err := c.CreateInstance(ctx, zoneA, s, compute.RequestID("not theirs")); !errors.Is(err, compute.ErrNotFound) {
+		t.Fatalf("the project's image in another project: %v", err)
+	}
+	clock.Advance(90*time.Minute + time.Second)
+	if _, err := c.Instance(ctx, zoneA, "lsr-build-amd64-0123456789abcdef0123"); !errors.Is(err, compute.ErrNotFound) {
+		t.Fatalf("past its maximum run duration: %v", err)
+	}
+}

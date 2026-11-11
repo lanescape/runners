@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lanescape/runners/internal/bases"
 	"github.com/lanescape/runners/internal/compute"
 	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/pass"
@@ -84,6 +85,12 @@ func (s *Service) Pass(p *pass.Pass) error {
 	}
 	ctx := p.Context()
 	s.stopPastLimit(ctx, inv)
+	if s.Bases != nil {
+		s.Bases.Pass(p)
+		if p.Lost() {
+			return context.Cause(p.Context())
+		}
+	}
 	s.followRefusals(ctx, inv)
 	s.give(ctx, inv)
 	s.cleanup(ctx, inv)
@@ -772,8 +779,9 @@ func (s *Service) group(ctx context.Context, inv *inventory, repo github.Reposit
 	return g, nil
 }
 
-// baseImage is the newest ready base image for an architecture,
-// lsr-base-<arch>-<key> (specs/0003-disks.md).
+// baseImage is the base image machines of an architecture boot,
+// lsr-base-<arch>-<key>: the current key's once it's ready, and until then
+// the previous one (specs/0003-disks.md, Which image machines boot).
 func (s *Service) baseImage(ctx context.Context, inv *inventory, arch string) (string, error) {
 	if im, ok := inv.images[arch]; ok {
 		return im, nil
@@ -782,17 +790,18 @@ func (s *Service) baseImage(ctx context.Context, inv *inventory, arch string) (s
 	if err != nil {
 		return "", err
 	}
-	var best compute.Image
-	for _, im := range ims {
-		if strings.HasPrefix(im.Name, "lsr-base-"+arch+"-") && im.Status == "READY" && (best.Name == "" || im.Created.After(best.Created)) {
-			best = im
-		}
+	var name string
+	var ok bool
+	if s.Bases != nil {
+		name, ok = s.Bases.Boot(ims, arch)
+	} else {
+		name, ok = bases.Boot(ims, arch, "")
 	}
-	if best.Name == "" {
+	if !ok {
 		return "", fmt.Errorf("there's no ready base image for %s", arch)
 	}
-	inv.images[arch] = best.Name
-	return best.Name, nil
+	inv.images[arch] = name
+	return name, nil
 }
 
 // make makes one machine for a job: a just-in-time runner for the selector

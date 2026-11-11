@@ -55,6 +55,7 @@ type Emulator struct {
 	instances map[string]*instance // by zone/name
 	disks     map[string]*disk     // by zone/name
 	images    map[string]*image    // by name
+	public    map[string]*image    // other projects' public images, by project/name
 	ops       map[string]*operation
 	requests  map[string]*operation // by requestId
 	stockouts map[capacityKey]bool
@@ -147,6 +148,7 @@ type disk struct {
 
 type image struct {
 	id         uint64
+	project    string // another project's, for a public image
 	name       string
 	family     string
 	status     string
@@ -179,7 +181,7 @@ func New(opts ...Option) *Emulator {
 		Project: "lanescape-dev", ProjectNumber: 123456789012,
 		clock:     clockwork.NewRealClock(),
 		zones:     []string{"northamerica-northeast1-a", "northamerica-northeast1-b"},
-		instances: map[string]*instance{}, disks: map[string]*disk{}, images: map[string]*image{},
+		instances: map[string]*instance{}, disks: map[string]*disk{}, images: map[string]*image{}, public: map[string]*image{},
 		ops: map[string]*operation{}, requests: map[string]*operation{},
 		stockouts: map[capacityKey]bool{}, refusing: map[capacityKey]bool{}, diskShort: map[string]bool{}, failNext: map[string]string{}, quotas: map[string]int64{}, booted: map[uint64]bool{},
 	}
@@ -258,6 +260,14 @@ func (e *Emulator) AddImage(name, family, arch string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.images[name] = &image{id: newID(), name: name, family: family, status: "READY", arch: arch, created: e.clock.Now(), sizeGB: 10}
+}
+
+// AddPublicImage adds a ready image to another project, public, as
+// Debian's own images in debian-cloud are, which any machine may boot.
+func (e *Emulator) AddPublicImage(project, name, arch string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.public[project+"/"+name] = &image{id: newID(), project: project, name: name, status: "READY", arch: arch, created: e.clock.Now(), sizeGB: 10}
 }
 
 // Stockout makes a zone have no capacity for a machine type, standard or

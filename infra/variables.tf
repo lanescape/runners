@@ -32,3 +32,17 @@ variable "service_image" {
     error_message = "service_image must be an image in the lanescape-runners repository, by digest."
   }
 }
+
+# CD's run ID and attempt, on the service's template, so that every apply
+# makes a new revision, even of an image already deployed: a rerun of a
+# deploy whose revision couldn't start, such as the first, before the App's
+# secrets had values, starts one afresh.
+variable "deploy_id" {
+  description = "CD's run ID and attempt, <run ID>-<attempt>."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[0-9]+-[0-9]+$", var.deploy_id))
+    error_message = "deploy_id must be <run ID>-<attempt>."
+  }
+}

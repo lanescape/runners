@@ -1,0 +1,26 @@
+# The base images (specs/0003-disks.md, Base images). Each names exactly
+# what goes into the image, so that only a deploy changes the base images'
+# key, and so the images.
+
+# Debian 13's image for each architecture, from Google's debian-cloud
+# project. A pull request moves it to the current one, as
+#   gcloud compute images describe-from-family debian-13 --project=debian-cloud
+#   gcloud compute images describe-from-family debian-13-arm64 --project=debian-cloud
+# give it.
+debian:
+  amd64: debian-13-trixie-v20261109
+  arm64: debian-13-trixie-arm64-v20261109
+
+# Go, at the version go.mod's toolchain line names, which a test holds this
+# to, with the SHA-256 of each architecture's release that Go publishes
+# (https://go.dev/dl/?mode=json&include=all).
+go:
+  version: 1.27.3
+  sha256:
+    amd64: 65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40
+    arm64: a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49
+
+# The machine types a base image's builder may be, in order of preference.
+builders:
+  amd64: [n4-standard-2, c4-standard-2]
+  arm64: [c4a-standard-2]

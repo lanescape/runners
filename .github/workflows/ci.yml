@@ -1,21 +1,27 @@
 name: CI
 
+# On pull requests, and from cd.yml, as its checks before it deploys
+# (specs/0004-deployment.md, CI and CD).
 on:
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
 
+# A pull request's newer push cancels its older checks. Called from cd.yml,
+# each run's checks are its own.
 concurrency:
-  group: ci-${{ github.event.pull_request.number }}
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 jobs:
   go:
     name: Go
-    # The organization's own pull requests run on Blacksmith. A fork's runs
-    # on GitHub's runners, since nothing in CI needs anything of ours.
-    runs-on: ${{ github.repository_owner_id == '303994381' && github.event.pull_request.head.repo.full_name == github.repository && 'blacksmith-2vcpu-ubuntu-2604' || 'ubuntu-24.04' }}
+    # The organization's own pull requests, and its pushes to main through
+    # cd.yml, run on Blacksmith. A fork's pull request runs on GitHub's
+    # runners, since nothing in CI needs anything of ours.
+    runs-on: ${{ github.repository_owner_id == '303994381' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'blacksmith-2vcpu-ubuntu-2604' || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -38,7 +44,7 @@ jobs:
 
   terraform:
     name: Terraform
-    runs-on: ${{ github.repository_owner_id == '303994381' && github.event.pull_request.head.repo.full_name == github.repository && 'blacksmith-2vcpu-ubuntu-2604' || 'ubuntu-24.04' }}
+    runs-on: ${{ github.repository_owner_id == '303994381' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'blacksmith-2vcpu-ubuntu-2604' || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

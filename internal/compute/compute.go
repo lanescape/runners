@@ -156,23 +156,29 @@ type InstanceSpec struct {
 	Name        string
 	MachineType string
 	Spot        bool
-	// Image is the boot image's name, in the project.
+	// Image is the boot image's name, in the project, or in ImageProject
+	// if that's set, such as Debian's own images' project.
 	Image                 string
+	ImageProject          string
 	BootDiskGB            int64
 	DiskType              string
 	ProvisionedIOPS       int64
 	ProvisionedThroughput int64
 	Labels                map[string]string
 	// Metadata can include credentials: never log it.
-	Metadata       map[string]string
+	Metadata map[string]string
+	// ServiceAccount is the machine's account, with Scopes; with none, the
+	// machine has no account, and so no identity at all.
 	ServiceAccount string
 	Scopes         []string
 	Network        string
 	// Subnetwork is the subnetwork the machine joins, in its zone's
 	// region.
 	Subnetwork string
-	// MaxRunDuration is when Compute Engine itself stops the machine.
+	// MaxRunDuration is when Compute Engine itself stops the machine, or
+	// deletes it if DeleteAtMaxRun.
 	MaxRunDuration time.Duration
+	DeleteAtMaxRun bool
 }
 
 // DiskSpec is a disk to make.
@@ -418,7 +424,7 @@ func (c *Client) zonePath(zone string) string { return "projects/" + c.project +
 
 // CreateInstance implements API. A Spot machine, and a standard one at its
 // maximum run duration, stops rather than being deleted, so its disks are
-// left for the service to deal with.
+// left for the service to deal with, unless DeleteAtMaxRun.
 func (c *Client) CreateInstance(ctx context.Context, zone string, s InstanceSpec, requestID string) error {
 	var items []*gce.MetadataItems
 	for k, v := range s.Metadata {
@@ -432,6 +438,13 @@ func (c *Client) CreateInstance(ctx context.Context, zone string, s InstanceSpec
 	if s.MaxRunDuration > 0 {
 		sch.MaxRunDuration = &gce.Duration{Seconds: int64(s.MaxRunDuration / time.Second)}
 		sch.InstanceTerminationAction = "STOP"
+		if s.DeleteAtMaxRun {
+			sch.InstanceTerminationAction = "DELETE"
+		}
+	}
+	imageProject := c.project
+	if s.ImageProject != "" {
+		imageProject = s.ImageProject
 	}
 	inst := &gce.Instance{
 		Name:        s.Name,
@@ -441,7 +454,7 @@ func (c *Client) CreateInstance(ctx context.Context, zone string, s InstanceSpec
 		Disks: []*gce.AttachedDisk{{
 			Boot: true, AutoDelete: true, DeviceName: "boot",
 			InitializeParams: &gce.AttachedDiskInitializeParams{
-				SourceImage: "projects/" + c.project + "/global/images/" + s.Image,
+				SourceImage: "projects/" + imageProject + "/global/images/" + s.Image,
 				DiskSizeGb:  s.BootDiskGB, DiskType: c.zonePath(zone) + "/diskTypes/" + s.DiskType,
 				ProvisionedIops: s.ProvisionedIOPS, ProvisionedThroughput: s.ProvisionedThroughput,
 				Labels: s.Labels,
@@ -451,8 +464,10 @@ func (c *Client) CreateInstance(ctx context.Context, zone string, s InstanceSpec
 			Network:       "projects/" + c.project + "/global/networks/" + s.Network,
 			AccessConfigs: []*gce.AccessConfig{{Type: "ONE_TO_ONE_NAT", Name: "External NAT"}},
 		}},
-		ServiceAccounts: []*gce.ServiceAccount{{Email: s.ServiceAccount, Scopes: s.Scopes}},
-		Scheduling:      sch,
+		Scheduling: sch,
+	}
+	if s.ServiceAccount != "" {
+		inst.ServiceAccounts = []*gce.ServiceAccount{{Email: s.ServiceAccount, Scopes: s.Scopes}}
 	}
 	if s.Subnetwork != "" {
 		inst.NetworkInterfaces[0].Subnetwork = "projects/" + c.project + "/regions/" + Region(zone) + "/subnetworks/" + s.Subnetwork

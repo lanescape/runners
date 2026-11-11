@@ -243,7 +243,7 @@ func (e *env) queue(run *ghemu.Run, labels ...string) *ghemu.WorkflowJob {
 func (e *env) ours() []gceemu.InstanceState {
 	var out []gceemu.InstanceState
 	for _, in := range e.gce.Instances() {
-		if strings.HasPrefix(in.Name, "lsr-") {
+		if strings.HasPrefix(in.Name, "lsr-") && !strings.HasPrefix(in.Name, "lsr-build-") {
 			out = append(out, in)
 		}
 	}

@@ -1,6 +1,7 @@
 package machines_test
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"slices"
@@ -9,9 +10,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lanescape/runners/config"
 	ghemu "github.com/lanescape/runners/emulators/github"
+	"github.com/lanescape/runners/internal/bases"
+	"github.com/lanescape/runners/internal/compute"
 	"github.com/lanescape/runners/internal/machines"
+	"github.com/lanescape/runners/internal/pass"
 	"github.com/lanescape/runners/internal/selector"
+	baseimage "github.com/lanescape/runners/machine"
 )
 
 func TestAMachineForAQueuedJob(t *testing.T) {
@@ -454,5 +460,101 @@ func TestARefusedRunDoesntBlockAnotherRunsJob(t *testing.T) {
 	ms := e.wantMachines(1)
 	if ms[0].Labels[machines.LabelJob] != strconv.FormatInt(j.ID, 10) {
 		t.Fatalf("the machine is job %s's; want the other run's", ms[0].Labels[machines.LabelJob])
+	}
+}
+
+// fakeBases is the base images' part of a pass, as the machines' pass sees
+// it.
+type fakeBases struct {
+	key string
+	e   *env
+	// machinesAtPass are how many machines there were when it ran.
+	machinesAtPass []int
+}
+
+func (f *fakeBases) Pass(*pass.Pass) {
+	f.machinesAtPass = append(f.machinesAtPass, len(f.e.gce.Instances()))
+}
+
+func (f *fakeBases) Boot(ims []compute.Image, arch string) (string, bool) {
+	return bases.Boot(ims, arch, f.key)
+}
+
+// TestMachinesBootTheCurrentKeysBaseImage: machines boot the current key's
+// base image once it's ready, even an older one, and the previous until
+// then; the base images move on before queued jobs are given machines, so
+// they never starve a builder (specs/0003-disks.md, Which image machines
+// boot; specs/0001-architecture.md, Passes).
+func TestMachinesBootTheCurrentKeysBaseImage(t *testing.T) {
+	e := setup(t)
+	fb := &fakeBases{key: "made-later", e: e}
+	e.svc.Bases = fb
+	run := e.mainRun()
+	e.queue(run, sel2)
+	e.pass()
+	if !slices.Equal(fb.machinesAtPass, []int{0}) {
+		t.Fatalf("the base images' part ran with %v machines made; it runs before any is", fb.machinesAtPass)
+	}
+	source := func(name string) string {
+		for _, d := range e.gce.Disks() {
+			if d.Name == name {
+				return d.SourceImage[strings.LastIndex(d.SourceImage, "/")+1:]
+			}
+		}
+		return ""
+	}
+	first := e.one().Name
+	if got := source(first); got != "lsr-base-amd64-new" {
+		t.Fatalf("with the current key's image not ready, a machine boots %s, not the newest", got)
+	}
+	// A reverted deploy's key, whose image is older, is booted once it's
+	// there.
+	fb.key = "old"
+	e.queue(run, sel2)
+	e.pass()
+	e.wantMachines(2)
+	for _, m := range e.gce.Instances() {
+		if got := source(m.Name); m.Name != first && got != "lsr-base-amd64-old" {
+			t.Fatalf("with the current key's image ready, a machine boots %s", got)
+		}
+	}
+}
+
+// TestTheFirstDeploysJobsWaitForTheBaseImage: with no base image at all, as
+// at the first deploy, a queued job waits while the builder makes one, and
+// gets its machine in the pass that makes the image.
+func TestTheFirstDeploysJobsWaitForTheBaseImage(t *testing.T) {
+	e := setup(t)
+	e.gce.DeleteImageNow("lsr-base-amd64-old")
+	e.gce.DeleteImageNow("lsr-base-amd64-new")
+	e.gce.AddPublicImage(config.DebianProject, e.cfg.Base.Debian["amd64"], "X86_64")
+	keys := bases.Keys(e.cfg)
+	// arm64's image is there already.
+	e.gce.AddImage(bases.ImageName("arm64", keys["arm64"]), "", "ARM64")
+	gcec, err := compute.New(context.Background(), e.gce.Project, e.gce.ClientOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.svc.Bases = &bases.Service{Config: e.cfg, Compute: gcec, Objects: e.svc.Objects, Clock: e.clock, Logger: e.svc.Logger,
+		Network: machines.Network, Subnetwork: machines.Subnetwork, DiskType: machines.DiskType, Keys: keys}
+	run := e.mainRun()
+	e.queue(run, sel2)
+	e.pass()
+	e.wantMachines(0)
+	builder := bases.BuilderName("amd64", keys["amd64"])
+	st, ok := e.gce.Instance(zoneA, builder)
+	if !ok {
+		t.Fatal("no builder")
+	}
+	if st.ServiceAccount != "" || len(e.gh.Runners()) != 0 {
+		t.Fatalf("builder = %+v; runners %+v", st, e.gh.Runners())
+	}
+	e.gce.WriteSerial(zoneA, builder, baseimage.Built+"amd64-"+keys["amd64"]+"\n")
+	e.pass()
+	m := e.one()
+	for _, d := range e.gce.Disks() {
+		if d.Name == m.Name && !strings.HasSuffix(d.SourceImage, "/"+bases.ImageName("amd64", keys["amd64"])) {
+			t.Fatalf("the job's machine boots %s", d.SourceImage)
+		}
 	}
 }
