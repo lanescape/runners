@@ -134,9 +134,10 @@ func (g *GCS) write(ctx context.Context, obj *storage.ObjectHandle, data []byte)
 	// request with its checksum, and can retry. With no chunking at all it
 	// streams, and can't. A chunk smaller than the object would start a
 	// resumable upload, whose session URI is a credential that a failed
-	// chunk's error would carry, so the chunk is the object's size, in
-	// the multiples the SDK takes, and at least the smallest.
-	w.ChunkSize = max(googleapi.MinUploadChunkSize, (len(data)+googleapi.MinUploadChunkSize-1)/googleapi.MinUploadChunkSize*googleapi.MinUploadChunkSize)
+	// chunk's error would carry, so the chunk is larger than the object,
+	// in the multiples the SDK takes: the SDK sends one request only if it
+	// reaches the object's end before its buffer is full.
+	w.ChunkSize = (len(data)/googleapi.MinUploadChunkSize + 1) * googleapi.MinUploadChunkSize
 	if _, err := io.Copy(w, bytes.NewReader(data)); err != nil {
 		_ = w.CloseWithError(err)
 		return 0, classify(err)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -174,12 +175,16 @@ func TestCallsStopAtTheContextsDeadline(t *testing.T) {
 func TestALargeObjectGoesInOneRequest(t *testing.T) {
 	ctx := context.Background()
 	emu, s := newStore(t)
-	big := bytes.Repeat([]byte("console line\n"), 300<<10/13)
-	if _, err := s.Create(ctx, "logs/big.txt", big); err != nil {
-		t.Fatalf("creating %d bytes: %v", len(big), err)
-	}
-	if data, _, ok := emu.Object("state", "logs/big.txt"); !ok || !bytes.Equal(data, big) {
-		t.Fatal("the object isn't what was written")
+	// Every side of a chunk's boundary, up to the boot log's 4 MiB.
+	for _, n := range []int{0, 1, 256<<10 - 1, 256 << 10, 256<<10 + 1, 300 << 10, 512 << 10, 4 << 20} {
+		big := bytes.Repeat([]byte("x"), n)
+		name := fmt.Sprintf("logs/%d.txt", n)
+		if _, err := s.Create(ctx, name, big); err != nil {
+			t.Fatalf("creating %d bytes: %v", n, err)
+		}
+		if data, _, ok := emu.Object("state", name); !ok || !bytes.Equal(data, big) {
+			t.Fatalf("the %d-byte object isn't what was written", n)
+		}
 	}
 }
 
