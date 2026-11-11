@@ -752,14 +752,14 @@ func Delisted(ctx context.Context, gh github.API, repo *github.Repository, log *
 	if repo == nil {
 		return out, nil
 	}
-	// A file that isn't a JSON object lists nothing, as it binds nothing;
-	// any other failure to read it confirms nothing.
-	f, err := binding.ReadRunners(ctx, gh, *repo, log)
-	if err != nil && !errors.Is(err, binding.ErrRunnersFile) {
+	// A file that isn't valid lists nothing, as it binds nothing; any
+	// other failure to read it confirms nothing.
+	branches, err := binding.ReadBranches(ctx, gh, *repo, log)
+	if err != nil {
 		return out, err
 	}
 	byName := map[string]string{}
-	for branch, name := range f.Branches {
+	for branch, name := range branches {
 		byName["branch-"+name] = branch
 	}
 	var errs []error

@@ -3,6 +3,7 @@ package machine_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -25,14 +27,14 @@ import (
 
 const zone = "northamerica-northeast1-a"
 
-// bins builds the supervisor, from its embedded source alone, and the
-// runner stand-in, once for every test.
+// bins builds the service's programs, each from its embedded source alone,
+// and the runner stand-in, once for every test.
 var bins struct {
-	once       sync.Once
-	dir        string
-	supervisor string
-	standIn    string
-	err        error
+	once     sync.Once
+	dir      string
+	programs map[string]string
+	standIn  string
+	err      error
 }
 
 func goTool() string {
@@ -42,40 +44,24 @@ func goTool() string {
 	return filepath.Join(runtime.GOROOT(), "bin", "go")
 }
 
-func build(t *testing.T) (supervisor, standIn string) {
+// build builds the programs, and returns where each is, by its source's
+// directory, and the runner stand-in.
+func build(t *testing.T) (map[string]string, string) {
 	t.Helper()
 	bins.once.Do(func() {
 		bins.dir, bins.err = os.MkdirTemp("", "lanescape-runners-machine-")
 		if bins.err != nil {
 			return
 		}
-		// The supervisor builds from the embedded files and nothing else.
-		src := filepath.Join(bins.dir, "src")
-		for path, b := range machine.Files() {
-			if !strings.HasPrefix(path, "supervisor/") {
-				continue
-			}
-			p := filepath.Join(src, strings.TrimPrefix(path, "supervisor/"))
-			if bins.err = os.MkdirAll(filepath.Dir(p), 0o755); bins.err != nil {
+		bins.programs = map[string]string{}
+		// Each program builds from its embedded files and nothing else.
+		for _, p := range machine.Programs() {
+			if bins.programs[p.Source], bins.err = buildEmbedded(bins.dir, p.Source); bins.err != nil {
 				return
 			}
-			if bins.err = os.WriteFile(p, b, 0o644); bins.err != nil {
-				return
-			}
-		}
-		if bins.err = os.WriteFile(filepath.Join(src, "go.mod"), []byte("module supervisor\n\ngo 1.27\n"), 0o644); bins.err != nil {
-			return
-		}
-		bins.supervisor = filepath.Join(bins.dir, "supervisor")
-		cmd := exec.Command(goTool(), "build", "-o", bins.supervisor, ".")
-		cmd.Dir = src
-		cmd.Env = append(os.Environ(), "GOWORK=off", "GOFLAGS=-mod=mod", "CGO_ENABLED=0")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			bins.err = fmt.Errorf("building the supervisor from its embedded source: %v\n%s", err, out)
-			return
 		}
 		bins.standIn = filepath.Join(bins.dir, "standin")
-		cmd = exec.Command(goTool(), "build", "-o", bins.standIn, "github.com/lanescape/runners/emulators/github/cmd/standin")
+		cmd := exec.Command(goTool(), "build", "-o", bins.standIn, "github.com/lanescape/runners/emulators/github/cmd/standin")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			bins.err = fmt.Errorf("building the runner stand-in: %v\n%s", err, out)
 		}
@@ -83,7 +69,37 @@ func build(t *testing.T) (supervisor, standIn string) {
 	if bins.err != nil {
 		t.Fatal(bins.err)
 	}
-	return bins.supervisor, bins.standIn
+	return bins.programs, bins.standIn
+}
+
+// buildEmbedded builds one of the embedded programs from its embedded
+// files alone, in a module of its own with no requirements, statically,
+// as the base image does.
+func buildEmbedded(dir, prog string) (string, error) {
+	src := filepath.Join(dir, "src-"+prog)
+	for path, b := range machine.Files() {
+		if !strings.HasPrefix(path, prog+"/") {
+			continue
+		}
+		p := filepath.Join(src, strings.TrimPrefix(path, prog+"/"))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(p, b, 0o644); err != nil {
+			return "", err
+		}
+	}
+	if err := os.WriteFile(filepath.Join(src, "go.mod"), []byte("module "+prog+"\n\ngo 1.27\n"), 0o644); err != nil {
+		return "", err
+	}
+	out := filepath.Join(dir, prog)
+	cmd := exec.Command(goTool(), "build", "-o", out, ".")
+	cmd.Dir = src
+	cmd.Env = append(os.Environ(), "GOWORK=off", "GOFLAGS=-mod=mod", "CGO_ENABLED=0")
+	if b, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("building %s from its embedded source: %v\n%s", prog, err, b)
+	}
+	return out, nil
 }
 
 func TestMain(m *testing.M) {
@@ -102,51 +118,74 @@ func TestEmbedded(t *testing.T) {
 			t.Errorf("%s: embedded copy isn't the file", path)
 		}
 	}
-	// Every file of the supervisor's is embedded.
-	srcs, _ := filepath.Glob("supervisor/*.go")
-	for _, s := range srcs {
-		if !strings.HasSuffix(s, "_test.go") {
-			if _, ok := fs[filepath.ToSlash(s)]; !ok {
-				t.Errorf("%s isn't embedded", s)
+	// Every file of the programs' is embedded, and none of their tests;
+	// every program is in the service's own directory.
+	for _, p := range machine.Programs() {
+		srcs, _ := filepath.Glob(p.Source + "/*.go")
+		if len(srcs) == 0 {
+			t.Errorf("%s has no source", p.Source)
+		}
+		for _, s := range srcs {
+			_, ok := fs[filepath.ToSlash(s)]
+			if test := strings.HasSuffix(s, "_test.go"); ok == test {
+				t.Errorf("%s: embedded %v", s, ok)
+			}
+		}
+		if filepath.Dir(p.Path) != machine.Dir {
+			t.Errorf("%s is installed at %s, outside %s", p.Source, p.Path, machine.Dir)
+		}
+	}
+	// Every other file is installed somewhere, and every installed file is
+	// embedded.
+	installed := map[string]bool{}
+	for _, in := range machine.Installs() {
+		installed[in.File] = true
+		if _, ok := fs[in.File]; !ok || in.Path == "" || in.Mode == 0 {
+			t.Errorf("%+v isn't an embedded file with a place on the base image", in)
+		}
+	}
+	for path := range fs {
+		if !strings.HasSuffix(path, ".go") && !installed[path] {
+			t.Errorf("%s has no place on the base image", path)
+		}
+	}
+	// The programs' defaults are the paths the base image gives, and the
+	// script, units and rule name the programs by their full paths
+	// (specs/0002-machines.md, A machine's life). The mount program runs
+	// mkfs.ext4 from the one path machine.MkfsPath names.
+	for file, wants := range map[string][]string{
+		"supervisor/main.go":                   {`"` + machine.HookPath + `"`},
+		"job-started.sh":                       {"\nexec " + machine.HookProgramPath + ` "$@"` + "\n"},
+		"lanescape-runners-supervisor.service": {"ExecStart=" + machine.SupervisorPath + "\n", "StandardOutput=journal+console\n"},
+		"lanescape-runners-work-disk.service":  {"ExecStart=" + machine.MountPath + "\n"},
+		"90-lanescape-runners-work.rules":      {`SYSTEMD_WANTS}+="` + filepath.Base(machine.WorkDiskUnitPath) + `"`, `SYMLINK=="disk/by-id/google-work"`},
+		"mountwork/main.go": {`Mkfs: "` + machine.MkfsPath + `"`, `Mountpoint: "` + machine.WorkPath + `"`, `Device: "/dev/disk/by-id/google-work"`,
+			"UID: 1001, GID: 1001"},
+	} {
+		for _, want := range wants {
+			if !strings.Contains(string(fs[file]), want) {
+				t.Errorf("%s doesn't say %q", file, want)
 			}
 		}
 	}
-	if _, ok := fs["job-started.sh"]; !ok {
-		t.Error("the hook isn't embedded")
+	if machine.WorkOwner != "1001:1001" {
+		t.Errorf("the work disk's owner is %s", machine.WorkOwner)
 	}
-	// The supervisor's defaults are the paths the base image gives.
-	sup := string(fs["supervisor/main.go"])
-	for _, p := range []string{machine.HookPath, machine.SaveMarker} {
-		if !strings.Contains(sup, `"`+p+`"`) {
-			t.Errorf("the supervisor's defaults don't name %s", p)
+	// The script runs the hook's program and nothing else.
+	var lines []string
+	for _, l := range strings.Split(string(fs["job-started.sh"]), "\n") {
+		if l != "" && !strings.HasPrefix(l, "#") {
+			lines = append(lines, l)
 		}
+	}
+	if len(lines) != 1 {
+		t.Errorf("the hook's script runs more than its program: %q", lines)
 	}
 	if d := machine.Digest(); len(d) != 64 || d != machine.Digest() {
 		t.Fatalf("digest = %q", d)
 	}
+	// Every program builds from what's embedded, statically.
 	build(t)
-}
-
-// fakeBin is a directory with a sudo that records what it was asked and
-// does only what a test needs: mkdir, and blkid that finds a filesystem
-// only if told to.
-func fakeBin(t *testing.T) string {
-	t.Helper()
-	dir := t.TempDir()
-	sudo := `#!/bin/bash
-[ "$1" = -n ] || exit 1
-shift
-echo "$*" >> "$SUDO_LOG"
-case $1 in
-blkid) [ -n "${HAS_FS:-}" ] ;;
-mkdir) "$@" ;;
-*) exit 0 ;;
-esac
-`
-	if err := os.WriteFile(filepath.Join(dir, "sudo"), []byte(sudo), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	return dir
 }
 
 // hookEnv is one machine for the hook to run on, and a service it asks.
@@ -155,12 +194,10 @@ type hookEnv struct {
 	emu      *gceemu.Emulator
 	dir      string
 	settings string
-	sudoLog  string
-	device   string
-	work     string
 
 	mu     sync.Mutex
 	codes  []int
+	body   string
 	asked  []string
 	tokens []string
 }
@@ -185,6 +222,9 @@ func newHookEnv(t *testing.T) *hookEnv {
 			code = http.StatusNotFound
 		}
 		w.WriteHeader(code)
+		if code != http.StatusOK && h.body != "" {
+			_, _ = io.WriteString(w, h.body)
+		}
 	}))
 	t.Cleanup(srv.Close)
 	h.emu = gceemu.New()
@@ -202,27 +242,28 @@ func newHookEnv(t *testing.T) *hookEnv {
 	if _, err := api.Instances.Insert(h.emu.Project, zone, inst).Do(); err != nil {
 		t.Fatal(err)
 	}
-	h.device = filepath.Join(h.dir, "google-work")
-	h.work = filepath.Join(h.dir, "work")
-	h.sudoLog = filepath.Join(h.dir, "sudo.log")
 	h.settings = filepath.Join(h.dir, "job-started.conf")
-	conf := fmt.Sprintf("metadata=%s\ndevice=%s\nmountpoint=%s\n", h.emu.MetadataURL(zone, inst.Name), h.device, h.work)
-	if err := os.WriteFile(h.settings, []byte(conf), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(h.device, nil, 0o644); err != nil {
+	if err := os.WriteFile(h.settings, []byte("metadata="+h.emu.MetadataURL(zone, inst.Name)+"\nask_every=100ms\nretry_every=100ms\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return h
 }
 
-// run starts the hook as the runner does, with the job's environment.
+// run starts the hook as the runner does, with the job's environment: its
+// script, with bash, which runs its program, built from its embedded
+// source, here from where the test built it.
 func (h *hookEnv) run(env ...string) (*exec.Cmd, chan error, *lockedBuffer) {
 	h.t.Helper()
-	cmd := exec.Command("bash", "job-started.sh", h.settings)
+	programs, _ := build(h.t)
+	script := filepath.Join(h.dir, "job-started.sh")
+	text := strings.ReplaceAll(string(machine.Files()["job-started.sh"]), machine.HookProgramPath, programs["hook"])
+	if err := os.WriteFile(script, []byte(text), 0o755); err != nil {
+		h.t.Fatal(err)
+	}
+	cmd := exec.Command("bash", script, h.settings)
 	out := &lockedBuffer{}
 	cmd.Stdout, cmd.Stderr = out, out
-	cmd.Env = append([]string{"PATH=" + fakeBin(h.t) + ":" + os.Getenv("PATH"), "SUDO_LOG=" + h.sudoLog, "HOME=" + h.dir}, env...)
+	cmd.Env = append([]string{"PATH=" + os.Getenv("PATH"), "HOME=" + h.dir}, env...)
 	if err := cmd.Start(); err != nil {
 		h.t.Fatal(err)
 	}
@@ -239,14 +280,14 @@ func (h *hookEnv) requests() ([]string, []string) {
 	return slices.Clone(h.asked), slices.Clone(h.tokens)
 }
 
-func (h *hookEnv) sudo() string {
-	b, _ := os.ReadFile(h.sudoLog)
-	return string(b)
-}
-
-func TestTheHookMountsTheWorkDisk(t *testing.T) {
+// The hook asks with what GitHub told the runner, returns once allowed, and
+// mounts nothing: a work disk comes only from the job's own steps.
+func TestTheHookAsksAndReturns(t *testing.T) {
 	h := newHookEnv(t)
-	_, done, out := h.run("GITHUB_RUN_ID=77")
+	event := filepath.Join(h.dir, "event.json")
+	_ = os.WriteFile(event, []byte(`{"pull_request": {"number": 12, "head": {"sha": "`+strings.Repeat("c", 40)+`", "repo": {"id": 7001}}}}`), 0o644)
+	_, done, out := h.run("GITHUB_RUN_ID=77", "GITHUB_EVENT_NAME=pull_request_target", "GITHUB_REF=refs/heads/main", "GITHUB_REF_TYPE=branch",
+		"GITHUB_SHA="+strings.Repeat("a", 40), "GITHUB_EVENT_PATH="+event)
 	select {
 	case err := <-done:
 		if err != nil {
@@ -255,19 +296,15 @@ func TestTheHookMountsTheWorkDisk(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("the hook didn't return once allowed")
 	}
-	want := []string{
-		"blkid -p " + h.device,
-		"mkfs.ext4 -q -m 0 -L work " + h.device,
-		"mkdir -p " + h.work,
-		"mount -o discard,noatime " + h.device + " " + h.work,
-		fmt.Sprintf("chown %d:%d %s", os.Getuid(), os.Getgid(), h.work),
-	}
-	if got := strings.Split(strings.TrimSpace(h.sudo()), "\n"); !slices.Equal(got, want) {
-		t.Fatalf("the hook did %q, want %q", got, want)
-	}
 	asked, tokens := h.requests()
-	if len(asked) != 1 || asked[0] != `{"run_id": 77}` {
+	var got map[string]any
+	if len(asked) != 1 || json.Unmarshal([]byte(asked[0]), &got) != nil {
 		t.Fatalf("asked %q", asked)
+	}
+	told := map[string]any{"run_id": 77.0, "event": "pull_request_target", "ref": "refs/heads/main", "ref_type": "branch",
+		"sha": strings.Repeat("a", 40), "pull_request": 12.0, "head_repository_id": 7001.0, "head_sha": strings.Repeat("c", 40)}
+	if !reflect.DeepEqual(got, told) {
+		t.Fatalf("asked %v, want what GitHub told the runner, %v", got, told)
 	}
 	tok := tokens[0]
 	if strings.Count(tok, ".") != 2 || strings.Contains(out.String(), tok) {
@@ -275,19 +312,8 @@ func TestTheHookMountsTheWorkDisk(t *testing.T) {
 	}
 }
 
-func TestTheHookKeepsAFilesystem(t *testing.T) {
-	h := newHookEnv(t)
-	_, done, out := h.run("HAS_FS=1")
-	if err := <-done; err != nil {
-		t.Fatalf("hook failed: %v\n%s", err, out)
-	}
-	if strings.Contains(h.sudo(), "mkfs") {
-		t.Fatal("a disk with a filesystem was formatted")
-	}
-}
-
 func TestTheHookNeverReturnsOnARefusal(t *testing.T) {
-	for _, code := range []int{http.StatusForbidden, http.StatusUnauthorized} {
+	for _, code := range []int{http.StatusForbidden, http.StatusUnauthorized, http.StatusNotFound} {
 		t.Run(fmt.Sprint(code), func(t *testing.T) {
 			h := newHookEnv(t)
 			h.codes = []int{code}
@@ -297,13 +323,25 @@ func TestTheHookNeverReturnsOnARefusal(t *testing.T) {
 				t.Fatalf("the hook returned (%v) on a refusal:\n%s", err, out)
 			case <-time.After(3 * time.Second):
 			}
-			if h.sudo() != "" {
-				t.Fatal("a refused hook mounted something")
-			}
 			if !strings.Contains(out.String(), "refused") {
 				t.Fatalf("the hook said %q", out)
 			}
 		})
+	}
+}
+
+func TestTheHookPrintsWhyItsJobFails(t *testing.T) {
+	h := newHookEnv(t)
+	h.codes = []int{http.StatusForbidden}
+	h.body = `{"error": "Forbidden", "reason": "the run's pull request isn't the head of one open pull request"}`
+	_, done, out := h.run()
+	select {
+	case err := <-done:
+		t.Fatalf("the hook returned (%v) for a failed job:\n%s", err, out)
+	case <-time.After(3 * time.Second):
+	}
+	if !strings.Contains(out.String(), "the run's pull request isn't the head of one open pull request") {
+		t.Fatalf("the hook said %q", out)
 	}
 }
 
@@ -330,7 +368,7 @@ func TestTheJobsEnvironmentCantRedirectTheHook(t *testing.T) {
 	_ = os.MkdirAll(curlHome, 0o755)
 	_ = os.WriteFile(filepath.Join(curlHome, ".curlrc"), []byte("proxy = \"http://127.0.0.1:9\"\n"), 0o644)
 	_, done, out := h.run("http_proxy=http://127.0.0.1:9", "HTTP_PROXY=http://127.0.0.1:9", "all_proxy=http://127.0.0.1:9",
-		"CURL_HOME="+curlHome, "GITHUB_RUN_ID=1; touch /tmp/x")
+		"HTTPS_PROXY=http://127.0.0.1:9", "CURL_HOME="+curlHome, "GITHUB_RUN_ID=1; touch /tmp/x")
 	select {
 	case err := <-done:
 		if err != nil {
@@ -339,28 +377,17 @@ func TestTheJobsEnvironmentCantRedirectTheHook(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatalf("the hook was redirected:\n%s", out)
 	}
-	if asked, _ := h.requests(); asked[0] != `{"run_id": 0}` {
-		t.Fatalf("asked %q; a run ID that isn't a number is sent as 0", asked[0])
+	var got struct {
+		RunID int64 `json:"run_id"`
 	}
-}
-
-func TestTheHookWaitsForItsDisk(t *testing.T) {
-	h := newHookEnv(t)
-	os.Remove(h.device)
-	// The disk appears after a while, as udev makes its link.
-	go func() {
-		time.Sleep(2 * time.Second)
-		_ = os.WriteFile(h.device, nil, 0o644)
-	}()
-	_, done, out := h.run()
-	if err := <-done; err != nil {
-		t.Fatalf("hook failed waiting for its disk: %v\n%s", err, out)
+	if asked, _ := h.requests(); json.Unmarshal([]byte(asked[0]), &got) != nil || got.RunID != 0 {
+		t.Fatalf("asked %q; a run ID that isn't a number is sent as 0", asked[0])
 	}
 }
 
 func TestTheJobsEnvironmentCantTraceTheToken(t *testing.T) {
 	h := newHookEnv(t)
-	_, done, out := h.run("SHELLOPTS=xtrace", "BASH_XTRACEFD=2", "PS4=+ ")
+	_, done, out := h.run("SHELLOPTS=xtrace", "BASH_XTRACEFD=2", "PS4=+ ", "GODEBUG=http2debug=2,http2client=1", "GOTRACEBACK=all")
 	if err := <-done; err != nil {
 		t.Fatalf("hook failed: %v\n%s", err, out)
 	}

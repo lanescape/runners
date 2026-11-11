@@ -3,15 +3,12 @@ package machines
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -29,23 +26,31 @@ const (
 	finishedTimeout  = 30 * time.Second
 )
 
-// StartedRequest is what the job-started hook sends. RunID is only where to
-// look first: the service finds the machine's job from GitHub's record of
-// which job is on its runner, never from what the machine says.
+// StartedRequest is what the job-started hook sends: what GitHub told the
+// runner about the job (specs/0002-machines.md, Binding a run). RunID is
+// only where to look first: the service finds the machine's job from
+// GitHub's record of which job is on its runner, never from what the
+// machine says, and binds a run from the facts only on a machine's first
+// check, as GitHub's records confirm.
 type StartedRequest struct {
 	RunID int64 `json:"run_id,omitempty"`
+	binding.Facts
 }
 
-// StartedAnswer is what the hook is told when its job may run: where its
-// work disk is.
-type StartedAnswer struct {
-	Device string `json:"device"`
+// StartedAnswer is what the hook is told when its job may run: nothing more.
+// A job asks for its work disk in a step, with the disk action.
+type StartedAnswer struct{}
+
+// FailedAnswer is what the hook is told when its job is failed, which it
+// prints in the job's log before it waits for the machine to stop.
+type FailedAnswer struct {
+	Error  string `json:"error"`
+	Reason string `json:"reason"`
 }
 
-// FinishedRequest is the supervisor's report.
-type FinishedRequest struct {
-	Save bool `json:"save"`
-}
+// FinishedRequest is the supervisor's report, which says only that the job
+// is done.
+type FinishedRequest struct{}
 
 // errNotOurs means the caller isn't a machine the service made.
 var errNotOurs = errors.New("not one of the service's machines")
@@ -94,7 +99,11 @@ func (s *Service) caller(ctx context.Context, w http.ResponseWriter, r *http.Req
 			code = http.StatusForbidden
 		}
 		s.log().Warn("machine refused", "path", r.URL.Path, "status", code, "reason", err.Error())
-		writeJSON(w, code, map[string]any{"error": http.StatusText(code)})
+		if code == http.StatusForbidden {
+			refuse(w, "the token isn't a machine of the service's")
+		} else {
+			writeJSON(w, code, map[string]any{"error": http.StatusText(code)})
+		}
 		return Machine{}, false
 	}
 	data, err := io.ReadAll(io.LimitReader(r.Body, machineBodyLimit+1))
@@ -114,7 +123,7 @@ func (s *Service) caller(ctx context.Context, w http.ResponseWriter, r *http.Req
 	switch {
 	case errors.Is(err, errNotOurs):
 		s.log().Warn("machine refused", "path", r.URL.Path, "zone", c.Zone, "instance", c.InstanceName, "reason", err.Error())
-		forbidden(w)
+		refuse(w, "not one of the service's machines")
 		return Machine{}, false
 	case err != nil:
 		s.log().Warn("machine not identified", "path", r.URL.Path, "instance", c.InstanceName, "err", err.Error())
@@ -164,7 +173,7 @@ func (s *Service) jobStarted(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	a, err := s.admit(ctx, m, req.RunID)
+	a, err := s.admit(ctx, m, req)
 	switch {
 	case errors.Is(err, errNotRunning):
 		s.log().Warn("job-started check from a machine that isn't running", "machine", m.Name, "status", m.Status)
@@ -172,18 +181,42 @@ func (s *Service) jobStarted(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		s.log().Warn("job-started check not answered", "machine", m.Name, "err", err.Error())
 		retryLater(w, "the job-started check got no confirmed answer; ask again")
-	case !a.Allowed:
+	case !a.Allowed && a.Fail == "":
+		// A refused machine stops at once; its hook gets no answer it can
+		// use.
+		s.refuse(ctx, m, a)
 		forbidden(w)
+	case !a.Allowed:
+		// A failed job's hook is answered, and its machine stopped only a
+		// little later, so that the hook has read the reason and printed
+		// it in the job's log. Until then the hook holds; a pass stops the
+		// machine and cancels the run should this not.
+		writeJSON(w, http.StatusForbidden, FailedAnswer{Error: http.StatusText(http.StatusForbidden), Reason: a.Fail})
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		delay := s.FailStopDelay
+		if delay == 0 {
+			delay = DefaultFailStopDelay
+		}
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), delay+startedTimeout)
+			defer cancel()
+			// The grace counts from the answer, which passes honour too.
+			if _, _, err := createOnce(ctx, s.Objects, answeredKey(m.Name), Answered{Machine: m.Name, At: s.now()}); err != nil {
+				s.log().Warn("recording a failed job's answer", "machine", m.Name, "err", err.Error())
+			}
+			time.Sleep(delay)
+			s.refuse(ctx, m, a)
+		}()
 	default:
-		writeJSON(w, http.StatusOK, StartedAnswer{Device: "/dev/disk/by-id/google-" + WorkDevice})
+		writeJSON(w, http.StatusOK, StartedAnswer{})
 	}
 }
 
-// admit decides once whether the job on a machine's runner may run there,
-// and carries out the decision: a refused machine is stopped at once, and
-// an allowed job gets its work disk. A retried check carries on from what's
-// recorded.
-func (s *Service) admit(ctx context.Context, m Machine, hint int64) (Admission, error) {
+// admit decides once whether the job on a machine's runner may run there.
+// A retried check is answered from what's recorded.
+func (s *Service) admit(ctx context.Context, m Machine, req StartedRequest) (Admission, error) {
 	a, _, found, err := getJSON[Admission](ctx, s.Objects, admissionKey(m.Name))
 	if err != nil {
 		return Admission{}, err
@@ -201,11 +234,11 @@ func (s *Service) admit(ctx context.Context, m Machine, hint int64) (Admission, 
 			// cleanup finds it idle.
 			return Admission{}, retryErr(err)
 		}
-		job, run, err := s.findJob(ctx, repo, m, hint)
+		job, run, err := s.findJob(ctx, repo, m, req.RunID)
 		if err != nil {
 			return Admission{}, err
 		}
-		decided, err := s.decide(ctx, repo, m, job, run)
+		decided, err := s.decide(ctx, repo, m, job, run, req.Facts)
 		if err != nil {
 			return Admission{}, err
 		}
@@ -221,13 +254,12 @@ func (s *Service) admit(ctx context.Context, m Machine, hint int64) (Admission, 
 		}
 	}
 	if !a.Allowed {
-		s.refuse(ctx, m, a)
 		return a, nil
 	}
 	if found {
-		// A retried check gives a work disk only to a consumer that's
-		// still the organization's: a repository transferred since its
-		// job was admitted gets nothing of the organization's.
+		// A retried check allows only a consumer that's still the
+		// organization's: a repository transferred since its job was
+		// admitted gets nothing of the organization's.
 		repo, err := s.GitHub.RepositoryByID(ctx, m.RepositoryID)
 		if err != nil {
 			return a, retryErr(err)
@@ -238,9 +270,6 @@ func (s *Service) admit(ctx context.Context, m Machine, hint int64) (Admission, 
 			}
 			return a, errNotRunning
 		}
-	}
-	if err := s.workDisk(ctx, m, a); err != nil {
-		return a, retryErr(err)
 	}
 	return a, nil
 }
@@ -331,40 +360,34 @@ func (s *Service) searchJob(ctx context.Context, repo github.Repository, m Machi
 	return github.Job{}, github.WorkflowRun{}, errNoAssignment
 }
 
-// isFork reports whether a run is from a fork's pull request: its head is
-// in another repository, by GitHub's run record or, for a pull_request_target
-// run, whose record is the base's, by its binding. A pull_request_target run
-// with no pull request's binding counts as a fork's.
-func isFork(repo github.Repository, run github.WorkflowRun, bd binding.Binding, bound bool) bool {
-	if run.HeadRepositoryID != repo.ID {
-		return true
-	}
-	return run.Event == "pull_request_target" && (!bound || bd.HeadRepositoryID != repo.ID)
-}
-
 // approved reports whether GitHub records an approval of the contribution
 // environment for a run.
 func (s *Service) approved(ctx context.Context, repo github.Repository, runID int64) (bool, error) {
-	as, err := s.GitHub.RunApprovals(ctx, repo, runID)
-	if err != nil {
-		return false, err
-	}
-	for _, a := range as {
-		if a.State == "approved" && slices.ContainsFunc(a.Environments, func(e string) bool { return strings.EqualFold(e, ContributionEnvironment) }) {
-			return true, nil
-		}
-	}
-	return false, nil
+	return binding.Approved(ctx, s.GitHub, repo, runID)
 }
 
-// decide applies the job-started check's four conditions to the job on a
-// machine's runner (specs/0002-machines.md, The job-started check). An error
-// means GitHub or the bucket gave no confirmed answer.
-func (s *Service) decide(ctx context.Context, repo github.Repository, m Machine, job github.Job, run github.WorkflowRun) (Admission, error) {
+// facts are what a machine's first check reported, kept so that a retried
+// check is decided from them, never new ones (specs/0002-machines.md,
+// Binding a run).
+func (s *Service) facts(ctx context.Context, m Machine, f binding.Facts) (binding.Facts, error) {
+	got, _, err := createOnce(ctx, s.Objects, factsKey(m.Name), f)
+	return got, err
+}
+
+// decide applies the job-started check's conditions to the job on a
+// machine's runner (specs/0002-machines.md, The job-started check), binding
+// its run if it has no binding. The reason a job is failed is decided for
+// the job, from GitHub's records and its run, never from the machine.
+// An error means GitHub or the bucket gave no confirmed answer.
+func (s *Service) decide(ctx context.Context, repo github.Repository, m Machine, job github.Job, run github.WorkflowRun, reported binding.Facts) (Admission, error) {
 	a := Admission{Machine: m.Name, Zone: m.Zone, RepositoryID: m.RepositoryID, JobID: job.ID, RunID: run.ID,
 		RunAttempt: job.RunAttempt, JobName: job.Name, Selector: m.Selector.String(), At: s.now()}
 	refuse := func(reason string, cancel bool) (Admission, error) {
 		a.Allowed, a.Reason, a.Cancel = false, reason, cancel
+		return a, nil
+	}
+	fail := func(reason string) (Admission, error) {
+		a.Allowed, a.Reason, a.Cancel, a.Fail = false, reason, true, reason
 		return a, nil
 	}
 	// The job's repository is the machine's consumer, and the
@@ -372,38 +395,55 @@ func (s *Service) decide(ctx context.Context, repo github.Repository, m Machine,
 	if repo.ID != m.RepositoryID || run.RepositoryID != repo.ID || repo.OwnerID != s.Config.Organization.ID {
 		return refuse("the job's repository isn't the machine's consumer", false)
 	}
+	// Its labels are exactly one selector, the machine's.
+	if err := selector.MatchesMachine(job.Labels, m.Selector); err != nil {
+		return refuse(err.Error(), errors.Is(err, selector.ErrOtherLabels))
+	}
+	// A fork's pull_request run never gets a machine.
+	if run.Event != "pull_request_target" && run.HeadRepositoryID != repo.ID {
+		return refuse("the run is a fork's pull request's", true)
+	}
+
 	bd, bound, err := s.Binder.Lookup(ctx, repo.ID, run.ID)
 	if err != nil {
 		return Admission{}, retryErr(err)
 	}
-	// Its run isn't from a fork's pull request, unless it's an approved
-	// contribution.
-	if isFork(repo, run, bd, bound) {
-		if run.Event != "pull_request_target" {
-			return refuse("the run is a fork's pull request's", true)
-		}
-		ok, err := s.approved(ctx, repo, run.ID)
-		if github.IsUnavailable(err) {
+	if !bound {
+		// Every machine boots the base image, and its first check binds,
+		// from what that check reported.
+		f, err := s.facts(ctx, m, reported)
+		if err != nil {
 			return Admission{}, retryErr(err)
 		}
-		if err != nil || !ok {
-			return refuse("the contribution's run has no approval of the "+ContributionEnvironment+" environment", true)
+		bd, err = s.Binder.Bind(ctx, repo, run, f)
+		switch {
+		case errors.Is(err, binding.ErrUnapproved):
+		case err != nil:
+			return Admission{}, retryErr(err)
+		default:
+			bound = true
 		}
-		a.Contribution = true
 	}
-
-	// Its labels hold exactly one selector, the machine's, with nothing
-	// else but GitHub's own labels that the runner has.
-	if err := selector.MatchesMachine(job.Labels, m.Selector); err != nil {
-		return refuse(err.Error(), false)
-	}
-	// The selector's scope is the run's binding.
 	if !bound {
-		return refuse("the job's run has no binding", true)
+		// An unbound pull_request_target run's job may have the smallest
+		// shape, standard: nothing restored, nothing saved.
+		if run.Event == "pull_request_target" && m.Selector.Plain(s.Config.Shapes.Smallest()) {
+			a.Allowed, a.Unbound = true, true
+			return a, nil
+		}
+		if run.Event == "pull_request_target" {
+			return fail("the contribution's run isn't approved, so its jobs may have only " + s.Config.Shapes.Smallest() +
+				", standard, until its contribution job is approved")
+		}
+		return refuse("the job's run has no binding", false)
 	}
-	if bd.Scope != m.Selector.Scope {
-		return refuse(fmt.Sprintf("the selector's scope %s isn't the run's binding, %s", m.Selector.Scope, bd.Scope), true)
+	if bd.Fail != "" {
+		return fail(bd.Fail)
 	}
+	if run.Event == "pull_request_target" {
+		a.Contribution = bd.HeadRepositoryID != repo.ID
+	}
+	a.Scope, a.Base, a.Commit = bd.Scope, bd.Base, bd.Commit
 	a.Allowed = true
 	return a, nil
 }
@@ -430,22 +470,12 @@ func (s *Service) refuse(ctx context.Context, m Machine, a Admission) {
 	}
 }
 
-// recordRefusal records a refused run, once, with the refused job's
-// selector among those no machine is made for.
+// recordRefusal records a refused run attempt, once: no machine is made for
+// its jobs until GitHub shows it finished.
 func (s *Service) recordRefusal(ctx context.Context, a Admission) (Refusal, int64, error) {
 	key := refusalKey(a.RepositoryID, a.RunID, a.RunAttempt)
-	rf := Refusal{RepositoryID: a.RepositoryID, RunID: a.RunID, RunAttempt: a.RunAttempt, Reason: a.Reason, Selectors: []string{a.Selector}, RefusedAt: s.now()}
-	got, gen, err := createOnce(ctx, s.Objects, key, rf)
-	if err != nil {
-		return Refusal{}, 0, err
-	}
-	if !slices.Contains(got.Selectors, a.Selector) {
-		got.Selectors = append(got.Selectors, a.Selector)
-		if gen, err = replaceJSON(ctx, s.Objects, key, got, gen); err != nil {
-			return Refusal{}, 0, err
-		}
-	}
-	return got, gen, nil
+	rf := Refusal{RepositoryID: a.RepositoryID, RunID: a.RunID, RunAttempt: a.RunAttempt, Reason: a.Reason, RefusedAt: s.now()}
+	return createOnce(ctx, s.Objects, key, rf)
 }
 
 // cancel asks GitHub to cancel a refused run, or to force it once it's been
@@ -518,106 +548,6 @@ func attemptOver(run github.WorkflowRun, rf Refusal) bool {
 	return run.Status == "completed" || run.Attempt > rf.RunAttempt
 }
 
-// workDisk gives an admitted job its work disk: recorded before it's made,
-// then made, then attached, each step recorded, so a retried check carries
-// on with the disk already recorded.
-func (s *Service) workDisk(ctx context.Context, m Machine, a Admission) error {
-	name := WorkDisk(m.Name)
-	key := diskKey(name)
-	rec, gen, found, err := getJSON[DiskRecord](ctx, s.Objects, key)
-	if err != nil {
-		return err
-	}
-	if !found {
-		shape := s.Config.Shapes.Shapes[m.Selector.Shape]
-		if shape == nil {
-			return fmt.Errorf("the machine's shape %s isn't configured", m.Selector.Shape)
-		}
-		size, image := int64(shape.WorkDiskGB), ""
-		if s.Disks != nil {
-			if image, size, err = s.Disks.Choose(ctx, m, a, size); err != nil {
-				return err
-			}
-		}
-		var nonce [8]byte
-		_, _ = rand.Read(nonce[:])
-		rec = DiskRecord{Disk: name, Machine: m.Name, Zone: m.Zone, RepositoryID: m.RepositoryID, JobID: a.JobID, State: DiskMaking,
-			SizeGB: size, SourceImage: image, Nonce: hex.EncodeToString(nonce[:]), At: s.now()}
-		if rec, gen, err = createOnce(ctx, s.Objects, key, rec); err != nil {
-			return err
-		}
-	}
-	if rec.Machine != m.Name || rec.JobID != a.JobID {
-		return fmt.Errorf("work disk %s is recorded for another machine or job", name)
-	}
-	step := func(state string) error {
-		rec.State, rec.At = state, s.now()
-		g, err := replaceJSON(ctx, s.Objects, key, rec, gen)
-		if err != nil {
-			return err
-		}
-		gen = g
-		return nil
-	}
-	attempt := strconv.Itoa(rec.Attempt)
-	if rec.Nonce != "" {
-		attempt += "/" + rec.Nonce
-	}
-	// A confirmed failure is tried again under a new request ID, since
-	// Compute Engine answers a request ID it has seen with its first
-	// outcome.
-	failed := func(err error) error {
-		if compute.IsUnavailable(err) {
-			return err
-		}
-		rec.Attempt++
-		if g, rerr := replaceJSON(ctx, s.Objects, key, rec, gen); rerr == nil {
-			gen = g
-		}
-		return err
-	}
-	if rec.State == DiskMaking {
-		err := s.Compute.CreateDisk(ctx, m.Zone, compute.DiskSpec{
-			Name: name, SizeGB: rec.SizeGB, DiskType: DiskType, SourceImage: rec.SourceImage,
-			ProvisionedIOPS: int64(s.Config.Shapes.DiskIOPS), ProvisionedThroughput: int64(s.Config.Shapes.DiskThroughputMiBps),
-			Labels: map[string]string{LabelRepository: strconv.FormatInt(m.RepositoryID, 10), LabelMachine: m.Name,
-				LabelJob: strconv.FormatInt(a.JobID, 10), LabelCreated: strconv.FormatInt(s.now().Unix(), 10)},
-		}, compute.RequestID("work disk", name, strconv.FormatInt(a.JobID, 10), attempt))
-		if err != nil && rec.SourceImage != "" && errors.Is(err, compute.ErrNotFound) {
-			// The image it was to start from went after it was chosen:
-			// the record goes, and the next try chooses again.
-			s.log().Warn("a work disk's image is gone; choosing again", "machine", m.Name, "image", rec.SourceImage)
-			if derr := s.Objects.Delete(ctx, key, gen); derr != nil {
-				return errors.Join(err, derr)
-			}
-			return err
-		}
-		if err != nil && !errors.Is(err, compute.ErrExists) {
-			return failed(err)
-		}
-		if err := step(DiskMade); err != nil {
-			return err
-		}
-	}
-	if rec.State == DiskMade {
-		err := s.Compute.AttachDisk(ctx, m.Zone, m.Name, name, WorkDevice, compute.RequestID("attach", name, m.Name, attempt))
-		if errors.Is(err, compute.ErrInUse) || (err != nil && !compute.IsUnavailable(err)) {
-			// Perhaps our own earlier attachment, whose answer was lost.
-			if in, ierr := s.Compute.Instance(ctx, m.Zone, m.Name); ierr == nil &&
-				slices.ContainsFunc(in.Disks, func(d compute.AttachedDisk) bool { return d.Disk == name && d.DeviceName == WorkDevice }) {
-				err = nil
-			}
-		}
-		if err != nil {
-			return failed(err)
-		}
-		if err := step(DiskAttached); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (s *Service) jobFinished(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), finishedTimeout)
 	defer cancel()
@@ -626,15 +556,26 @@ func (s *Service) jobFinished(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rep, _, err := createOnce(ctx, s.Objects, reportKey(m.Name), Report{Machine: m.Name, Save: req.Save, At: s.now()})
-	if err != nil {
+	if _, _, err := createOnce(ctx, s.Objects, reportKey(m.Name), Report{Machine: m.Name, At: s.now()}); err != nil {
 		s.log().Warn("recording a report", "machine", m.Name, "err", err.Error())
 		retryLater(w, "the report wasn't recorded; send it again")
 		return
 	}
-	s.log().Info("machine reported", "machine", m.Name, "save", rep.Save)
+	s.log().Info("machine reported", "machine", m.Name)
 	w.WriteHeader(http.StatusNoContent)
 	if s.Kick != nil {
 		s.Kick()
 	}
+}
+
+// AdmissionOf is the job-started check's record for a machine, if it has
+// one.
+func (s *Service) AdmissionOf(ctx context.Context, machine string) (Admission, bool, error) {
+	a, _, ok, err := getJSON[Admission](ctx, s.Objects, admissionKey(machine))
+	return a, ok, err
+}
+
+// RunFilesOf is a run's record of its files, read once per run.
+func (s *Service) RunFilesOf(ctx context.Context, repo github.Repository, bd binding.Binding) (RunFiles, error) {
+	return s.runFiles(ctx, repo, bd)
 }

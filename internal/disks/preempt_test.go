@@ -18,7 +18,7 @@ import (
 	"github.com/lanescape/runners/internal/selector"
 )
 
-const spot = "lanescape-2vcpu-linux-amd64-spot-main"
+const spot = "lanescape-2vcpu-linux-amd64-spot-disk-build-" + zero + "-main"
 
 // preempt preempts an admitted job's Spot machine, and GitHub fails the job
 // whose runner it lost.
@@ -69,13 +69,13 @@ func TestAPreemptedJobResumes(t *testing.T) {
 	}
 	rec, ok := e.record("preemptions/5001/" + strconv.FormatInt(run.ID, 10) + "/" + strconv.FormatUint(jb.in.ID, 10) + ".json")
 	if !ok || rec["preempted"] != disks.Preempted || rec["job_id"] != float64(jb.j.ID) || rec["job_name"] != "build" ||
-		rec["run_attempt"] != float64(1) || rec["selector"] != spot || rec["zone"] != jb.in.Zone || rec["runner_id"] == float64(0) {
+		rec["run_attempt"] != float64(1) || rec["selector"] != newLabel(spot) || rec["family"] != familyOf([]string{spot}) || rec["zone"] != jb.in.Zone || rec["runner_id"] == float64(0) {
 		t.Fatalf("preemption record = %v", rec)
 	}
 	resume := disks.ResumeName(repoID, jb.in.ID)
 	im, ok := e.images()[resume]
 	if !ok || im.Labels[disks.LabelKind] != disks.KindResume || im.Labels[disks.LabelRun] != strconv.FormatInt(run.ID, 10) ||
-		im.Labels[disks.LabelSelector] != selector.Hash(spot) || im.Labels[disks.LabelJobName] != selector.Hash("build") {
+		im.Labels[disks.LabelFamily] != selector.Hash(familyOf([]string{spot})) || im.Labels[disks.LabelJobName] != selector.Hash("build") {
 		t.Fatalf("resume image = %+v, %v", im, ok)
 	}
 	// The run has finished with its Spot job lost, so it's rerun.
@@ -678,7 +678,7 @@ func TestARerunWaitsAndReadsAgain(t *testing.T) {
 	}()
 	time.Sleep(300 * time.Millisecond)
 	e.gh.Rerun(run)
-	e.gh.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+	e.queueJob(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
 	release()
 	<-done
 	if a := e.attempt(run); a != 2 {

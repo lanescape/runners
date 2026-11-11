@@ -1,11 +1,12 @@
 package machine_test
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -15,10 +16,11 @@ import (
 
 // action is a client that speaks the interface for actions
 // (specs/0005-interface.md) as the actions in lanescape/actions do, and
-// nothing more: it binds a run with the job's token, builds selectors from
-// the binding, and asks for a save by writing the request file. These tests
-// are the service's promise to the actions; one that has to change breaks
-// /v1/.
+// nothing more: it writes a job's selector, which names a shape alone; it
+// writes the steps that ask for the job's work disk and its save, which
+// run in the job, signed with the machine's identity token from its
+// metadata server, and wait for /work to be the mounted disk. These tests are the service's promise to the actions; one
+// that has to change breaks /v1/.
 type action struct {
 	t *testing.T
 	// service stands in for endpoints.Service, which is also the audience
@@ -26,105 +28,148 @@ type action struct {
 	service string
 }
 
-// bindAnswer is what POST /v1/bind answers.
-type bindAnswer struct {
-	Status int
-	Scope  string
-	Reason string
-}
+var shapePattern = regexp.MustCompile(`^lanescape-[1-9][0-9]*vcpu-linux-(amd64|arm64)$`)
 
-// bind calls POST /v1/bind with the job's GitHub OIDC token, whose audience
-// is the service, and a body that's empty, except from a bootstrap workflow
-// in a pull_request_target run.
-func (a action) bind(token string, event *bindEvent) bindAnswer {
+// selector writes a job's selector, as a workflow does:
+// lanescape-<vCPUs>vcpu-linux-<arch>[-spot].
+func (a action) selector(shape string, spot bool) string {
 	a.t.Helper()
-	var body []byte
-	if event != nil {
-		body, _ = json.Marshal(event)
+	if !shapePattern.MatchString(shape) {
+		a.t.Fatalf("no selector for shape %q", shape)
 	}
-	req, _ := http.NewRequest(http.MethodPost, a.service+"/v1/bind", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		a.t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	var out struct {
-		Scope     string `json:"scope"`
-		Reason    string `json:"reason"`
-		Retryable bool   `json:"retryable"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		a.t.Fatalf("bind answered %d with a body that isn't JSON: %v", resp.StatusCode, err)
-	}
-	switch resp.StatusCode {
-	case http.StatusOK:
-		if !scopePattern.MatchString(out.Scope) {
-			a.t.Fatalf("bind answered 200 with scope %q", out.Scope)
-		}
-	case http.StatusForbidden:
-		if out.Reason == "" {
-			a.t.Fatal("bind answered 403 with no reason")
-		}
-	case http.StatusServiceUnavailable:
-		if !out.Retryable || resp.Header.Get("Retry-After") == "" {
-			a.t.Fatalf("bind answered 503 without retryable and Retry-After: %+v", out)
-		}
-	default:
-		a.t.Fatalf("bind answered %d, which the interface doesn't have", resp.StatusCode)
-	}
-	return bindAnswer{Status: resp.StatusCode, Scope: out.Scope, Reason: out.Reason}
-}
-
-// bindEvent is what a bootstrap workflow sends from its own event.
-type bindEvent struct {
-	PullRequest      int    `json:"pull_request"`
-	HeadRepositoryID int64  `json:"head_repository_id"`
-	HeadSHA          string `json:"head_sha"`
-}
-
-var (
-	scopePattern  = regexp.MustCompile(`^(main|read|pr[1-9][0-9]*|branch-[a-z][a-z0-9]{0,15})$`)
-	shapePattern  = regexp.MustCompile(`^lanescape-[1-9][0-9]*vcpu-linux-(amd64|arm64)$`)
-	familyPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
-	keyPattern    = regexp.MustCompile(`^[0-9a-f]{20}$`)
-)
-
-// selector builds a job's selector, as the runners action does:
-// lanescape-<vCPUs>vcpu-linux-<arch>[-spot][-disk-<family>-<key>]-<scope>,
-// in lowercase, with the scope the binding returned.
-func (a action) selector(shape string, spot bool, family, key, scope string) string {
-	a.t.Helper()
-	if !shapePattern.MatchString(shape) || !scopePattern.MatchString(scope) {
-		a.t.Fatalf("no selector for shape %q and scope %q", shape, scope)
-	}
-	var b strings.Builder
-	b.WriteString(shape)
 	if spot {
-		b.WriteString("-spot")
+		return shape + "-spot"
 	}
-	if family != "" {
-		if !familyPattern.MatchString(family) || !keyPattern.MatchString(key) {
-			a.t.Fatalf("family %q and key %q aren't the interface's", family, key)
-		}
-		fmt.Fprintf(&b, "-disk-%s-%s", family, key)
-	}
-	b.WriteString("-" + scope)
-	return b.String()
+	return shape
 }
 
-// saveStep is the step that asks to save the work disk, as the save action
-// does on the service's machines: {"save": true} in the request file, which
-// on a real machine is machine.SaveMarker and here is $LSR_TEST_SAVE.
+// stepRequest is how the actions call the service from a job's step: the
+// service's address and a fresh identity token from the metadata server,
+// which $LSR_TEST_METADATA stands in for, the token in a header read from
+// standard input, never in an argument another process could see. It
+// prints the answer's status, leaves its body in the file $answer, and
+// prints both in the job's log, as "<path> <status> <body>", where a test
+// reads them.
+const stepRequest = `set -e
+answer=$(mktemp)
+trap 'rm -f "$answer"' EXIT
+lsr_request() {
+	local md=$LSR_TEST_METADATA service token code
+	service=$(curl -fsS -H 'Metadata-Flavor: Google' "$md/computeMetadata/v1/instance/attributes/lsr-service") || return 1
+	token=$(curl -fsS -G -H 'Metadata-Flavor: Google' --data-urlencode "audience=$service" --data-urlencode format=full \
+		"$md/computeMetadata/v1/instance/service-accounts/default/identity") || return 1
+	code=$(printf 'header = "Authorization: Bearer %s"\n' "$token" |
+		curl -sS --config - -o "$answer" -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data "$2" "$service$1") || code=000
+	echo "lanescape-runners test action: $1 $code $(tr -d '\n' <"$answer")" >&2
+	echo "$code"
+}
+`
+
+// steps joins a job's steps into the script the runner runs: each must
+// succeed for the next to run, as a workflow's steps do.
+func (a action) steps(parts ...string) string {
+	return stepRequest + strings.Join(parts, "\n") + "\n"
+}
+
+// diskStep asks for the job's work disk of a family, as the disk action
+// does: POST /v1/disks until the answer is ready, then waits until /work,
+// which $LSR_TEST_WORK stands in for, is the mounted disk. A refusal fails
+// the step.
+func (a action) diskStep(family string) string {
+	return fmt.Sprintf(`while :; do
+	code=$(lsr_request /v1/disks '{"family": "%s"}') || code=000
+	case $code in
+	200) [ "$(jq -r .state "$answer")" = ready ] && break ;;
+	403) exit 1 ;;
+	esac
+	sleep 0.2
+done
+until [ -e "$LSR_TEST_WORK/.disk" ]; do sleep 0.1; done`, family)
+}
+
+// saveStep asks for the job's work disk to be saved when the job finishes,
+// as the save-disk action does. A refusal fails the step.
 func (a action) saveStep() string {
-	return fmt.Sprintf(`printf '%%s' '%s' > "$LSR_TEST_SAVE"`, machine.SaveRequest)
+	return `code=$(lsr_request /v1/disks/save '{"save": true}') || code=000
+[ "$code" = 200 ]`
+}
+
+// noDiskYetStep fails unless /work is still without a disk, as it is
+// before the job asks for one.
+func (a action) noDiskYetStep() string {
+	return `[ ! -e "$LSR_TEST_WORK/.disk" ]`
+}
+
+// stepAnswer is one of a job's requests from its steps, as its log shows
+// it.
+type stepAnswer struct {
+	Path string
+	Code int
+	Body map[string]any
+}
+
+var stepAnswerLine = regexp.MustCompile(`lanescape-runners test action: (\S+) (\d{3}) (.*)$`)
+
+// stepAnswers reads a job's requests from its log, checking each answer
+// is one the interface has.
+func (a action) stepAnswers(log string) []stepAnswer {
+	a.t.Helper()
+	var out []stepAnswer
+	for _, l := range strings.Split(log, "\n") {
+		m := stepAnswerLine.FindStringSubmatch(l)
+		if m == nil {
+			continue
+		}
+		code, _ := strconv.Atoi(m[2])
+		var body map[string]any
+		if err := json.Unmarshal([]byte(m[3]), &body); err != nil {
+			a.t.Fatalf("%s answered %d with a body that isn't JSON: %q", m[1], code, m[3])
+		}
+		sa := stepAnswer{Path: m[1], Code: code, Body: body}
+		a.checkStepAnswer(sa)
+		out = append(out, sa)
+	}
+	return out
+}
+
+// The steps of the restore order a work disk can come from, and resume.
+var restoredSteps = []string{"resume", "pull_request_exact", "pull_request_newest", "main_exact", "main_newest", "branch_exact",
+	"branch_newest", "none"}
+
+func (a action) checkStepAnswer(sa stepAnswer) {
+	a.t.Helper()
+	switch {
+	case sa.Code == http.StatusForbidden:
+		if r, _ := sa.Body["reason"].(string); r == "" {
+			a.t.Fatalf("%s answered 403 with no reason: %v", sa.Path, sa.Body)
+		}
+	case sa.Code == http.StatusServiceUnavailable:
+		if sa.Body["retryable"] != true {
+			a.t.Fatalf("%s answered 503 without retryable: %v", sa.Path, sa.Body)
+		}
+	case sa.Code != http.StatusOK:
+		a.t.Fatalf("%s answered %d, which the interface doesn't have", sa.Path, sa.Code)
+	case sa.Path == "/v1/disks":
+		state, _ := sa.Body["state"].(string)
+		restored, _ := sa.Body["restored"].(string)
+		if (state != "making" && state != "ready") || !slices.Contains(restoredSteps, restored) || len(sa.Body) != 2 {
+			a.t.Fatalf("/v1/disks answered %v, which the interface doesn't have", sa.Body)
+		}
+	case sa.Path == "/v1/disks/save":
+		saves, ok := sa.Body["saves"].(bool)
+		reason, _ := sa.Body["reason"].(string)
+		if !ok || (saves && reason != "") || (!saves && reason == "") {
+			a.t.Fatalf("/v1/disks/save answered %v, which the interface doesn't have", sa.Body)
+		}
+	}
 }
 
 func TestTheInterfacesConstants(t *testing.T) {
 	if endpoints.Organization != orgID || !strings.HasPrefix(endpoints.Service, "https://") {
 		t.Fatalf("endpoints = %d %s", endpoints.Organization, endpoints.Service)
 	}
-	if machine.SaveMarker != "/var/lib/lanescape-runners/save" || machine.SaveRequest != `{"save": true}` {
-		t.Fatalf("save request = %s in %s", machine.SaveRequest, machine.SaveMarker)
+	// The work disk is mounted where the actions wait for it.
+	if machine.WorkPath != "/work" {
+		t.Fatalf("the work disk is at %s", machine.WorkPath)
 	}
 }

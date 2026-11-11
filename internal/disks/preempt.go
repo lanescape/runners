@@ -41,7 +41,7 @@ func (s *Service) Stopped(ctx context.Context, m machines.Machine, a machines.Ad
 	key := preemptionKey(repo, a.RunID, m.ID)
 	rec, gen, err := createOnce(ctx, s.Objects, key, Preemption{InstanceID: m.ID, Machine: m.Name, Zone: m.Zone, RepositoryID: repo,
 		JobID: a.JobID, RunnerID: m.RunnerID, JobName: a.JobName, RunID: a.RunID, RunAttempt: a.RunAttempt, Selector: a.Selector,
-		Preempted: evidence, StoppedAt: stopped})
+		Arch: m.Selector.Arch, Family: m.Selector.Family, Preempted: evidence, StoppedAt: stopped})
 	if err != nil {
 		return err
 	}
@@ -56,7 +56,7 @@ func (s *Service) Stopped(ctx context.Context, m machines.Machine, a machines.Ad
 		log.Info("stopped Spot machine recorded, past its age limit, with no resume image")
 		return nil
 	}
-	if !m.Selector.Scope.Saves() || rec.NoDisk {
+	if !m.Selector.Scope.Saves() || rec.NoDisk || rec.Family == "" {
 		log.Info("stopped Spot machine recorded")
 		return nil
 	}
@@ -86,7 +86,7 @@ func (s *Service) Stopped(ctx context.Context, m machines.Machine, a machines.Ad
 	}
 	ikey := imageKey(repo, rec.ResumeImage)
 	im, igen, err := createOnce(ctx, s.Objects, ikey, Image{Image: rec.ResumeImage, RepositoryID: repo, Kind: KindResume, State: ImageMaking,
-		Arch: m.Selector.Arch, Machine: m.Name, Zone: m.Zone, InstanceID: m.ID, JobID: a.JobID, JobName: a.JobName, RunID: a.RunID,
+		Arch: rec.Arch, Family: rec.Family, Machine: m.Name, Zone: m.Zone, InstanceID: m.ID, JobID: a.JobID, JobName: a.JobName, RunID: a.RunID,
 		RunAttempt: a.RunAttempt, Selector: a.Selector, SizeGB: 0, SavedAt: rec.StoppedAt, LastUsed: rec.StoppedAt})
 	if err != nil {
 		return err

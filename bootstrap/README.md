@@ -12,6 +12,7 @@ It holds:
 - the service's custom roles and every project-level grant, each limited by IAM Conditions to the service's own resources by name wherever IAM can do that;
 - the network, `lanescape-runners`, its subnetwork, with no firewall rules, and who may attach to the subnetwork;
 - the Pub/Sub topics and push subscriptions, the scheduler job, and the log sink for Compute Engine's preemption and guest-shutdown events of the service's machines, with its fixed filter;
+- for the machines' boot logs (specs/0002-machines.md), a log bucket of the service's own, `lanescape-runners-serial`, a sink with a fixed filter that routes there only the serial console entries of the service's machines, and a view of it that only the service's account may read;
 - CD's workload identity pool, `lanescape-runners-github`, whose provider accepts only a push to `main` by `cd.yml` in this repository, checked by the repository's and the organization's IDs.
 
 The network, Pub/Sub, the scheduler job and the Cloud Run service's shell are here rather than in `infra/`, as specs/0004-deployment.md lists them, because IAM can't limit any of them by name: an identity that could make them could change every other team's networks, topics, subscriptions, jobs and services in the project too. The first three don't change with a deploy. A shell runs Google's sample container as the machines' account, with internal ingress and Cloud Run's invoker check, and once `infra/` has adopted it, this configuration ignores it.

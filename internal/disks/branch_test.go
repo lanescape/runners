@@ -6,16 +6,15 @@ import (
 	"time"
 
 	ghemu "github.com/lanescape/runners/emulators/github"
-	"github.com/lanescape/runners/internal/binding"
+	"github.com/lanescape/runners/internal/consumer"
 	"github.com/lanescape/runners/internal/disks"
-	"github.com/lanescape/runners/internal/selector"
 )
 
 // listV1 lists support/v1 as the long-lived branch v1 on the default
 // branch, and gives support/v1 a commit of its own.
 func (e *env) listV1() {
 	e.t.Helper()
-	e.repo.Commit("main", map[string]string{binding.RunnersFile: `{"branches": {"support/v1": "v1"}}`})
+	e.repo.Commit("main", map[string]string{consumer.RunnersFile: `{"branches": {"support/v1": "v1"}}`})
 	e.repo.Commit("support/v1", map[string]string{"v1": "1"})
 }
 
@@ -38,7 +37,7 @@ func (e *env) saveBranch(key string) string {
 
 func (e *env) step(run *ghemu.Run, label string) string {
 	e.t.Helper()
-	rec, ok := e.record("choices/5001/" + strconv.FormatInt(run.ID, 10) + "/" + selector.Hash(label) + ".json")
+	rec, ok := e.record("choices/5001/" + strconv.FormatInt(run.ID, 10) + "/" + choiceHash(label) + ".json")
 	if !ok {
 		e.t.Fatalf("no choice for %s", label)
 	}
@@ -66,6 +65,8 @@ func TestALongLivedBranchsRestoreOrder(t *testing.T) {
 		e.step(run, sel(key1, "branch-v1")) != disks.StepBranchExact {
 		t.Fatalf("the branch's own for the key: %q, step %s", src, e.step(run, sel(key1, "branch-v1")))
 	}
+	// A run has one key per family: another key is another run's.
+	run = e.branchRun()
 	if src := e.start(run, ghemu.JobSpec{Name: "c", Labels: []string{sel(zero, "branch-v1")}}).source(); src != v1 ||
 		e.step(run, sel(zero, "branch-v1")) != disks.StepBranchNewest {
 		t.Fatalf("the branch's newest: %q, want %s", src, v1)
@@ -79,6 +80,7 @@ func TestALongLivedBranchsRestoreOrder(t *testing.T) {
 		e.step(prun, sel(key2, pr)) != disks.StepBranchExact {
 		t.Fatalf("a pull request into the branch: %q, want %s", src, v1)
 	}
+	prun = e.pullRun(p)
 	if src := e.start(prun, ghemu.JobSpec{Name: "e", Labels: []string{sel(key3, pr)}}).source(); src != v1 ||
 		e.step(prun, sel(key3, pr)) != disks.StepBranchNewest {
 		t.Fatalf("a pull request into the branch, another key: %q, want %s", src, v1)
@@ -99,7 +101,7 @@ func TestALongLivedBranchsDisksExpire(t *testing.T) {
 		t.Fatalf("key1 %v, key2 %v, key3 %v; want the branch's two newest keys", e.has(k1), e.has(k2), e.has(k3))
 	}
 	main1 := e.saveMain(key1)
-	e.repo.Commit("main", map[string]string{binding.RunnersFile: `{}`})
+	e.repo.Commit("main", map[string]string{consumer.RunnersFile: `{}`})
 	e.pass()
 	if e.has(k2) || e.has(k3) || !e.has(main1) {
 		t.Fatalf("after the branch was delisted: key2 %v, key3 %v, main %v", e.has(k2), e.has(k3), e.has(main1))

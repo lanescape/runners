@@ -3,17 +3,21 @@
 // job that may have one, from one pool for every consumer, oldest job
 // first, and deletes what's
 // finished; the job-started check decides, from GitHub's records, whether
-// the job a machine's runner took may run there, and gives it its work disk;
-// and the supervisor's report says the job is done.
+// the job a machine's runner took may run there; an admitted job asks for its
+// work disk and its save in its steps; and the supervisor's report says the
+// job is done.
 //
 // What machines exist, and what they're for, is in their names, labels and
 // metadata; what jobs want is in GitHub; what can't be read back from either
 // is in the bucket:
 //
+//	machines/<machine>/facts.json      what a machine's first check reported GitHub told its runner
 //	machines/<machine>/admission.json  the job a machine's runner took, and the check's decision
+//	machines/<machine>/answered.json   when a failed job's hook was answered with its reason
 //	machines/<machine>/report.json     the supervisor's report
-//	disks/<disk>.json                  a work disk, recorded before it's made
-//	refusals/<repository>/<run>-<attempt>.json  a run attempt refused for a fork's job or a claimed scope, until it's cancelled
+//	machines/<machine>/save-request.json  the job's request to save its work disk
+//	disks/<disk>.json                  a work disk, with its family, recorded before it's made
+//	refusals/<repository>/<run>-<attempt>.json  a run attempt refused or cancelled, until GitHub shows it finished
 //	jobs/<repository>/<job>.json       when a queued job's first machine was made
 //	logs/<machine>-<created>.txt       a deleted machine's boot log
 package machines
@@ -36,6 +40,7 @@ import (
 	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/compute"
 	"github.com/lanescape/runners/internal/github"
+	"github.com/lanescape/runners/internal/scope"
 	"github.com/lanescape/runners/internal/selector"
 	"github.com/lanescape/runners/internal/store"
 )
@@ -116,12 +121,17 @@ var (
 	diskName    = regexp.MustCompile(`^lsr-([1-9][0-9]*)-([a-z0-9]{8})(-work)?$`)
 )
 
-// DiskSource chooses what a job's work disk starts from: a resume image or
-// a recorded restore choice (specs/0003-disks.md). It returns the image's
-// name, or "" for an empty disk, and the disk's size, at least sizeGB.
+// DiskSource chooses what a job's work disk of a family starts from: a
+// resume image or its run's restore choice (specs/0003-disks.md). m is
+// resolved with the run's scope and the family and its key. It returns the
+// image's name, or "" for an empty disk, the disk's size, at least sizeGB,
+// and where it came from: Resumed, or the step of the restore order.
 type DiskSource interface {
-	Choose(ctx context.Context, m Machine, a Admission, sizeGB int64) (image string, size int64, err error)
+	Choose(ctx context.Context, m Machine, a Admission, sizeGB int64) (image string, size int64, restored string, err error)
 }
+
+// Resumed is where a work disk made from a resume image came from.
+const Resumed = "resume"
 
 // Saver saves a finished job's work disk, from its stopped machine
 // (specs/0003-disks.md).
@@ -172,6 +182,44 @@ type Service struct {
 	Disks       DiskSource
 	Saves       Saver
 	Preemptions Preemptions
+	// FailStopDelay is how long after a failed job's hook is answered its
+	// machine is stopped; zero is DefaultFailStopDelay.
+	FailStopDelay time.Duration
+	// BootLogs reads machines' serial consoles from Cloud Logging, after
+	// they're deleted; unset, a boot log is read from Compute Engine
+	// before its machine goes.
+	BootLogs BootLogs
+}
+
+// BootLogs reads a machine's serial console, by its numeric ID, from Cloud
+// Logging.
+type BootLogs interface {
+	Serial(ctx context.Context, instanceID uint64, limit int) (string, error)
+}
+
+// DefaultFailStopDelay is long enough for a failed job's hook to read its
+// answer and print the reason.
+const DefaultFailStopDelay = 5 * time.Second
+
+// BootLogWait is how long after its machine goes a boot log's last entries
+// are waited for, before it's recorded as it is, or as missing.
+const BootLogWait = 10 * time.Minute
+
+// LastLine is what the supervisor writes last, before the machine powers
+// off: a boot log that has it is complete.
+const LastLine = "lanescape-runners supervisor: powering off"
+
+// PendingLog is a deleted machine's boot log, still to be read from Cloud
+// Logging.
+type PendingLog struct {
+	Machine    string    `json:"machine"`
+	InstanceID uint64    `json:"instance_id"`
+	CreatedAt  time.Time `json:"created_at"`
+	DeletedAt  time.Time `json:"deleted_at"`
+}
+
+func pendingLogKey(m Machine) string {
+	return fmt.Sprintf("bootlogs/%s-%d.json", m.Name, m.CreatedAt.Unix())
 }
 
 // MachineAccountOf is the machines' account in a project.
@@ -260,15 +308,48 @@ type Admission struct {
 	Reason       string `json:"reason,omitempty"`
 	Contribution bool   `json:"contribution,omitempty"`
 	// Cancel says the refused job's run is to be cancelled: it came from a
-	// fork, or claimed a scope that isn't its run's.
-	Cancel bool      `json:"cancel,omitempty"`
-	At     time.Time `json:"at"`
+	// fork, or is failed with its reason.
+	Cancel bool `json:"cancel,omitempty"`
+	// Fail is the reason a failed job is told, in its log.
+	Fail string `json:"fail,omitempty"`
+	// What the check resolved for an allowed job: the run's scope and
+	// base, and its commit.
+	Scope  scope.Scope `json:"scope,omitzero"`
+	Base   scope.Scope `json:"base,omitzero"`
+	Commit string      `json:"commit,omitempty"`
+	// Unbound says the job was allowed on an unbound pull_request_target
+	// run: the smallest shape, standard, with no work disk.
+	Unbound bool      `json:"unbound,omitempty"`
+	At      time.Time `json:"at"`
 }
 
-// Report is the supervisor's report that its machine's job is done.
+// Resolve is the machine as its admitted job resolved it: with the run's
+// scope, and the family and key of the work disk the job asked for, if it
+// did, none of which the label carries.
+func (a Admission) Resolve(m Machine, d *DiskRecord) Machine {
+	if a.Allowed && !a.Unbound {
+		m.Selector.Scope = a.Scope
+		if d != nil && d.Machine == m.Name && d.JobID == a.JobID {
+			m.Selector.Family, m.Selector.Key = d.Family, d.Key
+		}
+	}
+	return m
+}
+
+// Report is the supervisor's report that its machine's job is done. It says
+// nothing else: a job asks to save its work disk itself, and no report
+// means no save.
 type Report struct {
 	Machine string    `json:"machine"`
-	Save    bool      `json:"save"`
+	At      time.Time `json:"at"`
+}
+
+// SaveRequest is a job's request, through the save-disk action, that its
+// work disk be saved once it has finished (specs/0003-disks.md). Nothing
+// withdraws it.
+type SaveRequest struct {
+	Machine string    `json:"machine"`
+	JobID   int64     `json:"job_id"`
 	At      time.Time `json:"at"`
 }
 
@@ -289,8 +370,14 @@ type DiskRecord struct {
 	RepositoryID int64  `json:"repository_id"`
 	JobID        int64  `json:"job_id"`
 	State        string `json:"state"`
-	SizeGB       int64  `json:"size_gb"`
-	SourceImage  string `json:"source_image,omitempty"`
+	// Family is what the job asked for, and Key the family's key at the
+	// run's commit; Restored is where the disk came from, as the request's
+	// answer says.
+	Family      string `json:"family"`
+	Key         string `json:"key"`
+	Restored    string `json:"restored"`
+	SizeGB      int64  `json:"size_gb"`
+	SourceImage string `json:"source_image,omitempty"`
 	// Attempt counts the confirmed failures to make or attach it, and
 	// names the request ID of the next try. Nonce is new with each record,
 	// so a record made again after its image went, whose attempts count
@@ -300,16 +387,16 @@ type DiskRecord struct {
 	At      time.Time `json:"at"`
 }
 
-// Refusal is a run attempt whose job was refused for coming from a fork or
-// claiming a scope that isn't its run's: it's cancelled, and no machine is
-// made for its selectors, until GitHub shows it finished. A rerun is another
-// attempt, refused afresh.
+// Refusal is a run attempt the service cancels: its job was refused for
+// coming from a fork, or failed with a reason, or it was cancelled without a
+// machine, for a job that named a label no runner of the service's has or
+// whose machines never started. No machine is made for its jobs until
+// GitHub shows it finished. A rerun is another attempt, decided afresh.
 type Refusal struct {
 	RepositoryID int64     `json:"repository_id"`
 	RunID        int64     `json:"run_id"`
 	RunAttempt   int       `json:"run_attempt"`
 	Reason       string    `json:"reason"`
-	Selectors    []string  `json:"selectors"`
 	RefusedAt    time.Time `json:"refused_at"`
 	CancelledAt  time.Time `json:"cancelled_at,omitzero"`
 	LastCancel   time.Time `json:"last_cancel,omitzero"`
@@ -330,8 +417,22 @@ type JobRecord struct {
 }
 
 func admissionKey(machine string) string { return "machines/" + machine + "/admission.json" }
-func reportKey(machine string) string    { return "machines/" + machine + "/report.json" }
-func diskKey(disk string) string         { return "disks/" + disk + ".json" }
+func factsKey(machine string) string     { return "machines/" + machine + "/facts.json" }
+func answeredKey(machine string) string  { return "machines/" + machine + "/answered.json" }
+
+// Answered is when a failed job's hook was answered with its reason.
+type Answered struct {
+	Machine string    `json:"machine"`
+	At      time.Time `json:"at"`
+}
+
+// AnswerWait is how long a failed job's machine waits for its answer to be
+// recorded before passes stop it anyway.
+const AnswerWait = 2 * time.Minute
+
+func reportKey(machine string) string      { return "machines/" + machine + "/report.json" }
+func saveRequestKey(machine string) string { return "machines/" + machine + "/save-request.json" }
+func diskKey(disk string) string           { return "disks/" + disk + ".json" }
 func refusalKey(repo, run int64, attempt int) string {
 	return fmt.Sprintf("refusals/%d/%d-%d.json", repo, run, attempt)
 }

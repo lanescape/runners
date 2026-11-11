@@ -200,6 +200,6 @@ func (e *Emulator) serial(w http.ResponseWriter, r *http.Request) {
 	if in == nil {
 		return
 	}
-	in.serial.Write(b)
+	e.writeSerial(in, string(b))
 	w.WriteHeader(http.StatusNoContent)
 }

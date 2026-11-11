@@ -1,0 +1,18 @@
+# The supervisor (specs/0002-machines.md, A machine's life): it registers
+# the machine's one-job runner, waits for it, reports, and powers the
+# machine off. Its output goes to the serial console too, where the service
+# reads the boot log from, ending with the line it writes as it powers the
+# machine off.
+[Unit]
+Description=Lanescape Runners: the supervisor
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/lanescape-runners/supervisor
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

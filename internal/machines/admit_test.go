@@ -3,20 +3,20 @@ package machines_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 
-	gceemu "github.com/lanescape/runners/emulators/compute"
 	"github.com/lanescape/runners/emulators/fault"
 	ghemu "github.com/lanescape/runners/emulators/github"
 	gcsemu "github.com/lanescape/runners/emulators/storage"
 	"github.com/lanescape/runners/internal/machines"
 )
 
-func TestAnAdmittedJobGetsItsWorkDisk(t *testing.T) {
+func TestAnAdmittedJobGetsNoWorkDiskFromItsCheck(t *testing.T) {
 	e := setup(t)
 	run := e.mainRun()
 	j := e.queue(run, sel2)
@@ -24,43 +24,32 @@ func TestAnAdmittedJobGetsItsWorkDisk(t *testing.T) {
 	m := e.boot(e.one())
 	m.taken(j)
 	// The hook may send the wrong run: it's only where to look first.
-	if code := m.started(run.ID + 1000); code != http.StatusOK {
-		t.Fatalf("job-started check: %d", code)
+	code, body := m.startedBody(run.ID + 1000)
+	if code != http.StatusOK || len(body) != 0 {
+		t.Fatalf("job-started check: %d %v; want 200 {}", code, body)
 	}
+	// A job asks for its work disk in a step; the check attaches none.
 	in, _ := e.gce.Instance(m.in.Zone, m.in.Name)
-	if in.Disks[machines.WorkDevice] != machines.WorkDisk(m.in.Name) {
-		t.Fatalf("disks = %v; want the work disk attached as %q", in.Disks, machines.WorkDevice)
+	if len(in.Disks) != 1 || len(e.gce.Disks()) != 1 {
+		t.Fatalf("disks = %v; want the boot disk alone", in.Disks)
 	}
-	var work bool
-	for _, d := range e.gce.Disks() {
-		if d.Name == machines.WorkDisk(m.in.Name) {
-			work = true
-			if d.SizeGB != 50 || d.SourceImage != "" || d.IOPS != 3000 || d.Throughput != 400 || d.Labels[machines.LabelMachine] != m.in.Name {
-				t.Fatalf("work disk = %+v; want an empty 50 GB disk", d)
-			}
-		}
-	}
-	if !work {
-		t.Fatal("no work disk")
-	}
-	rec, ok := e.record("disks/" + machines.WorkDisk(m.in.Name) + ".json")
-	if !ok || rec["state"] != machines.DiskAttached || rec["machine"] != m.in.Name || rec["job_id"] != float64(j.ID) {
-		t.Fatalf("disk record = %v", rec)
+	if _, ok := e.record("disks/" + machines.WorkDisk(m.in.Name) + ".json"); ok {
+		t.Fatal("the check recorded a work disk")
 	}
 	adm, ok := e.record("machines/" + m.in.Name + "/admission.json")
-	if !ok || adm["allowed"] != true || adm["job_id"] != float64(j.ID) || adm["run_id"] != float64(run.ID) {
+	if !ok || adm["allowed"] != true || adm["job_id"] != float64(j.ID) || adm["run_id"] != float64(run.ID) || adm["scope"] != "main" {
 		t.Fatalf("admission = %v", adm)
 	}
 	// Asking again gets the same answer, and nothing more.
 	if code := m.started(0); code != http.StatusOK {
 		t.Fatalf("again: %d", code)
 	}
-	if n := len(e.gce.Disks()); n != 2 {
-		t.Fatalf("%d disks, want the boot and work disks", n)
+	if n := len(e.gce.Disks()); n != 1 {
+		t.Fatalf("%d disks, want the boot disk alone", n)
 	}
 	m.release(true)
 	m.finished()
-	if code := m.report(false); code != http.StatusNoContent {
+	if code := m.report(); code != http.StatusNoContent {
 		t.Fatalf("report: %d", code)
 	}
 }
@@ -121,26 +110,37 @@ func TestTheCheckWithNoAnswer(t *testing.T) {
 				t.Fatalf("job-started check: %d", code)
 			}
 		}
-		if n := len(e.gce.Disks()); n != 2 {
-			t.Fatalf("%d disks, want the boot and work disks", n)
+		adm, _ := e.record("machines/" + m.in.Name + "/admission.json")
+		if adm["allowed"] != true {
+			t.Fatalf("admission = %v", adm)
 		}
 	})
+}
+
+func TestADiskRequestWhoseAnswersAreLost(t *testing.T) {
 	t.Run("Compute Engine loses answers", func(t *testing.T) {
 		e := setup(t)
-		run := e.mainRun()
-		j := e.queue(run, sel2)
-		e.pass()
-		m := e.boot(e.one())
-		m.taken(j)
+		e.repo.Commit("main", map[string]string{".github/runners.json": declares})
+		m, _ := e.admitted(sel2)
 		e.gce.LoseResponse(http.MethodPost, "/disks", 1)
 		e.gce.LoseResponse(http.MethodPost, "/attachDisk", 1)
-		for code := m.started(run.ID); code != http.StatusOK; code = m.started(run.ID) {
-			if code != http.StatusServiceUnavailable {
-				t.Fatalf("job-started check: %d", code)
-			}
-		}
+		m.diskReady("build")
 		in, _ := e.gce.Instance(m.in.Zone, m.in.Name)
-		if in.Disks[machines.WorkDevice] == "" || len(e.gce.Disks()) != 2 {
+		if in.Disks[machines.WorkDevice] != machines.WorkDisk(m.in.Name) || len(e.gce.Disks()) != 2 {
+			t.Fatal("the work disk wasn't made and attached once")
+		}
+	})
+	t.Run("the bucket loses answers", func(t *testing.T) {
+		e := setup(t)
+		e.repo.Commit("main", map[string]string{".github/runners.json": declares})
+		m, _ := e.admitted(sel2)
+		e.gcs.Faults().Add(fault.Rule{Method: http.MethodPost, Times: 3, After: true,
+			Match: func(r *http.Request) bool {
+				return strings.Contains(r.URL.RawQuery, "disks") || strings.Contains(r.URL.Path, "disks")
+			},
+			Respond: gcsemu.JSONError(http.StatusServiceUnavailable, "backendError", "Backend Error")})
+		m.diskReady("build")
+		if in, _ := e.gce.Instance(m.in.Zone, m.in.Name); in.Disks[machines.WorkDevice] != machines.WorkDisk(m.in.Name) || len(e.gce.Disks()) != 2 {
 			t.Fatal("the work disk wasn't made and attached once")
 		}
 	})
@@ -174,10 +174,20 @@ func TestIdentity(t *testing.T) {
 			if code, _ := e.post("/v1/jobs/finished", tc.token, machines.FinishedRequest{}); code != tc.code {
 				t.Fatalf("job-finished: %d, want %d", code, tc.code)
 			}
+			if code, _ := e.post(machines.DisksPath, tc.token, map[string]string{"family": "build"}); code != tc.code {
+				t.Fatalf("work disk: %d, want %d", code, tc.code)
+			}
+			if code, _ := e.post(machines.SavePath, tc.token, map[string]bool{"save": true}); code != tc.code {
+				t.Fatalf("save: %d, want %d", code, tc.code)
+			}
 		})
 	}
 	if code, _ := e.post("/v1/jobs/started", e.token(in), map[string]any{"job_id": 1}); code != http.StatusBadRequest {
 		t.Fatalf("a field the hook doesn't send: %d", code)
+	}
+	// The report says only that the job is done.
+	if code, _ := e.post("/v1/jobs/finished", e.token(in), map[string]any{"save": true}); code != http.StatusBadRequest {
+		t.Fatalf("a report that asks to save: %d", code)
 	}
 	if e.logged(wrongID) {
 		t.Fatal("a token was logged")
@@ -223,47 +233,43 @@ func TestRefusals(t *testing.T) {
 		stray := e.queue(run, "self-hosted")
 		meant := e.queue(run, sel2)
 		e.pass()
+		// A runner's only label is its selector, so GitHub never hands
+		// it a job that asked only for self-hosted.
 		m := e.boot(e.one())
-		m.taken(stray)
-		m.refused(run.ID)
-		if st, _ := e.gh.RunState(run); st == "completed" {
-			t.Fatal("the run was cancelled; only fork and scope refusals cancel")
-		}
-		// The machine goes, and the job it was made for gets another.
-		e.pass()
-		ms := e.wantMachines(1)
-		if ms[0].Name == m.in.Name || ms[0].Labels[machines.LabelJob] != strconv.FormatInt(meant.ID, 10) {
-			t.Fatalf("machines = %+v", ms)
+		m.taken(meant)
+		if e.gh.Job(stray.ID).Status != "queued" {
+			t.Fatal("a job that asked only for self-hosted was given the service's runner")
 		}
 	})
-	t.Run("a job of a scope that isn't its run's", func(t *testing.T) {
+	t.Run("another run's job of the selector", func(t *testing.T) {
 		e := setup(t)
 		main := e.mainRun()
 		meant := e.queue(main, sel2)
 		e.repo.Commit("feature", map[string]string{"f": "1"})
 		p := e.gh.PullRequest(e.repo, "main", e.repo, "feature", e.org)
 		pr := e.gh.PullRequestRun(p)
-		e.bind(pr, ghemu.Job{}, bindingRequest())
 		e.pass()
-		// The pull request's job claims main's scope, and is the only one
-		// queued when the machine's runner connects.
-		claim := e.queue(pr, sel2)
+		// The machine made for main's job is general: the pull request's
+		// job, of the same selector, takes it, and is admitted for itself.
+		other := e.queue(pr, sel2)
 		e.gh.CompleteJob(meant, "success")
 		m := e.boot(e.one())
-		m.taken(claim)
-		m.refused(pr.ID)
-		if _, ok := e.record("refusals/5001/" + strconv.FormatInt(pr.ID, 10) + "-1.json"); !ok {
-			t.Fatal("the refusal wasn't recorded")
+		m.taken(other)
+		if code := m.started(pr.ID); code != http.StatusOK {
+			t.Fatalf("job-started check: %d", code)
 		}
-		e.forceCancelled(pr)
+		adm, _ := e.record("machines/" + m.in.Name + "/admission.json")
+		if adm["allowed"] != true || adm["run_id"] != float64(pr.ID) || adm["scope"] != "pr"+strconv.Itoa(p.Number) {
+			t.Fatalf("admission = %v", adm)
+		}
 	})
 	t.Run("a fork's job", func(t *testing.T) {
 		e := setup(t)
 		main := e.mainRun()
 		meant := e.queue(main, sel2)
 		e.pass()
-		// The fork's two jobs name main's selector after a maintainer
-		// approved its run.
+		// The fork's two jobs name the service's selector after a
+		// maintainer approved its run.
 		fork := e.forkPull()
 		first := e.queue(fork, sel2)
 		e.queue(fork, sel2)
@@ -275,11 +281,11 @@ func TestRefusals(t *testing.T) {
 		if rec["cancelled_at"] == nil {
 			t.Fatalf("refusal = %v; the run wasn't cancelled", rec)
 		}
-		// Until the run is shown finished, no machine for its selectors,
-		// even for another run's job.
+		// Until the run is shown finished, no machine for its jobs; another
+		// run's job of the same selector gets one.
 		e.queue(e.mainRun(), sel2)
 		e.pass()
-		e.wantMachines(0)
+		e.wantMachines(1)
 		// The refused job's runner is gone, so an ordinary cancellation
 		// doesn't finish the run.
 		if st, _ := e.gh.RunState(fork); st == "completed" {
@@ -289,29 +295,10 @@ func TestRefusals(t *testing.T) {
 		e.pass()
 		e.wantMachines(1)
 	})
-	t.Run("an unapproved contribution", func(t *testing.T) {
+	t.Run("an unapproved contribution's plain job runs unbound", func(t *testing.T) {
 		e := setup(t)
-		crun, p := e.contribution(false)
-		csel := "lanescape-2vcpu-linux-amd64-pr" + strconv.Itoa(p.Number)
-		// The machine is made for an approved run's job of the same pull
-		// request, and the unapproved run's job takes it.
-		approved, _ := e.contributionFor(p)
-		meant := e.gh.Queue(approved, ghemu.JobSpec{Labels: []string{csel}, Environment: machines.ContributionEnvironment})
-		e.pass()
-		// The unapproved run's job doesn't name the environment, so it
-		// doesn't wait for a review.
-		stray := e.queue(crun, csel)
-		e.gh.CompleteJob(meant, "success")
-		m := e.boot(e.one())
-		m.taken(stray)
-		m.refused(crun.ID)
-		e.forceCancelled(crun)
-	})
-	t.Run("an approved contribution", func(t *testing.T) {
-		e := setup(t)
-		crun, p := e.contribution(true)
-		j := e.gh.Queue(crun, ghemu.JobSpec{Labels: []string{"lanescape-2vcpu-linux-amd64-pr" + strconv.Itoa(p.Number)},
-			Environment: machines.ContributionEnvironment})
+		crun, _ := e.contribution(false)
+		j := e.gh.Queue(crun, ghemu.JobSpec{Labels: []string{sel2}})
 		e.pass()
 		m := e.boot(e.one())
 		m.taken(j)
@@ -319,24 +306,66 @@ func TestRefusals(t *testing.T) {
 			t.Fatalf("job-started check: %d", code)
 		}
 		adm, _ := e.record("machines/" + m.in.Name + "/admission.json")
-		if adm["contribution"] != true {
+		if adm["allowed"] != true || adm["unbound"] != true {
+			t.Fatalf("admission = %v", adm)
+		}
+		if _, ok := e.record("bindings/5001/" + strconv.FormatInt(crun.ID, 10) + ".json"); ok {
+			t.Fatal("a run no maintainer approved was bound")
+		}
+	})
+	t.Run("an unapproved contribution's other job is failed", func(t *testing.T) {
+		e := setup(t)
+		crun, _ := e.contribution(false)
+		j := e.queue(crun, "lanescape-80vcpu-linux-amd64-spot")
+		e.pass()
+		// The job gets an ordinary machine of its own selector: the reason
+		// is decided at its check.
+		in := e.one()
+		if !strings.HasSuffix(in.MachineType, "n4-highcpu-80") || in.Provisioning != "SPOT" ||
+			in.Metadata[machines.MetaSelector] != "lanescape-80vcpu-linux-amd64-spot" {
+			t.Fatalf("machine = %+v; want one of the job's own selector", in)
+		}
+		m := e.boot(in)
+		m.taken(j)
+		m.failed(crun.ID, "isn't approved")
+		e.forceCancelled(crun)
+	})
+	t.Run("an approved contribution", func(t *testing.T) {
+		e := setup(t)
+		crun, p := e.contribution(true)
+		j := e.gh.Queue(crun, ghemu.JobSpec{Labels: []string{sel2}, Environment: machines.ContributionEnvironment})
+		e.pass()
+		m := e.boot(e.one())
+		m.taken(j)
+		if code := m.started(crun.ID); code != http.StatusOK {
+			t.Fatalf("job-started check: %d", code)
+		}
+		adm, _ := e.record("machines/" + m.in.Name + "/admission.json")
+		if adm["contribution"] != true || adm["scope"] != "pr"+strconv.Itoa(p.Number) {
 			t.Fatalf("admission = %v", adm)
 		}
 	})
-	t.Run("a job with GitHub's own labels", func(t *testing.T) {
-		e := setup(t)
-		run := e.mainRun()
-		meant := e.queue(run, sel2)
-		e.pass()
-		stray := e.queue(run, sel2, "Linux", "self-hosted")
-		e.gh.CompleteJob(meant, "success")
-		m := e.boot(e.one())
-		m.taken(stray)
-		// Its labels are the machine's selector and GitHub's own, which the
-		// runner has: it's allowed.
-		if code := m.started(run.ID); code != http.StatusOK {
-			t.Fatalf("job-started check: %d", code)
-		}
+}
+
+// failed checks that the job-started check failed a machine's job, saying
+// why: it answered 403 with the reason, stopped the machine, and gave it no
+// work disk.
+func (m *machine) failed(runID int64, reason string) {
+	m.e.t.Helper()
+	code, body := m.startedBody(runID)
+	if code != http.StatusForbidden || !strings.Contains(fmt.Sprint(body["reason"]), reason) {
+		m.e.t.Fatalf("job-started check: %d %v, want 403 saying %q", code, body, reason)
+	}
+	m.e.eventually("the failed job's machine stops", func() bool {
+		in, _ := m.e.gce.Instance(m.in.Zone, m.in.Name)
+		return in.Status == "TERMINATED"
+	})
+	if in, _ := m.e.gce.Instance(m.in.Zone, m.in.Name); len(in.Disks) != 1 {
+		m.e.t.Fatalf("a failed job's machine has disks %v", in.Disks)
+	}
+	m.e.eventually("the failed job's run is refused", func() bool {
+		_, ok := m.e.record("refusals/5001/" + strconv.FormatInt(runID, 10) + "-1.json")
+		return ok
 	})
 }
 
@@ -359,7 +388,6 @@ func (e *env) forceCancelled(run *ghemu.Run) {
 // contributionFor is another approved pull_request_target run of p.
 func (e *env) contributionFor(p *ghemu.Pull) (*ghemu.Run, *ghemu.Pull) {
 	run := e.gh.PullRequestTargetRun(p)
-	e.bind(run, ghemu.Job{WorkflowRef: bootstrap}, eventRequest(run))
 	e.gh.Approve(run, machines.ContributionEnvironment, e.maintainer)
 	return run, p
 }
@@ -388,19 +416,21 @@ func TestTheHookCanBeTamperedWith(t *testing.T) {
 
 func TestAPassRecordsARefusalTheCheckDidnt(t *testing.T) {
 	e := setup(t)
-	fork := e.forkPull()
-	j := e.queue(fork, sel2)
-	// The check recorded its decision and stopped short of the rest.
 	e.queue(e.mainRun(), sel2)
 	e.pass()
+	// A fork's job took the machine, and the check recorded its decision
+	// and stopped short of the rest.
+	fork := e.forkPull()
+	j := e.queue(fork, sel2)
 	m := e.one()
 	adm := machines.Admission{Machine: m.Name, Zone: m.Zone, RepositoryID: repoID, JobID: j.ID, RunID: fork.ID, RunAttempt: 1, Selector: sel2,
 		Reason: "the run is a fork's pull request's", Cancel: true}
 	b, _ := json.Marshal(adm)
 	e.gcs.Put("state", "machines/"+m.Name+"/admission.json", b)
 	e.pass()
-	if _, ok := e.record("refusals/5001/" + strconv.FormatInt(fork.ID, 10) + "-1.json"); !ok {
-		t.Fatal("the pass didn't record the refused run")
+	rec, ok := e.record("refusals/5001/" + strconv.FormatInt(fork.ID, 10) + "-1.json")
+	if !ok || rec["reason"] != adm.Reason {
+		t.Fatalf("refusal = %v; the pass didn't record the refused run from its admission", rec)
 	}
 	if st, c := e.gh.RunState(fork); st != "completed" || c != "cancelled" {
 		t.Fatalf("fork's run: %s %s", st, c)
@@ -409,20 +439,19 @@ func TestAPassRecordsARefusalTheCheckDidnt(t *testing.T) {
 
 func TestAWorkDiskThatCouldntBeMadeIsTriedAgain(t *testing.T) {
 	e := setup(t)
-	run := e.mainRun()
-	j := e.queue(run, sel2)
-	e.pass()
-	m := e.boot(e.one())
-	m.taken(j)
+	e.repo.Commit("main", map[string]string{".github/runners.json": declares})
+	m, _ := e.admitted(sel2)
 	e.gce.StockoutDisks(m.in.Zone, true)
-	if code := m.started(run.ID); code != http.StatusServiceUnavailable {
-		t.Fatalf("with no disk capacity: %d, want a retryable 503", code)
+	// The request is answered: the disk is being made, and the caller asks
+	// again.
+	if code, body := m.disk("build"); code != http.StatusOK || body["state"] != machines.DiskStateMaking {
+		t.Fatalf("with no disk capacity: %d %v, want 200 making", code, body)
 	}
 	// Compute Engine answers a request ID it has seen with its first
 	// outcome, so the next try needs another.
 	e.gce.StockoutDisks(m.in.Zone, false)
-	if code := m.started(run.ID); code != http.StatusOK {
-		t.Fatalf("once there's capacity: %d", code)
+	if code, body := m.disk("build"); code != http.StatusOK || body["state"] != machines.DiskStateReady {
+		t.Fatalf("once there's capacity: %d %v, want 200 ready", code, body)
 	}
 }
 
@@ -433,30 +462,37 @@ type vanishing struct {
 	calls int
 }
 
-func (v *vanishing) Choose(_ context.Context, _ machines.Machine, _ machines.Admission, size int64) (string, int64, error) {
+func (v *vanishing) Choose(_ context.Context, _ machines.Machine, _ machines.Admission, size int64) (string, int64, string, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.calls++
 	if v.calls == 1 {
-		return "lsr-5001-0123456789abcdef0123-1-gonegone", size, nil
+		return "lsr-5001-0123456789abcdef0123-1-gonegone", size, "main_exact", nil
 	}
-	return "", size, nil
+	return "", size, "none", nil
+}
+
+func (v *vanishing) choices() int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.calls
 }
 
 func TestAWorkDiskWhoseImageWentIsChosenAgain(t *testing.T) {
 	e := setup(t)
 	v := &vanishing{}
 	e.svc.Disks = v
-	run := e.mainRun()
-	j := e.queue(run, sel2)
-	e.pass()
-	m := e.boot(e.one())
-	m.taken(j)
-	if code := m.started(run.ID); code != http.StatusServiceUnavailable {
-		t.Fatalf("with its image gone: %d, want a retryable 503", code)
+	e.repo.Commit("main", map[string]string{".github/runners.json": declares})
+	m, _ := e.admitted(sel2)
+	if code, body := m.disk("build"); code != http.StatusOK || body["state"] != machines.DiskStateMaking {
+		t.Fatalf("with its image gone: %d %v, want 200 making", code, body)
 	}
-	if code := m.started(run.ID); code != http.StatusOK || v.calls != 2 {
-		t.Fatalf("the next try: %d, %d choices; want it to choose again", code, v.calls)
+	if _, ok := e.record("disks/" + machines.WorkDisk(m.in.Name) + ".json"); ok {
+		t.Fatal("the record of a disk whose image went was kept")
+	}
+	code, body := m.disk("build")
+	if code != http.StatusOK || body["state"] != machines.DiskStateReady || body["restored"] != "none" || v.choices() != 2 {
+		t.Fatalf("the next try: %d %v, %d choices; want it to choose again", code, body, v.choices())
 	}
 }
 
@@ -466,17 +502,14 @@ func TestAWorkDiskWhoseImageWentIsChosenAgain(t *testing.T) {
 func TestAWorkDiskWhoseImageWentInItsOperationIsChosenAgain(t *testing.T) {
 	e := setup(t)
 	e.svc.Disks = baseImage{}
-	run := e.mainRun()
-	j := e.queue(run, sel2)
-	e.pass()
-	m := e.boot(e.one())
-	m.taken(j)
+	e.repo.Commit("main", map[string]string{".github/runners.json": declares})
+	m, _ := e.admitted(sel2)
 	e.gce.FailNextOperation("disks.insert", "RESOURCE_NOT_FOUND")
-	if code := m.started(run.ID); code != http.StatusServiceUnavailable {
-		t.Fatalf("with its image gone: %d, want a retryable 503", code)
+	if code, body := m.disk("build"); code != http.StatusOK || body["state"] != machines.DiskStateMaking {
+		t.Fatalf("with its image gone: %d %v, want 200 making", code, body)
 	}
-	if code := m.started(run.ID); code != http.StatusOK {
-		t.Fatalf("the next try, which chose the same image again: %d", code)
+	if code, body := m.disk("build"); code != http.StatusOK || body["state"] != machines.DiskStateReady {
+		t.Fatalf("the next try, which chose the same image again: %d %v", code, body)
 	}
 }
 
@@ -484,8 +517,8 @@ func TestAWorkDiskWhoseImageWentInItsOperationIsChosenAgain(t *testing.T) {
 // saved disk.
 type baseImage struct{}
 
-func (baseImage) Choose(_ context.Context, _ machines.Machine, _ machines.Admission, size int64) (string, int64, error) {
-	return "lsr-base-amd64-new", size, nil
+func (baseImage) Choose(_ context.Context, _ machines.Machine, _ machines.Admission, size int64) (string, int64, string, error) {
+	return "lsr-base-amd64-new", size, "main_exact", nil
 }
 
 func TestAMachineThatIsntRunningGetsNoJob(t *testing.T) {
@@ -512,7 +545,7 @@ func TestAReportStartsAPass(t *testing.T) {
 	m, _ := e.admitted(sel2)
 	m.release(true)
 	m.finished()
-	m.report(false)
+	m.report()
 	select {
 	case <-kicked:
 	default:
@@ -541,39 +574,6 @@ func TestACancellationConflictIsntAFinish(t *testing.T) {
 	e.forceCancelled(fork)
 }
 
-// Contributions differ from other jobs only in what they must show to
-// run, never in which machines of their selector they may take.
-func TestAContributionOnAnOrdinaryMachine(t *testing.T) {
-	e := setup(t)
-	// A contribution whose bootstrap didn't run binds read, and is
-	// approved.
-	e.fork.Commit("feature", map[string]string{"src.go": "package app"})
-	p := e.gh.PullRequest(e.repo, "main", e.fork, "feature", e.contributor)
-	crun := e.gh.PullRequestTargetRun(p)
-	e.bind(crun, ghemu.Job{}, bindingRequest())
-	e.gh.Approve(crun, machines.ContributionEnvironment, e.maintainer)
-	read := "lanescape-2vcpu-linux-amd64-read"
-	stray := e.gh.Queue(crun, ghemu.JobSpec{Labels: []string{read}, Environment: machines.ContributionEnvironment})
-	other := e.gh.EventRun(e.repo, "workflow_dispatch", "main")
-	e.bind(other, ghemu.Job{}, bindingRequest())
-	ordinary := e.queue(other, read)
-	e.pass()
-	var made gceemu.InstanceState
-	for _, in := range e.wantMachines(2) {
-		if in.Labels[machines.LabelJob] == strconv.FormatInt(ordinary.ID, 10) {
-			made = in
-		}
-	}
-	m := e.boot(made)
-	m.taken(stray)
-	if code := m.started(crun.ID); code != http.StatusOK {
-		t.Fatalf("a contribution on an ordinary machine of its selector: %d", code)
-	}
-	if adm, _ := e.record("machines/" + m.in.Name + "/admission.json"); adm["allowed"] != true || adm["contribution"] != true {
-		t.Fatalf("admission = %v", adm)
-	}
-}
-
 // refuseFork has a fork's job take a machine made for main's, and returns
 // the fork's run once its job is refused.
 func (e *env) refuseFork() (*ghemu.Run, *machine) {
@@ -597,15 +597,15 @@ func TestARefusalThatCantBeRecorded(t *testing.T) {
 		Respond: gcsemu.JSONError(http.StatusForbidden, "forbidden", "Forbidden")}
 	e.gcs.Faults().Add(refusals)
 	fork, m := e.refuseFork()
-	// The machine and its admission stay, and its selector is blocked,
-	// until the refusal is recorded.
+	// The machine and its admission stay, and its run is blocked, until the
+	// refusal is recorded; another run's job of the selector gets a machine.
 	e.queue(e.mainRun(), sel2)
 	e.pass()
 	e.pass()
 	if !e.exists(m.in.Name) {
 		t.Fatal("a refused machine went before its run's refusal was recorded")
 	}
-	e.wantMachines(1)
+	e.wantMachines(2)
 	if _, ok := e.record("machines/" + m.in.Name + "/admission.json"); !ok {
 		t.Fatal("the only record of the refusal was removed")
 	}
@@ -637,67 +637,11 @@ func TestARerunIsRefusedAfresh(t *testing.T) {
 	if !ok || rec["cancelled_at"] == nil || rec["finished_at"] != nil {
 		t.Fatalf("the rerun's refusal = %v, %v; want it recorded and cancelled, not finished", rec, ok)
 	}
-	// The refused machine goes, and no other is made for its selector.
+	// The refused machine goes, and no other is made for its run's jobs;
+	// another run's job gets its own.
 	e.queue(e.mainRun(), sel2)
 	e.pass()
-	e.wantMachines(0)
-}
-
-func TestAnOrdinaryJobOnAContributionMachine(t *testing.T) {
-	e := setup(t)
-	read := "lanescape-2vcpu-linux-amd64-read"
-	other := e.gh.EventRun(e.repo, "workflow_dispatch", "main")
-	e.bind(other, ghemu.Job{}, bindingRequest())
-	// The consumer's own job is older, and its machine is made first; the
-	// contribution's comes next.
-	ordinary := e.queue(other, read)
-	e.fork.Commit("feature", map[string]string{"src.go": "package app"})
-	p := e.gh.PullRequest(e.repo, "main", e.fork, "feature", e.contributor)
-	crun := e.gh.PullRequestTargetRun(p)
-	e.bind(crun, ghemu.Job{}, bindingRequest())
-	e.gh.Approve(crun, machines.ContributionEnvironment, e.maintainer)
-	e.gh.Queue(crun, ghemu.JobSpec{Labels: []string{read}, Environment: machines.ContributionEnvironment})
-	e.pass()
-	ms := e.wantMachines(2)
-	var contribution gceemu.InstanceState
-	for _, in := range ms {
-		if in.Labels[machines.LabelContribution] == "true" {
-			contribution = in
-		}
-	}
-	// Only the contribution's machine boots: GitHub hands it the older,
-	// ordinary job.
-	m := e.boot(contribution)
-	m.taken(ordinary)
-	if code := m.started(other.ID); code != http.StatusOK {
-		t.Fatalf("an ordinary job on a contribution's machine of its selector: %d", code)
-	}
-	if adm, _ := e.record("machines/" + m.in.Name + "/admission.json"); adm["allowed"] != true || adm["contribution"] == true {
-		t.Fatalf("admission = %v", adm)
-	}
-}
-
-func TestAClaimedScopeOnAContributionMachineCancels(t *testing.T) {
-	e := setup(t)
-	crun, p := e.contribution(true)
-	csel := "lanescape-2vcpu-linux-amd64-pr" + strconv.Itoa(p.Number)
-	meant := e.gh.Queue(crun, ghemu.JobSpec{Labels: []string{csel}, Environment: machines.ContributionEnvironment})
-	e.pass()
-	// A push to main's job claims the pull request's scope, and takes the
-	// contribution's machine.
-	main := e.mainRun()
-	claim := e.queue(main, csel)
-	e.gh.CompleteJob(meant, "success")
-	m := e.boot(e.one())
-	m.taken(claim)
-	m.refused(main.ID)
-	adm, _ := e.record("machines/" + m.in.Name + "/admission.json")
-	if adm["cancel"] != true || !strings.Contains(adm["reason"].(string), "scope") {
-		t.Fatalf("admission = %v; a claimed scope cancels its run", adm)
-	}
-	if _, ok := e.record("refusals/5001/" + strconv.FormatInt(main.ID, 10) + "-1.json"); !ok {
-		t.Fatal("the refusal wasn't recorded")
-	}
+	e.wantMachines(1)
 }
 
 func TestARefusedAttemptDoesntCancelARerun(t *testing.T) {
@@ -705,7 +649,7 @@ func TestARefusedAttemptDoesntCancelARerun(t *testing.T) {
 	fork := e.forkPull()
 	// Attempt 1 was refused, and finished; a maintainer reran it before
 	// the refusal was followed up.
-	rf := machines.Refusal{RepositoryID: repoID, RunID: fork.ID, RunAttempt: 1, Selectors: []string{sel2}, RefusedAt: e.clock.Now()}
+	rf := machines.Refusal{RepositoryID: repoID, RunID: fork.ID, RunAttempt: 1, RefusedAt: e.clock.Now()}
 	b, _ := json.Marshal(rf)
 	e.gcs.Put("state", "refusals/5001/"+strconv.FormatInt(fork.ID, 10)+"-1.json", b)
 	e.gh.SetRunStatus(fork, "completed")
@@ -774,17 +718,14 @@ func TestARecordedRefusalsMachineIsStoppedAgain(t *testing.T) {
 
 func TestAWorkDiskWhoseOperationFailed(t *testing.T) {
 	e := setup(t)
-	run := e.mainRun()
-	j := e.queue(run, sel2)
-	e.pass()
-	m := e.boot(e.one())
-	m.taken(j)
+	e.repo.Commit("main", map[string]string{".github/runners.json": declares})
+	m, _ := e.admitted(sel2)
 	e.gce.FailNextOperation("disks.insert", "INTERNAL_ERROR")
-	if code := m.started(run.ID); code != http.StatusServiceUnavailable {
-		t.Fatalf("job-started check: %d, want a retryable 503", code)
+	if code, body := m.disk("build"); code != http.StatusOK || body["state"] != machines.DiskStateMaking {
+		t.Fatalf("work disk request: %d %v, want 200 making", code, body)
 	}
-	if code := m.started(run.ID); code != http.StatusOK {
-		t.Fatalf("asked again: %d; a finished operation's failure needs a new request", code)
+	if code, body := m.disk("build"); code != http.StatusOK || body["state"] != machines.DiskStateReady {
+		t.Fatalf("asked again: %d %v; a finished operation's failure needs a new request", code, body)
 	}
 }
 

@@ -115,7 +115,8 @@ func TestTheRestoreOrder(t *testing.T) {
 	if src := e.start(run, ghemu.JobSpec{Name: "a", Labels: []string{sel(key1, pr)}}).source(); src != main1 {
 		t.Fatalf("main's for the key: %s, want %s", src, main1)
 	}
-	if src := e.start(run, ghemu.JobSpec{Name: "b", Labels: []string{sel(zero, pr)}}).source(); src != main2 {
+	brun := e.pullRun(p)
+	if src := e.start(brun, ghemu.JobSpec{Name: "b", Labels: []string{sel(zero, pr)}}).source(); src != main2 {
 		t.Fatalf("main's newest: %s, want %s", src, main2)
 	}
 	// The pull request saves for the fixed key, an ordinary one.
@@ -134,10 +135,10 @@ func TestTheRestoreOrder(t *testing.T) {
 		label, step string
 	}{
 		{run, sel(key1, pr), disks.StepMainExact},
-		{run, sel(zero, pr), disks.StepMainNewest},
+		{brun, sel(zero, pr), disks.StepMainNewest},
 		{drun, sel(key1, pr), disks.StepPullRequestNewest},
 	} {
-		rec, ok := e.record("choices/5001/" + strconv.FormatInt(c.run.ID, 10) + "/" + selector.Hash(c.label) + ".json")
+		rec, ok := e.record("choices/5001/" + strconv.FormatInt(c.run.ID, 10) + "/" + choiceHash(c.label) + ".json")
 		if !ok || rec["step"] != c.step || rec["family"] != "build" || rec["scope"] != pr || rec["arch"] != "amd64" {
 			t.Fatalf("choice for %s = %v, want step %s", c.label, rec, c.step)
 		}
@@ -148,7 +149,7 @@ func TestTheRestoreOrder(t *testing.T) {
 	// So does a choice of nothing.
 	none := e.mainRun()
 	e.start(none, ghemu.JobSpec{Name: "e", Labels: []string{"lanescape-2vcpu-linux-amd64-disk-other-" + key1 + "-main"}})
-	if rec, _ := e.record("choices/5001/" + strconv.FormatInt(none.ID, 10) + "/" + selector.Hash("lanescape-2vcpu-linux-amd64-disk-other-"+key1+"-main") + ".json"); rec["step"] != disks.StepNone || rec["image"] != nil {
+	if rec, _ := e.record("choices/5001/" + strconv.FormatInt(none.ID, 10) + "/" + choiceHash("lanescape-2vcpu-linux-amd64-disk-other-"+key1+"-main") + ".json"); rec["step"] != disks.StepNone || rec["image"] != nil {
 		t.Fatalf("a choice of nothing = %v", rec)
 	}
 }
@@ -187,7 +188,7 @@ func TestAChoiceIsOncePerRunAndSelector(t *testing.T) {
 	if _, ok := e.images()[old]; ok {
 		t.Fatal("a superseded version outlived the choice that named it")
 	}
-	if _, ok := e.record("choices/5001/" + strconv.FormatInt(run.ID, 10) + "/" + selector.Hash(sel(key1, "main")) + ".json"); ok {
+	if _, ok := e.record("choices/5001/" + strconv.FormatInt(run.ID, 10) + "/" + choiceHash(sel(key1, "main")) + ".json"); ok {
 		t.Fatal("a finished run's choice was kept")
 	}
 }

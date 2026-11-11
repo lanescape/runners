@@ -31,13 +31,13 @@ import (
 )
 
 const (
-	orgID     = 303994381
-	repoID    = 5001
-	audience  = "https://runners.example.test"
-	bootstrap = "lanescape/app/.github/workflows/bootstrap.yml@refs/heads/main"
-	sel2      = "lanescape-2vcpu-linux-amd64-main"
-	zoneA     = "northamerica-northeast1-a"
-	zoneB     = "northamerica-northeast1-b"
+	orgID    = 303994381
+	repoID   = 5001
+	audience = "https://runners.example.test"
+	// sel2 is the smallest shape's selector.
+	sel2  = "lanescape-2vcpu-linux-amd64"
+	zoneA = "northamerica-northeast1-a"
+	zoneB = "northamerica-northeast1-b"
 )
 
 type lockedBuffer struct {
@@ -71,7 +71,7 @@ type env struct {
 	cfg         *config.Config
 	svc         *machines.Service
 	binder      *binding.Binder
-	actions     *auth.Actions
+	ghc         *github.Client
 	runner      *pass.Runner
 	url         string
 	logs        *lockedBuffer
@@ -101,7 +101,6 @@ func setup(t *testing.T) *env {
 	app := gh.NewApp(77)
 	gh.Install(app, org)
 	repo := gh.Repo(org, repoID, "app")
-	repo.Commit("main", map[string]string{binding.RunnersFile: `{"bootstrap": "` + bootstrap + `"}`})
 	gh.ProtectEnvironment(repo, machines.ContributionEnvironment)
 	contributor := gh.User(9001, "contributor")
 	fork := gh.Fork(repo, contributor, 7001)
@@ -129,10 +128,6 @@ func setup(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actions, err := auth.NewActions(auth.Options{Issuer: auth.Issuer{URL: gh.Actions.URL, JWKSURL: gh.Actions.JWKSURL}, Audience: audience}, orgID)
-	if err != nil {
-		t.Fatal(err)
-	}
 	logs := &lockedBuffer{}
 	log := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	t.Cleanup(func() {
@@ -143,14 +138,16 @@ func setup(t *testing.T) *env {
 	binder := &binding.Binder{GitHub: ghc, Objects: objects, OrganizationID: orgID, Clock: clock, Logger: log}
 	svc := &machines.Service{Config: cfg, Project: gce.Project, ServiceURL: audience, MachineAccount: account,
 		GitHub: ghc, Compute: gcec, Objects: objects, Binder: binder, Machines: verifier, Clock: clock, Logger: log,
-		AssignmentWait: 3 * time.Second, AssignmentRetry: 50 * time.Millisecond}
+		AssignmentWait: 3 * time.Second, AssignmentRetry: 50 * time.Millisecond, FailStopDelay: 100 * time.Millisecond}
 	mux := http.NewServeMux()
 	mux.Handle("POST /v1/jobs/started", svc.JobStarted())
 	mux.Handle("POST /v1/jobs/finished", svc.JobFinished())
+	mux.Handle("POST "+machines.DisksPath, svc.DiskRequest())
+	mux.Handle("POST "+machines.SavePath, svc.SaveRequest())
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	e := &env{t: t, clock: clock, gh: gh, gce: gce, gcs: gcs, org: org, contributor: contributor, maintainer: gh.User(42, "maintainer"),
-		repo: repo, fork: fork, cfg: cfg, svc: svc, binder: binder, actions: actions, url: srv.URL, logs: logs,
+		repo: repo, fork: fork, cfg: cfg, svc: svc, binder: binder, ghc: ghc, url: srv.URL, logs: logs,
 		runner: &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log}}
 	e.byMachine = map[string]context.CancelFunc{}
 	// A machine's runner dies with it.
@@ -164,13 +161,6 @@ func setup(t *testing.T) *env {
 	})
 	t.Cleanup(e.stopAll)
 	return e
-}
-
-func bindingRequest() binding.Request { return binding.Request{} }
-
-// eventRequest is what the bootstrap sends for a pull_request_target run.
-func eventRequest(run *ghemu.Run) binding.Request {
-	return binding.Request{PullRequest: run.EventPull.Number, HeadRepositoryID: run.EventPull.HeadRepositoryID, HeadSHA: run.EventPull.HeadSHA}
 }
 
 func (e *env) stopAll() {
@@ -189,15 +179,29 @@ func (e *env) pass() {
 	}
 }
 
-// bind binds a run's scope as its runners job does.
-func (e *env) bind(run *ghemu.Run, job ghemu.Job, req binding.Request) binding.Binding {
+// facts are what GitHub tells a run's jobs' runners, as the hook reports
+// them.
+func facts(run *ghemu.Run) binding.Facts {
+	f := binding.Facts{Event: run.Event, Ref: run.Ref, RefType: run.RefType, SHA: run.SHA}
+	if p := run.EventPull; p != nil {
+		f.PullRequest, f.HeadRepositoryID, f.HeadSHA = p.Number, p.HeadRepositoryID, p.HeadSHA
+	}
+	return f
+}
+
+// bind binds a run as a machine's first check would.
+func (e *env) bind(run *ghemu.Run) binding.Binding {
 	e.t.Helper()
-	job.Audience = audience
-	c, err := e.actions.Verify(context.Background(), e.gh.ActionsToken(run, job, nil))
+	ctx := context.Background()
+	repo, err := e.ghc.RepositoryByID(ctx, run.Repo.ID)
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	b, err := e.binder.Bind(context.Background(), c, req)
+	wr, err := e.ghc.WorkflowRun(ctx, repo, run.ID)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	b, err := e.binder.Bind(ctx, repo, wr, facts(run))
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -207,32 +211,30 @@ func (e *env) bind(run *ghemu.Run, job ghemu.Job, req binding.Request) binding.B
 // mainRun is a push to main, bound main.
 func (e *env) mainRun() *ghemu.Run {
 	run := e.gh.PushRun(e.repo, "main")
-	e.bind(run, ghemu.Job{}, binding.Request{})
+	e.bind(run)
 	return run
 }
 
-// contribution is an approved or unapproved pull_request_target run of a
-// fork's pull request, bound to it by the bootstrap.
+// contribution is a pull_request_target run of a fork's pull request,
+// approved or not, and unbound: its contribution job's check binds it.
 func (e *env) contribution(approve bool) (*ghemu.Run, *ghemu.Pull) {
 	e.fork.Commit("feature", map[string]string{"src.go": "package app"})
 	p := e.gh.PullRequest(e.repo, "main", e.fork, "feature", e.contributor)
 	run := e.gh.PullRequestTargetRun(p)
-	e.bind(run, ghemu.Job{WorkflowRef: bootstrap}, eventRequest(run))
 	if approve {
 		e.gh.Approve(run, machines.ContributionEnvironment, e.maintainer)
 	}
 	return run, p
 }
 
-// forkPull is a fork's pull_request run, bound read.
+// forkPull is a fork's pull_request run.
 func (e *env) forkPull() *ghemu.Run {
 	e.fork.Commit("evil", map[string]string{"x": "1"})
 	p := e.gh.PullRequest(e.repo, "main", e.fork, "evil", e.contributor)
-	run := e.gh.PullRequestRun(p)
-	e.bind(run, ghemu.Job{}, binding.Request{})
-	return run
+	return e.gh.PullRequestRun(p)
 }
 
+// queue queues a job of a run, naming labels.
 func (e *env) queue(run *ghemu.Run, labels ...string) *ghemu.WorkflowJob {
 	return e.gh.Queue(run, ghemu.JobSpec{Labels: labels})
 }
@@ -350,19 +352,63 @@ func (e *env) token(in gceemu.InstanceState) string {
 	return e.gce.Identity.Mint(e.gce.IdentityClaims(in.Zone, in.Name, audience, true))
 }
 
-// started asks the job-started check, as the hook does.
+// started asks the job-started check, as the hook does: with what GitHub
+// told the runner about the job it took, and runID as where to look first.
 func (m *machine) started(runID int64) int {
 	m.e.t.Helper()
-	code, _ := m.e.post("/v1/jobs/started", m.e.token(m.in), machines.StartedRequest{RunID: runID})
+	code, _ := m.startedBody(runID)
 	return code
 }
 
-// report sends the supervisor's report.
-func (m *machine) report(save bool) int {
+func (m *machine) startedBody(runID int64) (int, map[string]any) {
 	m.e.t.Helper()
-	code, _ := m.e.post("/v1/jobs/finished", m.e.token(m.in), machines.FinishedRequest{Save: save})
+	req := machines.StartedRequest{RunID: runID}
+	if _, run, ok := m.e.gh.JobOnRunner(m.in.Name); ok {
+		req.Facts = facts(run)
+	}
+	return m.e.post("/v1/jobs/started", m.e.token(m.in), req)
+}
+
+// report sends the supervisor's report.
+func (m *machine) report() int {
+	m.e.t.Helper()
+	code, _ := m.e.post("/v1/jobs/finished", m.e.token(m.in), machines.FinishedRequest{})
 	return code
 }
+
+// disk asks once for the job's work disk of a family, as the disk action
+// does.
+func (m *machine) disk(family string) (int, map[string]any) {
+	m.e.t.Helper()
+	return m.e.post(machines.DisksPath, m.e.token(m.in), map[string]string{"family": family})
+}
+
+// diskReady asks for the job's work disk of a family until it's ready, as
+// the disk action does, and returns where it came from.
+func (m *machine) diskReady(family string) string {
+	m.e.t.Helper()
+	var restored string
+	m.e.eventually("the work disk is ready", func() bool {
+		code, body := m.disk(family)
+		if code != http.StatusOK && code != http.StatusServiceUnavailable {
+			m.e.t.Fatalf("work disk request: %d %v", code, body)
+		}
+		restored, _ = body["restored"].(string)
+		return body["state"] == machines.DiskStateReady
+	})
+	return restored
+}
+
+// save asks for the job's work disk to be saved, as the save-disk action
+// does.
+func (m *machine) save() (int, map[string]any) {
+	m.e.t.Helper()
+	return m.e.post(machines.SavePath, m.e.token(m.in), map[string]bool{"save": true})
+}
+
+// declares is a .github/runners.json that declares the family build, with
+// no files.
+const declares = `{"disks": {"build": {}}}`
 
 func (e *env) eventually(what string, cond func() bool) {
 	e.t.Helper()

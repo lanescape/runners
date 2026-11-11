@@ -229,7 +229,7 @@ func TestAPreemptedJobThatSucceededLetsItsRunsChoiceGo(t *testing.T) {
 	if e.attempt(run) != 1 {
 		t.Fatal("a run whose preempted job succeeded was rerun")
 	}
-	if _, ok := e.record("choices/5001/" + strconv.FormatInt(run.ID, 10) + "/" + selector.Hash(label) + ".json"); ok {
+	if _, ok := e.record("choices/5001/" + strconv.FormatInt(run.ID, 10) + "/" + choiceHash(label) + ".json"); ok {
 		t.Fatal("a finished run due no rerun kept its choice")
 	}
 }
@@ -245,7 +245,9 @@ func TestASaveDoesntDeleteWhatARunDueARerunChose(t *testing.T) {
 	e.saveMain(key3)
 	e.clock.Advance(time.Minute)
 	run := e.mainRun()
-	saver := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key2, "main")}})
+	// Another push saves the family's newest key; this run's lost job
+	// chose the oldest.
+	saver := e.start(e.mainRun(), ghemu.JobSpec{Name: "build", Labels: []string{sel(key2, "main")}})
 	lost := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{"lanescape-2vcpu-linux-amd64-spot-disk-build-" + key1 + "-main"}})
 	if lost.source() != m1 {
 		t.Fatal("the run's lost job didn't restore main's disk")

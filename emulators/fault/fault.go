@@ -5,9 +5,11 @@ package fault
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -144,4 +146,29 @@ func Drop(w http.ResponseWriter, _ *http.Request) {
 	if err == nil {
 		_ = conn.Close()
 	}
+}
+
+// Refuse answers as this repository's service does when it won't do what a
+// request asks (specs/0005-interface.md, Requests from a job): 403, with
+// the reason, which the caller doesn't retry.
+func Refuse(reason string) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		answerJSON(w, http.StatusForbidden, map[string]any{"error": http.StatusText(http.StatusForbidden), "reason": reason})
+	}
+}
+
+// Unavailable answers as this repository's service does when GitHub
+// couldn't confirm an answer: 503, retryable, with a Retry-After of
+// retryAfter, rounded down to whole seconds and at least one.
+func Unavailable(retryAfter time.Duration) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", strconv.Itoa(max(1, int(retryAfter/time.Second))))
+		answerJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "no confirmed answer; try again", "retryable": true})
+	}
+}
+
+func answerJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
 }
