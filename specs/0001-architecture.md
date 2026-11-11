@@ -53,7 +53,7 @@ A pass:
 
 1. Lists the queued jobs of every consumer's runs, the service's machines, disks and Compute Engine images, and its records.
 2. Stops every machine past its age limit, before it changes anything else (specs/0002-machines.md, The age limit).
-3. Moves each architecture's base image for the current key on, if it isn't ready, and deletes base images it no longer needs (specs/0003-disks.md, Making a base image), before queued jobs take what capacity there is, so that a busy pool never starves a builder of its quota.
+3. Moves each architecture's base image for the current key on, if it isn't ready, and deletes base images it no longer needs (specs/0003-disks.md, Making a base image), before queued jobs take what capacity there is. A builder that finds no capacity or quota holds its machine families' quota as an older job does (specs/0002-machines.md, One pool): no job gets a machine of those families that pass, so that freed quota builds up for the builder, and a busy pool never starves it.
 4. Gives queued jobs machines, in one order, oldest first, from one pool for every consumer (specs/0002-machines.md, One pool).
 5. Saves the work disks of jobs that asked, and makes resume images for jobs lost to a preemption or to the age limit (specs/0003-disks.md).
 6. Reruns runs that lost a job to a preemption or to the age limit, once they've finished.
