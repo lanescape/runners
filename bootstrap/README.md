@@ -45,9 +45,21 @@ Read the plan before applying it: it's the only review this configuration's chan
 
 ## After the first apply
 
-1. Give CD what it needs from `terraform output`: the workload identity provider and the deployer's account for signing in, the image repository for `ko`, and the Infrastructure Manager artifacts bucket. `infra/README.md` says how CD starts an apply.
-2. Make sure the organization requires approval to run fork pull request workflows from every outside collaborator, which the service checks at deploy (specs/0002-machines.md).
-3. Let CD deploy `infra/` for the first time, then add the App's secrets as `infra/README.md` says.
+CD deploys nothing until the repository's Actions variables below are all set (specs/0004-deployment.md, What CD is given), so set them last:
+
+1. Make sure the organization requires approval to run fork pull request workflows from every outside collaborator, which the service checks at deploy (specs/0002-machines.md), and that the App exists and is installed as above, with its private key and webhook secret at hand.
+2. Give CD what it needs, from `terraform output` here and the App's ID. None of these is a secret:
+
+   ```sh
+   repo=lanescape/runners
+   gh variable set RUNNERS_WORKLOAD_IDENTITY_PROVIDER -R "$repo" --body "$(terraform output -raw workload_identity_provider)"
+   gh variable set RUNNERS_DEPLOYER -R "$repo" --body "$(terraform output -json accounts | jq -r .deployer)"
+   gh variable set RUNNERS_IMAGE_REPOSITORY -R "$repo" --body "$(terraform output -raw image_repository)"
+   gh variable set RUNNERS_INFRA_MANAGER_BUCKET -R "$repo" --body "$(terraform output -raw infra_manager_artifacts_bucket)"
+   gh variable set RUNNERS_GITHUB_APP_ID -R "$repo" --body "<the App's ID>"
+   ```
+
+3. Let CD deploy `infra/` for the first time: rerun the latest CD run on main, whose deploy was skipped, or push to main. That apply makes the App's secrets with no value, so it fails where the service would start. Add the secrets' values as `infra/README.md` says, then rerun the failed run's deploy, which starts the service.
 
 ## What IAM can't limit
 

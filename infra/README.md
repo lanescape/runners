@@ -11,7 +11,7 @@ The accounts, every project-level grant, the network, Pub/Sub, the scheduler job
 
 ## Who applies it
 
-Only Infrastructure Manager, from CD, as `lanescape-runners-infra`, never anyone by hand. That identity can change nothing but these resources: the bucket and secrets by name, and the Cloud Run service by a grant on it alone. It can't make or delete a Cloud Run service. What it holds that IAM can't limit is in `bootstrap/README.md`, What IAM can't limit. CD starts the apply, from this repository at the commit it has just built, with the image's digest:
+Only Infrastructure Manager, from CD, as `lanescape-runners-infra`, never anyone by hand. That identity can change nothing but these resources: the bucket and secrets by name, and the Cloud Run service by a grant on it alone. It can't make or delete a Cloud Run service. What it holds that IAM can't limit is in `bootstrap/README.md`, What IAM can't limit. CD (`.github/workflows/cd.yml`) first asks for a preview, with the same source and inputs, and prints its logs, then starts the apply, from this repository at the commit it has just built, with the image's digest, and prints its logs too:
 
 ```sh
 gcloud infra-manager deployments apply \
@@ -34,7 +34,7 @@ The source must come from the repository, not be uploaded: uploading needs proje
 - `bootstrap/`, applied, and what its README asks for before and after.
 - The image, pushed by CD.
 
-The first apply makes the App's secrets with no value, so the service can't start. Add the values once, by hand, then let CD apply again:
+CD deploys nothing until the repository's variables that `bootstrap/README.md` lists are set. The first apply makes the App's secrets with no value, so the service can't start, and the apply fails there. Add the values once, by hand, then rerun the failed CD run's deploy:
 
 ```sh
 gcloud secrets versions add lanescape-runners-app-key --data-file=app.pem
