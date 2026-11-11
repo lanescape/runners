@@ -68,8 +68,8 @@ func runKey(repo, id int64) string {
 
 // Pass is the disks' part of a pass (specs/0001-architecture.md, Passes),
 // after the machines': it looks for evidence that stopped Spot machines
-// were preempted, reruns runs that lost a Spot job to preemption once
-// they've finished, drops the restore choices of runs that need them no
+// were preempted, reruns runs that lost a job to a preemption or to the age
+// limit once they've finished, drops the restore choices of runs that need them no
 // more, and deletes saved disks and resume images that are superseded,
 // expired or orphaned. A failure on one image or run doesn't stop the rest.
 func (s *Service) Pass(p *pass.Pass) error {
@@ -160,11 +160,12 @@ func (s *Service) repository(ctx context.Context, st *state, id int64) (*github.
 // evidence looks, by instance ID, for evidence that each stopped Spot
 // machine recorded as perhaps preempted was: Compute Engine's recorded
 // event, or a zone operation of type compute.instances.preempted, for a
-// day after it stopped.
+// day after it stopped. A machine stopped at its age limit needs none: its
+// job was lost either way.
 func (s *Service) evidence(ctx context.Context, st *state) {
 	for key, r := range st.preemptions {
 		p := r.v
-		if p.Preempted != Unknown || s.now().Sub(p.StoppedAt) >= ResumeKept {
+		if p.Preempted != Unknown || p.AgeLimit || s.now().Sub(p.StoppedAt) >= ResumeKept {
 			continue
 		}
 		_, found := st.events[eventKey(p.InstanceID)]
@@ -194,7 +195,11 @@ func (s *Service) evidence(ctx context.Context, st *state) {
 // runState is what GitHub shows of a run, and whether it's due an automatic
 // rerun (specs/0002-machines.md, Reruns): finished, with fewer than 3
 // attempts in all, and a failed job of its latest attempt that was a Spot
-// job shown preempted; or, while a day hasn't passed, perhaps preempted. An
+// job shown preempted, or a job lost at the age limit; or, while a day
+// hasn't passed, perhaps preempted. It's rerun only once every failed job's
+// record is done, its resume image ready if it gets one, or a day has
+// passed since its machine stopped, and no machine of the run that's
+// admitted is still unreported. An
 // error means GitHub gave no confirmed answer.
 func (s *Service) runState(ctx context.Context, st *state, repoID, runID int64) (*run, error) {
 	key := runKey(repoID, runID)
@@ -235,17 +240,41 @@ func (s *Service) runState(ctx context.Context, st *state, repoID, runID int64) 
 			asked, pending = len(rr.v.Attempts), slices.Contains(rr.v.Attempts, r.attempt)
 		}
 		if r.attempt < MaxAttempts && (asked < MaxAttempts-1 || pending) {
+			// unready says some failed job's record isn't done: its resume
+			// image isn't ready yet, and the rerun, which reruns every
+			// failed job, waits for it, or else that job would start
+			// without it.
+			unready := false
 			for _, p := range st.preemptions {
 				v := p.v
 				if v.RepositoryID != repoID || v.RunID != runID || v.RunAttempt != r.attempt || !r.failed[v.JobID] {
 					continue
 				}
+				if !v.Done && s.now().Sub(v.StoppedAt) < ResumeKept {
+					unready = true
+				}
 				switch {
-				case v.Preempted == Preempted:
+				case v.Preempted == Preempted || v.AgeLimit:
 					r.due, r.rerun = true, true
-				case s.now().Sub(v.StoppedAt) < ResumeKept:
+				case v.Preempted == Unknown && s.now().Sub(v.StoppedAt) < ResumeKept:
 					r.due = true
 				}
+			}
+			if r.rerun && !unready {
+				// A machine of the run that's admitted and hasn't reported,
+				// such as one stopped whose record isn't written yet, may
+				// have a job to record: the rerun waits for it too.
+				if st.live == nil {
+					live, err := s.unreported(ctx, "")
+					if err != nil {
+						return nil, err
+					}
+					st.live = live
+				}
+				unready = st.live[runID]
+			}
+			if unready {
+				r.rerun = false
 			}
 		}
 	}
@@ -257,10 +286,10 @@ func (s *Service) runState(ctx context.Context, st *state, repoID, runID int64) 
 // failed jobs runs again.
 var failedConclusion = map[string]bool{"failure": true, "cancelled": true, "timed_out": true, "startup_failure": true}
 
-// follow reruns each finished run that lost a Spot job to preemption: its
-// failed jobs, rather than each lost job and its dependents, so there's one
-// rerun per run attempt. Each rerun is recorded, by the attempt it reran,
-// before it's asked for.
+// follow reruns each finished run that lost a job to a preemption or to the
+// age limit: its failed jobs, rather than each lost job and its dependents,
+// so there's one rerun per run attempt. Each rerun is recorded, by the
+// attempt it reran, before it's asked for.
 func (s *Service) follow(ctx context.Context, st *state) {
 	seen := map[string]bool{}
 	for _, r := range st.preemptions {
@@ -272,14 +301,14 @@ func (s *Service) follow(ctx context.Context, st *state) {
 		seen[key] = true
 		rs, err := s.runState(ctx, st, p.RepositoryID, p.RunID)
 		if err != nil {
-			s.log().Warn("reading a run that lost a Spot machine", "run_id", p.RunID, "err", err.Error())
+			s.log().Warn("reading a run that lost a job", "run_id", p.RunID, "err", err.Error())
 			continue
 		}
 		if !rs.rerun {
 			continue
 		}
 		if err := s.rerun(ctx, st, p.RepositoryID, p.RunID, rs); err != nil {
-			s.log().Warn("rerunning a run that lost a Spot job to preemption", "run_id", p.RunID, "err", err.Error())
+			s.log().Warn("rerunning a run that lost a job", "run_id", p.RunID, "err", err.Error())
 		}
 	}
 }
@@ -327,7 +356,7 @@ func (s *Service) rerunLocked(ctx context.Context, st *state, repoID, runID int6
 		return err
 	}
 	rs.finished, rs.rerun = false, false
-	s.log().Info("run rerun: a Spot job was preempted", "repository_id", repoID, "run_id", runID, "attempt", rs.attempt+1)
+	s.log().Info("run rerun: a job was lost to a preemption or to the age limit", "repository_id", repoID, "run_id", runID, "attempt", rs.attempt+1)
 	return nil
 }
 

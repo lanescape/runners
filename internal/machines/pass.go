@@ -74,15 +74,16 @@ func (inv *inventory) disk(machine string) *DiskRecord {
 }
 
 // Pass is the machines' part of a reconciler pass (specs/0001-architecture.md,
-// Passes): it gives queued jobs machines, follows up refused runs, and
-// deletes what's finished. A failure on one machine, job or disk doesn't
-// stop the rest.
+// Passes): it stops every machine past its age limit before anything else,
+// gives queued jobs machines, follows up refused runs, and deletes what's
+// finished. A failure on one machine, job or disk doesn't stop the rest.
 func (s *Service) Pass(p *pass.Pass) error {
 	inv := s.inventory(p)
 	if p.Lost() {
 		return context.Cause(p.Context())
 	}
 	ctx := p.Context()
+	s.stopPastLimit(ctx, inv)
 	s.followRefusals(ctx, inv)
 	s.give(ctx, inv)
 	s.cleanup(ctx, inv)

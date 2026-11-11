@@ -180,14 +180,30 @@ func TestAnIdleMachine(t *testing.T) {
 }
 
 type preemptions struct {
-	mu    sync.Mutex
-	calls map[string]bool
+	mu       sync.Mutex
+	calls    map[string]bool
+	ageLimit map[string]bool
+	// family is the family of each machine's work disk, as recorded.
+	family map[string]string
+	// at, if it's set, is called as each machine is recorded.
+	at func(m machines.Machine)
 }
 
-func (p *preemptions) Stopped(_ context.Context, m machines.Machine, _ machines.Admission, preempted, _ bool) error {
+func (p *preemptions) Stopped(_ context.Context, m machines.Machine, _ machines.Admission, preempted, ageLimit bool) error {
+	if p.at != nil {
+		p.at(m)
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.calls[m.Name] = preempted
+	if p.ageLimit == nil {
+		p.ageLimit = map[string]bool{}
+	}
+	p.ageLimit[m.Name] = ageLimit
+	if p.family == nil {
+		p.family = map[string]string{}
+	}
+	p.family[m.Name] = m.Selector.Family
 	return nil
 }
 
@@ -210,10 +226,226 @@ func TestAStoppedSpotMachine(t *testing.T) {
 				t.Fatal("a stopped Spot machine wasn't deleted")
 			}
 			got, called := p.calls[m.in.Name]
-			if !called || got != preempted {
-				t.Fatalf("preemption seam: called %v, preempted %v; want %v", called, got, preempted)
+			if !called || got != preempted || p.ageLimit[m.in.Name] {
+				t.Fatalf("preemption seam: called %v, preempted %v, at the age limit %v; want %v, not at the age limit", called, got,
+					p.ageLimit[m.in.Name], preempted)
 			}
 		})
+	}
+}
+
+// admittedToo admits another main job of a selector on a machine of its own,
+// beside those already there.
+func (e *env) admittedToo(sel string) *machine {
+	e.t.Helper()
+	had := map[string]bool{}
+	for _, in := range e.ours() {
+		had[in.Name] = true
+	}
+	run := e.mainRun()
+	j := e.queue(run, sel)
+	e.pass()
+	for _, in := range e.ours() {
+		if had[in.Name] {
+			continue
+		}
+		m := e.boot(in)
+		m.taken(j)
+		if code := m.started(run.ID); code != http.StatusOK {
+			e.t.Fatalf("job-started check: %d", code)
+		}
+		return m
+	}
+	e.t.Fatal("no machine made for the job")
+	return nil
+}
+
+// specs/0002-machines.md, The age limit: a job the limit cuts short, on a
+// standard machine as on a Spot one, is recorded to resume, and every
+// machine past the limit is stopped before any is recorded.
+func TestJobsAtTheAgeLimitAreRecordedOnceEveryMachineIsStopped(t *testing.T) {
+	e := setup(t)
+	p := &preemptions{calls: map[string]bool{}}
+	e.svc.Preemptions = p
+	a, _ := e.admitted(sel2)
+	b := e.admittedToo("lanescape-2vcpu-linux-amd64-spot")
+	var running []string
+	p.at = func(machines.Machine) {
+		for _, in := range e.ours() {
+			if in.Status != "TERMINATED" {
+				running = append(running, in.Name)
+			}
+		}
+	}
+	e.clock.Advance(machines.MaxAge - time.Second)
+	e.pass()
+	if !e.exists(a.in.Name) || !e.exists(b.in.Name) || len(p.calls) != 0 {
+		t.Fatal("a machine mid-job was stopped or recorded before its age limit")
+	}
+	e.clock.Advance(time.Second)
+	e.pass()
+	if e.exists(a.in.Name) || e.exists(b.in.Name) {
+		t.Fatal("a machine past its age limit wasn't deleted")
+	}
+	for _, m := range []*machine{a, b} {
+		if _, called := p.calls[m.in.Name]; !called || !p.ageLimit[m.in.Name] {
+			t.Fatalf("%s wasn't recorded as stopped at its age limit: %v, %v", m.in.Name, p.calls, p.ageLimit)
+		}
+	}
+	if len(running) != 0 {
+		t.Fatalf("machines %v were still running as a machine was recorded", running)
+	}
+}
+
+// A job whose supervisor reported before the age limit had finished:
+// nothing of it is recorded to resume.
+func TestAJobReportedBeforeTheAgeLimitIsntRecorded(t *testing.T) {
+	e := setup(t)
+	p := &preemptions{calls: map[string]bool{}}
+	e.svc.Preemptions = p
+	m, _ := e.admitted(sel2)
+	e.gce.Faults().Add(fault.Rule{Method: http.MethodDelete, Match: func(r *http.Request) bool { return strings.Contains(r.URL.Path, "/instances/") },
+		Respond: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusForbidden) }})
+	m.release(true)
+	m.finished()
+	m.report()
+	e.pass()
+	if !e.exists(m.in.Name) {
+		t.Fatal("the machine was deleted despite the fault")
+	}
+	e.clock.Advance(machines.MaxAge)
+	e.gce.Faults().Reset()
+	e.pass()
+	if e.exists(m.in.Name) {
+		t.Fatal("a machine past its age limit wasn't deleted")
+	}
+	if len(p.calls) != 0 {
+		t.Fatalf("a job reported before the age limit was recorded: %v", p.calls)
+	}
+}
+
+// What a check, a report or a disk request recorded after the pass read the
+// records, and before it stopped a machine past its age limit, decides what
+// the pass does with the machine: GitHub's queue is read in between, and
+// the test acts as it's read.
+func TestTheAgeLimitReadsTheRecordsAgain(t *testing.T) {
+	// meanwhile answers GitHub's listing of the consumers once, after act.
+	meanwhile := func(e *env, act func()) {
+		e.gh.Faults().Add(fault.Rule{Method: http.MethodGet, PathPrefix: "/installation/repositories", Times: 1,
+			Respond: func(w http.ResponseWriter, _ *http.Request) {
+				act()
+				w.WriteHeader(http.StatusBadGateway)
+			}})
+	}
+	t.Run("a check", func(t *testing.T) {
+		e := setup(t)
+		p := &preemptions{calls: map[string]bool{}}
+		e.svc.Preemptions = p
+		run := e.mainRun()
+		j := e.queue(run, sel2)
+		e.pass()
+		m := e.boot(e.one())
+		m.taken(j)
+		e.clock.Advance(machines.MaxAge)
+		var code int
+		meanwhile(e, func() { code = m.started(run.ID) })
+		e.pass()
+		if code != http.StatusOK {
+			t.Fatalf("job-started check: %d", code)
+		}
+		if e.exists(m.in.Name) || !p.ageLimit[m.in.Name] {
+			t.Fatalf("a job admitted as the pass read the queue wasn't recorded: %v", p.ageLimit)
+		}
+	})
+	t.Run("a report", func(t *testing.T) {
+		e := setup(t)
+		p := &preemptions{calls: map[string]bool{}}
+		e.svc.Preemptions = p
+		m, _ := e.admitted(sel2)
+		m.release(true)
+		m.finished()
+		e.clock.Advance(machines.MaxAge)
+		var code int
+		meanwhile(e, func() { code = m.report() })
+		e.pass()
+		if code != http.StatusNoContent {
+			t.Fatalf("report: %d", code)
+		}
+		if e.exists(m.in.Name) || len(p.calls) != 0 {
+			t.Fatalf("a job reported as the pass read the queue was recorded: %v", p.calls)
+		}
+	})
+	t.Run("a disk request", func(t *testing.T) {
+		e := setup(t)
+		e.repo.Commit("main", map[string]string{".github/runners.json": declares})
+		p := &preemptions{calls: map[string]bool{}}
+		e.svc.Preemptions = p
+		m, _ := e.admitted(sel2)
+		e.clock.Advance(machines.MaxAge)
+		var code int
+		meanwhile(e, func() { code, _ = m.disk("build") })
+		e.pass()
+		if code != http.StatusOK && code != http.StatusServiceUnavailable {
+			t.Fatalf("work disk request: %d", code)
+		}
+		if !p.ageLimit[m.in.Name] || p.family[m.in.Name] != "build" {
+			t.Fatalf("recorded %v with families %v; want the work disk asked for as the pass read the queue", p.ageLimit, p.family)
+		}
+	})
+}
+
+// Every stop at the age limit is asked for at once: one that Compute Engine
+// is slow to finish holds up no other.
+func TestStopsAtTheAgeLimitDontWaitForEachOther(t *testing.T) {
+	e := setup(t)
+	a, _ := e.admitted(sel2)
+	b := e.admittedToo(sel2)
+	slow := min(a.in.Name, b.in.Name)
+	var mu sync.Mutex
+	asked := map[string]time.Time{}
+	e.gce.Faults().Add(fault.Rule{Method: http.MethodPost, Match: func(r *http.Request) bool {
+		if strings.HasSuffix(r.URL.Path, "/stop") {
+			mu.Lock()
+			asked[r.URL.Path[strings.LastIndex(r.URL.Path[:len(r.URL.Path)-len("/stop")], "/")+1:len(r.URL.Path)-len("/stop")]] = time.Now()
+			mu.Unlock()
+		}
+		return false
+	}})
+	e.gce.Faults().Add(fault.Rule{Method: http.MethodPost, Delay: 2 * time.Second,
+		Match: func(r *http.Request) bool { return strings.HasSuffix(r.URL.Path, "/"+slow+"/stop") }})
+	e.clock.Advance(machines.MaxAge)
+	e.pass()
+	mu.Lock()
+	defer mu.Unlock()
+	ta, tb := asked[a.in.Name], asked[b.in.Name]
+	if ta.IsZero() || tb.IsZero() {
+		t.Fatalf("stops asked for: %v", asked)
+	}
+	if d := ta.Sub(tb); d > time.Second || d < -time.Second {
+		t.Fatalf("one stop was asked for %s after the other: it waited for a slow one", d)
+	}
+	if e.exists(a.in.Name) || e.exists(b.in.Name) {
+		t.Fatal("a machine past its age limit wasn't deleted")
+	}
+}
+
+// A machine past its age limit that can't be stopped waits, running, for
+// the next pass: its job isn't recorded until it's stopped.
+func TestAMachineAtTheAgeLimitWaitsForItsStop(t *testing.T) {
+	e := setup(t)
+	p := &preemptions{calls: map[string]bool{}}
+	e.svc.Preemptions = p
+	m, _ := e.admitted(sel2)
+	e.clock.Advance(machines.MaxAge)
+	e.gce.Faults().Add(fault.Rule{Method: http.MethodPost, Times: 1, Match: func(r *http.Request) bool { return strings.HasSuffix(r.URL.Path, "/stop") },
+		Respond: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusForbidden) }})
+	e.pass()
+	if !e.exists(m.in.Name) || len(p.calls) != 0 {
+		t.Fatalf("a machine that couldn't be stopped went, or was recorded: %v", p.calls)
+	}
+	e.pass()
+	if e.exists(m.in.Name) || !p.ageLimit[m.in.Name] {
+		t.Fatal("not stopped, recorded and deleted once it could be stopped")
 	}
 }
 

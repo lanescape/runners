@@ -1,7 +1,9 @@
 package disks_test
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -414,7 +416,8 @@ func TestAnUnusedResumeImageGoesWithItsRun(t *testing.T) {
 }
 
 // A Spot machine that a pass first finds stopped past its age limit is
-// recorded all the same, with no resume image, and its run rerun.
+// recorded all the same, with its evidence and a resume image, and its run
+// rerun.
 func TestAPreemptionPastTheAgeLimit(t *testing.T) {
 	e := setup(t)
 	run := e.mainRun()
@@ -426,15 +429,19 @@ func TestAPreemptionPastTheAgeLimit(t *testing.T) {
 	if _, ok := e.gce.Instance(jb.in.Zone, jb.in.Name); ok {
 		t.Fatal("a machine past its age limit wasn't deleted")
 	}
-	rec, ok := e.record("preemptions/5001/" + strconv.FormatInt(run.ID, 10) + "/" + strconv.FormatUint(jb.in.ID, 10) + ".json")
-	if !ok || rec["preempted"] != disks.Preempted {
+	rec, ok := e.record(lost(run, jb))
+	if !ok || rec["preempted"] != disks.Preempted || rec["age_limit"] != true {
 		t.Fatalf("preemption record = %v", rec)
 	}
-	if len(e.images()) != 0 {
-		t.Fatalf("images %v; a machine past its age limit saves nothing", e.images())
+	resume := disks.ResumeName(repoID, jb.in.ID)
+	if !e.has(resume) || len(e.images()) != 1 {
+		t.Fatalf("images %v; want only the resume image", e.images())
 	}
 	if e.attempt(run) != 2 {
 		t.Fatal("the run wasn't rerun")
+	}
+	if src := e.admit(run, e.rerunJob(run, 2, "build")).source(); src != resume {
+		t.Fatalf("the rerun's job started from %q, want %s", src, resume)
 	}
 }
 
@@ -551,47 +558,359 @@ func TestAPreemptionPastTheAgeLimitWaitsForTheRecords(t *testing.T) {
 	}
 }
 
-// A Spot machine still running past its age limit is stopped and recorded
-// before it's deleted, so a preemption after the pass read it isn't lost.
-func TestARunningSpotMachinePastTheAgeLimitIsRecorded(t *testing.T) {
+// A machine still running past its age limit, Spot or standard, is stopped
+// and recorded, with a resume image of its work disk, before it's deleted;
+// a Spot machine's record waits for evidence of a preemption no more.
+func TestARunningMachinePastTheAgeLimitIsRecorded(t *testing.T) {
+	for _, label := range []string{spot, standard} {
+		t.Run(newLabel(label), func(t *testing.T) {
+			e := setup(t)
+			run := e.mainRun()
+			jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{label}})
+			e.clock.Advance(machines.MaxAge + time.Minute)
+			e.pass()
+			if _, ok := e.gce.Instance(jb.in.Zone, jb.in.Name); ok {
+				t.Fatal("a machine past its age limit wasn't deleted")
+			}
+			want := disks.Unknown
+			if label == standard {
+				want = disks.NotPreempted
+			}
+			rec, ok := e.record(lost(run, jb))
+			if !ok || rec["preempted"] != want || rec["age_limit"] != true {
+				t.Fatalf("record = %v; want one at the age limit, preempted %s", rec, want)
+			}
+			if !e.has(disks.ResumeName(repoID, jb.in.ID)) || len(e.images()) != 1 {
+				t.Fatalf("images %v; want only the resume image", e.images())
+			}
+		})
+	}
+}
+
+// A running machine past its age limit, Spot or standard, is stopped even
+// while the records can't be read, and waits for them.
+func TestARunningMachinePastTheAgeLimitStopsWithoutTheRecords(t *testing.T) {
+	for _, label := range []string{spot, standard} {
+		t.Run(newLabel(label), func(t *testing.T) {
+			e := setup(t)
+			run := e.mainRun()
+			jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{label}})
+			e.clock.Advance(machines.MaxAge + time.Minute)
+			e.gcs.Faults().Add(fault.Rule{Method: http.MethodGet, Times: 1,
+				Match:   func(r *http.Request) bool { return r.URL.Query().Get("prefix") == "machines/" },
+				Respond: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusForbidden) }})
+			e.pass()
+			in, ok := e.gce.Instance(jb.in.Zone, jb.in.Name)
+			if !ok || in.Status != "TERMINATED" {
+				t.Fatalf("machine %v, %s; want it stopped and kept", ok, in.Status)
+			}
+			e.pass()
+			if _, ok := e.gce.Instance(jb.in.Zone, jb.in.Name); ok {
+				t.Fatal("not deleted once the records were read")
+			}
+			if _, ok := e.record(lost(run, jb)); !ok {
+				t.Fatal("not recorded")
+			}
+		})
+	}
+}
+
+// standard is a standard machine's job, with a work disk of family build,
+// in main's scope.
+const standard = "lanescape-2vcpu-linux-amd64-disk-build-" + zero + "-main"
+
+// lost is the record of a job's machine, once its job was lost.
+func lost(run *ghemu.Run, jb *job) string {
+	return "preemptions/5001/" + strconv.FormatInt(run.ID, 10) + "/" + strconv.FormatUint(jb.in.ID, 10) + ".json"
+}
+
+// atTheLimit plays a job to its machine's age limit: the pass stops the
+// machine, records the job and deletes the machine, and GitHub fails the
+// job whose runner it lost.
+func (jb *job) atTheLimit() {
+	jb.e.t.Helper()
+	jb.e.clock.Advance(machines.MaxAge)
+	jb.e.pass()
+	if _, ok := jb.e.gce.Instance(jb.in.Zone, jb.in.Name); ok {
+		jb.e.t.Fatal("a machine past its age limit wasn't deleted")
+	}
+	jb.e.gh.CompleteJobByID(jb.j.ID, "failure")
+}
+
+// specs/0002-machines.md, The age limit: a standard machine's job cut short
+// at the limit resumes, as a preempted one does, from a resume image of its
+// work disk, in its run's rerun; the resumed job's save is its own, as any
+// job's is.
+func TestAJobAtTheAgeLimitResumes(t *testing.T) {
 	e := setup(t)
 	run := e.mainRun()
-	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
-	e.clock.Advance(machines.MaxAge + time.Minute)
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{standard}})
+	if jb.in.Provisioning != "STANDARD" {
+		t.Fatalf("machine is %s", jb.in.Provisioning)
+	}
+	e.clock.Advance(machines.MaxAge - time.Second)
+	e.pass()
+	if in, ok := e.gce.Instance(jb.in.Zone, jb.in.Name); !ok || in.Status != "RUNNING" {
+		t.Fatal("a machine mid-job was stopped before its age limit")
+	}
+	e.clock.Advance(time.Second)
 	e.pass()
 	if _, ok := e.gce.Instance(jb.in.Zone, jb.in.Name); ok {
 		t.Fatal("a machine past its age limit wasn't deleted")
 	}
-	rec, ok := e.record("preemptions/5001/" + strconv.FormatInt(run.ID, 10) + "/" + strconv.FormatUint(jb.in.ID, 10) + ".json")
-	if !ok || rec["preempted"] != disks.Unknown {
-		t.Fatalf("record = %v; want one, with no evidence", rec)
+	rec, ok := e.record(lost(run, jb))
+	if !ok || rec["age_limit"] != true || rec["preempted"] != disks.NotPreempted || rec["job_id"] != float64(jb.j.ID) ||
+		rec["job_name"] != "build" || rec["family"] != "build" {
+		t.Fatalf("record = %v", rec)
 	}
-	if len(e.images()) != 0 {
-		t.Fatal("a machine past its age limit saved something")
+	resume := disks.ResumeName(repoID, jb.in.ID)
+	if !e.has(resume) {
+		t.Fatal("no resume image")
+	}
+	// The run isn't rerun until GitHub fails the job whose runner it lost,
+	// and the run finishes.
+	if e.attempt(run) != 1 {
+		t.Fatal("a run was rerun before it finished")
+	}
+	e.gh.CompleteJobByID(jb.j.ID, "failure")
+	e.pass()
+	if e.attempt(run) != 2 {
+		t.Fatal("a run whose job was lost at the age limit wasn't rerun")
+	}
+	again := e.admit(run, e.rerunJob(run, 2, "build"))
+	if src := again.source(); src != resume {
+		t.Fatalf("the rerun's job started from %q, want its resume image %s", src, resume)
+	}
+	e.pass()
+	if e.has(resume) {
+		t.Fatal("a resume image outlived its job's start")
+	}
+	before := e.images()
+	again.finish(true)
+	if im := e.saved(before); im.Labels[disks.LabelKind] != disks.KindSaved || im.Labels[disks.LabelScope] != selector.Hash("main") {
+		t.Fatalf("the resumed job's save = %+v; want main's saved disk", im)
+	}
+	if e.attempt(run) != 2 {
+		t.Fatal("a run whose rerun succeeded was rerun again")
 	}
 }
 
-// A running Spot machine past its age limit is stopped even while the
-// records can't be read, and waits for them.
-func TestARunningSpotMachinePastTheAgeLimitStopsWithoutTheRecords(t *testing.T) {
+// A lost job's run is rerun only once its resume image is ready, so that
+// the rerun's job never starts without it, Spot or standard.
+func TestARerunWaitsForTheResumeImage(t *testing.T) {
+	for _, label := range []string{spot, standard} {
+		t.Run(newLabel(label), func(t *testing.T) {
+			e := setup(t)
+			run := e.mainRun()
+			jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{label}})
+			e.gce.Faults().Add(fault.Rule{Method: http.MethodPost, Match: func(r *http.Request) bool { return strings.HasSuffix(r.URL.Path, "/global/images") },
+				Respond: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusForbidden) }})
+			if label == spot {
+				jb.preempt()
+			} else {
+				e.clock.Advance(machines.MaxAge)
+				e.gh.CompleteJobByID(jb.j.ID, "failure")
+			}
+			e.pass()
+			e.pass()
+			if _, ok := e.record(lost(run, jb)); !ok {
+				t.Fatal("not recorded")
+			}
+			if _, ok := e.gce.Instance(jb.in.Zone, jb.in.Name); !ok {
+				t.Fatal("the machine went before its resume image was made")
+			}
+			if e.attempt(run) != 1 {
+				t.Fatal("the run was rerun before its lost job's resume image was ready")
+			}
+			e.gce.Faults().Reset()
+			e.pass()
+			if e.attempt(run) != 2 {
+				t.Fatal("the run wasn't rerun once the resume image was ready")
+			}
+			if src := e.admit(run, e.rerunJob(run, 2, "build")).source(); src != disks.ResumeName(repoID, jb.in.ID) {
+				t.Fatalf("the rerun's job started from %q, not its resume image", src)
+			}
+		})
+	}
+}
+
+// A run that lost two jobs is rerun only once both are ready to resume: one
+// job's resume image ready, or its record written, doesn't let the rerun
+// start the other's job without its own.
+func TestARerunWaitsForEveryLostJob(t *testing.T) {
+	for _, held := range []string{"its resume image", "its record"} {
+		t.Run(held, func(t *testing.T) {
+			e := setup(t)
+			run := e.mainRun()
+			a := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+			b := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{spot}})
+			if held == "its resume image" {
+				name := disks.ResumeName(repoID, b.in.ID)
+				e.gce.Faults().Add(fault.Rule{Method: http.MethodPost,
+					Match: func(r *http.Request) bool {
+						if !strings.HasSuffix(r.URL.Path, "/global/images") {
+							return false
+						}
+						body, _ := io.ReadAll(r.Body)
+						r.Body = io.NopCloser(bytes.NewReader(body))
+						return bytes.Contains(body, []byte(name))
+					},
+					Respond: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusForbidden) }})
+			} else {
+				e.gcs.Faults().Add(fault.Rule{Method: http.MethodPost,
+					Match: func(r *http.Request) bool {
+						return r.URL.Query().Get("name") == lost(run, b)
+					},
+					Respond: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusForbidden) }})
+			}
+			a.preempt()
+			b.preempt()
+			e.pass()
+			e.pass()
+			if !e.has(disks.ResumeName(repoID, a.in.ID)) {
+				t.Fatal("the first job's resume image wasn't made")
+			}
+			if e.attempt(run) != 1 {
+				t.Fatalf("the run was rerun before %s was ready", held)
+			}
+			e.gce.Faults().Reset()
+			e.gcs.Faults().Reset()
+			e.pass()
+			if e.attempt(run) != 2 {
+				t.Fatal("the run wasn't rerun once both jobs were ready")
+			}
+			for _, jb := range []*job{a, b} {
+				name := e.gh.Job(jb.j.ID).Name
+				if src := e.admit(run, e.rerunJob(run, 2, name)).source(); src != disks.ResumeName(repoID, jb.in.ID) {
+					t.Fatalf("the rerun's %s started from %q, not its resume image", name, src)
+				}
+			}
+		})
+	}
+}
+
+// A lost job's run whose resume image can't be made is rerun all the same
+// once a day has passed since its machine stopped, when the image could no
+// longer resume it, and the service stops trying to make it.
+func TestARerunWaitsForTheResumeImageForADay(t *testing.T) {
 	e := setup(t)
 	run := e.mainRun()
-	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
-	e.clock.Advance(machines.MaxAge + time.Minute)
-	e.gcs.Faults().Add(fault.Rule{Method: http.MethodGet, Times: 1,
-		Match:   func(r *http.Request) bool { return r.URL.Query().Get("prefix") == "machines/" },
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{standard}})
+	e.gce.Faults().Add(fault.Rule{Method: http.MethodPost, Match: func(r *http.Request) bool { return strings.HasSuffix(r.URL.Path, "/global/images") },
+		Respond: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusForbidden) }})
+	e.clock.Advance(machines.MaxAge)
+	e.gh.CompleteJobByID(jb.j.ID, "failure")
+	e.pass()
+	if e.attempt(run) != 1 {
+		t.Fatal("rerun before its resume image was ready")
+	}
+	e.clock.Advance(disks.ResumeKept)
+	// Its deletion fails once, after the record is done: the next pass
+	// deletes it, rather than try the image again.
+	e.gce.Faults().Add(fault.Rule{Method: http.MethodDelete, Times: 1, Match: func(r *http.Request) bool { return strings.HasSuffix(r.URL.Path, "/instances/"+jb.in.Name) },
 		Respond: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusForbidden) }})
 	e.pass()
-	in, ok := e.gce.Instance(jb.in.Zone, jb.in.Name)
-	if !ok || in.Status != "TERMINATED" {
-		t.Fatalf("machine %v, %s; want it stopped and kept", ok, in.Status)
+	if _, ok := e.gce.Instance(jb.in.Zone, jb.in.Name); !ok {
+		t.Fatal("the machine went despite the fault")
+	}
+	if e.attempt(run) != 1 {
+		t.Fatal("rerun while a machine of the run hadn't gone")
 	}
 	e.pass()
 	if _, ok := e.gce.Instance(jb.in.Zone, jb.in.Name); ok {
-		t.Fatal("not deleted once the records were read")
+		t.Fatal("the machine was kept for a resume image that could no longer resume its job")
 	}
-	if _, ok := e.record("preemptions/5001/" + strconv.FormatInt(run.ID, 10) + "/" + strconv.FormatUint(jb.in.ID, 10) + ".json"); !ok {
-		t.Fatal("not recorded")
+	if e.attempt(run) != 2 {
+		t.Fatal("not rerun a day after its machine stopped")
+	}
+}
+
+// A job that never finishes resumes at most until its run has had 3
+// attempts: the third is lost at the limit for good, and its resume image
+// goes with its run.
+func TestAJobLostAtTheAgeLimitInEveryAttempt(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{standard}})
+	jb.atTheLimit()
+	e.pass()
+	for attempt := 2; attempt <= disks.MaxAttempts; attempt++ {
+		if e.attempt(run) != attempt {
+			t.Fatalf("attempt %d, want %d", e.attempt(run), attempt)
+		}
+		prev := disks.ResumeName(repoID, jb.in.ID)
+		jb = e.admit(run, e.rerunJob(run, attempt, "build"))
+		if src := jb.source(); src != prev {
+			t.Fatalf("attempt %d started from %q, want the last attempt's resume image %s", attempt, src, prev)
+		}
+		jb.atTheLimit()
+		e.pass()
+	}
+	e.pass()
+	if a := e.attempt(run); a != disks.MaxAttempts {
+		t.Fatalf("a run was rerun past %d attempts: %d", disks.MaxAttempts, a)
+	}
+	if len(e.images()) != 0 {
+		t.Fatalf("images %v; the last resume image should have gone with its run", e.images())
+	}
+}
+
+// A job of a run that saves nothing is rerun at the age limit, with no
+// resume image: it starts again as any job of its run does.
+func TestAReadRunsJobAtTheAgeLimitIsRerunWithoutAResumeImage(t *testing.T) {
+	e := setup(t)
+	run := e.gh.EventRun(e.repo, "workflow_dispatch", "main")
+	if e.bind(run) != "read" {
+		t.Fatal("not read")
+	}
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{"lanescape-2vcpu-linux-amd64-disk-build-" + zero + "-read"}})
+	jb.atTheLimit()
+	e.pass()
+	if len(e.images()) != 0 {
+		t.Fatalf("images %v; the read scope saves nothing", e.images())
+	}
+	if rec, ok := e.record(lost(run, jb)); !ok || rec["age_limit"] != true {
+		t.Fatalf("record = %v", rec)
+	}
+	if e.attempt(run) != 2 {
+		t.Fatal("a read run that lost a job at the age limit wasn't rerun")
+	}
+	if src := e.admit(run, e.rerunJob(run, 2, "build")).source(); src != "" {
+		t.Fatalf("a read run's rerun started from %q", src)
+	}
+}
+
+// A machine Compute Engine stopped at its maximum run duration, while the
+// service couldn't act, is recorded as one the service stopped at the age
+// limit, by when it stopped, and its job resumes.
+func TestAMachineTheBackstopStopped(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{standard}})
+	e.clock.Advance(machines.MaxRunDuration)
+	stopped := e.clock.Now().UTC()
+	if in, ok := e.gce.Instance(jb.in.Zone, jb.in.Name); !ok || in.Status != "TERMINATED" {
+		t.Fatalf("machine %v, %s; want Compute Engine to have stopped it", ok, in.Status)
+	}
+	e.clock.Advance(time.Hour)
+	e.gh.CompleteJobByID(jb.j.ID, "failure")
+	e.pass()
+	if _, ok := e.gce.Instance(jb.in.Zone, jb.in.Name); ok {
+		t.Fatal("the machine wasn't deleted")
+	}
+	rec, ok := e.record(lost(run, jb))
+	if !ok || rec["age_limit"] != true {
+		t.Fatalf("record = %v", rec)
+	}
+	at, _ := time.Parse(time.RFC3339Nano, rec["stopped_at"].(string))
+	if d := at.Sub(stopped); d < -time.Second || d > time.Second {
+		t.Fatalf("stopped at %s, but Compute Engine stopped it at %s", at, stopped)
+	}
+	if e.attempt(run) != 2 {
+		t.Fatal("not rerun")
+	}
+	if src := e.admit(run, e.rerunJob(run, 2, "build")).source(); src != disks.ResumeName(repoID, jb.in.ID) {
+		t.Fatalf("the rerun's job started from %q, not its resume image", src)
 	}
 }
 

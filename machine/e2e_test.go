@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -98,9 +99,12 @@ type world struct {
 	act         action
 	url         string
 	logs        *lockedBuffer
-	supervisor  string
-	hook        string
-	standIn     string
+	// later is the machines' part of the service's clock, which a test
+	// moves on to bring a machine to its age limit.
+	later      *laterClock
+	supervisor string
+	hook       string
+	standIn    string
 
 	mu       sync.Mutex
 	machines map[string]*booted
@@ -194,8 +198,9 @@ func newWorld(t *testing.T) *world {
 	dks := &disks.Service{Config: cfg, Project: gcp.Project, GitHub: ghc, Compute: gcec, Objects: objects, Clock: clock, Logger: log}
 	// A check that GitHub can't answer is answered sooner than in
 	// production, so a test sees the hook ask again without a long wait.
+	later := &laterClock{Clock: clock}
 	svc := &machines.Service{Config: cfg, Project: gcp.Project, ServiceURL: audience, MachineAccount: account,
-		GitHub: ghc, Compute: gcec, Objects: objects, Binder: binder, Machines: verifier, Clock: clock, Logger: log,
+		GitHub: ghc, Compute: gcec, Objects: objects, Binder: binder, Machines: verifier, Clock: later, Logger: log,
 		Disks: dks, Saves: dks, Preemptions: dks, FailStopDelay: time.Second, AssignmentWait: 3 * time.Second,
 		AssignmentRetry: 100 * time.Millisecond}
 	bootLogs, err := logging.New(ctx, gcp.Project, logging.View, gcp.LoggingOptions()...)
@@ -236,13 +241,26 @@ func newWorld(t *testing.T) *world {
 	}
 	w := &world{t: t, gh: gh, gce: gcp, gcs: gcs, gg: gg, org: org, repo: repo, fork: fork, contributor: contributor,
 		maintainer: gh.User(42, "maintainer"), client: ghc, objects: objects, act: action{t: t, service: srv.URL}, url: srv.URL,
-		logs: logs, supervisor: programs["supervisor"], hook: programs["hook"], standIn: standIn,
+		logs: logs, later: later, supervisor: programs["supervisor"], hook: programs["hook"], standIn: standIn,
 		machines: map[string]*booted{}, gates: map[string]chan struct{}{}, released: map[string]bool{}}
 	gcp.OnBoot(w.boot)
 	gcp.OnStop(w.halt)
 	t.Cleanup(w.haltAll)
 	return w
 }
+
+// laterClock is real time, moved on by as much as a test says.
+type laterClock struct {
+	clockwork.Clock
+	by atomic.Int64
+}
+
+func (c *laterClock) Now() time.Time                  { return c.Clock.Now().Add(time.Duration(c.by.Load())) }
+func (c *laterClock) Since(t time.Time) time.Duration { return c.Now().Sub(t) }
+func (c *laterClock) Until(t time.Time) time.Duration { return t.Sub(c.Now()) }
+
+// advance moves the clock on.
+func (c *laterClock) advance(d time.Duration) { c.by.Add(int64(d)) }
 
 // reconciler is a pass's body as the server runs it.
 type reconciler pass.Body
@@ -1039,6 +1057,76 @@ func TestASpotMachinePreemptedMidJobAndItsRunResumed(t *testing.T) {
 	if !ok || !strings.Contains(string(rec), `"preempted":"yes"`) {
 		t.Fatalf("preemption record = %s", rec)
 	}
+	var rerun *ghemu.WorkflowJob
+	for _, j := range w.gh.RunJobs(run, 2) {
+		if j.Name == "build" {
+			rerun = &ghemu.WorkflowJob{ID: j.ID}
+		}
+	}
+	if rerun == nil {
+		t.Fatal("no rerun job")
+	}
+	w.pass()
+	w.eventually("the rerun's job is done", 60*time.Second, func() bool { return w.done(rerun) })
+	second := w.runnerOf(rerun)
+	if c := w.gh.Job(rerun.ID).Conclusion; c != "success" {
+		t.Fatalf("the rerun's job: %s", c)
+	}
+	if got, img := w.diskAnswer(second), w.restored(second); got != "resume" || img != resume {
+		t.Fatalf("the rerun's job started from %q, %q, want its resume image %s", got, img, resume)
+	}
+	w.eventually("the resume image goes once its job has started from it", 60*time.Second, func() bool {
+		w.pass()
+		_, ok := w.saved()[resume]
+		return !ok
+	})
+	w.noCredentials()
+}
+
+// specs/0002-machines.md, The age limit: a standard machine whose job is
+// still running at the age limit is stopped, its job recorded with a resume
+// image of its work disk, and its run is rerun, and the rerun's job's disk
+// request is answered from the resume image, as after a preemption.
+func TestAJobStoppedAtTheAgeLimitAndItsRunResumed(t *testing.T) {
+	w := newWorld(t)
+	run := w.gh.PushRun(w.repo, "main")
+	// The first attempt runs until its machine reaches the age limit; its
+	// rerun finishes.
+	j := w.gh.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{w.act.selector(small, false)},
+		Steps: w.act.steps(w.act.diskStep("build"), `if [ "$GITHUB_RUN_ATTEMPT" = 1 ]; then sleep 600; fi`)})
+	w.pass()
+	m := w.ours()[0]
+	if m.Provisioning != "STANDARD" {
+		t.Fatalf("machine is %s", m.Provisioning)
+	}
+	w.eventually("the job runs with its work disk", 60*time.Second, func() bool {
+		bt := w.guest(m.Name)
+		if bt == nil {
+			return false
+		}
+		_, err := os.Stat(filepath.Join(bt.dir, "work", ".disk"))
+		return w.gh.Job(j.ID).Status == "in_progress" && err == nil
+	})
+	w.later.advance(machines.MaxAge)
+	w.pass()
+	if !w.gone(m.Name) {
+		t.Fatal("a machine past its age limit wasn't deleted")
+	}
+	resume := disks.ResumeName(repoID, m.ID)
+	if _, ok := w.saved()[resume]; !ok {
+		t.Fatalf("images %v; want the resume image %s", w.saved(), resume)
+	}
+	rec, _, ok := w.gcs.Object("state", "preemptions/5001/"+strconv.FormatInt(run.ID, 10)+"/"+strconv.FormatUint(m.ID, 10)+".json")
+	if !ok || !strings.Contains(string(rec), `"age_limit":true`) || !strings.Contains(string(rec), `"preempted":"no"`) {
+		t.Fatalf("record = %s", rec)
+	}
+	// GitHub fails the job whose runner it lost.
+	w.gh.CompleteJobByID(j.ID, "failure")
+	w.eventually("the run is rerun", 60*time.Second, func() bool {
+		w.pass()
+		status, _ := w.gh.RunState(run)
+		return status == "in_progress"
+	})
 	var rerun *ghemu.WorkflowJob
 	for _, j := range w.gh.RunJobs(run, 2) {
 		if j.Name == "build" {

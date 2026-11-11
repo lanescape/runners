@@ -13,24 +13,31 @@ import (
 	"github.com/lanescape/runners/internal/scope"
 )
 
-// Stopped records a Spot machine that stopped with its job admitted,
-// before it's deleted (specs/0002-machines.md, Preemption): its instance
-// ID, zone, the job's ID, runner ID and name, its run and attempt, its
-// selector, and whether it was preempted, yes or unknown. If its scope
-// saves disks, it then makes a resume image of its work disk. It implements
+// Stopped records a machine that stopped with its job admitted and
+// unfinished, before it's deleted (specs/0002-machines.md, Preemption): a
+// Spot machine, preempted or perhaps, or any machine the service stopped at
+// its age limit, which ageLimit says. The record holds its instance ID,
+// zone, the job's ID, runner ID and name, its run and attempt, its
+// selector, whether it was preempted, yes, unknown, or no for a standard
+// machine, and whether it was stopped at its age limit. If its scope saves
+// disks, it then makes a resume image of its work disk. It implements
 // machines.Preemptions, and is called again until it returns nil.
-func (s *Service) Stopped(ctx context.Context, m machines.Machine, a machines.Admission, preempted, resume bool) error {
+func (s *Service) Stopped(ctx context.Context, m machines.Machine, a machines.Admission, preempted, ageLimit bool) error {
 	repo := m.RepositoryID
-	if !preempted {
-		_, _, ok, err := getJSON[Event](ctx, s.Objects, eventKey(m.ID))
-		if err != nil {
-			return err
+	// Only Spot machines are preempted.
+	evidence := NotPreempted
+	if m.Spot {
+		if !preempted {
+			_, _, ok, err := getJSON[Event](ctx, s.Objects, eventKey(m.ID))
+			if err != nil {
+				return err
+			}
+			preempted = ok
 		}
-		preempted = ok
-	}
-	evidence := Unknown
-	if preempted {
-		evidence = Preempted
+		evidence = Unknown
+		if preempted {
+			evidence = Preempted
+		}
 	}
 	// The day a resume image is kept, and evidence looked for, counts from
 	// when Compute Engine stopped the machine, not from when a pass saw it.
@@ -41,24 +48,46 @@ func (s *Service) Stopped(ctx context.Context, m machines.Machine, a machines.Ad
 	key := preemptionKey(repo, a.RunID, m.ID)
 	rec, gen, err := createOnce(ctx, s.Objects, key, Preemption{InstanceID: m.ID, Machine: m.Name, Zone: m.Zone, RepositoryID: repo,
 		JobID: a.JobID, RunnerID: m.RunnerID, JobName: a.JobName, RunID: a.RunID, RunAttempt: a.RunAttempt, Selector: a.Selector,
-		Arch: m.Selector.Arch, Family: m.Selector.Family, Preempted: evidence, StoppedAt: stopped})
+		Arch: m.Selector.Arch, Family: m.Selector.Family, Preempted: evidence, AgeLimit: ageLimit, StoppedAt: stopped})
 	if err != nil {
 		return err
 	}
-	if preempted && rec.Preempted != Preempted {
+	if preempted && rec.Preempted == Unknown {
 		rec.Preempted = Preempted
 		if gen, err = replaceJSON(ctx, s.Objects, key, rec, gen); err != nil {
 			return err
 		}
 	}
-	log := s.log().With("machine", m.Name, "instance_id", m.ID, "run_id", a.RunID, "job_id", a.JobID, "preempted", rec.Preempted)
-	if !resume {
-		log.Info("stopped Spot machine recorded, past its age limit, with no resume image")
+	log := s.log().With("machine", m.Name, "instance_id", m.ID, "run_id", a.RunID, "job_id", a.JobID, "preempted", rec.Preempted,
+		"age_limit", rec.AgeLimit)
+	// done records that nothing more is to be made for the job: its run is
+	// rerun only then, so that its rerun's job never asks for its work disk
+	// before the resume image it would start from is ready.
+	done := func(msg string, args ...any) error {
+		if !rec.Done {
+			rec.Done = true
+			if _, err := replaceJSON(ctx, s.Objects, key, rec, gen); err != nil {
+				return err
+			}
+		}
+		log.Info(msg, args...)
+		return nil
+	}
+	if rec.Done {
+		// Recorded already, with its resume image ready or none to make:
+		// nothing is made again, whatever went wrong after.
+		log.Info("stopped machine recorded")
 		return nil
 	}
 	if !m.Selector.Scope.Saves() || rec.NoDisk || rec.Family == "" {
-		log.Info("stopped Spot machine recorded")
-		return nil
+		return done("stopped machine recorded")
+	}
+	// A resume image not ready a day after its machine stopped could no
+	// longer resume the job: the service stops trying to make it, and the
+	// machine goes.
+	if s.now().Sub(rec.StoppedAt) >= ResumeKept {
+		log.Warn("no resume image: it wasn't made within a day of its machine stopping")
+		return done("stopped machine recorded")
 	}
 	// A repository transferred out of the organization gets no resume
 	// image of the organization's.
@@ -66,21 +95,19 @@ func (s *Service) Stopped(ctx context.Context, m machines.Machine, a machines.Ad
 		return err
 	} else if repo.OwnerID != s.Config.Organization.ID {
 		log.Warn("no resume image: the repository is no longer the organization's")
-		return nil
+		return done("stopped machine recorded")
 	}
 	if rec.ResumeImage == "" {
 		_, err := s.Compute.Disk(ctx, m.Zone, machines.WorkDisk(m.Name))
 		if errors.Is(err, compute.ErrNotFound) {
 			rec.NoDisk = true
-			_, err = replaceJSON(ctx, s.Objects, key, rec, gen)
-			log.Info("stopped Spot machine recorded; it had no work disk to resume from")
-			return err
+			return done("stopped machine recorded; it had no work disk to resume from")
 		}
 		if err != nil {
 			return err
 		}
 		rec.ResumeImage = ResumeName(repo, m.ID)
-		if _, err = replaceJSON(ctx, s.Objects, key, rec, gen); err != nil {
+		if gen, err = replaceJSON(ctx, s.Objects, key, rec, gen); err != nil {
 			return err
 		}
 	}
@@ -106,8 +133,7 @@ func (s *Service) Stopped(ctx context.Context, m machines.Machine, a machines.Ad
 	if im, _, err = s.make(ctx, ikey, im, igen); err != nil {
 		return err
 	}
-	log.Info("stopped Spot machine recorded, with a resume image", "image", im.Image)
-	return nil
+	return done("stopped machine recorded, with a resume image", "image", im.Image)
 }
 
 // logEntry is what the service reads of a Cloud Logging entry the log sink
