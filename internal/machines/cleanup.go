@@ -187,7 +187,7 @@ func (s *Service) finish(ctx context.Context, inv *inventory, m Machine, why str
 			return
 		} else if save {
 			if s.Saves == nil {
-				log.Warn("the job asked to save its work disk, but saving isn't built yet; deleting it")
+				log.Warn("the job asked to save its work disk, but this service saves no disks; deleting it")
 			} else {
 				if !m.Stopped() {
 					// The disk is saved from the stopped machine. The

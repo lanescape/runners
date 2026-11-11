@@ -80,7 +80,7 @@ func TestAReportEndsTheMachine(t *testing.T) {
 	}
 }
 
-func TestASaveIsntBuiltYet(t *testing.T) {
+func TestAServiceThatSavesNothing(t *testing.T) {
 	e := setup(t)
 	e.repo.Commit("main", map[string]string{".github/runners.json": declares})
 	m, _ := e.admitted(sel2)
@@ -92,8 +92,8 @@ func TestASaveIsntBuiltYet(t *testing.T) {
 	m.finished()
 	m.report()
 	e.pass()
-	if e.exists(m.in.Name) || !e.logged("saving isn't built yet") {
-		t.Fatal("a save that isn't built yet should be logged, and the machine deleted")
+	if e.exists(m.in.Name) || !e.logged("this service saves no disks") {
+		t.Fatal("a save the service can't make should be logged, and the machine deleted")
 	}
 }
 
@@ -115,7 +115,7 @@ func TestNoReport(t *testing.T) {
 	}
 }
 
-func TestAMachinePastFiveHours(t *testing.T) {
+func TestAMachinePastItsAgeLimit(t *testing.T) {
 	e := setup(t)
 	m, _ := e.admitted(sel2)
 	e.clock.Advance(machines.MaxAge - time.Second)
