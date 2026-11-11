@@ -510,7 +510,8 @@ func refusals(t T, w *world) {
 	if a.Status != http.StatusForbidden || !strings.Contains(a.Reason, "deps.txt") {
 		t.Fatalf("a family whose listed file doesn't exist: %d %q", a.Status, a.Reason)
 	}
-	for _, file := range []string{`{"disks": {"cache": {}}, "images": {"build": ".github/images/build"}}`, `{"disks": {"cache": {"from": "x"}}}`, `[]`} {
+	for _, file := range []string{`{"disks": {"cache": {}}, "images": {"build": ".github/images/build"}}`, `{"disks": {"cache": {"from": "x"}}}`, `[]`,
+		`{"disks": {"cache": null}}`, `{"disks": {"cache": {"FROM": []}}}`} {
 		w.Commit(repo, "main", map[string]string{consumer.RunnersFile: file})
 		invalid := w.start(w.Push(repo, "main"), Small)
 		a, _ = w.c.Disk(w.Token(invalid), "cache")

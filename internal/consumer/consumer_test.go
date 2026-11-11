@@ -36,6 +36,12 @@ func TestParse(t *testing.T) {
 	if f.Branches["support/v1"] != "v1" || len(f.Disks["build"].From) != 2 || f.Disks["tools"].From != nil {
 		t.Fatalf("parsed %+v", f)
 	}
+	// A family that lists no files has a key of its name alone; one
+	// declared {} has the key of zeros.
+	f, err = consumer.Parse([]byte(`{"disks": {"none": {"from": []}, "zero": {}}}`))
+	if err != nil || f.Disks["none"].From == nil || f.Disks["zero"].From != nil {
+		t.Fatalf("parsed %+v, %v", f, err)
+	}
 	for _, bad := range []string{
 		``, `[]`, `null`, `{"Disks": {}}`, `{"bootstrap": "x"}`, `{"disks": []}`, `{"disks": {"build": {"from": "a"}}}`,
 		`{"disks": {"build": {"from": ["/a"]}}}`, `{"disks": {"build": {"from": ["a/../b"]}}}`, `{"disks": {"build": {"from": ["a", "a"]}}}`,
@@ -44,6 +50,10 @@ func TestParse(t *testing.T) {
 		// There are no consumer images: "images" is an unknown field like
 		// any other (specs/0005-interface.md, A consumer's files).
 		`{"images": {}}`, `{"images": {"build": ".github/images/build"}}`, `{"disks": {}, "images": {}}`,
+		// A declaration is exactly {} or {"from": [...]}.
+		`{"disks": {"build": null}}`, `{"disks": {"build": {"from": null}}}`, `{"disks": {"build": {"FROM": ["deps.txt"]}}}`,
+		`{"disks": {"build": {"From": []}}}`, `{"disks": {"build": []}}`, `{"disks": {"build": {"from": [1]}}}`, `{"branches": null}`,
+		`{"disks": null}`,
 	} {
 		if _, err := consumer.Parse([]byte(bad)); !errors.Is(err, consumer.ErrInvalid) {
 			t.Errorf("Parse(%s) = %v, want invalid", bad, err)

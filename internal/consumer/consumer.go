@@ -95,15 +95,20 @@ func Parse(data []byte) (File, error) {
 				if !selector.ValidName(family) {
 					return File{}, invalid("%s: %q isn't a family's name", RunnersFile, family)
 				}
-				var decl struct {
-					From *[]string `json:"from"`
-				}
-				if err := strict(raw, &decl); err != nil {
+				// Exactly {} or {"from": [<path>, ...]}: no other field, no
+				// other case, and neither null.
+				var decl map[string]json.RawMessage
+				if err := strict(raw, &decl); err != nil || decl == nil {
 					return File{}, invalid("%s: family %s: its declaration isn't {\"from\": [...]} or {}", RunnersFile, family)
 				}
 				var dd Disk
-				if decl.From != nil {
-					dd.From = *decl.From
+				for k, v := range decl {
+					if k != "from" || !bytes.HasPrefix(bytes.TrimSpace(v), []byte("[")) || json.Unmarshal(v, &dd.From) != nil {
+						return File{}, invalid("%s: family %s: its declaration isn't {\"from\": [...]} or {}", RunnersFile, family)
+					}
+					if dd.From == nil {
+						dd.From = []string{}
+					}
 				}
 				seen := map[string]bool{}
 				for _, p := range dd.From {
