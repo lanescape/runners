@@ -74,7 +74,9 @@ type standInJob struct {
 	Name  string            `json:"name"`
 	Env   map[string]string `json:"env"`
 	Steps string            `json:"steps"`
-	Event json.RawMessage   `json:"event"`
+	// AlwaysSteps run after a failure, of the hook or of the steps.
+	AlwaysSteps string          `json:"always_steps"`
+	Event       json.RawMessage `json:"event"`
 }
 
 // Run registers, takes one job, runs it and reports it. It returns once the
@@ -207,6 +209,11 @@ func (s StandIn) Run(ctx context.Context) error {
 		if err := runBash("-c", job.Steps); err != nil {
 			conclusion = "failure"
 		}
+	}
+	// A failed hook fails the job, but the steps whose condition is
+	// always() or failure() still run, as on the real runner.
+	if conclusion == "failure" && job.AlwaysSteps != "" && jctx.Err() == nil {
+		_ = runBash("-c", job.AlwaysSteps)
 	}
 	if ctx.Err() != nil {
 		// Killed with its job: it reports nothing.

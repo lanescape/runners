@@ -327,20 +327,28 @@ func TestStandInTakesAnyJobItsLabelsMatch(t *testing.T) {
 	}
 }
 
+// A hook that fails fails the job: its steps don't run, but those whose
+// condition is always() or failure() do, as on the real runner.
 func TestStandInHookFailureFailsTheJob(t *testing.T) {
 	e := setup(t)
 	run := e.emu.PushRun(e.repo, "main")
-	j := e.emu.Queue(run, ghemu.JobSpec{Labels: []string{"x"}, Steps: "exit 0"})
 	dir := t.TempDir()
+	j := e.emu.Queue(run, ghemu.JobSpec{Labels: []string{"x"}, Steps: `touch "$OUT/steps"`, AlwaysSteps: `touch "$OUT/always"`})
 	hook := filepath.Join(dir, "hook.sh")
 	_ = os.WriteFile(hook, []byte("exit 3"), 0o755)
-	standIn(t, e, "lsr-5001-bbbbbbbb", []string{"x"}, hook, nil, func(ctx context.Context, s ghemu.StandIn) {
+	standIn(t, e, "lsr-5001-bbbbbbbb", []string{"x"}, hook, append(os.Environ(), "OUT="+dir), func(ctx context.Context, s ghemu.StandIn) {
 		if err := s.Run(ctx); err != nil {
 			t.Fatal(err)
 		}
 	})
 	if got := e.emu.Job(j.ID); got.Conclusion != "failure" {
 		t.Fatalf("job = %s %s, want a failure", got.Status, got.Conclusion)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "steps")); err == nil {
+		t.Fatal("a job's steps ran after its hook failed")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "always")); err != nil {
+		t.Fatal("a step whose condition is always() didn't run after the hook failed")
 	}
 }
 

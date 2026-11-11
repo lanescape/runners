@@ -54,6 +54,10 @@ type WorkflowJob struct {
 	// with the job's environment; its exit status decides the job's
 	// conclusion. Empty means steps that succeed at once.
 	Steps string
+	// AlwaysSteps is a bash script of the steps whose condition is
+	// always() or failure(): the stand-in runs it after the job-started
+	// hook fails, or after Steps fail, as the real runner does.
+	AlwaysSteps string
 
 	delivered  bool
 	cancelling bool
@@ -67,6 +71,7 @@ type JobSpec struct {
 	Environment string
 	Env         map[string]string
 	Steps       string
+	AlwaysSteps string
 }
 
 // Approval is a reviewer's decision on a run's pending deployments, as its
@@ -172,7 +177,7 @@ func (e *Emulator) Queue(r *Run, spec JobSpec) *WorkflowJob {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	j := &WorkflowJob{ID: e.id(), Run: r, Attempt: r.Attempt, Name: spec.Name, Labels: slices.Clone(spec.Labels),
-		Environment: spec.Environment, Env: spec.Env, Steps: spec.Steps, Status: "queued", Created: e.clock.Now()}
+		Environment: spec.Environment, Env: spec.Env, Steps: spec.Steps, AlwaysSteps: spec.AlwaysSteps, Status: "queued", Created: e.clock.Now()}
 	if j.Name == "" {
 		j.Name = fmt.Sprintf("job-%d", j.ID)
 	}
@@ -1074,7 +1079,7 @@ func (e *Emulator) rerunFailedJobs(w http.ResponseWriter, r *http.Request, rp *R
 	run.Triggers[run.Attempt] = in.App.Bot
 	for _, j := range last {
 		n := &WorkflowJob{ID: e.id(), Run: run, Attempt: run.Attempt, Name: j.Name, Labels: slices.Clone(j.Labels),
-			Environment: j.Environment, Env: j.Env, Steps: j.Steps, Status: "queued", Created: e.clock.Now()}
+			Environment: j.Environment, Env: j.Env, Steps: j.Steps, AlwaysSteps: j.AlwaysSteps, Status: "queued", Created: e.clock.Now()}
 		if !failedConclusions[j.Conclusion] {
 			n.Status, n.Conclusion, n.Started, n.Completed = "completed", j.Conclusion, j.Started, j.Completed
 		}
@@ -1196,7 +1201,7 @@ func (e *Emulator) runnerAcquire(w http.ResponseWriter, r *http.Request, rn *Run
 			j.delivered = true
 			body := map[string]any{
 				"id": j.ID, "run_id": j.Run.ID, "attempt": j.Attempt, "name": j.Name,
-				"repository": j.Run.Repo.FullName(), "env": e.jobEnv(j), "steps": j.Steps, "event": EventPayload(j.Run),
+				"repository": j.Run.Repo.FullName(), "env": e.jobEnv(j), "steps": j.Steps, "always_steps": j.AlwaysSteps, "event": EventPayload(j.Run),
 			}
 			e.notify()
 			e.mu.Unlock()

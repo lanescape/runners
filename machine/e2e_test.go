@@ -667,7 +667,7 @@ func TestAJobFailedWithItsReason(t *testing.T) {
 	// the smallest shape, standard; this job asks for Spot. It's given a
 	// machine like any queued job, and its check fails it.
 	j := w.gh.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{w.act.selector(small, true)},
-		Steps: `touch "$LSR_TEST_DIR/a-step-ran"`})
+		Steps: `touch "$LSR_TEST_DIR/a-step-ran"`, AlwaysSteps: `touch "$LSR_TEST_DIR/an-always-step-ran"`})
 	w.pass()
 	m := w.madeFor(j)
 	w.eventually("the hook prints why in the job's log", 60*time.Second, func() bool {
@@ -687,8 +687,12 @@ func TestAJobFailedWithItsReason(t *testing.T) {
 	if c := w.gh.Job(j.ID).Conclusion; c == "success" {
 		t.Fatal("a failed job succeeded")
 	}
-	if _, err := os.Stat(filepath.Join(w.guest(m.Name).dir, "a-step-ran")); err == nil {
-		t.Fatal("a failed job's step ran")
+	// The hook never returns, so not even a step whose condition is
+	// always() runs.
+	for _, f := range []string{"a-step-ran", "an-always-step-ran"} {
+		if _, err := os.Stat(filepath.Join(w.guest(m.Name).dir, f)); err == nil {
+			t.Fatalf("a failed job's step ran: %s", f)
+		}
 	}
 	if s := w.scope(run); s != "" {
 		t.Fatalf("an unapproved contribution's run was bound %q", s)
@@ -765,7 +769,8 @@ func TestAForksJobHandedToAMachine(t *testing.T) {
 	w.fork.Commit("evil", map[string]string{"x": "1"})
 	p := w.gh.PullRequest(w.repo, "main", w.fork, "evil", w.contributor)
 	forkRun := w.gh.PullRequestRun(p)
-	stray := w.gh.Queue(forkRun, ghemu.JobSpec{Name: "steal", Labels: []string{sel}, Steps: `touch "$LSR_TEST_DIR/a-fork-ran"`})
+	stray := w.gh.Queue(forkRun, ghemu.JobSpec{Name: "steal", Labels: []string{sel}, Steps: `touch "$LSR_TEST_DIR/a-fork-ran"`,
+		AlwaysSteps: `touch "$LSR_TEST_DIR/a-fork-ran"`})
 	second := w.gh.Queue(forkRun, ghemu.JobSpec{Name: "steal-too", Labels: []string{sel}})
 	meant := w.gh.Queue(main, ghemu.JobSpec{Name: "build", Labels: []string{sel}})
 	w.gh.Faults().Add(fault.Rule{Method: http.MethodPost, Match: func(r *http.Request) bool {
