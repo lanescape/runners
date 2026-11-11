@@ -180,6 +180,10 @@ type Record struct {
 	// Attempts is how many builders were made, or may have been: each is
 	// counted before it's made.
 	Attempts int `json:"attempts"`
+	// Started is when the latest attempt was counted, before its builder
+	// was made: the build's limit runs from it, whatever becomes of the
+	// builder.
+	Started time.Time `json:"started,omitzero"`
 	// Seen is the instance ID of the builder last seen, so that one that
 	// goes without its failure recorded is counted as failed.
 	Seen uint64 `json:"seen,omitempty"`
@@ -371,12 +375,20 @@ func (s *Service) advance(ctx context.Context, inv *inventory, arch, key string)
 			}
 			s.prune(ctx, inv, arch, im)
 		default:
-			// Not ready: within the build's limit, from its builder's
-			// making, or the image's own if its builder is gone, a failed
-			// image is deleted, to be made again from the stopped builder,
-			// and one being made or deleted is waited for. Past it, the
-			// build fails, whatever becomes of the image.
+			// Not ready: within the build's limit, from its attempt's
+			// start, a failed image is deleted, to be made again from the
+			// stopped builder, and one being made or deleted is waited
+			// for. Past it, the build fails, whatever becomes of the image
+			// or the builder.
+			rec, gen, err := s.record(ctx, arch, key)
+			if err != nil {
+				s.log().Error("reading a base image's record", "arch", arch, "key", key, "err", err.Error())
+				return
+			}
 			since := im.Created
+			if !rec.Started.IsZero() && rec.Started.Before(since) {
+				since = rec.Started
+			}
 			for _, b := range builders {
 				if b.Created.Before(since) {
 					since = b.Created
@@ -389,21 +401,24 @@ func (s *Service) advance(ctx context.Context, inv *inventory, arch, key string)
 					s.log().Warn("deleting a base image that wasn't made", "image", name, "err", err.Error())
 				}
 			}
-			if !late {
-				return
-			}
-			rec, gen, err := s.record(ctx, arch, key)
-			if err != nil {
-				s.log().Error("reading a base image's record", "arch", arch, "key", key, "err", err.Error())
-				return
-			}
-			reason := fmt.Sprintf("no ready image within %d hours of its builder being made", int(BuildLimit.Hours()))
-			for _, b := range builders {
-				if rec.failed(b.ID) {
-					s.deleteBuilder(ctx, b, "its build failed")
-					continue
+			if late {
+				reason := fmt.Sprintf("no ready image within %d hours of its builder being made", int(BuildLimit.Hours()))
+				for _, b := range builders {
+					if rec.failed(b.ID) {
+						s.deleteBuilder(ctx, b, "its build failed")
+						continue
+					}
+					rec, gen = s.failWith(ctx, arch, key, rec, gen, b, reason, "")
 				}
-				rec, gen = s.failWith(ctx, arch, key, rec, gen, b, reason, "")
+				if len(builders) == 0 && inv.listed {
+					var ok bool
+					if rec, gen, ok = s.settle(ctx, arch, key, rec, gen, reason); !ok {
+						return
+					}
+				}
+			}
+			if len(builders) == 0 && rec.Attempts >= Attempts && len(rec.Failures) >= rec.Attempts {
+				s.exhausted(inv, arch, key, rec)
 			}
 		}
 		return
@@ -419,38 +434,12 @@ func (s *Service) advance(ctx context.Context, inv *inventory, arch, key string)
 			// A builder may be in a zone that wasn't listed.
 			return
 		}
-		// The builder last seen went without its failure recorded, such
-		// as one deleted by someone else, or by Compute Engine at its
-		// maximum run duration while the service couldn't act.
-		// So does any other builder counted and never seen to fail, such
-		// as one that went before a pass saw it, or whose making's answer
-		// was lost and that was never made: every attempt ends in a
-		// failure once its builder is gone.
-		changed := false
-		if rec.Seen != 0 && !rec.failed(rec.Seen) {
-			rec.Failures = append(rec.Failures, Failure{Builder: rec.Seen, At: s.now(), Reason: "the builder went before its image was ready"})
-			changed = true
-		}
-		for len(rec.Failures) < rec.Attempts {
-			rec.Failures = append(rec.Failures, Failure{At: s.now(), Reason: "the builder went before a pass saw it, or was never made"})
-			changed = true
-		}
-		if changed {
-			if gen, err = s.write(ctx, rec, gen); err != nil {
-				s.log().Warn("recording a base image builder that went", "arch", arch, "key", key, "err", err.Error())
-				return
-			}
-			s.log().Warn("base image build failed", "arch", arch, "key", key, "attempt", rec.Attempts, "of", Attempts,
-				"reason", rec.Failures[len(rec.Failures)-1].Reason)
+		var ok bool
+		if rec, gen, ok = s.settle(ctx, arch, key, rec, gen, ""); !ok {
+			return
 		}
 		if rec.Attempts >= Attempts {
-			last := ""
-			if n := len(rec.Failures); n > 0 {
-				last = rec.Failures[n-1].Reason
-			}
-			boot, _ := Boot(inv.images, arch, key)
-			s.log().Error("base image builds failed; making no more for this key", "arch", arch, "key", key, "image", name,
-				"attempts", rec.Attempts, "last_failure", last, "machines_boot", boot)
+			s.exhausted(inv, arch, key, rec)
 			return
 		}
 		return s.makeBuilder(ctx, arch, key, rec, gen)
@@ -517,6 +506,55 @@ func (s *Service) advance(ctx context.Context, inv *inventory, arch, key string)
 	return holdNone
 }
 
+// settle records every attempt whose builder went without its failure
+// recorded as failed: the builder last seen, such as one deleted by someone
+// else or by Compute Engine at its maximum run duration while the service
+// couldn't act, and any other counted and never seen to fail, such as one
+// that went before a pass saw it, or whose making's answer was lost and
+// that was never made. reason, if given, is why. It reports whether the
+// record is as written.
+func (s *Service) settle(ctx context.Context, arch, key string, rec Record, gen int64, reason string) (Record, int64, bool) {
+	changed := false
+	if rec.Seen != 0 && !rec.failed(rec.Seen) {
+		why := reason
+		if why == "" {
+			why = "the builder went before its image was ready"
+		}
+		rec.Failures = append(rec.Failures, Failure{Builder: rec.Seen, At: s.now(), Reason: why})
+		changed = true
+	}
+	for len(rec.Failures) < rec.Attempts {
+		why := reason
+		if why == "" {
+			why = "the builder went before a pass saw it, or was never made"
+		}
+		rec.Failures = append(rec.Failures, Failure{At: s.now(), Reason: why})
+		changed = true
+	}
+	if !changed {
+		return rec, gen, true
+	}
+	gen, err := s.write(ctx, rec, gen)
+	if err != nil {
+		s.log().Warn("recording a base image builder that went", "arch", arch, "key", key, "err", err.Error())
+		return rec, gen, false
+	}
+	s.log().Warn("base image build failed", "arch", arch, "key", key, "attempt", rec.Attempts, "of", Attempts,
+		"reason", rec.Failures[len(rec.Failures)-1].Reason)
+	return rec, gen, true
+}
+
+// exhausted logs, at every pass, that a key's builders have all failed.
+func (s *Service) exhausted(inv *inventory, arch, key string, rec Record) {
+	last := ""
+	if n := len(rec.Failures); n > 0 {
+		last = rec.Failures[n-1].Reason
+	}
+	boot, _ := Boot(inv.images, arch, key)
+	s.log().Error("base image builds failed; making no more for this key", "arch", arch, "key", key, "image", ImageName(arch, key),
+		"attempts", rec.Attempts, "last_failure", last, "machines_boot", boot)
+}
+
 // Result reads a builder's console: whether it said it built the image of
 // arch and key, or why it failed, which wins if it said both.
 func Result(console, arch, key string) (built bool, failed string) {
@@ -568,6 +606,7 @@ func (s *Service) makeBuilder(ctx context.Context, arch, key string, rec Record,
 		script = machine.BuildScript()
 	}
 	rec.Attempts++
+	rec.Started = s.now()
 	attempt := rec.Attempts
 	gen, err := s.write(ctx, rec, gen)
 	if err != nil {

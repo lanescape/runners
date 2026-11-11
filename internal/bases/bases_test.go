@@ -862,3 +862,70 @@ func TestABuilderNoPassSawStillFails(t *testing.T) {
 		t.Fatalf("no new builder: %+v", b2)
 	}
 }
+
+// TestABuildsLimitRunsFromItsAttempt: a builder that goes while its image is
+// still being made doesn't move the build's limit, which runs from when its
+// attempt was counted.
+func TestABuildsLimitRunsFromItsAttempt(t *testing.T) {
+	e := setup(t)
+	e.only("amd64")
+	e.gce.HoldImages(true)
+	e.pass()
+	b, _ := e.builder("amd64")
+	e.clock.Advance(50 * time.Minute)
+	e.say(b, e.built("amd64"))
+	e.pass()
+	name := bases.ImageName("amd64", e.keys["amd64"])
+	if im, ok := e.image(name); !ok || im.Status != "PENDING" {
+		t.Fatalf("image = %+v, %v", im, ok)
+	}
+	if err := e.gcec.DeleteInstance(context.Background(), b.Zone, b.Name, compute.RequestID("someone")); err != nil {
+		t.Fatal(err)
+	}
+	e.clock.Advance(70 * time.Minute)
+	e.pass()
+	if _, ok := e.image(name); ok {
+		t.Fatal("the image kept past its build's limit")
+	}
+	r, _ := e.record("amd64")
+	if len(r.Failures) != 1 || r.Failures[0].Builder != b.ID || !strings.Contains(r.Failures[0].Reason, "within 2 hours") {
+		t.Fatalf("record = %+v", r)
+	}
+}
+
+// TestGivingUpIsLoggedWhateverTheImage: once a key's builders have all
+// failed, the error is logged at every pass, even while a failed image of
+// it won't go.
+func TestGivingUpIsLoggedWhateverTheImage(t *testing.T) {
+	e := setup(t)
+	e.only("amd64")
+	for i := 0; i < bases.Attempts-1; i++ {
+		e.pass()
+		b, _ := e.builder("amd64")
+		e.say(b, machine.Failed+"no network")
+		e.pass()
+		e.clock.Advance(time.Minute)
+	}
+	e.pass()
+	b, _ := e.builder("amd64")
+	e.say(b, e.built("amd64"))
+	e.gce.FailNextOperation("images.insert.leave", "INTERNAL_ERROR")
+	e.pass()
+	name := bases.ImageName("amd64", e.keys["amd64"])
+	e.gce.ServerError(http.MethodDelete, "/global/images/"+name, http.StatusForbidden, 1000)
+	e.clock.Advance(bases.BuildLimit)
+	e.pass()
+	e.pass()
+	if r, _ := e.record("amd64"); r.Attempts != bases.Attempts || len(r.Failures) != bases.Attempts {
+		t.Fatalf("record = %+v", r)
+	}
+	// The pass that fails the last build deletes its builder; each pass
+	// after it logs the error.
+	if n := strings.Count(e.logs.String(), "making no more for this key"); n != 1 {
+		t.Fatalf("logged giving up %d times", n)
+	}
+	e.pass()
+	if n := strings.Count(e.logs.String(), "making no more for this key"); n != 2 {
+		t.Fatalf("logged giving up %d times", n)
+	}
+}
