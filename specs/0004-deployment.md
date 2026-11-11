@@ -10,6 +10,7 @@ Go, at the latest stable release, pinned by `go.mod`'s `toolchain` line, using G
 - `conformance/`: the interface's test suite, which holds the emulator and the service to the same answers.
 - `config/`: the organization's ID, shapes, the runner version, and the base images' Debian images, Go checksums and builders (`base.yaml`).
 - `machine/`: the supervisor, the job-started hook and the work disk's mount program, with the units and rule that start them, and the builder's script, `build-base.sh`, embedded into the service's binary and baked into the base images by the service's own builders (specs/0003-disks.md, Making a base image), so that what a machine does before its job starts is the service's alone, and what it does after, the service checks against GitHub's records (specs/0002-machines.md, A machine's life): every machine boots a base image, and no consumer can change one (specs/0003-disks.md).
+- `cd/`: CD's preview and apply of `infra/`, which `cd.yml` runs, and its test against stand-ins for gcloud and curl.
 - `infra/`: the Terraform for everything the service runs on.
 - `bootstrap/`: the Terraform that lets `infra/` be applied at all (below).
 
