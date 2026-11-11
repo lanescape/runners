@@ -22,10 +22,10 @@ gcloud infra-manager deployments apply \
   --git-source-ref="$GITHUB_SHA" \
   --artifacts-gcs-bucket=gs://lanescape-runners-infra-manager \
   --tf-version-constraint=1.5.7 \
-  --input-values="github_app_id=<App ID>,service_image=<image>@sha256:<digest>"
+  --input-values="github_app_id=<App ID>,service_image=<image>@sha256:<digest>,deploy_id=<run ID>-<attempt>"
 ```
 
-The source must come from the repository, not be uploaded: uploading needs project-wide Cloud Storage access that CD doesn't have. The image must be in the `lanescape-runners` repository, by digest. Terraform here must work with 1.5.7, Infrastructure Manager's newest; CI validates it with that and the latest.
+`deploy_id`, on the Cloud Run service's template, makes every apply a new revision, even of an image already deployed, so a rerun of a deploy whose revision couldn't start tries again. The source must come from the repository, not be uploaded: uploading needs project-wide Cloud Storage access that CD doesn't have. The image must be in the `lanescape-runners` repository, by digest. Terraform here must work with 1.5.7, Infrastructure Manager's newest; CI validates it with that and the latest.
 
 `check.sh`, which CI runs, refuses provisioners, `local-exec`, `external` data sources and modules here, any network here, any firewall rule or policy here or in `bootstrap/`, and any grant that replaces a policy rather than adding a member.
 

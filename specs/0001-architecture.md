@@ -53,13 +53,13 @@ A pass:
 
 1. Lists the queued jobs of every consumer's runs, the service's machines, disks and Compute Engine images, and its records.
 2. Stops every machine past its age limit, before it changes anything else (specs/0002-machines.md, The age limit).
-3. Gives queued jobs machines, in one order, oldest first, from one pool for every consumer (specs/0002-machines.md, One pool).
-4. Saves the work disks of jobs that asked, and makes resume images for jobs lost to a preemption or to the age limit (specs/0003-disks.md).
-5. Reruns runs that lost a job to a preemption or to the age limit, once they've finished.
-6. Deletes what's finished, too old, expired or orphaned, and removes offline runner registrations named after its machines.
-7. Moves each architecture's base image for the current key on, if it isn't ready, and deletes base images it no longer needs (specs/0003-disks.md, Base images).
+3. Moves each architecture's base image for the current key on, if it isn't ready, and deletes base images it no longer needs (specs/0003-disks.md, Making a base image), before queued jobs take what capacity there is, so that a busy pool never starves a builder of its quota.
+4. Gives queued jobs machines, in one order, oldest first, from one pool for every consumer (specs/0002-machines.md, One pool).
+5. Saves the work disks of jobs that asked, and makes resume images for jobs lost to a preemption or to the age limit (specs/0003-disks.md).
+6. Reruns runs that lost a job to a preemption or to the age limit, once they've finished.
+7. Deletes what's finished, too old, expired or orphaned, and removes offline runner registrations named after its machines.
 
-A failure on one machine, job or disk doesn't stop the rest of a pass. If the service itself fails, Compute Engine still stops every machine at its maximum run duration, leaving only its disks to pay for, and deletes a base image's builder at its own.
+A failure on one machine, job or disk doesn't stop the rest of a pass. If the service itself fails, Compute Engine still stops every machine at its maximum run duration, leaving only its disks to pay for, and deletes a running base image's builder at its own.
 
 ## Forks and contributions
 
