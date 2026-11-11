@@ -902,11 +902,14 @@ func TestTheHookWaitsForAnAnswer(t *testing.T) {
 	// GitHub can't say which job is on the runner for a while.
 	w.gh.ServerError("/repos/lanescape/app/actions/runs/", http.StatusBadGateway, 0)
 	j := w.gh.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{w.act.selector(small, false)}})
-	// The pass reads the queue before GitHub fails.
+	// The pass reads the queue before GitHub fails, and the machine boots
+	// only once it has, so its hook can't be answered first.
 	w.gh.Faults().Reset()
+	w.holdBoots()
 	w.pass()
 	w.gh.ServerError("/repos/lanescape/app/actions/", http.StatusBadGateway, 0)
 	m := w.ours()[0]
+	w.release(m.Name)
 	w.eventually("the hook is told to ask again", 60*time.Second, func() bool {
 		return strings.Contains(w.logs.String(), `msg="job-started check not answered" machine=`+m.Name)
 	})
