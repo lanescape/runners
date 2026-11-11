@@ -52,10 +52,11 @@ One pass runs at a time, under a lease in the bucket: an object taken with a gen
 A pass:
 
 1. Lists the queued jobs of every consumer's runs, the service's machines, disks and Compute Engine images, and its records.
-2. Gives queued jobs machines, in one order, oldest first, from one pool for every consumer (specs/0002-machines.md, One pool).
-3. Saves the work disks of jobs that asked, and makes resume images for preempted Spot jobs (specs/0003-disks.md).
-4. Reruns runs that lost a Spot job to preemption, once they've finished.
-5. Deletes what's finished, too old, expired or orphaned, and removes offline runner registrations named after its machines.
+2. Stops every machine past its age limit, before it changes anything else (specs/0002-machines.md, The age limit).
+3. Gives queued jobs machines, in one order, oldest first, from one pool for every consumer (specs/0002-machines.md, One pool).
+4. Saves the work disks of jobs that asked, and makes resume images for jobs lost to a preemption or to the age limit (specs/0003-disks.md).
+5. Reruns runs that lost a job to a preemption or to the age limit, once they've finished.
+6. Deletes what's finished, too old, expired or orphaned, and removes offline runner registrations named after its machines.
 
 A failure on one machine, job or disk doesn't stop the rest of a pass. If the service itself fails, Compute Engine still stops every machine at its maximum run duration, leaving only its disks to pay for.
 

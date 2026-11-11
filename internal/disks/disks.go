@@ -1,10 +1,10 @@
 // Package disks saves and restores work disks, and makes resume images of
-// preempted Spot machines' work disks (specs/0003-disks.md,
-// specs/0002-machines.md, Preemption). It serves the machines' part of the
-// service through the seams machines.Service offers: choosing what a job's
-// work disk starts from, saving a finished job's disk, and recording a
-// stopped Spot machine; and it adds its own part of each pass, which reruns
-// runs that lost a Spot job to preemption, and deletes what's no longer
+// the work disks of jobs lost to a preemption or to the age limit
+// (specs/0003-disks.md, specs/0002-machines.md, Preemption). It serves the
+// machines' part of the service through the seams machines.Service offers:
+// choosing what a job's work disk starts from, saving a finished job's disk,
+// and recording a machine whose job was lost; and it adds its own part of
+// each pass, which reruns runs that lost a job, and deletes what's no longer
 // needed, as early as its rules allow.
 //
 // What images exist is in Compute Engine, by their names and labels; what
@@ -16,7 +16,7 @@
 //	closures/<repository>/<scope>.json          when a pull request was last seen closed
 //	families/<repository>/<family hash>.json    when a family of main's or a long-lived branch's was last used
 //	claims/<repository>/<image>.json            the job a resume image is claimed for
-//	preemptions/<repository>/<run>/<instance ID>.json  a stopped Spot machine, preempted or perhaps
+//	preemptions/<repository>/<run>/<instance ID>.json  a machine whose job was lost: a stopped Spot machine, preempted or perhaps, or one stopped at its age limit
 //	events/<instance ID>.json                   Compute Engine's event that it preempted an instance
 //	reruns/<repository>/<run>.json              the attempts of a run the service has rerun
 //	machines/<machine>/save.json                a finished job's save, once decided
@@ -130,10 +130,12 @@ const (
 	StepNone              = "none"
 )
 
-// The preemption evidence a record holds.
+// The preemption evidence a record holds: a standard machine is never
+// preempted.
 const (
-	Preempted = "yes"
-	Unknown   = "unknown"
+	Preempted    = "yes"
+	Unknown      = "unknown"
+	NotPreempted = "no"
 )
 
 var (
@@ -184,8 +186,8 @@ func SavedName(repositoryID int64, series string, at time.Time, machine string) 
 	return fmt.Sprintf("lsr-%d-%s-%d-%s", repositoryID, series, at.Unix(), machine[strings.LastIndex(machine, "-")+1:])
 }
 
-// ResumeName names a preempted machine's resume image, by the machine's
-// numeric instance ID.
+// ResumeName names a lost job's resume image, by its machine's numeric
+// instance ID.
 func ResumeName(repositoryID int64, instanceID uint64) string {
 	return fmt.Sprintf("lsr-%d-resume-%d", repositoryID, instanceID)
 }
@@ -323,7 +325,10 @@ type Claim struct {
 	At           time.Time `json:"at"`
 }
 
-// Preemption is a stopped Spot machine, recorded before it's deleted.
+// Preemption is a machine that stopped with its job admitted and
+// unfinished, recorded before it's deleted: a Spot machine, preempted or
+// perhaps, or any machine the service stopped at its age limit. Its job is
+// lost either way, and its run's rerun resumes it.
 type Preemption struct {
 	InstanceID   uint64 `json:"instance_id"`
 	Machine      string `json:"machine"`
@@ -340,13 +345,22 @@ type Preemption struct {
 	// same family on the same architecture.
 	Arch   string `json:"arch"`
 	Family string `json:"family,omitempty"`
-	// Preempted is yes, or unknown while there's no evidence.
-	Preempted string    `json:"preempted"`
+	// Preempted is yes, or unknown while there's no evidence, or no for a
+	// standard machine.
+	Preempted string `json:"preempted"`
+	// AgeLimit says the service stopped the machine at its age limit, its
+	// job unfinished: the job was lost, whatever the evidence of a
+	// preemption.
+	AgeLimit  bool      `json:"age_limit,omitempty"`
 	StoppedAt time.Time `json:"stopped_at"`
 	// ResumeImage is the resume image made of its work disk, if its scope
 	// saves and it had one.
 	ResumeImage string `json:"resume_image,omitempty"`
 	NoDisk      bool   `json:"no_disk,omitempty"`
+	// Done says nothing more is to be made for the job: its resume image is
+	// ready, or it gets none. Its run is rerun only once it's done, or once
+	// the day a resume image could resume it has passed.
+	Done bool `json:"done,omitempty"`
 }
 
 // Event is Compute Engine's word that it preempted an instance, as the log

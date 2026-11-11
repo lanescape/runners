@@ -71,16 +71,20 @@ const (
 
 	// MaxAge is the most a machine lives, from its creation: a job on the
 	// service should take under 30 minutes, 60 at worst, and this is the
-	// absolute maximum. A machine past it is deleted, even mid-job, saving
-	// nothing; a Spot machine is stopped and recorded first, with no resume
-	// image (specs/0002-machines.md). It's the one constant that says so.
+	// absolute maximum. A machine past it is stopped, even mid-job, and
+	// deleted, saving nothing; a job it cut short is recorded first, with a
+	// resume image of its work disk, and resumes in its run's rerun, as from
+	// a preemption (specs/0002-machines.md, The age limit). It's the one
+	// constant that says so.
 	MaxAge = 90 * time.Minute
 	// MaxRunDuration is when Compute Engine itself stops a machine, the
 	// backstop for when the service can't. Its margin over MaxAge covers
-	// the service's own path, so the backstop never races it: a pass runs
+	// the service's own stop, so the backstop never races it: a pass runs
 	// within 5 minutes of a machine reaching MaxAge, or waits up to 10 for
-	// a lease an earlier pass holds, then has up to 7 to stop and record a
-	// Spot machine, which takes a minute or two; that's under 25 minutes.
+	// a lease an earlier pass holds, then stops every machine past MaxAge
+	// before anything else, within its 7; that's under 25 minutes. Recording
+	// the machine's job and making its resume image come after the stop, and
+	// take as many passes as they need.
 	MaxRunDuration  = MaxAge + 30*time.Minute
 	IdleLimit       = 20 * time.Minute
 	ReportWait      = 10 * time.Minute
@@ -139,12 +143,14 @@ type Saver interface {
 	Save(ctx context.Context, m Machine, a Admission) error
 }
 
-// Preemptions deals with a Spot machine that stopped with its job admitted:
-// preempted, or perhaps (specs/0002-machines.md, Preemption). It returns
-// once the machine may be deleted. resume says whether to make a resume
-// image of its work disk, which a machine past its age limit doesn't get.
+// Preemptions deals with a machine that stopped with its job admitted and
+// unfinished: a Spot machine, preempted or perhaps, or any machine the
+// service stopped at its age limit (specs/0002-machines.md, Preemption). It
+// records the job, so that its run is rerun, and makes a resume image of its
+// work disk, and returns once the machine may be deleted. ageLimit says the
+// service stopped it at its age limit.
 type Preemptions interface {
-	Stopped(ctx context.Context, m Machine, a Admission, preempted, resume bool) error
+	Stopped(ctx context.Context, m Machine, a Admission, preempted, ageLimit bool) error
 }
 
 // Service is the machines' part of the service.
@@ -178,7 +184,8 @@ type Service struct {
 
 	// The later parts of a machine's life, which the disks package serves
 	// (specs/0003-disks.md): unset, every work disk starts empty, nothing
-	// is saved, and a stopped Spot machine is deleted.
+	// is saved, and a stopped Spot machine, or one stopped at its age limit,
+	// is deleted.
 	Disks       DiskSource
 	Saves       Saver
 	Preemptions Preemptions

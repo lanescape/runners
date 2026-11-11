@@ -8,6 +8,8 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/lanescape/runners/internal/compute"
 	"github.com/lanescape/runners/internal/github"
@@ -40,6 +42,82 @@ func (s *Service) cleanup(ctx context.Context, inv *inventory) {
 	}
 }
 
+// stopPastLimit stops every running machine past its age limit, before the
+// pass changes anything else: recording a job the limit cut short, and
+// making its resume image, can take longer than a pass, and must never hold
+// up another machine's stop past Compute Engine's backstop
+// (specs/0002-machines.md, The age limit). Every stop is asked for at once,
+// so that one Compute Engine is slow to finish holds up no other. A machine
+// it stops is stopped in the inventory too, as of when the stop finished;
+// one it can't stop is left for the next pass.
+func (s *Service) stopPastLimit(ctx context.Context, inv *inventory) {
+	var due []Machine
+	for _, m := range inv.machines {
+		if s.now().Sub(m.CreatedAt) >= MaxAge && !m.Stopped() {
+			due = append(due, m)
+		}
+	}
+	stopped := make([]time.Time, len(due))
+	var wg sync.WaitGroup
+	for i, m := range due {
+		wg.Go(func() {
+			err := s.Compute.StopInstance(ctx, m.Zone, m.Name, s.requestID("stop", m.Name))
+			if err != nil && !errors.Is(err, compute.ErrNotFound) {
+				s.log().Warn("stopping a machine past its age limit", "machine", m.Name, "err", err.Error())
+				return
+			}
+			stopped[i] = s.now()
+			s.log().Info("machine stopped at its age limit", "machine", m.Name, "repository_id", m.RepositoryID)
+		})
+	}
+	wg.Wait()
+	for i, m := range due {
+		if !stopped[i].IsZero() {
+			m.Status, m.LastStop = "TERMINATED", stopped[i]
+			inv.machines[m.Name] = m
+		}
+	}
+}
+
+// refresh reads a machine's admission, report and work disk's record again,
+// for a machine past its age limit: a job-started check, a report or a disk
+// request may have finished since the pass read the records. A machine with
+// no admission is retired, as an idle one is, so that a check that comes
+// later finds it refused.
+func (s *Service) refresh(ctx context.Context, inv *inventory, m Machine) error {
+	a, err := s.claim(ctx, m, "it was past its age limit before its job was admitted")
+	if err != nil {
+		return err
+	}
+	inv.admissions[m.Name] = a
+	rep, _, ok, err := getJSON[Report](ctx, s.Objects, reportKey(m.Name))
+	if err != nil {
+		return err
+	}
+	if ok {
+		inv.reports[m.Name] = rep
+	}
+	disk := WorkDisk(m.Name)
+	d, gen, ok, err := getJSON[DiskRecord](ctx, s.Objects, diskKey(disk))
+	if err != nil {
+		return err
+	}
+	if ok {
+		inv.diskRecords[disk] = record[DiskRecord]{d, gen}
+	}
+	return nil
+}
+
+// lostAtLimit reports whether a machine past its age limit had a job the
+// limit cut short: admitted, allowed, and not reported done by its
+// supervisor. A stop leaves the supervisor no time to report, so a report
+// says the job ended on its own.
+func (inv *inventory) lostAtLimit(m Machine) bool {
+	a, admitted := inv.admissions[m.Name]
+	_, reported := inv.reports[m.Name]
+	return admitted && a.Allowed && !reported
+}
+
 // gone reports whether a machine is known not to exist: it wasn't listed,
 // and this pass didn't try to make it. Machine names are never used again.
 func (inv *inventory) gone(name string) bool {
@@ -66,30 +144,35 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 	}
 	switch {
 	case age >= MaxAge:
-		// A Spot machine is recorded all the same, without a resume
-		// image, so its run may be rerun if it was preempted: one still
-		// running when the pass read it is stopped first, so a
-		// preemption since then isn't lost with it. A stopped machine
-		// waits for its record, and, without the records, for them, since
-		// whether it was admitted isn't known.
-		if m.Spot && s.Preemptions != nil {
-			if !m.Stopped() {
-				if err := s.Compute.StopInstance(ctx, m.Zone, m.Name, s.requestID("stop", m.Name)); err != nil && !errors.Is(err, compute.ErrNotFound) {
-					s.log().Warn("stopping a Spot machine past the age limit to record it", "machine", m.Name, "err", err.Error())
-					return
-				}
-			}
+		// A job the limit cut short is recorded, with a resume image of its
+		// work disk, so that its run's rerun resumes it, as from a
+		// preemption (specs/0002-machines.md, The age limit). The pass
+		// stopped the machine first; one it couldn't stop waits for the
+		// next. A stopped machine waits for its record, and, without the
+		// records, for them, since whether it was admitted isn't known.
+		if s.Preemptions != nil {
 			if !inv.recordsComplete {
 				return
 			}
-		}
-		if admitted && a.Allowed && m.Spot && s.Preemptions != nil {
-			if err := s.Preemptions.Stopped(ctx, a.Resolve(m, inv.disk(m.Name)), a, s.preempted(ctx, m), false); err != nil {
-				s.log().Warn("recording a stopped Spot machine past the age limit; it waits for its record", "machine", m.Name, "err", err.Error())
+			if err := s.refresh(ctx, inv, m); err != nil {
+				s.log().Warn("reading a machine's records again at its age limit; it waits for them", "machine", m.Name, "err", err.Error())
 				return
 			}
+			a = inv.admissions[m.Name]
 		}
-		s.finish(ctx, inv, m, "past "+MaxAge.String()+", deleted even mid-job, saving nothing", nil)
+		if s.Preemptions != nil && inv.lostAtLimit(m) {
+			if !m.Stopped() {
+				return
+			}
+			preempted := m.Spot && s.preempted(ctx, m)
+			if err := s.Preemptions.Stopped(ctx, a.Resolve(m, inv.disk(m.Name)), a, preempted, true); err != nil {
+				s.log().Warn("recording a machine stopped at its age limit; it waits for its record", "machine", m.Name, "err", err.Error())
+				return
+			}
+			s.finish(ctx, inv, m, "past "+MaxAge.String()+", its job recorded to resume, saving nothing", nil)
+			return
+		}
+		s.finish(ctx, inv, m, "past "+MaxAge.String()+", saving nothing", nil)
 	case !inv.recordsComplete:
 		return
 	case reported:
@@ -142,8 +225,7 @@ func (s *Service) requestID(parts ...string) string {
 // check that decides first keeps the machine, and one that comes later finds
 // it refused. It reports whether the machine may be deleted.
 func (s *Service) retire(ctx context.Context, m Machine, why string) bool {
-	a, _, err := createOnce(ctx, s.Objects, admissionKey(m.Name), Admission{Machine: m.Name, Zone: m.Zone,
-		RepositoryID: m.RepositoryID, Selector: m.Selector.String(), Reason: "retired: " + why, At: s.now()})
+	a, err := s.claim(ctx, m, why)
 	if err != nil {
 		s.log().Warn("retiring a machine", "machine", m.Name, "err", err.Error())
 		return false
@@ -151,12 +233,21 @@ func (s *Service) retire(ctx context.Context, m Machine, why string) bool {
 	return !a.Allowed
 }
 
+// claim writes a machine's admission as retired, only if it has none, and
+// returns the admission it has: that one, or the check's, whichever was
+// first.
+func (s *Service) claim(ctx context.Context, m Machine, why string) (Admission, error) {
+	a, _, err := createOnce(ctx, s.Objects, admissionKey(m.Name), Admission{Machine: m.Name, Zone: m.Zone,
+		RepositoryID: m.RepositoryID, Selector: m.Selector.String(), Reason: "retired: " + why, At: s.now()})
+	return a, err
+}
+
 // stoppedSpot deals with a Spot machine that stopped with its job admitted:
 // preempted, by Compute Engine's record, or perhaps.
 func (s *Service) stoppedSpot(ctx context.Context, inv *inventory, m Machine, a Admission) {
 	preempted := s.preempted(ctx, m)
 	if s.Preemptions != nil {
-		if err := s.Preemptions.Stopped(ctx, a.Resolve(m, inv.disk(m.Name)), a, preempted, true); err != nil {
+		if err := s.Preemptions.Stopped(ctx, a.Resolve(m, inv.disk(m.Name)), a, preempted, false); err != nil {
 			s.log().Warn("recording a stopped Spot machine", "machine", m.Name, "err", err.Error())
 			return
 		}
