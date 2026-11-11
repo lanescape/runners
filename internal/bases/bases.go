@@ -254,13 +254,17 @@ type inventory struct {
 }
 
 // Pass moves each architecture's build on (specs/0003-disks.md, Making a
-// base image). Nothing it fails to do stops the rest of the pass.
-func (s *Service) Pass(p *pass.Pass) {
+// base image). Nothing it fails to do stops the rest of the pass. It
+// returns the machine families of builders that found no capacity or
+// quota, which queued jobs mustn't draw on for the rest of the pass, so
+// that freed quota builds up for the builder (specs/0001-architecture.md,
+// Passes).
+func (s *Service) Pass(p *pass.Pass) (short []string) {
 	ctx := p.Context()
 	ims, err := s.Compute.Images(ctx)
 	if err != nil {
 		s.log().Error("listing images for the base images", "err", err.Error())
-		return
+		return nil
 	}
 	inv := &inventory{images: ims, builders: map[string][]compute.Instance{}, listed: true, records: map[string]store.Object{}}
 	for _, z := range s.Config.Shapes.Zones {
@@ -279,7 +283,7 @@ func (s *Service) Pass(p *pass.Pass) {
 	objs, err := s.Objects.List(ctx, "bases/")
 	if err != nil {
 		s.log().Error("listing base images' records", "err", err.Error())
-		return
+		return nil
 	}
 	for _, o := range objs {
 		inv.records[o.Name] = o
@@ -292,9 +296,15 @@ func (s *Service) Pass(p *pass.Pass) {
 	}
 	for _, a := range config.Arches {
 		if p.Lost() {
-			return
+			return short
 		}
-		s.advance(ctx, inv, a, keys[a])
+		if s.advance(ctx, inv, a, keys[a]) {
+			for _, mt := range s.Config.Base.Builders[a] {
+				if f := mt[:strings.Index(mt, "-")]; !slices.Contains(short, f) {
+					short = append(short, f)
+				}
+			}
+		}
 	}
 	// Another key's builder or record may be a build that a pass of a
 	// revision of the service a deploy replaced is still moving on: it
@@ -313,10 +323,12 @@ func (s *Service) Pass(p *pass.Pass) {
 			}
 		}
 	}
+	return short
 }
 
-// advance moves one architecture's build for its current key on.
-func (s *Service) advance(ctx context.Context, inv *inventory, arch, key string) {
+// advance moves one architecture's build for its current key on. It
+// reports whether it couldn't make a builder for want of capacity or quota.
+func (s *Service) advance(ctx context.Context, inv *inventory, arch, key string) (short bool) {
 	name := ImageName(arch, key)
 	builders := inv.builders[BuilderName(arch, key)]
 	for _, im := range inv.images {
@@ -366,8 +378,7 @@ func (s *Service) advance(ctx context.Context, inv *inventory, arch, key string)
 				"attempts", rec.Attempts, "last_failure", last, "machines_boot", boot)
 			return
 		}
-		s.makeBuilder(ctx, arch, key, rec, gen)
-		return
+		return s.makeBuilder(ctx, arch, key, rec, gen)
 	}
 	// Two builders, made in two zones when an answer was lost: the oldest
 	// goes on.
@@ -421,6 +432,7 @@ func (s *Service) advance(ctx context.Context, inv *inventory, arch, key string)
 			s.failWith(ctx, arch, key, rec, gen, b, fmt.Sprintf("the builder didn't say it built the image within %d minutes", int(ReportLimit.Minutes())), console)
 		}
 	}
+	return false
 }
 
 // Result reads a builder's console: whether it said it built the image of
@@ -457,8 +469,9 @@ func clean(s string) string {
 }
 
 // makeBuilder counts an attempt, then makes the key's builder in the first
-// placement with capacity, or takes the attempt back if none had any.
-func (s *Service) makeBuilder(ctx context.Context, arch, key string, rec Record, gen int64) {
+// placement with capacity, or takes the attempt back if none had any, and
+// reports that.
+func (s *Service) makeBuilder(ctx context.Context, arch, key string, rec Record, gen int64) (short bool) {
 	files := s.Files
 	if files == "" {
 		b, err := machine.Archive()
@@ -516,11 +529,13 @@ func (s *Service) makeBuilder(ctx context.Context, arch, key string, rec Record,
 	}
 	// No placement had capacity: no builder was made, so the attempt is
 	// taken back, and the next pass tries again.
-	s.log().Info("no capacity for a base image builder", "arch", arch, "key", key, "err", fmt.Sprint(last))
+	s.log().Info("no capacity for a base image builder; its machine families' quota is held from jobs this pass", "arch", arch, "key", key,
+		"err", fmt.Sprint(last))
 	rec.Attempts--
 	if _, err := s.write(ctx, rec, gen); err != nil {
 		s.log().Warn("taking back a base image builder's attempt", "arch", arch, "key", key, "err", err.Error())
 	}
+	return true
 }
 
 // stopAndMake stops a builder that built its image, then makes the image.

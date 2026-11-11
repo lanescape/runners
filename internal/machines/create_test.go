@@ -470,10 +470,13 @@ type fakeBases struct {
 	e   *env
 	// machinesAtPass are how many machines there were when it ran.
 	machinesAtPass []int
+	// short are the machine families a builder waits for.
+	short []string
 }
 
-func (f *fakeBases) Pass(*pass.Pass) {
+func (f *fakeBases) Pass(*pass.Pass) []string {
 	f.machinesAtPass = append(f.machinesAtPass, len(f.e.gce.Instances()))
+	return f.short
 }
 
 func (f *fakeBases) Boot(ims []compute.Image, arch string) (string, bool) {
@@ -557,4 +560,28 @@ func TestTheFirstDeploysJobsWaitForTheBaseImage(t *testing.T) {
 			t.Fatalf("the job's machine boots %s", d.SourceImage)
 		}
 	}
+}
+
+// TestABuilderWaitingForQuotaHoldsIt: a base image's builder that found no
+// capacity or quota holds its machine families from queued jobs for the
+// pass, so freed quota builds up for it; jobs of other families go on
+// (specs/0001-architecture.md, Passes).
+func TestABuilderWaitingForQuotaHoldsIt(t *testing.T) {
+	e := setup(t)
+	fb := &fakeBases{key: "new", e: e, short: []string{"n4", "c4"}}
+	e.svc.Bases = fb
+	run := e.mainRun()
+	e.queue(run, sel2)
+	e.queue(run, "lanescape-16vcpu-linux-arm64")
+	e.pass()
+	ms := e.wantMachines(1)
+	if ms[0].MachineType != "c4a-highcpu-16" {
+		t.Fatalf("machine = %+v; only the arm64 job, of another family, gets one", ms[0])
+	}
+	if !strings.Contains(e.logs.String(), "a base image's builder, is waiting for quota") {
+		t.Error("the waiting job's reason isn't logged")
+	}
+	fb.short = nil
+	e.pass()
+	e.wantMachines(2)
 }

@@ -207,7 +207,10 @@ type Service struct {
 
 // Bases are the base images (specs/0003-disks.md, Base images).
 type Bases interface {
-	Pass(p *pass.Pass)
+	// Pass moves them on, and returns the machine families whose quota
+	// a builder is waiting for, which no job draws on for the rest of the
+	// pass.
+	Pass(p *pass.Pass) (short []string)
 	Boot(images []compute.Image, arch string) (string, bool)
 }
 

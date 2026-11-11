@@ -40,6 +40,9 @@ type record[T any] struct {
 // and disks they describe, since every record is written before what it
 // describes is made.
 type inventory struct {
+	// baseShort are the machine families whose quota a base image's
+	// builder is waiting for.
+	baseShort        []string
 	machines         map[string]Machine
 	machinesComplete bool
 	disks            []compute.Disk
@@ -86,7 +89,7 @@ func (s *Service) Pass(p *pass.Pass) error {
 	ctx := p.Context()
 	s.stopPastLimit(ctx, inv)
 	if s.Bases != nil {
-		s.Bases.Pass(p)
+		inv.baseShort = s.Bases.Pass(p)
 		if p.Lost() {
 			return context.Cause(p.Context())
 		}
@@ -481,7 +484,12 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 	slices.SortStableFunc(all, func(a, b wanted) int {
 		return cmp.Or(a.job.CreatedAt.Compare(b.job.CreatedAt), cmp.Compare(a.repo.ID, b.repo.ID), cmp.Compare(a.job.ID, b.job.ID))
 	})
+	// A base image's builder that found no capacity or quota is older
+	// than every job: what its machine families free goes to it.
 	short := map[string]bool{}
+	for _, f := range inv.baseShort {
+		short[f] = true
+	}
 	for _, w := range all {
 		if ctx.Err() != nil {
 			return
@@ -497,7 +505,7 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 			pools = append(pools, spotPool)
 		}
 		if slices.ContainsFunc(pools, func(f string) bool { return short[f] }) {
-			s.log().Info("a job waits: an older job is waiting for quota or capacity it would draw on", "repository_id", w.repo.ID,
+			s.log().Info("a job waits: an older job, or a base image's builder, is waiting for quota or capacity it would draw on", "repository_id", w.repo.ID,
 				"job_id", w.job.ID, "selector", w.sel.String())
 			continue
 		}

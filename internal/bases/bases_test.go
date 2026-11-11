@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -62,6 +63,8 @@ type env struct {
 	runner  *pass.Runner
 	logs    *lockedBuffer
 	keys    map[string]string
+	// short is what the last pass held from jobs.
+	short []string
 }
 
 func setup(t *testing.T) *env {
@@ -103,7 +106,7 @@ func setup(t *testing.T) *env {
 
 func (e *env) pass() {
 	e.t.Helper()
-	if err := e.runner.Run(context.Background(), func(p *pass.Pass) error { e.svc.Pass(p); return nil }); err != nil {
+	if err := e.runner.Run(context.Background(), func(p *pass.Pass) error { e.short = e.svc.Pass(p); return nil }); err != nil {
 		e.t.Fatalf("pass: %v", err)
 	}
 }
@@ -622,8 +625,15 @@ func TestNoCapacityTakesTheAttemptBack(t *testing.T) {
 	if r, _ := e.record("amd64"); r.Attempts != 0 {
 		t.Fatalf("record with no capacity = %+v", r)
 	}
+	// Its machine families' quota is held from jobs for the pass.
+	if !slices.Equal(e.short, []string{"n4", "c4"}) {
+		t.Fatalf("held from jobs: %v", e.short)
+	}
 	e.gce.ClearStockout(zoneB, "n4-standard-2", false)
 	e.pass()
+	if e.short != nil {
+		t.Fatalf("held from jobs once the builder was made: %v", e.short)
+	}
 	b, ok := e.builder("amd64")
 	if !ok || b.Zone != zoneB || b.MachineType != "n4-standard-2" {
 		t.Fatalf("builder = %+v, %v", b, ok)

@@ -163,7 +163,7 @@ systemctl is-enabled lanescape-runners-supervisor.service >/dev/null || fail "th
 # What's of this builder alone goes, so each machine is its own.
 say "clearing the builder's own state"
 apt-get clean
-rm -rf "$work" /root/.cache /root/go
+rm -rf "$work" /root/.cache /root/.config/go /root/go
 rm -f /var/lib/systemd/timers/stamp-apt-daily.timer /var/lib/systemd/timers/stamp-apt-daily-upgrade.timer
 truncate -s 0 /etc/machine-id
 rm -f /var/lib/dbus/machine-id

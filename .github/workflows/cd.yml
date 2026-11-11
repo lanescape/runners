@@ -16,11 +16,15 @@ on:
 permissions:
   contents: read
 
-# One run at a time, none cancelled once it has started; of the runs
-# waiting, only the latest runs.
+# One run at a time, each in its turn, in the order they began to wait,
+# and none cancelled, waiting or running. A run's deploy goes ahead only if
+# its commit is still main's head when its turn comes (the gate below), so
+# an older commit never deploys over a newer one, and main's head always
+# has a run of its own to deploy it.
 concurrency:
   group: cd
   cancel-in-progress: false
+  queue: max
 
 jobs:
   checks:
@@ -79,8 +83,8 @@ jobs:
           if [ ${#missing[@]} -gt 0 ]; then
             skip "The repository's variables ${missing[*]} aren't set yet. The maintainer sets them after applying bootstrap/ (bootstrap/README.md, After the first apply); until then nothing deploys."
           fi
-          # An older commit never deploys over a newer one: a later push's
-          # run, waiting behind this one, deploys main's head.
+          # An older commit never deploys over a newer one: main's head has
+          # a run of its own, waiting behind this one, which deploys it.
           head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
           if [ "$head" != "$GITHUB_SHA" ]; then
             skip "main has moved on to $head since $GITHUB_SHA; the run for a later push deploys it."
