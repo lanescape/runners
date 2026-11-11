@@ -11,7 +11,7 @@ The accounts, every project-level grant, the network, Pub/Sub, the scheduler job
 
 ## Who applies it
 
-Only Infrastructure Manager, from CD, as `lanescape-runners-infra`, never anyone by hand. That identity can change nothing but these resources: the bucket and secrets by name, and the Cloud Run service by a grant on it alone. It can't make or delete a Cloud Run service. What it holds that IAM can't limit is in `bootstrap/README.md`, What IAM can't limit. CD (`.github/workflows/cd.yml`) first asks for a preview, with the same source and inputs, and prints its logs, then starts the apply, from this repository at the commit it has just built, with the image's digest, and prints its logs too:
+Only Infrastructure Manager, from CD, as `lanescape-runners-infra`, never anyone by hand. That identity can change nothing but these resources: the bucket and secrets by name, and the Cloud Run service by a grant on it alone. It can't make or delete a Cloud Run service. What it holds that IAM can't limit is in `bootstrap/README.md`, What IAM can't limit. CD (`.github/workflows/cd.yml`) first asks for a preview, with the same source and inputs, and prints its logs, then starts the apply, from this repository at the commit it has just built, with the image's digest, and prints its logs too. It starts the apply through Infrastructure Manager's API itself, since gcloud's apply of an existing deployment first lists the project's shared default staging bucket, which CD has no grant on and a git source never uses; the request is the same as this:
 
 ```sh
 gcloud infra-manager deployments apply \
