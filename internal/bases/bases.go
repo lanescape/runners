@@ -417,7 +417,7 @@ func (s *Service) advance(ctx context.Context, inv *inventory, arch, key string)
 					}
 				}
 			}
-			if len(builders) == 0 && rec.Attempts >= Attempts && len(rec.Failures) >= rec.Attempts {
+			if rec.Attempts >= Attempts && len(rec.Failures) >= rec.Attempts {
 				s.exhausted(inv, arch, key, rec)
 			}
 		}

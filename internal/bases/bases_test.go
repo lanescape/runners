@@ -914,21 +914,24 @@ func TestGivingUpIsLoggedWhateverTheImage(t *testing.T) {
 	e.gce.FailNextOperation("images.insert.leave", "INTERNAL_ERROR")
 	e.pass()
 	name := bases.ImageName("amd64", e.keys["amd64"])
+	// Neither the failed image nor the builder will go.
 	e.gce.ServerError(http.MethodDelete, "/global/images/"+name, http.StatusForbidden, 1000)
+	e.gce.ServerError(http.MethodDelete, "/instances/"+b.Name, http.StatusForbidden, 1000)
 	e.clock.Advance(bases.BuildLimit)
 	e.pass()
 	e.pass()
+	if _, ok := e.builder("amd64"); !ok {
+		t.Fatal("the builder was to linger")
+	}
 	if r, _ := e.record("amd64"); r.Attempts != bases.Attempts || len(r.Failures) != bases.Attempts {
 		t.Fatalf("record = %+v", r)
 	}
-	// The pass that fails the last build deletes its builder; each pass
-	// after it logs the error.
-	if n := strings.Count(e.logs.String(), "making no more for this key"); n != 1 {
-		t.Fatalf("logged giving up %d times", n)
+	if n := strings.Count(e.logs.String(), "making no more for this key"); n != 2 {
+		t.Fatalf("logged giving up %d times in two passes", n)
 	}
 	e.pass()
-	if n := strings.Count(e.logs.String(), "making no more for this key"); n != 2 {
-		t.Fatalf("logged giving up %d times", n)
+	if n := strings.Count(e.logs.String(), "making no more for this key"); n != 3 {
+		t.Fatalf("logged giving up %d times in three passes", n)
 	}
 }
 

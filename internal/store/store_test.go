@@ -1,10 +1,12 @@
 package store_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -162,5 +164,38 @@ func TestCallsStopAtTheContextsDeadline(t *testing.T) {
 	}
 	if d := time.Since(start); d > 10*time.Second {
 		t.Fatalf("get took %v despite its deadline", d)
+	}
+}
+
+// TestALargeObjectGoesInOneRequest: a boot log or a builder's console,
+// larger than the smallest chunk, goes in one request, as the emulator,
+// which takes no resumable uploads, insists: a resumable upload's session
+// URI is a credential that a failed chunk's error would carry.
+func TestALargeObjectGoesInOneRequest(t *testing.T) {
+	ctx := context.Background()
+	emu, s := newStore(t)
+	big := bytes.Repeat([]byte("console line\n"), 300<<10/13)
+	if _, err := s.Create(ctx, "logs/big.txt", big); err != nil {
+		t.Fatalf("creating %d bytes: %v", len(big), err)
+	}
+	if data, _, ok := emu.Object("state", "logs/big.txt"); !ok || !bytes.Equal(data, big) {
+		t.Fatal("the object isn't what was written")
+	}
+}
+
+// TestNoErrorCarriesAnUploadSession: an error that names an upload
+// session's ID has it taken out, so no caller can log it.
+func TestNoErrorCarriesAnUploadSession(t *testing.T) {
+	ctx := context.Background()
+	emu, s := newStore(t)
+	emu.Faults().Add(fault.Rule{Method: http.MethodPost, Times: 10,
+		Respond: gcsemu.JSONError(http.StatusBadRequest, "invalid",
+			"bad chunk for https://storage.googleapis.com/upload/storage/v1/b/state/o?uploadType=resumable&upload_id=SECRETSESSION")})
+	_, err := s.Create(ctx, "r", []byte("1"))
+	if err == nil {
+		t.Fatal("create succeeded")
+	}
+	if strings.Contains(err.Error(), "SECRETSESSION") || !strings.Contains(err.Error(), "upload_id=REDACTED") {
+		t.Fatalf("error = %v", err)
 	}
 }
