@@ -459,11 +459,19 @@ func (s *Service) advance(ctx context.Context, inv *inventory, arch, key string)
 		}
 	}
 	age := s.now().Sub(b.Created)
+	// The build's limit runs from its attempt's start.
+	since := b.Created
+	if !rec.Started.IsZero() && rec.Started.Before(since) {
+		since = rec.Started
+	}
 	switch {
 	case rec.failed(b.ID):
 		// Its failure is recorded; its deletion didn't finish.
 		s.deleteBuilder(ctx, b, "its build failed")
-	case age >= BuildLimit:
+		if rec.Attempts >= Attempts && len(rec.Failures) >= rec.Attempts {
+			s.exhausted(inv, arch, key, rec)
+		}
+	case s.now().Sub(since) >= BuildLimit:
 		s.fail(ctx, arch, key, rec, gen, b, fmt.Sprintf("no ready image within %d hours of its builder being made", int(BuildLimit.Hours())))
 	case b.Status == "STOPPING":
 	case b.Stopped():
@@ -481,10 +489,9 @@ func (s *Service) advance(ctx context.Context, inv *inventory, arch, key string)
 	default:
 		console, err := s.Compute.SerialOutput(ctx, b.Zone, b.Name, consoleLimit)
 		if err != nil {
+			// Its silence is judged only from a console read; the build's
+			// limit, and Compute Engine's, bound one never read.
 			s.log().Warn("reading a builder's console", "builder", b.Name, "err", err.Error())
-			if age >= ReportLimit {
-				s.fail(ctx, arch, key, rec, gen, b, fmt.Sprintf("the builder didn't say it built the image within %d minutes", int(ReportLimit.Minutes())))
-			}
 			return
 		}
 		built, failed := Result(console, arch, key)

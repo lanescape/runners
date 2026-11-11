@@ -269,6 +269,19 @@ jobs:
             logs_failed=true
             revision=
           fi
+          # The operation's end isn't the apply's success: the revision must
+          # be applied, and the deployment active.
+          if [ "$apply_ok" = true ]; then
+            state=$(gcloud infra-manager deployments describe "$DEPLOYMENT" --format='value(state)' || true)
+            revision_state=
+            if [ -n "$revision" ]; then
+              revision_state=$(gcloud infra-manager revisions describe "$revision" --format='value(state)' || true)
+            fi
+            if [ "$state" != ACTIVE ] || [ "$revision_state" != APPLIED ]; then
+              echo "::error::The deployment is ${state:-unknown} and its latest revision ${revision_state:-unknown}, not ACTIVE and APPLIED."
+              apply_ok=false
+            fi
+          fi
           if [ -n "$revision" ]; then
             gcloud infra-manager revisions describe "$revision" --format='yaml(name,state,stateDetail,errorCode,tfErrors,errorLogs)' || logs_failed=true
             if where=$(gcloud infra-manager revisions describe "$revision" --format='value(logs)'); then

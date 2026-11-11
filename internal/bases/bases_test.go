@@ -70,7 +70,9 @@ type env struct {
 func setup(t *testing.T) *env {
 	t.Helper()
 	ctx := context.Background()
-	clock := clockwork.NewFakeClockAt(time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC))
+	// The storage emulator stamps records with the real time, which a
+	// record's age is read from.
+	clock := clockwork.NewFakeClockAt(time.Now())
 	gce := gceemu.New(gceemu.WithClock(clock))
 	t.Cleanup(gce.Close)
 	cfg, err := config.Default()
@@ -927,5 +929,68 @@ func TestGivingUpIsLoggedWhateverTheImage(t *testing.T) {
 	e.pass()
 	if n := strings.Count(e.logs.String(), "making no more for this key"); n != 2 {
 		t.Fatalf("logged giving up %d times", n)
+	}
+}
+
+// TestAConsoleThatCantBeReadIsntSilence: a builder whose console a pass
+// can't read isn't judged silent; the next pass that reads it finds its
+// success.
+func TestAConsoleThatCantBeReadIsntSilence(t *testing.T) {
+	e := setup(t)
+	e.only("amd64")
+	e.pass()
+	b, _ := e.builder("amd64")
+	e.say(b, e.built("amd64"))
+	e.clock.Advance(bases.ReportLimit + 5*time.Minute)
+	e.gce.ServerError(http.MethodGet, "/serialPort", http.StatusServiceUnavailable, 1)
+	e.pass()
+	if got, ok := e.builder("amd64"); !ok || got.ID != b.ID {
+		t.Fatal("a builder whose console couldn't be read was failed")
+	}
+	e.pass()
+	if im, ok := e.image(bases.ImageName("amd64", e.keys["amd64"])); !ok || im.Status != "READY" {
+		t.Fatalf("image = %+v, %v", im, ok)
+	}
+	if r, _ := e.record("amd64"); len(r.Failures) != 0 {
+		t.Fatalf("record = %+v", r)
+	}
+}
+
+// TestABuildsLimitRunsFromItsAttemptWithNoImage: with no image yet, the
+// build's limit still runs from its attempt's start, not its builder's.
+func TestABuildsLimitRunsFromItsAttemptWithNoImage(t *testing.T) {
+	e := setup(t)
+	e.only("amd64")
+	ctx := context.Background()
+	e.pass()
+	b, _ := e.builder("amd64")
+	// The attempt was counted 10 minutes before its builder was made.
+	key := "bases/amd64-" + e.keys["amd64"] + ".json"
+	data, gen, err := e.objects.Get(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var r bases.Record
+	if err := json.Unmarshal(data, &r); err != nil {
+		t.Fatal(err)
+	}
+	r.Started = r.Started.Add(-10 * time.Minute)
+	data, _ = json.Marshal(r)
+	if _, err := e.objects.Replace(ctx, key, data, gen); err != nil {
+		t.Fatal(err)
+	}
+	e.say(b, e.built("amd64"))
+	e.gce.FailNextOperation("images.insert", "INTERNAL_ERROR")
+	e.pass()
+	if _, ok := e.image(bases.ImageName("amd64", e.keys["amd64"])); ok {
+		t.Fatal("an image was to fail to be made")
+	}
+	e.clock.Advance(bases.BuildLimit - 10*time.Minute)
+	e.pass()
+	if _, ok := e.builder("amd64"); ok {
+		t.Fatal("builder kept past its attempt's limit")
+	}
+	if r, _ := e.record("amd64"); len(r.Failures) != 1 || !strings.Contains(r.Failures[0].Reason, "within 2 hours") {
+		t.Fatalf("record = %+v", r)
 	}
 }
