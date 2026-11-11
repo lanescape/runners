@@ -56,16 +56,6 @@ func renewal(t *testing.T, e env) int64 {
 	return rec.Renewal
 }
 
-func eventually(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	for end := time.Now().Add(10 * time.Second); time.Now().Before(end); time.Sleep(5 * time.Millisecond) {
-		if cond() {
-			return
-		}
-	}
-	t.Fatalf("timed out waiting until %s", what)
-}
-
 // start runs a pass in the background whose body waits for release or for
 // its context to end, and returns once the pass is under way.
 func start(t *testing.T, e env) (p chan *pass.Pass, release chan struct{}, result chan error) {
@@ -91,15 +81,42 @@ func start(t *testing.T, e env) (p chan *pass.Pass, release chan struct{}, resul
 	return p, release, result
 }
 
+// renewals reports each renewal that succeeds, once Renew has returned.
+func renewals(e env) <-chan struct{} {
+	ch := make(chan struct{}, 16)
+	pass.OnRenewal(e.runner, func() {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	})
+	return ch
+}
+
+// renewTo moves the clock on by one renewal interval and waits until that
+// renewal has returned, so that the next move can't end it mid-flight.
+func renewTo(t *testing.T, e env, renewed <-chan struct{}, want int64) {
+	t.Helper()
+	e.clock.Advance(pass.RenewEvery)
+	select {
+	case <-renewed:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for renewal %d", want)
+	}
+	if n := renewal(t, e); n != want {
+		t.Fatalf("lease renewal = %d, want %d", n, want)
+	}
+}
+
 func TestPassRenewsEveryMinuteAndReleases(t *testing.T) {
 	e := setup(t)
+	renewed := renewals(e)
 	_, release, result := start(t, e)
 	if n := renewal(t, e); n != 1 {
 		t.Fatalf("lease renewal = %d at start, want 1", n)
 	}
 	for want := int64(2); want <= 6; want++ {
-		e.clock.Advance(pass.RenewEvery)
-		eventually(t, "the lease is renewed", func() bool { return renewal(t, e) == want })
+		renewTo(t, e, renewed, want)
 	}
 	close(release)
 	if err := <-result; err != nil {
@@ -129,6 +146,7 @@ func TestOnePassAtATime(t *testing.T) {
 
 func TestPassDeadline(t *testing.T) {
 	e := setup(t)
+	renewed := renewals(e)
 	ps, _, result := start(t, e)
 	p := <-ps
 	if got := p.Deadline().Sub(e.clock.Now()); got != pass.Deadline {
@@ -136,8 +154,7 @@ func TestPassDeadline(t *testing.T) {
 	}
 	// Renewals carry on until the deadline.
 	for want := int64(2); want <= 7; want++ {
-		e.clock.Advance(pass.RenewEvery)
-		eventually(t, "the lease is renewed", func() bool { return renewal(t, e) == want })
+		renewTo(t, e, renewed, want)
 	}
 	e.clock.Advance(pass.RenewEvery)
 	err := <-result
