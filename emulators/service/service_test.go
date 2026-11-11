@@ -163,6 +163,48 @@ func TestPullRequestDisks(t *testing.T) {
 	saveOne(service.StepPullRequestExact)
 }
 
+// A save from a run bound before its pull request was closed, finishing
+// after the reopened pull request saved again, replaces nothing: the newer
+// disk is the one later runs start from (specs/0003-disks.md, Expiry).
+func TestALateSaveFromBeforeAClosureReplacesNothing(t *testing.T) {
+	e, gh, c := onGitHub(t)
+	repo := e.Repository("app")
+	e.Commit(repo, "main", conformance.Files)
+	pr := e.PullRequest(repo, "main", "fix")
+	old, err := e.StartJob(e.PullRequestRun(pr), conformance.Small)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, d := c.Disk(e.Token(old), "build"); d.State != "ready" {
+		t.Fatalf("the old run's disk: %+v", d)
+	}
+	c.Save(e.Token(old))
+	p := e.GitHubPull(pr)
+	gh.ClosePull(p)
+	// The emulator sees the closure at a disk request.
+	probe, err := e.StartJob(e.Push(repo, "main"), conformance.Small)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Disk(e.Token(probe), "build")
+	gh.ReopenPull(p)
+	fresh, err := e.StartJob(e.PullRequestRun(pr), conformance.Small)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Disk(e.Token(fresh), "build")
+	c.Save(e.Token(fresh))
+	e.FinishJob(fresh, "success")
+	e.FinishJob(old, "success")
+	next, err := e.StartJob(e.PullRequestRun(pr), conformance.Small)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, d := c.Disk(e.Token(next), "build"); d.Restored != service.StepPullRequestExact {
+		t.Fatalf("after a late save from before the closure, restored %s; want the reopened pull request's own", d.Restored)
+	}
+}
+
 // The contribution environment's approval is what binds a contribution.
 func TestApprovalIsTheContributionEnvironments(t *testing.T) {
 	e, gh, _ := onGitHub(t)

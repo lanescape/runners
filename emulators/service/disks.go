@@ -318,13 +318,17 @@ func (e *Emulator) saveDisk(m *machine) {
 	if bd, ok, err := e.binder.Lookup(context.Background(), m.repo, m.run); err == nil && ok {
 		boundAt = bd.BoundAt
 	}
-	if _, ok := d.scope.PullRequestNumber(); ok {
+	saved := &savedDisk{SavedDisk: SavedDisk{Scope: d.Scope, Family: d.Family, Architecture: d.Architecture, Key: d.Key, Job: m.job},
+		repo: m.repo, boundAt: boundAt}
+	// A disk saved by a run bound before its pull request was last seen
+	// closed is never chosen, and replaces none of the pull request's
+	// other disks (specs/0003-disks.md, Expiry).
+	if _, ok := d.scope.PullRequestNumber(); ok && !e.retired(saved) {
 		for _, o := range e.dsk.saved {
 			if o.repo == m.repo && o.Scope == d.Scope && o.Family == d.Family && o.Architecture == d.Architecture {
 				o.replaced = true
 			}
 		}
 	}
-	e.dsk.saved = append(e.dsk.saved, &savedDisk{SavedDisk: SavedDisk{Scope: d.Scope, Family: d.Family, Architecture: d.Architecture,
-		Key: d.Key, Job: m.job}, repo: m.repo, boundAt: boundAt})
+	e.dsk.saved = append(e.dsk.saved, saved)
 }
