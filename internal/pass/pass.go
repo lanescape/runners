@@ -46,6 +46,12 @@ type Runner struct {
 	// Deadline and RenewEvery default to the spec's.
 	Deadline   time.Duration
 	RenewEvery time.Duration
+
+	// renewed, if set, is called after each renewal that succeeds, once
+	// Renew has returned. Tests use it to know a renewal is over before
+	// they move the clock on: a renewal seen in storage may still be in
+	// flight, and moving the clock past its deadline would end it.
+	renewed func()
 }
 
 // Pass is one running pass.
@@ -133,6 +139,9 @@ func (r *Runner) Run(ctx context.Context, body Body) error {
 				log.Error("pass lease renewal failed; stopping the pass", "err", err)
 				stop(fmt.Errorf("%w: %w", ErrLeaseLost, err))
 				return
+			}
+			if r.renewed != nil {
+				r.renewed()
 			}
 		}
 	})
