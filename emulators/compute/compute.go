@@ -64,9 +64,11 @@ type Emulator struct {
 	failNext  map[string]string
 	quotas    map[string]int64 // by region/metric
 	opDelay   time.Duration
-	onBoot    func(Machine)
-	onStop    func(Machine)
-	booted    map[uint64]bool
+	// pendingImages makes new images stay PENDING.
+	pendingImages bool
+	onBoot        func(Machine)
+	onStop        func(Machine)
+	booted        map[uint64]bool
 	// logged is each instance's serial console as Cloud Logging keeps it,
 	// by instance ID, line by line, after the instance is gone too.
 	logged map[uint64][]logLine
@@ -260,6 +262,22 @@ func (e *Emulator) AddImage(name, family, arch string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.images[name] = &image{id: newID(), name: name, family: family, status: "READY", arch: arch, created: e.clock.Now(), sizeGB: 10}
+}
+
+// HoldImages makes images made from now on stay PENDING, as one Compute
+// Engine is slow to finish does, or lets them be READY again, those held
+// included.
+func (e *Emulator) HoldImages(hold bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.pendingImages = hold
+	if !hold {
+		for _, im := range e.images {
+			if im.status == "PENDING" {
+				im.status = "READY"
+			}
+		}
+	}
 }
 
 // AddPublicImage adds a ready image to another project, public, as

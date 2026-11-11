@@ -149,41 +149,61 @@ jobs:
           IMAGE: ${{ steps.image.outputs.image }}
         run: |
           set -euo pipefail
-          inputs="github_app_id=$GITHUB_APP_ID,service_image=$IMAGE,deploy_id=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          deploy_id="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          inputs="github_app_id=$GITHUB_APP_ID,service_image=$IMAGE,deploy_id=$deploy_id"
           source_flags=(--service-account="$INFRA_ACCOUNT" --git-source-repo="$SOURCE" --git-source-directory=infra
             --git-source-ref="$GITHUB_SHA" --artifacts-gcs-bucket="$INFRA_MANAGER_BUCKET" --tf-version-constraint="$TF_VERSION"
             --input-values="$inputs")
+          logs_failed=false
 
           # Prints what Infrastructure Manager logged, from its artifacts
-          # bucket, which the deployer may read.
+          # bucket, which the deployer may read. A location with nothing in
+          # it says so; one that can't be read fails the job, at its end.
           print_logs() {
-            local what=$1 where=$2 objects
+            local what=$1 where=$2 listing objects
             if [ -z "$where" ]; then
               echo "No logs recorded for the $what."
               return 0
             fi
-            # Terraform's plans and state are binary, and hold nothing the
-            # logs don't say.
-            if ! objects=$(gcloud storage ls -r "$where" 2>/dev/null | grep -v -E '/$|:$|\.(tfplan|tfstate|zip|gz|tar)$'); then
+            if ! listing=$(gcloud storage ls -r "$where" 2>&1); then
+              if grep -q "matched no objects" <<<"$listing"; then
+                echo "No logs found for the $what at $where."
+                return 0
+              fi
+              echo "::error::Couldn't list the $what's logs at $where: $listing"
+              logs_failed=true
+              return 0
+            fi
+            # Terraform's plans and state are binary, and say nothing the
+            # logs don't.
+            objects=$(grep -v -E '/$|:$|\.(tfplan|tfstate|zip|gz|tar)$' <<<"$listing" || true)
+            if [ -z "$objects" ]; then
               echo "No logs found for the $what at $where."
               return 0
             fi
             while read -r obj; do
               echo "::group::The $what's log, $obj"
-              gcloud storage cat "$obj" || true
+              if ! gcloud storage cat "$obj"; then
+                echo "::error::Couldn't read $obj"
+                logs_failed=true
+              fi
               echo "::endgroup::"
             done <<<"$objects"
           }
 
           # The preview, against the deployment if there is one yet.
-          deployment_flags=()
+          exists=false
           if out=$(gcloud infra-manager deployments describe "$DEPLOYMENT" --format='value(name)' 2>&1); then
-            deployment_flags=(--deployment="$DEPLOYMENT")
+            exists=true
           elif ! grep -q NOT_FOUND <<<"$out"; then
             echo "$out"
             exit 1
           fi
-          preview="projects/$PROJECT/locations/$REGION/previews/lanescape-runners-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          deployment_flags=()
+          if [ "$exists" = true ]; then
+            deployment_flags=(--deployment="$DEPLOYMENT")
+          fi
+          preview="projects/$PROJECT/locations/$REGION/previews/lanescape-runners-$deploy_id"
           trap 'gcloud infra-manager previews delete "$preview" --quiet >/dev/null 2>&1 || true' EXIT
           preview_ok=true
           gcloud infra-manager previews create "$preview" "${deployment_flags[@]}" "${source_flags[@]}" || preview_ok=false
@@ -194,10 +214,49 @@ jobs:
             exit 1
           fi
 
-          # The apply, which deploys the service with the infrastructure.
+          # The apply, which deploys the service with the infrastructure,
+          # through Infrastructure Manager's API itself: gcloud's apply of
+          # an existing deployment first lists the project's shared default
+          # staging bucket, which CD has no grant on and git sources never
+          # use. The access token goes only in a header, never to the log.
+          api=https://config.googleapis.com/v1
+          body=$(jq -n --arg sa "$INFRA_ACCOUNT" --arg bucket "$INFRA_MANAGER_BUCKET" --arg tf "$TF_VERSION" \
+            --arg repo "$SOURCE" --arg ref "$GITHUB_SHA" --arg app "$GITHUB_APP_ID" --arg image "$IMAGE" --arg deploy "$deploy_id" '{
+              serviceAccount: $sa, artifactsGcsBucket: $bucket, tfVersionConstraint: $tf,
+              terraformBlueprint: {
+                gitSource: {repo: $repo, directory: "infra", ref: $ref},
+                inputValues: {github_app_id: {inputValue: $app}, service_image: {inputValue: $image}, deploy_id: {inputValue: $deploy}}
+              }
+            }')
+          call() {
+            local method=$1 url=$2 data=${3:-}
+            local args=(-sS --fail-with-body -X "$method" -H "Authorization: Bearer $(gcloud auth print-access-token)" -H "Content-Type: application/json")
+            if [ -n "$data" ]; then
+              args+=(--data "$data")
+            fi
+            curl "${args[@]}" "$url"
+          }
           apply_ok=true
-          gcloud infra-manager deployments apply "$DEPLOYMENT" "${source_flags[@]}" || apply_ok=false
-          revision=$(gcloud infra-manager deployments describe "$DEPLOYMENT" --format='value(latestRevision)')
+          if [ "$exists" = true ]; then
+            op=$(call PATCH "$api/$DEPLOYMENT" "$body") || apply_ok=false
+          else
+            op=$(call POST "$api/projects/$PROJECT/locations/$REGION/deployments?deploymentId=${DEPLOYMENT##*/}" "$body") || apply_ok=false
+          fi
+          if [ "$apply_ok" = true ]; then
+            name=$(jq -r .name <<<"$op")
+            echo "Applying: $name"
+            until jq -e .done <<<"$op" >/dev/null; do
+              sleep 15
+              op=$(call GET "$api/$name") || { apply_ok=false; break; }
+            done
+            if [ "$apply_ok" = true ] && jq -e .error <<<"$op" >/dev/null; then
+              jq .error <<<"$op"
+              apply_ok=false
+            fi
+          else
+            echo "$op"
+          fi
+          revision=$(gcloud infra-manager deployments describe "$DEPLOYMENT" --format='value(latestRevision)' 2>/dev/null || true)
           if [ -n "$revision" ]; then
             gcloud infra-manager revisions describe "$revision" --format='yaml(name,state,stateDetail,errorCode,tfErrors,errorLogs)' || true
             print_logs apply "$(gcloud infra-manager revisions describe "$revision" --format='value(logs)' 2>/dev/null || true)"
@@ -205,5 +264,9 @@ jobs:
           fi
           if [ "$apply_ok" != true ]; then
             echo "::error title=Apply failed::Infrastructure Manager's apply of infra/ failed: see its logs above."
+            exit 1
+          fi
+          if [ "$logs_failed" = true ]; then
+            echo "::error title=Logs unread::infra/ was applied, but its logs couldn't all be read."
             exit 1
           fi

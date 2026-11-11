@@ -186,3 +186,53 @@ func TestTheBuildersScript(t *testing.T) {
 		}
 	}
 }
+
+// TestTheBuildersScriptSaysWhyItFailed runs the script with Debian's tools
+// stood in for, failing in turn: inside a function, in a command
+// substitution, and at its own checks. Each time its last word on the
+// console is why it failed, never that it built the image.
+func TestTheBuildersScriptSaysWhyItFailed(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("no bash")
+	}
+	for _, tc := range []struct {
+		name, aptGet, curl, want string
+	}{
+		{"apt fails inside its function", "exit 100", "exit 0", "exited 100: apt-get -q"},
+		{"the metadata server fails in a command substitution", "exit 0", "exit 22", "exited 22"},
+		{"a setting isn't valid", "exit 0", `case "$*" in *lsr-files) printf AAAA ;; *lsr-arch) printf x86 ;; *) printf 0 ;; esac`, "lsr-arch isn't amd64 or arm64"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			console := filepath.Join(dir, "console")
+			// The script as a builder runs it, but with its console, /opt
+			// and /var/tmp in the test's own directory. The console is
+			// appended to, as /dev/console is, never truncated.
+			script := strings.NewReplacer(">/dev/console", ">>"+console, "/opt/", dir+"/opt/", "/var/tmp/", dir+"/").Replace(machine.BuildScript())
+			stubs := filepath.Join(dir, "bin")
+			if err := os.Mkdir(stubs, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			for name, body := range map[string]string{
+				"systemctl": "exit 0", "getent": "exit 2", "apt-get": tc.aptGet, "curl": tc.curl, "dpkg": "echo amd64",
+			} {
+				if err := os.WriteFile(filepath.Join(stubs, name), []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cmd := exec.Command(bash, "-c", script)
+			cmd.Env = []string{"PATH=" + stubs + ":/usr/bin:/bin", "HOME=" + dir}
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("the script succeeded:\n%s", out)
+			}
+			got, _ := os.ReadFile(console)
+			lines := strings.Split(strings.TrimSpace(string(got)), "\n")
+			last := lines[len(lines)-1]
+			if !strings.HasPrefix(last, machine.Failed) || !strings.Contains(string(got), tc.want) || strings.Contains(string(got), machine.Built) {
+				t.Fatalf("console = %q; want it to end saying it failed, with %q\noutput:\n%s", got, tc.want, out)
+			}
+		})
+	}
+}

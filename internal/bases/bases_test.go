@@ -571,7 +571,50 @@ func TestABuilderThatStopsBeforeItSaysFails(t *testing.T) {
 	if !ok || b2.ID == b.ID {
 		t.Fatalf("no new builder: %+v", b2)
 	}
-	if r, _ := e.record("amd64"); r.Attempts != 3 {
+	r, _ = e.record("amd64")
+	if r.Attempts != 3 || len(r.Failures) != 2 || r.Failures[1].Builder != b.ID || !strings.Contains(r.Failures[1].Reason, "went before") {
+		t.Fatalf("record = %+v; the builder that went is to be recorded as failed", r)
+	}
+}
+
+// TestAnImageNotReadyInTimeFails: an image Compute Engine is still making
+// two hours after its builder was made fails the build, and the next
+// builder starts again.
+func TestAnImageNotReadyInTimeFails(t *testing.T) {
+	e := setup(t)
+	e.only("amd64")
+	e.gce.HoldImages(true)
+	e.pass()
+	b, _ := e.builder("amd64")
+	e.say(b, e.built("amd64"))
+	e.pass()
+	name := bases.ImageName("amd64", e.keys["amd64"])
+	if im, ok := e.image(name); !ok || im.Status != "PENDING" {
+		t.Fatalf("image = %+v, %v", im, ok)
+	}
+	e.clock.Advance(bases.BuildLimit - time.Minute)
+	e.pass()
+	if _, ok := e.builder("amd64"); !ok {
+		t.Fatal("builder deleted within the build's limit")
+	}
+	e.clock.Advance(time.Minute)
+	e.pass()
+	if _, ok := e.builder("amd64"); ok {
+		t.Fatal("stopped builder kept past the build's limit")
+	}
+	if _, ok := e.image(name); ok {
+		t.Fatal("late image kept")
+	}
+	r, _ := e.record("amd64")
+	if len(r.Failures) != 1 || r.Failures[0].Builder != b.ID || !strings.Contains(r.Failures[0].Reason, "within 2 hours") {
+		t.Fatalf("record = %+v", r)
+	}
+	e.gce.HoldImages(false)
+	e.pass()
+	if b2, ok := e.builder("amd64"); !ok || b2.ID == b.ID {
+		t.Fatalf("no new builder: %+v", b2)
+	}
+	if r, _ := e.record("amd64"); r.Attempts != 2 || len(r.Failures) != 1 {
 		t.Fatalf("record = %+v", r)
 	}
 }
@@ -625,10 +668,19 @@ func TestNoCapacityTakesTheAttemptBack(t *testing.T) {
 	if r, _ := e.record("amd64"); r.Attempts != 0 {
 		t.Fatalf("record with no capacity = %+v", r)
 	}
-	// Its machine families' quota is held from jobs for the pass.
+	// A stockout holds its machine families back from jobs for the pass.
 	if !slices.Equal(e.short, []string{"n4", "c4"}) {
 		t.Fatalf("held from jobs: %v", e.short)
 	}
+	// Short of quota, which every family may share, it holds every job.
+	e.gce.SetQuota("northamerica-northeast1", "N4_CPUS", 0)
+	e.gce.SetQuota("northamerica-northeast1", "C4_CPUS", 0)
+	e.pass()
+	if !slices.Equal(e.short, []string{bases.AllPools}) {
+		t.Fatalf("held from jobs short of quota: %v", e.short)
+	}
+	e.gce.SetQuota("northamerica-northeast1", "N4_CPUS", 100)
+	e.gce.SetQuota("northamerica-northeast1", "C4_CPUS", 100)
 	e.gce.ClearStockout(zoneB, "n4-standard-2", false)
 	e.pass()
 	if e.short != nil {

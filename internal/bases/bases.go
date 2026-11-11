@@ -180,6 +180,9 @@ type Record struct {
 	// Attempts is how many builders were made, or may have been: each is
 	// counted before it's made.
 	Attempts int `json:"attempts"`
+	// Seen is the instance ID of the builder last seen, so that one that
+	// goes without its failure recorded is counted as failed.
+	Seen uint64 `json:"seen,omitempty"`
 	// Built is the instance ID of the builder that said it built the
 	// image, and BuiltAt when the service read it.
 	Built   uint64    `json:"built,omitempty"`
@@ -253,12 +256,27 @@ type inventory struct {
 	records  map[string]store.Object
 }
 
+// AllPools, among what Pass holds back, is every job's: a builder found no
+// quota, which machines of every family may share.
+const AllPools = "*"
+
+// hold is what a builder that couldn't be made holds back from jobs.
+type hold int
+
+const (
+	holdNone hold = iota
+	// holdFamilies is its machine families', for want of capacity alone.
+	holdFamilies
+	// holdAll is every job's, for want of quota.
+	holdAll
+)
+
 // Pass moves each architecture's build on (specs/0003-disks.md, Making a
 // base image). Nothing it fails to do stops the rest of the pass. It
-// returns the machine families of builders that found no capacity or
-// quota, which queued jobs mustn't draw on for the rest of the pass, so
-// that freed quota builds up for the builder (specs/0001-architecture.md,
-// Passes).
+// returns the quota pools a builder that couldn't be made holds back from
+// queued jobs for the rest of the pass, so that what jobs free builds up for
+// it (specs/0001-architecture.md, Passes): its machine families, for a
+// stockout, or AllPools, for want of quota.
 func (s *Service) Pass(p *pass.Pass) (short []string) {
 	ctx := p.Context()
 	ims, err := s.Compute.Images(ctx)
@@ -298,7 +316,12 @@ func (s *Service) Pass(p *pass.Pass) (short []string) {
 		if p.Lost() {
 			return short
 		}
-		if s.advance(ctx, inv, a, keys[a]) {
+		switch s.advance(ctx, inv, a, keys[a]) {
+		case holdAll:
+			if !slices.Contains(short, AllPools) {
+				short = append(short, AllPools)
+			}
+		case holdFamilies:
 			for _, mt := range s.Config.Base.Builders[a] {
 				if f := mt[:strings.Index(mt, "-")]; !slices.Contains(short, f) {
 					short = append(short, f)
@@ -327,8 +350,8 @@ func (s *Service) Pass(p *pass.Pass) (short []string) {
 }
 
 // advance moves one architecture's build for its current key on. It
-// reports whether it couldn't make a builder for want of capacity or quota.
-func (s *Service) advance(ctx context.Context, inv *inventory, arch, key string) (short bool) {
+// reports what a builder that couldn't be made holds back from jobs.
+func (s *Service) advance(ctx context.Context, inv *inventory, arch, key string) (h hold) {
 	name := ImageName(arch, key)
 	builders := inv.builders[BuilderName(arch, key)]
 	for _, im := range inv.images {
@@ -353,8 +376,37 @@ func (s *Service) advance(ctx context.Context, inv *inventory, arch, key string)
 				!errors.Is(err, compute.ErrNotFound) {
 				s.log().Warn("deleting a failed base image", "image", name, "err", err.Error())
 			}
+		case "DELETING":
+		default:
+			// Still being made: within the build's limit, from its
+			// builder's making, or the image's own if its builder is gone.
+			since := im.Created
+			for _, b := range builders {
+				if b.Created.Before(since) {
+					since = b.Created
+				}
+			}
+			if s.now().Sub(since) < BuildLimit {
+				return
+			}
+			reason := fmt.Sprintf("no ready image within %d hours of its builder being made", int(BuildLimit.Hours()))
+			s.log().Warn("base image not ready in time; deleting it", "image", name, "status", im.Status)
+			if err := s.Compute.DeleteImage(ctx, name, requestID("delete late base image", name)); err != nil && !errors.Is(err, compute.ErrNotFound) {
+				s.log().Warn("deleting a late base image", "image", name, "err", err.Error())
+			}
+			rec, gen, err := s.record(ctx, arch, key)
+			if err != nil {
+				s.log().Error("reading a base image's record", "arch", arch, "key", key, "err", err.Error())
+				return
+			}
+			for _, b := range builders {
+				if rec.failed(b.ID) {
+					s.deleteBuilder(ctx, b, "its build failed")
+					continue
+				}
+				rec, gen = s.failWith(ctx, arch, key, rec, gen, b, reason, "")
+			}
 		}
-		// Anything else is still being made, or deleted.
 		return
 	}
 
@@ -367,6 +419,18 @@ func (s *Service) advance(ctx context.Context, inv *inventory, arch, key string)
 		if !inv.listed {
 			// A builder may be in a zone that wasn't listed.
 			return
+		}
+		// The builder last seen went without its failure recorded, such
+		// as one deleted by someone else, or by Compute Engine at its
+		// maximum run duration while the service couldn't act.
+		if rec.Seen != 0 && !rec.failed(rec.Seen) {
+			rec.Failures = append(rec.Failures, Failure{Builder: rec.Seen, At: s.now(), Reason: "the builder went before its image was ready"})
+			if gen, err = s.write(ctx, rec, gen); err != nil {
+				s.log().Warn("recording a base image builder that went", "arch", arch, "key", key, "err", err.Error())
+				return
+			}
+			s.log().Warn("base image build failed", "arch", arch, "key", key, "instance_id", rec.Seen, "attempt", rec.Attempts, "of", Attempts,
+				"reason", "the builder went before its image was ready")
 		}
 		if rec.Attempts >= Attempts {
 			last := ""
@@ -387,6 +451,13 @@ func (s *Service) advance(ctx context.Context, inv *inventory, arch, key string)
 		s.deleteBuilder(ctx, extra, "another builder of its key was made first")
 	}
 	b := builders[0]
+	if rec.Seen != b.ID && !rec.failed(b.ID) {
+		rec.Seen = b.ID
+		if gen, err = s.write(ctx, rec, gen); err != nil {
+			s.log().Warn("recording a base image builder", "arch", arch, "key", key, "err", err.Error())
+			return
+		}
+	}
 	age := s.now().Sub(b.Created)
 	switch {
 	case rec.failed(b.ID):
@@ -432,7 +503,7 @@ func (s *Service) advance(ctx context.Context, inv *inventory, arch, key string)
 			s.failWith(ctx, arch, key, rec, gen, b, fmt.Sprintf("the builder didn't say it built the image within %d minutes", int(ReportLimit.Minutes())), console)
 		}
 	}
-	return false
+	return holdNone
 }
 
 // Result reads a builder's console: whether it said it built the image of
@@ -470,8 +541,8 @@ func clean(s string) string {
 
 // makeBuilder counts an attempt, then makes the key's builder in the first
 // placement with capacity, or takes the attempt back if none had any, and
-// reports that.
-func (s *Service) makeBuilder(ctx context.Context, arch, key string, rec Record, gen int64) (short bool) {
+// reports what it then holds back from jobs.
+func (s *Service) makeBuilder(ctx context.Context, arch, key string, rec Record, gen int64) (h hold) {
 	files := s.Files
 	if files == "" {
 		b, err := machine.Archive()
@@ -506,6 +577,7 @@ func (s *Service) makeBuilder(ctx context.Context, arch, key string, rec Record,
 		Network: s.Network, Subnetwork: s.Subnetwork, MaxRunDuration: MaxRunDuration, DeleteAtMaxRun: true,
 	}
 	var last error
+	quota := false
 	for _, mt := range cfg.Base.Builders[arch] {
 		for _, z := range cfg.Shapes.Zones {
 			spec.MachineType = mt
@@ -520,7 +592,8 @@ func (s *Service) makeBuilder(ctx context.Context, arch, key string, rec Record,
 				return
 			}
 			last = err
-			if compute.IsCapacity(err) {
+			if capacity := (*compute.CapacityError)(nil); errors.As(err, &capacity) {
+				quota = quota || !capacity.Stockout
 				continue
 			}
 			s.log().Error("making a base image builder", "arch", arch, "key", key, "zone", z, "machine_type", mt, "err", err.Error())
@@ -529,13 +602,17 @@ func (s *Service) makeBuilder(ctx context.Context, arch, key string, rec Record,
 	}
 	// No placement had capacity: no builder was made, so the attempt is
 	// taken back, and the next pass tries again.
-	s.log().Info("no capacity for a base image builder; its machine families' quota is held from jobs this pass", "arch", arch, "key", key,
-		"err", fmt.Sprint(last))
+	h = holdFamilies
+	if quota {
+		h = holdAll
+	}
+	s.log().Info("no capacity or quota for a base image builder; jobs are held back this pass", "arch", arch, "key", key,
+		"every_job", quota, "err", fmt.Sprint(last))
 	rec.Attempts--
 	if _, err := s.write(ctx, rec, gen); err != nil {
 		s.log().Warn("taking back a base image builder's attempt", "arch", arch, "key", key, "err", err.Error())
 	}
-	return true
+	return h
 }
 
 // stopAndMake stops a builder that built its image, then makes the image.
@@ -588,8 +665,8 @@ func (s *Service) fail(ctx context.Context, arch, key string, rec Record, gen in
 }
 
 // failWith records a builder's failure, once, saves its console, and deletes
-// it. Nothing waits on the console.
-func (s *Service) failWith(ctx context.Context, arch, key string, rec Record, gen int64, b compute.Instance, reason, console string) {
+// it. Nothing waits on the console. It returns the record as written.
+func (s *Service) failWith(ctx context.Context, arch, key string, rec Record, gen int64, b compute.Instance, reason, console string) (Record, int64) {
 	if console != "" {
 		logName := fmt.Sprintf("logs/%s-%d.txt", b.Name, b.Created.Unix())
 		if _, err := s.Objects.Create(ctx, logName, []byte(console)); err != nil && !errors.Is(err, store.ErrPrecondition) {
@@ -598,14 +675,17 @@ func (s *Service) failWith(ctx context.Context, arch, key string, rec Record, ge
 	}
 	if !rec.failed(b.ID) {
 		rec.Failures = append(rec.Failures, Failure{Builder: b.ID, At: s.now(), Reason: reason})
-		if _, err := s.write(ctx, rec, gen); err != nil {
+		next, err := s.write(ctx, rec, gen)
+		if err != nil {
 			s.log().Warn("recording a failed base image build", "arch", arch, "key", key, "err", err.Error())
-			return
+			return rec, gen
 		}
+		gen = next
 	}
 	s.log().Warn("base image build failed", "arch", arch, "key", key, "builder", b.Name, "instance_id", b.ID,
 		"attempt", rec.Attempts, "of", Attempts, "reason", reason)
 	s.deleteBuilder(ctx, b, "its build failed")
+	return rec, gen
 }
 
 func (s *Service) deleteBuilder(ctx context.Context, b compute.Instance, why string) {

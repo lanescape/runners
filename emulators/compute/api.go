@@ -1080,6 +1080,9 @@ func (e *Emulator) insertImage(r *http.Request, _ string) (*operation, *apiError
 		e.images[im.name] = im
 		return op.fail(http.StatusInternalServerError, code, "The operation failed."), nil
 	}
+	if e.pendingImages {
+		im.status = "PENDING"
+	}
 	e.images[im.name] = im
 	return op, nil
 }

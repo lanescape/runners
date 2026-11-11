@@ -16,7 +16,9 @@
 # sources and the files the image installs as they are, with where each
 # goes: programs and installs. Nothing of any
 # consumer's ever reaches it.
-set -euo pipefail
+# errtrace (-E): a failure inside a function, a command substitution or a
+# subshell reports itself too.
+set -Eeuo pipefail
 umask 022
 export DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8
 

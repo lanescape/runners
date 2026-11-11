@@ -484,11 +484,24 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 	slices.SortStableFunc(all, func(a, b wanted) int {
 		return cmp.Or(a.job.CreatedAt.Compare(b.job.CreatedAt), cmp.Compare(a.repo.ID, b.repo.ID), cmp.Compare(a.job.ID, b.job.ID))
 	})
-	// A base image's builder that found no capacity or quota is older
-	// than every job: what its machine families free goes to it.
+	// A base image's builder that couldn't be made is older than every
+	// job: what its machine families free, or for want of quota every job,
+	// goes to it. With none of the service's machines running, nothing of
+	// the service's holds what it lacks, and holding jobs back would only
+	// stop them too.
 	short := map[string]bool{}
-	for _, f := range inv.baseShort {
-		short[f] = true
+	running := 0
+	for _, m := range inv.machines {
+		if !m.Stopped() {
+			running++
+		}
+	}
+	if running > 0 {
+		for _, f := range inv.baseShort {
+			short[f] = true
+		}
+	} else if len(inv.baseShort) > 0 {
+		s.log().Warn("a base image's builder couldn't be made, and none of the service's machines is running; jobs aren't held back for it")
 	}
 	for _, w := range all {
 		if ctx.Err() != nil {
@@ -504,7 +517,7 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 		if w.sel.Spot {
 			pools = append(pools, spotPool)
 		}
-		if slices.ContainsFunc(pools, func(f string) bool { return short[f] }) {
+		if short[bases.AllPools] || slices.ContainsFunc(pools, func(f string) bool { return short[f] }) {
 			s.log().Info("a job waits: an older job, or a base image's builder, is waiting for quota or capacity it would draw on", "repository_id", w.repo.ID,
 				"job_id", w.job.ID, "selector", w.sel.String())
 			continue

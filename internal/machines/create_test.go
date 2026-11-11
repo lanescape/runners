@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/lanescape/runners/config"
+	gceemu "github.com/lanescape/runners/emulators/compute"
 	ghemu "github.com/lanescape/runners/emulators/github"
 	"github.com/lanescape/runners/internal/bases"
 	"github.com/lanescape/runners/internal/compute"
@@ -568,20 +569,51 @@ func TestTheFirstDeploysJobsWaitForTheBaseImage(t *testing.T) {
 // (specs/0001-architecture.md, Passes).
 func TestABuilderWaitingForQuotaHoldsIt(t *testing.T) {
 	e := setup(t)
-	fb := &fakeBases{key: "new", e: e, short: []string{"n4", "c4"}}
+	fb := &fakeBases{key: "new", e: e}
 	e.svc.Bases = fb
 	run := e.mainRun()
+	// A machine of the service's is running.
+	e.queue(run, sel2)
+	e.pass()
+	e.wantMachines(1)
+
+	// A stockout of the builder's types holds its families back.
+	fb.short = []string{"n4", "c4"}
 	e.queue(run, sel2)
 	e.queue(run, "lanescape-16vcpu-linux-arm64")
 	e.pass()
-	ms := e.wantMachines(1)
-	if ms[0].MachineType != "c4a-highcpu-16" {
-		t.Fatalf("machine = %+v; only the arm64 job, of another family, gets one", ms[0])
+	ms := e.wantMachines(2)
+	if !slices.ContainsFunc(ms, func(m gceemu.InstanceState) bool { return m.MachineType == "c4a-highcpu-16" }) {
+		t.Fatalf("machines = %+v; the arm64 job, of another family, gets one", ms)
 	}
 	if !strings.Contains(e.logs.String(), "a base image's builder, is waiting for quota") {
 		t.Error("the waiting job's reason isn't logged")
 	}
 	fb.short = nil
 	e.pass()
-	e.wantMachines(2)
+	e.wantMachines(3)
+
+	// For want of quota, which every family may share, every job waits.
+	fb.short = []string{bases.AllPools}
+	e.queue(run, sel2)
+	e.queue(run, "lanescape-16vcpu-linux-arm64")
+	e.pass()
+	e.wantMachines(3)
+	fb.short = nil
+	e.pass()
+	e.wantMachines(5)
+}
+
+// TestNoHoldWithNothingRunning: with none of the service's machines
+// running, nothing of the service's holds what a builder lacks, so jobs
+// aren't held back for it.
+func TestNoHoldWithNothingRunning(t *testing.T) {
+	e := setup(t)
+	e.svc.Bases = &fakeBases{key: "new", e: e, short: []string{bases.AllPools}}
+	e.queue(e.mainRun(), sel2)
+	e.pass()
+	e.wantMachines(1)
+	if !strings.Contains(e.logs.String(), "jobs aren't held back for it") {
+		t.Error("not logged")
+	}
 }
