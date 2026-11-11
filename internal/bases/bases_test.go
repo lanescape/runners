@@ -814,3 +814,51 @@ func TestAFailureIsCountedOncePerBuilder(t *testing.T) {
 		t.Fatalf("record = %+v", r)
 	}
 }
+
+// TestAFailedImageThatWontGoStillEndsTheBuild: a failed image whose deletion
+// keeps failing doesn't hold the build past its limit.
+func TestAFailedImageThatWontGoStillEndsTheBuild(t *testing.T) {
+	e := setup(t)
+	e.only("amd64")
+	e.pass()
+	b, _ := e.builder("amd64")
+	e.say(b, e.built("amd64"))
+	e.gce.FailNextOperation("images.insert.leave", "INTERNAL_ERROR")
+	e.pass()
+	name := bases.ImageName("amd64", e.keys["amd64"])
+	e.gce.ServerError(http.MethodDelete, "/global/images/"+name, http.StatusForbidden, 1000)
+	e.pass()
+	if im, ok := e.image(name); !ok || im.Status != "FAILED" {
+		t.Fatalf("image = %+v, %v", im, ok)
+	}
+	e.clock.Advance(bases.BuildLimit)
+	e.pass()
+	if _, ok := e.builder("amd64"); ok {
+		t.Fatal("builder kept past the build's limit")
+	}
+	r, _ := e.record("amd64")
+	if len(r.Failures) != 1 || r.Failures[0].Builder != b.ID || !strings.Contains(r.Failures[0].Reason, "within 2 hours") {
+		t.Fatalf("record = %+v", r)
+	}
+}
+
+// TestABuilderNoPassSawStillFails: a builder that went before any pass saw
+// it, such as one deleted at its maximum run duration while the service
+// couldn't act, ends its attempt as a failure.
+func TestABuilderNoPassSawStillFails(t *testing.T) {
+	e := setup(t)
+	e.only("arm64")
+	e.pass()
+	b, _ := e.builder("arm64")
+	if err := e.gcec.DeleteInstance(context.Background(), b.Zone, b.Name, compute.RequestID("max run")); err != nil {
+		t.Fatal(err)
+	}
+	e.pass()
+	r, _ := e.record("arm64")
+	if r.Attempts != 2 || len(r.Failures) != 1 || r.Failures[0].Builder != 0 || !strings.Contains(r.Failures[0].Reason, "before a pass saw it") {
+		t.Fatalf("record = %+v", r)
+	}
+	if b2, ok := e.builder("arm64"); !ok || b2.ID == b.ID {
+		t.Fatalf("no new builder: %+v", b2)
+	}
+}

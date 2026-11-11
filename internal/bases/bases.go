@@ -187,7 +187,8 @@ type Record struct {
 	// image, and BuiltAt when the service read it.
 	Built   uint64    `json:"built,omitempty"`
 	BuiltAt time.Time `json:"built_at,omitzero"`
-	// Failures are the builds that failed, one for each builder.
+	// Failures are the builds that failed, one for each builder; Builder
+	// is 0 for one never seen.
 	Failures []Failure `json:"failures,omitempty"`
 }
 
@@ -199,7 +200,7 @@ type Failure struct {
 }
 
 func (r Record) failed(id uint64) bool {
-	return slices.ContainsFunc(r.Failures, func(f Failure) bool { return f.Builder == id })
+	return id != 0 && slices.ContainsFunc(r.Failures, func(f Failure) bool { return f.Builder == id })
 }
 
 // Service makes the base images.
@@ -369,36 +370,34 @@ func (s *Service) advance(ctx context.Context, inv *inventory, arch, key string)
 				}
 			}
 			s.prune(ctx, inv, arch, im)
-		case "FAILED":
-			// Made again from the stopped builder, at the next pass.
-			s.log().Warn("base image failed; deleting it", "image", name)
-			if err := s.Compute.DeleteImage(ctx, name, requestID("delete failed base image", name)); err != nil &&
-				!errors.Is(err, compute.ErrNotFound) {
-				s.log().Warn("deleting a failed base image", "image", name, "err", err.Error())
-			}
-		case "DELETING":
 		default:
-			// Still being made: within the build's limit, from its
-			// builder's making, or the image's own if its builder is gone.
+			// Not ready: within the build's limit, from its builder's
+			// making, or the image's own if its builder is gone, a failed
+			// image is deleted, to be made again from the stopped builder,
+			// and one being made or deleted is waited for. Past it, the
+			// build fails, whatever becomes of the image.
 			since := im.Created
 			for _, b := range builders {
 				if b.Created.Before(since) {
 					since = b.Created
 				}
 			}
-			if s.now().Sub(since) < BuildLimit {
-				return
+			late := s.now().Sub(since) >= BuildLimit
+			if im.Status == "FAILED" || late && im.Status != "DELETING" {
+				s.log().Warn("base image not made; deleting it", "image", name, "status", im.Status, "late", late)
+				if err := s.Compute.DeleteImage(ctx, name, requestID("delete unmade base image", name)); err != nil && !errors.Is(err, compute.ErrNotFound) {
+					s.log().Warn("deleting a base image that wasn't made", "image", name, "err", err.Error())
+				}
 			}
-			reason := fmt.Sprintf("no ready image within %d hours of its builder being made", int(BuildLimit.Hours()))
-			s.log().Warn("base image not ready in time; deleting it", "image", name, "status", im.Status)
-			if err := s.Compute.DeleteImage(ctx, name, requestID("delete late base image", name)); err != nil && !errors.Is(err, compute.ErrNotFound) {
-				s.log().Warn("deleting a late base image", "image", name, "err", err.Error())
+			if !late {
+				return
 			}
 			rec, gen, err := s.record(ctx, arch, key)
 			if err != nil {
 				s.log().Error("reading a base image's record", "arch", arch, "key", key, "err", err.Error())
 				return
 			}
+			reason := fmt.Sprintf("no ready image within %d hours of its builder being made", int(BuildLimit.Hours()))
 			for _, b := range builders {
 				if rec.failed(b.ID) {
 					s.deleteBuilder(ctx, b, "its build failed")
@@ -423,14 +422,26 @@ func (s *Service) advance(ctx context.Context, inv *inventory, arch, key string)
 		// The builder last seen went without its failure recorded, such
 		// as one deleted by someone else, or by Compute Engine at its
 		// maximum run duration while the service couldn't act.
+		// So does any other builder counted and never seen to fail, such
+		// as one that went before a pass saw it, or whose making's answer
+		// was lost and that was never made: every attempt ends in a
+		// failure once its builder is gone.
+		changed := false
 		if rec.Seen != 0 && !rec.failed(rec.Seen) {
 			rec.Failures = append(rec.Failures, Failure{Builder: rec.Seen, At: s.now(), Reason: "the builder went before its image was ready"})
+			changed = true
+		}
+		for len(rec.Failures) < rec.Attempts {
+			rec.Failures = append(rec.Failures, Failure{At: s.now(), Reason: "the builder went before a pass saw it, or was never made"})
+			changed = true
+		}
+		if changed {
 			if gen, err = s.write(ctx, rec, gen); err != nil {
 				s.log().Warn("recording a base image builder that went", "arch", arch, "key", key, "err", err.Error())
 				return
 			}
-			s.log().Warn("base image build failed", "arch", arch, "key", key, "instance_id", rec.Seen, "attempt", rec.Attempts, "of", Attempts,
-				"reason", "the builder went before its image was ready")
+			s.log().Warn("base image build failed", "arch", arch, "key", key, "attempt", rec.Attempts, "of", Attempts,
+				"reason", rec.Failures[len(rec.Failures)-1].Reason)
 		}
 		if rec.Attempts >= Attempts {
 			last := ""

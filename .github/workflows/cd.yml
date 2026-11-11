@@ -207,8 +207,13 @@ jobs:
           trap 'gcloud infra-manager previews delete "$preview" --quiet >/dev/null 2>&1 || true' EXIT
           preview_ok=true
           gcloud infra-manager previews create "$preview" "${deployment_flags[@]}" "${source_flags[@]}" || preview_ok=false
-          gcloud infra-manager previews describe "$preview" --format='yaml(state,errorCode,tfErrors,errorLogs)' || true
-          print_logs preview "$(gcloud infra-manager previews describe "$preview" --format='value(logs)' 2>/dev/null || true)"
+          gcloud infra-manager previews describe "$preview" --format='yaml(state,errorCode,tfErrors,errorLogs)' || logs_failed=true
+          if where=$(gcloud infra-manager previews describe "$preview" --format='value(logs)'); then
+            print_logs preview "$where"
+          else
+            echo "::error::Couldn't find the preview's logs."
+            logs_failed=true
+          fi
           if [ "$preview_ok" != true ] || [ "$(gcloud infra-manager previews describe "$preview" --format='value(state)')" != SUCCEEDED ]; then
             echo "::error title=Preview failed::Infrastructure Manager's preview of infra/ failed; nothing was applied."
             exit 1
@@ -228,13 +233,16 @@ jobs:
                 inputValues: {github_app_id: {inputValue: $app}, service_image: {inputValue: $image}, deploy_id: {inputValue: $deploy}}
               }
             }')
+          # The token reaches curl as its configuration, on its standard
+          # input, so it's in no process's arguments either.
           call() {
-            local method=$1 url=$2 data=${3:-}
-            local args=(-sS --fail-with-body -X "$method" -H "Authorization: Bearer $(gcloud auth print-access-token)" -H "Content-Type: application/json")
+            local method=$1 url=$2 data=${3:-} token
+            token=$(gcloud auth print-access-token)
+            local args=(-sS --fail-with-body -X "$method" -K - -H "Content-Type: application/json")
             if [ -n "$data" ]; then
               args+=(--data "$data")
             fi
-            curl "${args[@]}" "$url"
+            printf 'header = "Authorization: Bearer %s"\n' "$token" | curl "${args[@]}" "$url"
           }
           apply_ok=true
           if [ "$exists" = true ]; then
@@ -256,11 +264,23 @@ jobs:
           else
             echo "$op"
           fi
-          revision=$(gcloud infra-manager deployments describe "$DEPLOYMENT" --format='value(latestRevision)' 2>/dev/null || true)
+          if ! revision=$(gcloud infra-manager deployments describe "$DEPLOYMENT" --format='value(latestRevision)'); then
+            echo "::error::Couldn't find the apply's revision."
+            logs_failed=true
+            revision=
+          fi
           if [ -n "$revision" ]; then
-            gcloud infra-manager revisions describe "$revision" --format='yaml(name,state,stateDetail,errorCode,tfErrors,errorLogs)' || true
-            print_logs apply "$(gcloud infra-manager revisions describe "$revision" --format='value(logs)' 2>/dev/null || true)"
+            gcloud infra-manager revisions describe "$revision" --format='yaml(name,state,stateDetail,errorCode,tfErrors,errorLogs)' || logs_failed=true
+            if where=$(gcloud infra-manager revisions describe "$revision" --format='value(logs)'); then
+              print_logs apply "$where"
+            else
+              echo "::error::Couldn't find the apply's logs."
+              logs_failed=true
+            fi
             echo "Revision: \`$revision\`" >>"$GITHUB_STEP_SUMMARY"
+          elif [ "$logs_failed" != true ]; then
+            echo "::error::The deployment has no revision."
+            logs_failed=true
           fi
           if [ "$apply_ok" != true ]; then
             echo "::error title=Apply failed::Infrastructure Manager's apply of infra/ failed: see its logs above."
