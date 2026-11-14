@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -40,7 +41,12 @@ var ErrFingerprint = errors.New("fingerprint no longer current in Compute Engine
 // quota is used up. Another machine type or zone may succeed.
 type CapacityError struct {
 	Stockout bool
-	Message  string
+	// Quota is the quota that's used up, by its metric's name, such as
+	// CPUS_PER_VM_FAMILY, a machine family's vCPUs in a region, or
+	// CPUS_ALL_REGIONS, as Compute Engine's answer names it, or empty if it
+	// names none.
+	Quota   string
+	Message string
 }
 
 func (c *CapacityError) Error() string {
@@ -270,7 +276,7 @@ func classify(err error) error {
 	case ge.Code == http.StatusConflict && reason == "alreadyExists":
 		return fmt.Errorf("%w: %s", ErrExists, ge.Message)
 	case reason == "quotaExceeded" || reason == "QUOTA_EXCEEDED":
-		return &CapacityError{Message: ge.Message}
+		return &CapacityError{Quota: quotaNamed(ge.Message), Message: ge.Message}
 	case stockout(reason):
 		// Compute Engine can refuse a request for want of capacity at
 		// once, as well as in its operation.
@@ -285,6 +291,18 @@ func classify(err error) error {
 		return &Failed{Err: err}
 	}
 	return &Unavailable{Err: err}
+}
+
+// quotaMessage is how Compute Engine names the quota a request exceeded, in
+// its message: "Quota 'CPUS_ALL_REGIONS' exceeded.  Limit: 96.0 globally."
+var quotaMessage = regexp.MustCompile(`Quota '([A-Za-z0-9_-]+)' exceeded`)
+
+// quotaNamed is the quota a message names, or empty.
+func quotaNamed(message string) string {
+	if m := quotaMessage.FindStringSubmatch(message); m != nil {
+		return strings.ToUpper(m[1])
+	}
+	return ""
 }
 
 // stockout reports whether an error's reason or code says the zone has no
@@ -306,7 +324,14 @@ func opError(op *gce.Operation) error {
 	case stockout(e.Code):
 		return &CapacityError{Stockout: true, Message: e.Message}
 	case e.Code == "QUOTA_EXCEEDED":
-		return &CapacityError{Message: e.Message}
+		q := quotaNamed(e.Message)
+		for _, d := range e.ErrorDetails {
+			if d != nil && d.QuotaInfo != nil && d.QuotaInfo.MetricName != "" {
+				q = strings.ToUpper(d.QuotaInfo.MetricName[strings.LastIndex(d.QuotaInfo.MetricName, "/")+1:])
+				break
+			}
+		}
+		return &CapacityError{Quota: q, Message: e.Message}
 	case e.Code == "RESOURCE_ALREADY_EXISTS":
 		return fmt.Errorf("%w: %s", ErrExists, e.Message)
 	case e.Code == "RESOURCE_NOT_FOUND":

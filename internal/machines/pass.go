@@ -464,7 +464,10 @@ type wanted struct {
 // capacity stays queued, and is tried again by later passes; meanwhile no
 // younger job gets a machine that draws on a quota it could have drawn on:
 // of its machine families, such as N4, whose machines share their quota,
-// or, if it's a Spot job, of the Spot quota every family shares.
+// for a stockout or a family's quota, or, if it's a Spot job, of the Spot
+// quota every family shares; and for a quota that every machine draws on,
+// such as CPUS_ALL_REGIONS, or one Compute Engine didn't name, no younger
+// job at all, while any of the service's machines runs.
 func (s *Service) give(ctx context.Context, inv *inventory) {
 	if !inv.machinesComplete || !inv.recordsComplete {
 		s.log().Warn("making no machines this pass: the machines or records couldn't all be read")
@@ -496,6 +499,18 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 			running++
 		}
 	}
+	// A quota every machine draws on holds every younger job back only while
+	// some of the service's machines run, whose ending frees it: otherwise
+	// what uses it up isn't the service's, or the job asks for more than all
+	// of it, and holding jobs back would only stop them too.
+	sharedHold := func(w wanted, quota string) {
+		if running > 0 {
+			short[bases.AllPools] = true
+			return
+		}
+		s.log().Warn("an older job waits for a quota every machine draws on, and none of the service's machines is running; younger jobs aren't held back for that quota",
+			"repository_id", w.repo.ID, "job_id", w.job.ID, "selector", w.sel.String(), "quota", quota)
+	}
 	if running > 0 {
 		for _, f := range inv.baseShort {
 			short[f] = true
@@ -524,16 +539,60 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 		}
 		err := s.make(ctx, inv, w)
 		if err == nil {
+			running++
 			continue
 		}
 		s.log().Warn("no machine made; the job stays queued", "repository_id", w.repo.ID, "job_id", w.job.ID, "selector", w.sel.String(),
 			"err", err.Error())
 		if compute.IsCapacity(err) {
-			for _, f := range pools {
-				short[f] = true
+			families, shared := s.shortOf(err)
+			if families {
+				for _, f := range pools {
+					short[f] = true
+				}
+			}
+			if shared != "" {
+				sharedHold(w, shared)
 			}
 		}
 	}
+}
+
+// shortOf says what a job's placements that found no quota or capacity
+// hold back. families is whether one found a stockout, or no quota of a
+// machine family's vCPUs, CPUS_PER_VM_FAMILY, or of Spot machines',
+// PREEMPTIBLE_CPUS: those hold back the job's machine families, and for a
+// Spot job, Spot jobs. shared names the first that found no quota of any
+// other kind, one every machine draws on: CPUS_ALL_REGIONS, the project's
+// vCPUs in every region, or another that every machine has, such as
+// external addresses or disks; and a quota Compute Engine's answer didn't
+// name, which might be any of them, as "unnamed".
+func (s *Service) shortOf(err error) (families bool, shared string) {
+	family := map[string]bool{"CPUS_PER_VM_FAMILY": true, "PREEMPTIBLE_CPUS": true}
+	for _, sh := range s.Config.Shapes.Shapes {
+		for _, t := range sh.MachineTypes {
+			// A family's own metric, as older quotas name it.
+			family[strings.ToUpper(t[:strings.Index(t, "-")])+"_CPUS"] = true
+		}
+	}
+	errs := []error{err}
+	if many, ok := err.(interface{ Unwrap() []error }); ok {
+		errs = many.Unwrap()
+	}
+	for _, e := range errs {
+		var c *compute.CapacityError
+		switch {
+		case !errors.As(e, &c):
+		case c.Stockout || family[c.Quota]:
+			families = true
+		case shared != "":
+		case c.Quota == "":
+			shared = "unnamed"
+		default:
+			shared = c.Quota
+		}
+	}
+	return families, shared
 }
 
 // spotPool names the Spot quota, which every machine family's Spot
@@ -895,7 +954,10 @@ func (s *Service) make(ctx context.Context, inv *inventory, w wanted) error {
 		Labels: labels, Metadata: metadata,
 		ServiceAccount: s.MachineAccount, Scopes: scopes, Network: Network, Subnetwork: Subnetwork, MaxRunDuration: MaxRunDuration,
 	}
+	// Every placement's want of quota or capacity is kept, so the pass knows
+	// every quota the job couldn't have.
 	var last error
+	var short []error
 	for _, pl := range selector.Placements(shape, s.Config.Shapes.Zones, sel.Spot) {
 		spec.MachineType, spec.Spot = pl.MachineType, pl.Spot
 		err := s.Compute.CreateInstance(ctx, pl.Zone, spec, compute.RequestID("create", name, pl.Zone, pl.MachineType, strconv.FormatBool(pl.Spot)))
@@ -908,6 +970,7 @@ func (s *Service) make(ctx context.Context, inv *inventory, w wanted) error {
 		if compute.IsCapacity(err) {
 			s.log().Info("no capacity for a machine", "machine", name, "zone", pl.Zone, "machine_type", pl.MachineType, "spot", pl.Spot, "err", err.Error())
 			last = err
+			short = append(short, err)
 			continue
 		}
 		if compute.IsUnavailable(err) {
@@ -922,8 +985,21 @@ func (s *Service) make(ctx context.Context, inv *inventory, w wanted) error {
 	if err := s.GitHub.DeleteRunner(ctx, runner.ID); err != nil && !errors.Is(err, github.ErrNotFound) {
 		s.log().Warn("removing an unused runner registration", "runner", name, "err", err.Error())
 	}
+	if len(short) > 1 && compute.IsCapacity(last) {
+		return shortages{last: last, all: short}
+	}
 	return last
 }
+
+// shortages is every placement's want of quota or capacity for a job's
+// machine. It reads as the last.
+type shortages struct {
+	last error
+	all  []error
+}
+
+func (s shortages) Error() string   { return s.last.Error() }
+func (s shortages) Unwrap() []error { return s.all }
 
 // onlyLabel reports whether a runner's labels are exactly its selector.
 func onlyLabel(labels []string, sel string) bool {

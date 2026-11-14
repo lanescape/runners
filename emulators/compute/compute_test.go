@@ -174,3 +174,51 @@ func TestBootAndStopHooks(t *testing.T) {
 		t.Fatal("a deleted machine never stopped")
 	}
 }
+
+// CPUS_ALL_REGIONS counts every machine in every region, and an operation
+// that reports it names it as Compute Engine does.
+func TestAllRegionsQuota(t *testing.T) {
+	ctx := context.Background()
+	emu := gceemu.New(gceemu.WithZones("northamerica-northeast1-a", "us-central1-a"))
+	t.Cleanup(emu.Close)
+	emu.AddImage("base", "", "X86_64")
+	emu.SetGlobalQuota("CPUS_ALL_REGIONS", 4)
+	emu.ReportQuotaInOperation(true)
+	svc, err := gce.NewService(ctx, emu.ClientOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insert := func(z, name, mt string) *gce.Operation {
+		inst := &gce.Instance{Name: name, MachineType: "zones/" + z + "/machineTypes/" + mt,
+			Disks: []*gce.AttachedDisk{{Boot: true, AutoDelete: true, InitializeParams: &gce.AttachedDiskInitializeParams{
+				SourceImage: "global/images/base", DiskType: "zones/" + z + "/diskTypes/hyperdisk-balanced"}}}}
+		op, err := svc.Instances.Insert(emu.Project, z, inst).Do()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for op.Status != "DONE" {
+			if op, err = svc.ZoneOperations.Wait(emu.Project, z, op.Name).Do(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return op
+	}
+	if op := insert("northamerica-northeast1-a", "a", "n4-highcpu-2"); op.Error != nil {
+		t.Fatalf("within the quota: %+v", op.Error.Errors[0])
+	}
+	// Another region, another family: the same quota.
+	op := insert("us-central1-a", "b", "c4-highcpu-4")
+	if op.Error == nil || len(op.Error.Errors) != 1 {
+		t.Fatal("a machine past the quota in another region was made")
+	}
+	e := op.Error.Errors[0]
+	if e.Code != "QUOTA_EXCEEDED" || len(e.ErrorDetails) != 1 || e.ErrorDetails[0].QuotaInfo == nil {
+		t.Fatalf("error %+v", e)
+	}
+	if q := e.ErrorDetails[0].QuotaInfo; q.MetricName != "compute.googleapis.com/cpus_all_regions" || q.LimitName != "CPUS-ALL-REGIONS-per-project" || q.Limit != 4 {
+		t.Fatalf("quota info %+v", q)
+	}
+	if op := insert("us-central1-a", "c", "c4-highcpu-2"); op.Error != nil {
+		t.Fatalf("within the quota, in another region: %+v", op.Error.Errors[0])
+	}
+}
