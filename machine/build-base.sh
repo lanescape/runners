@@ -38,11 +38,23 @@ trap 'fail "line $LINENO exited $?: $BASH_COMMAND"' ERR
 
 say() { printf 'lanescape-runners base image: %s\n' "$*"; }
 
+# lookup DB KEY sets entry to the account database's entry for KEY, or to
+# nothing if it has none; any other failure fails the build.
+lookup() {
+	local status=0
+	entry=$(getent "$1" "$2") || status=$?
+	[ "$status" -eq 0 ] || [ "$status" -eq 2 ] || fail "getent $1 $2 exited $status"
+}
+
 # A builder's disk is fresh: a second run, such as after a restart, would
 # start from what the first left, so it fails instead.
-if [ -e /opt/lanescape-runners ] || [ -e /opt/actions-runner ] || getent passwd runner >/dev/null; then
+if [ -e /opt/lanescape-runners ] || [ -e /opt/actions-runner ]; then
 	fail "the builder's disk isn't fresh from Debian's image"
 fi
+for db in passwd group; do
+	lookup "$db" runner
+	[ -z "$entry" ] || fail "the builder's disk isn't fresh from Debian's image"
+done
 
 # Debian's own updates while a machine lives would hold the package
 # manager's lock while a job's first step installs what it needs; they go
@@ -90,10 +102,76 @@ ln -s /usr/local/go/bin/go /usr/local/bin/go
 ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt
 
 # The runner's user, as on GitHub's runners: UID and GID 1001, with
-# passwordless sudo.
+# passwordless sudo, in no other group. Google's guest agent makes groups of
+# its own as it starts, each only if no group of its name exists, with
+# groupadd's next GID from 1000, above the highest in use: google-sudoers,
+# then those of the groups it puts the accounts it makes in that Debian's
+# image lacks, docker and lxd, so docker holds GID 1001. A group holding GID 1001 that has no
+# members, is no user's primary group and owns no file on the boot disk, as
+# one just made at boot, moves to the highest free GID of the system groups'
+# range, 101 to 999, as groupadd --system would have made it, and as
+# Debian's Docker package makes its group. It keeps its name, so at every
+# boot of a machine made from the image the guest agent finds it and makes
+# nothing. Anything else holding UID or GID 1001 fails the build, naming it.
+
+# free_gid_1001 moves each group but runner that holds GID 1001 in
+# /etc/group, where groupadd looks, if nothing depends on its number, or
+# fails naming it.
+free_gid_1001() {
+	local entry names name members user file gid
+	names=$(awk -F: '$3 == 1001 && $1 != "runner" { print $1 }' /etc/group)
+	for name in $names; do
+		lookup group "$name"
+		IFS=: read -r _ _ _ members <<<"$entry"
+		[ -z "$members" ] || fail "GID 1001 is the group $name's, with members $members"
+		user=$(awk -F: '$4 == 1001 { print $1; exit }' /etc/passwd)
+		[ -z "$user" ] || fail "GID 1001 is the group $name's, the user $user's own group"
+		file=$(find / -xdev -ignore_readdir_race -gid 1001 -print -quit)
+		[ -z "$file" ] || fail "GID 1001 is the group $name's, which owns $file"
+		for ((gid = 999; gid >= 101; gid--)); do
+			lookup group "$gid"
+			[ -n "$entry" ] || break
+		done
+		[ "$gid" -ge 101 ] || fail "GID 1001 is the group $name's, and no system GID is free to move it to"
+		say "moving the group $name from GID 1001 to $gid"
+		groupmod --gid "$gid" "$name"
+	done
+}
+
+# make_runner_user makes the runner's user. The guest agent may still be
+# making its groups as this script runs, and may take GID 1001 again once
+# it's freed. If it does before groupadd looks, groupadd's 4, a GID that
+# isn't unique, says so, and the group that took it is moved in turn: the
+# agent makes at most seven groups, google-sudoers and the six of its
+# default list, so eight tries outlast it. If it does after groupadd looks,
+# which groupadd does before it locks the group file, both groups hold GID
+# 1001, and the agent's moves once groupadd is done; after that, the agent
+# finds GID 1001 taken. useradd looks for a UID that's taken only once it
+# has locked the user file, so its UID is never shared.
+make_runner_user() {
+	local entry status try
+	lookup passwd 1001
+	[ -z "$entry" ] || fail "UID 1001 is the user ${entry%%:*}'s"
+	for try in 1 2 3 4 5 6 7 8; do
+		free_gid_1001
+		status=0
+		groupadd --gid 1001 runner || status=$?
+		[ "$status" -ne 0 ] || break
+		[ "$status" -eq 4 ] || fail "groupadd --gid 1001 runner exited $status"
+		[ "$try" -lt 8 ] || fail "GID 1001 was taken again each of 8 times it was freed"
+		say "GID 1001 was taken again as it was freed"
+	done
+	free_gid_1001
+	status=0
+	useradd --uid 1001 --gid 1001 --create-home --shell /bin/bash runner || status=$?
+	if [ "$status" -ne 0 ]; then
+		lookup passwd 1001
+		[ -z "$entry" ] || fail "useradd --uid 1001 runner exited $status: UID 1001 is the user ${entry%%:*}'s"
+		fail "useradd --uid 1001 runner exited $status"
+	fi
+}
 say "making the runner's user"
-groupadd --gid 1001 runner
-useradd --uid 1001 --gid 1001 --create-home --shell /bin/bash runner
+make_runner_user
 printf 'runner ALL=(ALL) NOPASSWD:ALL\n' >"$work/sudoers"
 visudo -cqf "$work/sudoers"
 install -o root -g root -m 0440 "$work/sudoers" /etc/sudoers.d/runner
@@ -153,6 +231,8 @@ while read -r source path; do
 	fi
 done <"$work/files/programs"
 [ "$(id -u runner):$(id -g runner)" = "1001:1001" ] || fail "the runner's user isn't UID and GID 1001"
+[ "$(awk -F: '$3 == 1001 { print $1 }' /etc/group)" = runner ] || fail "GID 1001 isn't the group runner's alone"
+[ "$(id -Gn runner)" = runner ] || fail "the runner's user is in groups other than its own: $(id -Gn runner)"
 runuser -u runner -- sudo -n true || fail "the runner's user has no passwordless sudo"
 [ "$(stat -c '%U:%G %a' /work)" = "root:root 755" ] || fail "/work isn't owned by root, mode 755"
 [ -z "$(ls -A /work)" ] || fail "/work isn't empty"
