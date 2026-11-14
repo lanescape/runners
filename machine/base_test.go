@@ -259,7 +259,8 @@ func scriptFunction(t *testing.T, name string) string {
 // it starts with the next free GIDs from 1000, so docker holds GID 1001: a
 // group holding it that nothing depends on moves to the highest free system
 // GID, keeping its name, as does one the agent makes at 1001 once it's
-// freed; anything else holding UID or GID 1001 fails the build, naming it,
+// freed, whether before groupadd looks for GID 1001 or after, when both
+// hold it; anything else holding UID or GID 1001 fails the build, naming it,
 // with nothing changed (specs/0003-disks.md, Making a base image).
 func TestTheBuildersScriptMakesTheRunnersUser(t *testing.T) {
 	bash, err := exec.LookPath("bash")
@@ -291,16 +292,20 @@ awk -F: -v k="$2" '$1 == k || $3 == k { print; found = 1; exit } END { exit !fou
 		"groupmod": `[ ! -e "$DB/fail-groupmod" ] || exit "$(cat "$DB/fail-groupmod")"
 echo "groupmod $*" >>"$DB/calls"
 awk -F: -v OFS=: -v g="$2" -v n="$3" '$1 == n { $3 = g } { print }' "$DB/group" >"$DB/group.new" && mv "$DB/group.new" "$DB/group"`,
-		// groupadd --gid GID NAME. Before each, the guest agent may make
-		// the next group of the test's agent file, with groupadd's next
-		// free GID from 1000.
+		// groupadd --gid GID NAME, which, as Debian's, looks for the GID
+		// before it locks the group file. The guest agent may make the
+		// next group of the test's agent file before it looks, or of its
+		// agent-during file after, as Debian's groupadd does with no
+		// GID: the GID above the highest from 1000.
 		"groupadd": `echo "groupadd $*" >>"$DB/calls"
-if [ -s "$DB/agent" ]; then
-	g=$(head -n 1 "$DB/agent"); sed 1d "$DB/agent" >"$DB/agent.new"; mv "$DB/agent.new" "$DB/agent"
-	id=1000; while awk -F: -v i="$id" '$3 == i { found = 1 } END { exit !found }' "$DB/group"; do id=$((id + 1)); done
-	echo "$g:x:$id:" >>"$DB/group"
-fi
+agent() {
+	[ -s "$DB/$1" ] || return 0
+	g=$(head -n 1 "$DB/$1"); sed 1d "$DB/$1" >"$DB/$1.new"; mv "$DB/$1.new" "$DB/$1"
+	echo "$g:x:$(awk -F: 'BEGIN { hi = 999 } $3 >= 1000 && $3 <= 60000 && $3 > hi { hi = $3 } END { print hi + 1 }' "$DB/group"):" >>"$DB/group"
+}
+agent agent
 awk -F: -v g="$2" -v n="$3" '$1 == n { exit 9 } $3 == g { exit 4 }' "$DB/group" || exit
+agent agent-during
 echo "$3:x:$2:" >>"$DB/group"`,
 		// useradd --uid UID --gid GID --create-home --shell SHELL NAME.
 		// Before it, a user of the test's agent-user file may be made.
@@ -331,7 +336,10 @@ case " $* " in *" -gid 1001 "*) cat "$DB/owned" ;; *) exit 1 ;; esac`,
 		{name: "the guest agent takes GID 1001 again once it's freed", group: debian + "google-sudoers:x:1000:\ndocker:x:1001:\n", passwd: passwd,
 			files:     map[string]string{"agent": "lxd\n"},
 			wantGroup: debian + "google-sudoers:x:1000:\ndocker:x:997:\nlxd:x:996:\n" + runner, wantPasswd: passwd + user},
-		{name: "the guest agent takes GID 1001 again each time", group: debian + guest, passwd: passwd,
+		{name: "the guest agent takes GID 1001 as groupadd makes runner", group: debian + "google-sudoers:x:1000:\ndocker:x:1001:\n", passwd: passwd,
+			files:     map[string]string{"agent-during": "lxd\n"},
+			wantGroup: debian + "google-sudoers:x:1000:\ndocker:x:997:\nlxd:x:996:\n" + runner, wantPasswd: passwd + user},
+		{name: "the guest agent takes GID 1001 again each time", group: debian + "google-sudoers:x:1000:\ndocker:x:1001:\n", passwd: passwd,
 			files: map[string]string{"agent": "g1\ng2\ng3\ng4\ng5\ng6\ng7\ng8\n"},
 			want:  "GID 1001 was taken again each of 8 times it was freed", changed: true},
 		{name: "a group with members holds GID 1001", group: debian + "google-sudoers:x:1000:\ndocker:x:1001:alice,bob\n", passwd: passwd,
@@ -351,8 +359,8 @@ case " $* " in *" -gid 1001 "*) cat "$DB/owned" ;; *) exit 1 ;; esac`,
 		{name: "looking for UID 1001 fails", group: debian + guest, passwd: passwd + "bob:x:1001:1003::/home/bob:/bin/bash\n",
 			files: map[string]string{"fail-getent-passwd-1001": "1"},
 			want:  "getent passwd 1001 exited 1"},
-		{name: "looking for GID 1001 fails", group: debian + guest, passwd: passwd, files: map[string]string{"fail-getent-group-1001": "1"},
-			want: "getent group 1001 exited 1"},
+		{name: "looking up the group holding GID 1001 fails", group: debian + guest, passwd: passwd, files: map[string]string{"fail-getent-group-docker": "1"},
+			want: "getent group docker exited 1"},
 		{name: "a user takes UID 1001 as the runner's is made", group: debian + guest, passwd: passwd,
 			files: map[string]string{"agent-user": "carol:x:1001:1003::/home/carol:/bin/bash\n"},
 			want:  "useradd --uid 1001 runner exited 4: UID 1001 is the user carol's", changed: true},
@@ -384,7 +392,7 @@ case " $* " in *" -gid 1001 "*) cat "$DB/owned" ;; *) exit 1 ;; esac`,
 			for _, fn := range []string{"lookup", "free_gid_1001", "make_runner_user"} {
 				script += scriptFunction(t, fn)
 			}
-			script = strings.NewReplacer(">/dev/console", ">>"+console, "/etc/passwd", filepath.Join(db, "passwd")).Replace(script)
+			script = strings.NewReplacer(">/dev/console", ">>"+console, "/etc/passwd", filepath.Join(db, "passwd"), "/etc/group", filepath.Join(db, "group")).Replace(script)
 			cmd := exec.Command(bash, "-c", script+"make_runner_user\ntrap - ERR\nresult \"built\"\n")
 			cmd.Env = []string{"PATH=" + bin + ":/usr/bin:/bin", "HOME=" + dir, "DB=" + db}
 			out, err := cmd.CombinedOutput()

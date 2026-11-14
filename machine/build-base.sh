@@ -110,33 +110,40 @@ lookup() {
 	[ "$status" -eq 0 ] || [ "$status" -eq 2 ] || fail "getent $1 $2 exited $status"
 }
 
-# free_gid_1001 moves the group holding GID 1001, if any and if nothing
-# depends on its number, or fails naming it.
+# free_gid_1001 moves each group but runner that holds GID 1001 in
+# /etc/group, where groupadd looks, if nothing depends on its number, or
+# fails naming it.
 free_gid_1001() {
-	local entry name members user file gid
-	lookup group 1001
-	[ -n "$entry" ] || return 0
-	IFS=: read -r name _ _ members <<<"$entry"
-	[ -z "$members" ] || fail "GID 1001 is the group $name's, with members $members"
-	user=$(awk -F: '$4 == 1001 { print $1; exit }' /etc/passwd)
-	[ -z "$user" ] || fail "GID 1001 is the group $name's, the user $user's own group"
-	file=$(find / -xdev -ignore_readdir_race -gid 1001 -print -quit)
-	[ -z "$file" ] || fail "GID 1001 is the group $name's, which owns $file"
-	for ((gid = 999; gid >= 101; gid--)); do
-		lookup group "$gid"
-		[ -n "$entry" ] || break
+	local entry names name members user file gid
+	names=$(awk -F: '$3 == 1001 && $1 != "runner" { print $1 }' /etc/group)
+	for name in $names; do
+		lookup group "$name"
+		IFS=: read -r _ _ _ members <<<"$entry"
+		[ -z "$members" ] || fail "GID 1001 is the group $name's, with members $members"
+		user=$(awk -F: '$4 == 1001 { print $1; exit }' /etc/passwd)
+		[ -z "$user" ] || fail "GID 1001 is the group $name's, the user $user's own group"
+		file=$(find / -xdev -ignore_readdir_race -gid 1001 -print -quit)
+		[ -z "$file" ] || fail "GID 1001 is the group $name's, which owns $file"
+		for ((gid = 999; gid >= 101; gid--)); do
+			lookup group "$gid"
+			[ -n "$entry" ] || break
+		done
+		[ "$gid" -ge 101 ] || fail "GID 1001 is the group $name's, and no system GID is free to move it to"
+		say "moving the group $name from GID 1001 to $gid"
+		groupmod --gid "$gid" "$name"
 	done
-	[ "$gid" -ge 101 ] || fail "GID 1001 is the group $name's, and no system GID is free to move it to"
-	say "moving the group $name from GID 1001 to $gid"
-	groupmod --gid "$gid" "$name"
 }
 
 # make_runner_user makes the runner's user. The guest agent may still be
 # making its groups as this script runs, and may take GID 1001 again once
-# it's freed, which groupadd's 4, a GID that isn't unique, shows: then the
-# group that took it is looked at and moved in turn. The agent makes at most
-# seven groups, google-sudoers and the six of its default list, so eight
-# tries outlast it.
+# it's freed. If it does before groupadd looks, groupadd's 4, a GID that
+# isn't unique, says so, and the group that took it is moved in turn: the
+# agent makes at most seven groups, google-sudoers and the six of its
+# default list, so eight tries outlast it. If it does after groupadd looks,
+# which groupadd does before it locks the group file, both groups hold GID
+# 1001, and the agent's moves once groupadd is done; after that, the agent
+# finds GID 1001 taken. useradd looks for a UID that's taken only once it
+# has locked the user file, so its UID is never shared.
 make_runner_user() {
 	local entry status try
 	lookup passwd 1001
@@ -150,6 +157,7 @@ make_runner_user() {
 		[ "$try" -lt 8 ] || fail "GID 1001 was taken again each of 8 times it was freed"
 		say "GID 1001 was taken again as it was freed"
 	done
+	free_gid_1001
 	status=0
 	useradd --uid 1001 --gid 1001 --create-home --shell /bin/bash runner || status=$?
 	if [ "$status" -ne 0 ]; then
@@ -219,7 +227,7 @@ while read -r source path; do
 	fi
 done <"$work/files/programs"
 [ "$(id -u runner):$(id -g runner)" = "1001:1001" ] || fail "the runner's user isn't UID and GID 1001"
-[ "$(getent group 1001 | cut -d: -f1)" = runner ] || fail "GID 1001 isn't the group runner"
+[ "$(awk -F: '$3 == 1001 { print $1 }' /etc/group)" = runner ] || fail "GID 1001 isn't the group runner's alone"
 [ "$(id -Gn runner)" = runner ] || fail "the runner's user is in groups other than its own: $(id -Gn runner)"
 runuser -u runner -- sudo -n true || fail "the runner's user has no passwordless sudo"
 [ "$(stat -c '%U:%G %a' /work)" = "root:root 755" ] || fail "/work isn't owned by root, mode 755"
