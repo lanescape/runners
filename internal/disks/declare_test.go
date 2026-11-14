@@ -2,9 +2,11 @@ package disks_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -160,11 +162,16 @@ func TestRemovingADeclarationKeepsWhatAnUnfinishedRunChose(t *testing.T) {
 	}
 }
 
+// notFound answers 404, as GitHub does for everything of a repository the
+// App can't read.
+var notFound = fault.Status(http.StatusNotFound, nil, `{"message": "Not Found"}`)
+
 // A repository GitHub answers 404 for, as it does once the App can no
 // longer read it, deletes nothing: not main's disks, a long-lived branch's
 // or a pull request's, nor a family whose declaration was removed
-// meanwhile, and its pull request isn't taken as closed. Once GitHub shows
-// it again, its declarations decide as before.
+// meanwhile; its pull request isn't taken as closed, and a finished run's
+// restore choice isn't dropped. Once GitHub shows it again, its
+// declarations decide as before.
 func TestARepositoryGitHubDoesntFindDeletesNothing(t *testing.T) {
 	e := setup(t)
 	e.listV1()
@@ -172,23 +179,105 @@ func TestARepositoryGitHubDoesntFindDeletesNothing(t *testing.T) {
 	b := e.saveBranch(key1)
 	p, _ := e.pull()
 	pr := e.savePull(p, sel(key1, "pr"+strconv.Itoa(p.Number)))
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}})
+	if jb.source() != m {
+		t.Fatal("no restore")
+	}
+	choice := "choices/5001/" + strconv.FormatInt(run.ID, 10) + "/" + choiceHash(sel(key1, "main")) + ".json"
 	e.repo.Commit("main", map[string]string{consumer.RunnersFile: `{"branches": {"support/v1": "v1"}, "disks": {"tools": {}}}`})
-	e.gh.Faults().Add(fault.Rule{PathPrefix: "/repos", Respond: fault.Status(http.StatusNotFound, nil, `{"message": "Not Found"}`)})
-	e.pass()
+	e.gh.Faults().Add(fault.Rule{PathPrefix: "/repos", Respond: notFound})
+	jb.finish(false)
+	e.eventually("the run is finished", func() bool { s, _ := e.gh.RunState(run); return s == "completed" })
 	e.pass()
 	e.gh.Faults().Reset()
 	if !e.has(m) || !e.has(b) || !e.has(pr) {
 		t.Fatalf("main's %v, the branch's %v, the pull request's %v; want all kept while GitHub answered 404", e.has(m), e.has(b), e.has(pr))
 	}
+	if _, ok := e.record(choice); !ok {
+		t.Fatal("a finished run's choice was dropped while GitHub answered 404 for its repository")
+	}
+	if _, ok := e.record("closures/5001/pr" + strconv.Itoa(p.Number) + ".json"); ok {
+		t.Fatal("a pull request was recorded closed while GitHub answered 404 for its repository")
+	}
 	if !e.logged("GitHub answers 404 for it") {
 		t.Fatal("no warning naming the repository GitHub doesn't find")
 	}
 	e.pass()
+	if _, ok := e.record(choice); ok {
+		t.Fatal("a finished run's choice wasn't dropped once GitHub showed its repository again")
+	}
 	if e.has(m) {
 		t.Fatal("a family no longer declared kept its disk once GitHub showed its repository again")
 	}
 	if !e.has(b) || !e.has(pr) {
 		t.Fatalf("the branch's %v, the pull request's %v; want both kept", e.has(b), e.has(pr))
+	}
+}
+
+// Access lost during a pass deletes nothing: a 404 for a pull request, or
+// for the default branch's file, counts as its absence only if GitHub,
+// asked again, still shows the repository.
+func TestAccessLostDuringAPassDeletesNothing(t *testing.T) {
+	for name, path := range map[string]string{
+		"a pull request":            "/repos/lanescape/app/pulls/",
+		"the default branch's file": "/repos/lanescape/app/contents/" + consumer.RunnersFile,
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := setup(t)
+			m := e.saveMain(key1)
+			p, _ := e.pull()
+			pr := e.savePull(p, sel(key1, "pr"+strconv.Itoa(p.Number)))
+			// From the first read of path on, GitHub answers 404 for
+			// everything of the repository's.
+			var lost atomic.Bool
+			e.gh.Faults().Add(fault.Rule{PathPrefix: "/repos", Respond: notFound, Match: func(r *http.Request) bool {
+				if strings.HasPrefix(r.URL.Path, path) {
+					lost.Store(true)
+				}
+				return lost.Load()
+			}})
+			e.pass()
+			e.gh.Faults().Reset()
+			if !lost.Load() {
+				t.Fatalf("the pass never read %s", path)
+			}
+			if !e.has(m) || !e.has(pr) {
+				t.Fatalf("main's %v, the pull request's %v; want both kept", e.has(m), e.has(pr))
+			}
+			if _, ok := e.record("closures/5001/pr" + strconv.Itoa(p.Number) + ".json"); ok {
+				t.Fatal("a pull request was recorded closed once access was lost")
+			}
+		})
+	}
+}
+
+// A repository GitHub can't be read for deletes nothing, not even what a
+// recorded closing would: once it can be, that goes.
+func TestAnUnreadableRepositoryDeletesNothing(t *testing.T) {
+	e := setup(t)
+	p, _ := e.pull()
+	pr := "pr" + strconv.Itoa(p.Number)
+	img := e.savePull(p, sel(key1, pr))
+	delivery, _ := json.Marshal(map[string]any{"action": "closed",
+		"pull_request": map[string]any{"number": p.Number, "closed_at": e.clock.Now().UTC().Add(time.Second).Format(time.RFC3339)},
+		"repository":   map[string]any{"id": repoID, "owner": map[string]any{"id": orgID}}})
+	if err := e.disks.RecordEvent(context.Background(), map[string]string{"event": "pull_request"}, delivery); err != nil {
+		t.Fatal(err)
+	}
+	e.clock.Advance(time.Minute)
+	e.gh.Faults().Add(fault.Rule{PathPrefix: "/repositories/", Respond: fault.Status(http.StatusBadGateway, nil, `{"message": "Bad Gateway"}`)})
+	e.pass()
+	e.gh.Faults().Reset()
+	if !e.has(img) {
+		t.Fatal("a disk went while GitHub couldn't be read for its repository")
+	}
+	if !e.logged("deleting none of them this pass") {
+		t.Fatal("no warning that the repository couldn't be read")
+	}
+	e.pass()
+	if e.has(img) {
+		t.Fatal("a disk saved before its pull request's closing outlived it")
 	}
 }
 
@@ -222,11 +311,19 @@ func TestATransferredRepositorysDisksAreKept(t *testing.T) {
 	m := e.saveMain(key1)
 	p, _ := e.pull()
 	pr := e.savePull(p, sel(key1, "pr"+strconv.Itoa(p.Number)))
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}})
+	choice := "choices/5001/" + strconv.FormatInt(run.ID, 10) + "/" + choiceHash(sel(key1, "main")) + ".json"
 	e.repo.Commit("main", map[string]string{consumer.RunnersFile: `{"disks": {"tools": {}}}`})
 	e.gh.Transfer(e.repo, e.gh.Org(1234, "elsewhere"))
+	jb.finish(false)
+	e.eventually("the run is finished", func() bool { s, _ := e.gh.RunState(run); return s == "completed" })
 	e.pass()
 	if !e.has(m) || !e.has(pr) {
 		t.Fatalf("main's %v, the pull request's %v; a transferred repository's disks went", e.has(m), e.has(pr))
+	}
+	if _, ok := e.record(choice); !ok {
+		t.Fatal("a finished run's choice was dropped while its repository was another owner's")
 	}
 	if !e.logged("another owner's") {
 		t.Fatal("no warning naming the transferred repository")
