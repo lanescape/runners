@@ -1,15 +1,19 @@
 package disks_test
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/lanescape/runners/emulators/fault"
 	ghemu "github.com/lanescape/runners/emulators/github"
 	"github.com/lanescape/runners/internal/consumer"
+	"github.com/lanescape/runners/internal/disks"
 )
 
 // armBuild is a label of the arm64 shape whose job asks for the family
@@ -159,16 +163,427 @@ func TestRemovingADeclarationKeepsWhatAnUnfinishedRunChose(t *testing.T) {
 	}
 }
 
-// A repository no longer the organization's declares nothing: its disks go.
-func TestATransferredRepositorysDisksGo(t *testing.T) {
+// notFound answers 404, as GitHub does for everything of a repository the
+// App can't read.
+var notFound = fault.Status(http.StatusNotFound, nil, `{"message": "Not Found"}`)
+
+// A repository GitHub answers 404 for, as it does once the App can no
+// longer read it, deletes nothing: not main's disks, a long-lived branch's
+// or a pull request's, nor a family whose declaration was removed
+// meanwhile; its pull request isn't taken as closed, and a finished run's
+// restore choice isn't dropped. Once GitHub shows it again, its
+// declarations decide as before.
+func TestARepositoryGitHubDoesntFindDeletesNothing(t *testing.T) {
 	e := setup(t)
-	k1 := e.saveMain(key1)
+	e.listV1()
+	m := e.saveMain(key1)
+	b := e.saveBranch(key1)
 	p, _ := e.pull()
 	pr := e.savePull(p, sel(key1, "pr"+strconv.Itoa(p.Number)))
-	e.gh.Transfer(e.repo, e.gh.Org(1234, "elsewhere"))
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}})
+	if jb.source() != m {
+		t.Fatal("no restore")
+	}
+	choice := "choices/5001/" + strconv.FormatInt(run.ID, 10) + "/" + choiceHash(sel(key1, "main")) + ".json"
+	e.repo.Commit("main", map[string]string{consumer.RunnersFile: `{"branches": {"support/v1": "v1"}, "disks": {"tools": {}}}`})
+	e.gh.Faults().Add(fault.Rule{PathPrefix: "/repos", Respond: notFound})
+	jb.finish(false)
+	e.eventually("the run is finished", func() bool { s, _ := e.gh.RunState(run); return s == "completed" })
 	e.pass()
-	if e.has(k1) || e.has(pr) {
-		t.Fatalf("main's %v, the pull request's %v; a transferred repository's disks were kept", e.has(k1), e.has(pr))
+	e.gh.Faults().Reset()
+	if !e.has(m) || !e.has(b) || !e.has(pr) {
+		t.Fatalf("main's %v, the branch's %v, the pull request's %v; want all kept while GitHub answered 404", e.has(m), e.has(b), e.has(pr))
+	}
+	if _, ok := e.record(choice); !ok {
+		t.Fatal("a finished run's choice was dropped while GitHub answered 404 for its repository")
+	}
+	if _, ok := e.record("closures/5001/pr" + strconv.Itoa(p.Number) + ".json"); ok {
+		t.Fatal("a pull request was recorded closed while GitHub answered 404 for its repository")
+	}
+	if !e.logged("GitHub answers 404 for it") {
+		t.Fatal("no warning naming the repository GitHub doesn't find")
+	}
+	e.pass()
+	if _, ok := e.record(choice); ok {
+		t.Fatal("a finished run's choice wasn't dropped once GitHub showed its repository again")
+	}
+	if e.has(m) {
+		t.Fatal("a family no longer declared kept its disk once GitHub showed its repository again")
+	}
+	if !e.has(b) || !e.has(pr) {
+		t.Fatalf("the branch's %v, the pull request's %v; want both kept", e.has(b), e.has(pr))
+	}
+}
+
+// closeByDelivery records a pull request's closing from GitHub's delivery,
+// as the service does, without closing it on GitHub.
+func (e *env) closeByDelivery(p *ghemu.Pull) {
+	e.t.Helper()
+	delivery, _ := json.Marshal(map[string]any{"action": "closed",
+		"pull_request": map[string]any{"number": p.Number, "closed_at": e.clock.Now().UTC().Add(time.Second).Format(time.RFC3339)},
+		"repository":   map[string]any{"id": repoID, "owner": map[string]any{"id": orgID}}})
+	if err := e.disks.RecordEvent(context.Background(), map[string]string{"event": "pull_request"}, delivery); err != nil {
+		e.t.Fatal(err)
+	}
+	e.clock.Advance(time.Minute)
+}
+
+// Access lost during a pass deletes nothing more of the repository's: a 404
+// for a pull request, a run, the default branch or its file counts as its
+// absence only if GitHub, asked again, still shows the repository, and
+// once it doesn't, or can't be read, nothing the pass would have deleted
+// goes: not a family no longer declared, a disk a recorded closing retires,
+// an image with no record, nor a lost job's record.
+func TestAccessLostDuringAPassDeletesNothing(t *testing.T) {
+	type lost struct {
+		// path is the read from whose nth on GitHub answers 404 for
+		// everything of the repository's, and then gives answer for the
+		// repository itself: of chose, a finished run with a restore
+		// choice, or of rerun, a run due its rerun.
+		path   func(chose, rerun *ghemu.Run) string
+		nth    int
+		answer func(http.ResponseWriter, *http.Request)
+	}
+	runPath := func(run *ghemu.Run) string {
+		return "/repos/lanescape/app/actions/runs/" + strconv.FormatInt(run.ID, 10)
+	}
+	file := func(_, _ *ghemu.Run) string { return "/repos/lanescape/app/contents/" + consumer.RunnersFile }
+	badGateway := fault.Status(http.StatusBadGateway, nil, `{"message": "Bad Gateway"}`)
+	for name, c := range map[string]lost{
+		"a pull request":                           {func(_, _ *ghemu.Run) string { return "/repos/lanescape/app/pulls/" }, 1, notFound},
+		"the default branch's file":                {file, 1, notFound},
+		"the default branch's file, then a 502":    {file, 1, badGateway},
+		"the default branch":                       {func(_, _ *ghemu.Run) string { return "/repos/lanescape/app/git/ref/heads/main" }, 1, notFound},
+		"a run, read again under the disks' lease": {func(chose, _ *ghemu.Run) string { return runPath(chose) }, 2, notFound},
+		"a run's jobs":                             {func(chose, _ *ghemu.Run) string { return runPath(chose) + "/jobs" }, 1, notFound},
+		"a run read again before its rerun":        {func(_, rerun *ghemu.Run) string { return runPath(rerun) }, 2, notFound},
+		"a rerun":                                  {func(_, rerun *ghemu.Run) string { return runPath(rerun) + "/rerun-failed-jobs" }, 1, notFound},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := setup(t)
+			m := e.saveMain(key1)
+			orphan := e.saveMainLabel(tools(key1, "main"))
+			p, _ := e.pull()
+			pr := e.savePull(p, sel(key1, "pr"+strconv.Itoa(p.Number)))
+			closed, _ := e.pull()
+			retired := e.savePull(closed, sel(key1, "pr"+strconv.Itoa(closed.Number)))
+			// A run that chose main's disk, and a run's lost job.
+			chose := e.mainRun()
+			restored := e.start(chose, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}})
+			if restored.source() != m {
+				t.Fatal("no restore")
+			}
+			rerun := e.mainRun()
+			lostJob := e.start(rerun, ghemu.JobSpec{Name: "test", Labels: []string{spot}})
+			run := e.mainRun()
+			jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{"lanescape-2vcpu-linux-amd64-spot-disk-build-" + key1 + "-main"}})
+			if err := e.gce.Preempt(jb.in.Zone, jb.in.Name); err != nil {
+				t.Fatal(err)
+			}
+			e.gh.CompleteJobByID(jb.j.ID, "success")
+			e.eventually("the run is finished", func() bool { s, _ := e.gh.RunState(run); return s == "completed" })
+			e.pass()
+			preemption := "preemptions/5001/" + strconv.FormatInt(run.ID, 10) + "/" + strconv.FormatUint(jb.in.ID, 10) + ".json"
+			if _, ok := e.record(preemption); !ok {
+				t.Fatal("no record of the lost job")
+			}
+			// The run that chose finishes, and the lost job's record is past
+			// its day.
+			e.gh.CompleteJobByID(restored.j.ID, "success")
+			e.eventually("the run is finished", func() bool { s, _ := e.gh.RunState(chose); return s == "completed" })
+			e.clock.Advance(2 * disks.ResumeKept)
+			// What a pass that GitHub showed the repository to would delete:
+			// a family no longer declared, an image with no record, and a
+			// disk saved before its pull request's recorded closing.
+			e.repo.Commit("main", map[string]string{consumer.RunnersFile: `{"disks": {"other": {}}}`})
+			if err := e.objects.Delete(context.Background(), "images/5001/"+orphan+".json", mustGen(t, e, "images/5001/"+orphan+".json")); err != nil {
+				t.Fatal(err)
+			}
+			e.closeByDelivery(closed)
+			lostJob.preempt()
+
+			path, seen := c.path(chose, rerun), 0
+			var gone atomic.Bool
+			e.gh.Faults().Add(fault.Rule{PathPrefix: "/repositories/", Respond: c.answer, Match: func(*http.Request) bool { return gone.Load() }})
+			e.gh.Faults().Add(fault.Rule{PathPrefix: "/repos", Respond: notFound, Match: func(r *http.Request) bool {
+				if !gone.Load() && strings.HasPrefix(r.URL.Path, path) && (c.nth == 1 || r.URL.Path == path) {
+					if seen++; seen >= c.nth {
+						gone.Store(true)
+					}
+				}
+				return gone.Load()
+			}})
+			e.pass()
+			e.gh.Faults().Reset()
+			if !gone.Load() {
+				t.Fatalf("the pass read %s only %d times", path, seen)
+			}
+			for what, img := range map[string]string{"main's": m, "the open pull request's": pr, "the closed pull request's": retired,
+				"the image with no record": orphan} {
+				if !e.has(img) {
+					t.Errorf("%s disk went once access was lost", what)
+				}
+			}
+			if _, ok := e.record("closures/5001/pr" + strconv.Itoa(p.Number) + ".json"); ok {
+				t.Error("a pull request was recorded closed once access was lost")
+			}
+			if _, ok := e.record(preemption); !ok {
+				t.Error("a lost job's record went once access was lost")
+			}
+			// A choice dropped before access was lost, with GitHub's
+			// answer, went rightly; one read under the lease after isn't.
+			if _, ok := e.record("choices/5001/" + strconv.FormatInt(chose.ID, 10) + "/" + choiceHash(sel(key1, "main")) + ".json"); !ok && c.nth > 1 {
+				t.Error("a finished run's choice was dropped once access was lost")
+			}
+		})
+	}
+}
+
+// Access lost at a pass's last read of a repository's, with nothing read of
+// it after, deletes nothing either: the pass reads the repository again
+// before it acts.
+func TestAccessLostAtThePassesLastReadDeletesNothing(t *testing.T) {
+	for name, setup1 := range map[string]func(e *env) string{
+		// A finished run with a restore choice: its jobs are read before
+		// the choice is dropped.
+		"a run's jobs": func(e *env) string {
+			run := e.mainRun()
+			jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}})
+			e.gh.CompleteJobByID(jb.j.ID, "success")
+			e.eventually("the run is finished", func() bool { s, _ := e.gh.RunState(run); return s == "completed" })
+			return "/repos/lanescape/app/actions/runs/" + strconv.FormatInt(run.ID, 10) + "/jobs"
+		},
+		// A run that lost a job, rerun in the pass.
+		"a rerun": func(e *env) string {
+			run := e.mainRun()
+			e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{spot}}).preempt()
+			return "/repos/lanescape/app/actions/runs/" + strconv.FormatInt(run.ID, 10) + "/rerun-failed-jobs"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := setup(t)
+			// Of a family no run here chooses, so no choice keeps it.
+			orphan := e.saveMainLabel("lanescape-2vcpu-linux-amd64-disk-other-" + key1 + "-main")
+			path := setup1(e)
+			if err := e.objects.Delete(context.Background(), "images/5001/"+orphan+".json", mustGen(t, e, "images/5001/"+orphan+".json")); err != nil {
+				t.Fatal(err)
+			}
+			var gone atomic.Bool
+			e.gh.Faults().Add(fault.Rule{PathPrefix: "/repos", Respond: notFound, Match: func(r *http.Request) bool {
+				if r.URL.Path == path {
+					gone.Store(true)
+				}
+				return gone.Load()
+			}})
+			e.pass()
+			e.gh.Faults().Reset()
+			if !gone.Load() {
+				t.Fatalf("the pass never read %s", path)
+			}
+			if !e.has(orphan) {
+				t.Fatal("an image with no record went once access was lost")
+			}
+		})
+	}
+}
+
+// A transfer just before a pass would act deletes nothing: as it takes the
+// disks' lease to mark images, or as it reads, under the lease, the last of
+// a run whose choice it would drop. The pass reads the repository again
+// under the lease.
+func TestATransferJustBeforeAPassActsDeletesNothing(t *testing.T) {
+	transferred := func(e *env, done *atomic.Bool) {
+		if done.CompareAndSwap(false, true) {
+			e.gh.Transfer(e.repo, e.gh.Org(1234, "elsewhere"))
+		}
+	}
+	asItLeases := func(e *env, done *atomic.Bool) {
+		e.gcs.Faults().Add(fault.Rule{Method: http.MethodPost, Match: func(r *http.Request) bool {
+			if strings.HasPrefix(r.URL.Query().Get("name"), "leases/disks/") {
+				transferred(e, done)
+			}
+			return false
+		}})
+	}
+	for name, c := range map[string]func(e *env, done *atomic.Bool) (kept func() bool){
+		"a family no longer declared": func(e *env, done *atomic.Bool) func() bool {
+			m := e.saveMain(key1)
+			e.repo.Commit("main", map[string]string{consumer.RunnersFile: `{"disks": {"tools": {}}}`})
+			asItLeases(e, done)
+			return func() bool { return e.has(m) }
+		},
+		"an image with no record": func(e *env, done *atomic.Bool) func() bool {
+			orphan := e.saveMain(key1)
+			if err := e.objects.Delete(context.Background(), "images/5001/"+orphan+".json", mustGen(t, e, "images/5001/"+orphan+".json")); err != nil {
+				t.Fatal(err)
+			}
+			asItLeases(e, done)
+			return func() bool { return e.has(orphan) }
+		},
+		// The save itself is made, then the older disk it replaces is
+		// marked under the lease. The saving job started before the older
+		// disk was saved, so no choice of its keeps it.
+		"a disk a save replaces": func(e *env, done *atomic.Bool) func() bool {
+			jb := e.start(e.mainRun(), ghemu.JobSpec{Name: "build", Labels: []string{sel(key2, "main")}})
+			m := e.saveMain(key1)
+			e.clock.Advance(time.Minute)
+			before := e.images()
+			e.gcs.Faults().Add(fault.Rule{Method: http.MethodPost, Match: func(r *http.Request) bool {
+				if !strings.HasPrefix(r.URL.Query().Get("name"), "leases/disks/") {
+					return false
+				}
+				for n, im := range e.images() {
+					if _, had := before[n]; !had && im.Status == "READY" {
+						transferred(e, done)
+					}
+				}
+				return false
+			}})
+			jb.finish(true)
+			return func() bool { return e.has(m) }
+		},
+		"a finished run's choice": func(e *env, done *atomic.Bool) func() bool {
+			run := e.mainRun()
+			jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{tools(key1, "main")}})
+			jobs := "/repos/lanescape/app/actions/runs/" + strconv.FormatInt(run.ID, 10) + "/jobs"
+			// The pass that follows the job's end reads the run's jobs,
+			// then again under the lease; it's transferred once GitHub has
+			// answered that read, before any other.
+			var leased, read atomic.Bool
+			e.gcs.Faults().Add(fault.Rule{Method: http.MethodPost, Match: func(r *http.Request) bool {
+				if strings.HasPrefix(r.URL.Query().Get("name"), "leases/disks/") {
+					leased.Store(true)
+				}
+				return false
+			}})
+			e.gh.Faults().Add(fault.Rule{Match: func(r *http.Request) bool {
+				if read.Load() {
+					transferred(e, done)
+				}
+				if r.URL.Path == jobs && leased.Load() {
+					read.Store(true)
+				}
+				return false
+			}})
+			jb.finish(false)
+			choice := "choices/5001/" + strconv.FormatInt(run.ID, 10) + "/" + choiceHash(tools(key1, "main")) + ".json"
+			return func() bool { _, ok := e.record(choice); return ok }
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := setup(t)
+			var done atomic.Bool
+			kept := c(e, &done)
+			e.pass()
+			e.gh.Faults().Reset()
+			e.gcs.Faults().Reset()
+			if !done.Load() {
+				t.Fatal("the repository was never transferred")
+			}
+			if !kept() {
+				t.Fatal("deleted once the repository was transferred")
+			}
+		})
+	}
+}
+
+// A repository GitHub can't be read for once in a pass deletes nothing that
+// pass, even once it can be read again, not even what a recorded closing
+// would: the next pass deletes it.
+func TestAnUnreadableRepositoryDeletesNothing(t *testing.T) {
+	e := setup(t)
+	p, _ := e.pull()
+	pr := "pr" + strconv.Itoa(p.Number)
+	img := e.savePull(p, sel(key1, pr))
+	e.closeByDelivery(p)
+	e.gh.Faults().Add(fault.Rule{PathPrefix: "/repositories/", Times: 1, Respond: fault.Status(http.StatusBadGateway, nil, `{"message": "Bad Gateway"}`)})
+	e.pass()
+	e.gh.Faults().Reset()
+	if !e.has(img) {
+		t.Fatal("a disk went while GitHub couldn't be read for its repository")
+	}
+	if !e.logged("deleting none of them this pass") {
+		t.Fatal("no warning that the repository couldn't be read")
+	}
+	e.pass()
+	if e.has(img) {
+		t.Fatal("a disk saved before its pull request's closing outlived it")
+	}
+}
+
+// A recorded closing is kept while GitHub answers 404 for its repository,
+// however long ago its scope's disks went.
+func TestAClosureIsKeptWhileGitHubDoesntFindItsRepository(t *testing.T) {
+	e := setup(t)
+	p, _ := e.pull()
+	e.closeByDelivery(p)
+	closure := "closures/5001/pr" + strconv.Itoa(p.Number) + ".json"
+	e.clock.Advance(disks.RunLimit)
+	e.gh.Faults().Add(fault.Rule{PathPrefix: "/repos", Respond: notFound})
+	e.pass()
+	e.gh.Faults().Reset()
+	if _, ok := e.record(closure); !ok {
+		t.Fatal("a closure went while GitHub answered 404 for its repository")
+	}
+	e.pass()
+	if _, ok := e.record(closure); ok {
+		t.Fatal("a closure with no disks outlived its runs once GitHub showed its repository again")
+	}
+}
+
+// A deleted repository's disks are kept, for a maintainer to remove by
+// hand: GitHub's 404 for it is the same answer as for one the App can't
+// read. So is an image of its with no record.
+func TestADeletedRepositorysDisksAreKept(t *testing.T) {
+	e := setup(t)
+	m := e.saveMain(key1)
+	orphan := e.saveMainLabel(tools(key1, "main"))
+	p, _ := e.pull()
+	pr := e.savePull(p, sel(key1, "pr"+strconv.Itoa(p.Number)))
+	if err := e.objects.Delete(context.Background(), "images/5001/"+orphan+".json", mustGen(t, e, "images/5001/"+orphan+".json")); err != nil {
+		t.Fatal(err)
+	}
+	e.gh.Delete(e.repo)
+	e.pass()
+	if !e.has(m) || !e.has(pr) || !e.has(orphan) {
+		t.Fatalf("main's %v, the pull request's %v, the image with no record %v; a deleted repository's images went", e.has(m), e.has(pr),
+			e.has(orphan))
+	}
+	if !e.logged("GitHub answers 404 for it") {
+		t.Fatal("no warning naming the deleted repository")
+	}
+}
+
+// A repository GitHub shows as another owner's, transferred, deletes
+// nothing either; transferred back, it's the same consumer, with its disks.
+func TestATransferredRepositorysDisksAreKept(t *testing.T) {
+	e := setup(t)
+	m := e.saveMain(key1)
+	p, _ := e.pull()
+	pr := e.savePull(p, sel(key1, "pr"+strconv.Itoa(p.Number)))
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}})
+	choice := "choices/5001/" + strconv.FormatInt(run.ID, 10) + "/" + choiceHash(sel(key1, "main")) + ".json"
+	e.repo.Commit("main", map[string]string{consumer.RunnersFile: `{"disks": {"tools": {}}}`})
+	e.gh.Transfer(e.repo, e.gh.Org(1234, "elsewhere"))
+	jb.finish(false)
+	e.eventually("the run is finished", func() bool { s, _ := e.gh.RunState(run); return s == "completed" })
+	e.pass()
+	if !e.has(m) || !e.has(pr) {
+		t.Fatalf("main's %v, the pull request's %v; a transferred repository's disks went", e.has(m), e.has(pr))
+	}
+	if _, ok := e.record(choice); !ok {
+		t.Fatal("a finished run's choice was dropped while its repository was another owner's")
+	}
+	if !e.logged("another owner's") {
+		t.Fatal("no warning naming the transferred repository")
+	}
+	e.gh.Transfer(e.repo, e.org)
+	e.repo.Commit("main", map[string]string{consumer.RunnersFile: declares})
+	e.pass()
+	if !e.has(m) || !e.has(pr) {
+		t.Fatalf("main's %v, the pull request's %v; want both kept once transferred back", e.has(m), e.has(pr))
 	}
 }
 

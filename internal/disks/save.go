@@ -137,9 +137,10 @@ func (s *Service) unreported(ctx context.Context, except string) (map[int64]bool
 
 // settled reports whether a run has finished with no automatic rerun it is,
 // or may yet be, due, read afresh from GitHub and the bucket, as a pass
-// reads it: a run or repository GitHub confirms is gone has settled. A run
-// among unreported hasn't.
-func (s *Service) settled(ctx context.Context, repo, runID int64, unreported map[int64]bool) (bool, error) {
+// reads it: a run GitHub confirms is gone has settled. A run among
+// unreported hasn't. A repository the pass's state, pass, can't confirm
+// settles nothing, and one this read can't confirm is recorded there.
+func (s *Service) settled(ctx context.Context, pass *state, repo, runID int64, unreported map[int64]bool) (bool, error) {
 	if unreported[runID] {
 		return false, nil
 	}
@@ -147,7 +148,8 @@ func (s *Service) settled(ctx context.Context, repo, runID int64, unreported map
 	if err != nil {
 		return false, err
 	}
-	st := &state{preemptions: ps, reruns: map[string]record[Rerun]{}, repos: map[int64]*github.Repository{}, runs: map[string]*run{}}
+	st := &state{preemptions: ps, reruns: map[string]record[Rerun]{}, repos: map[int64]*github.Repository{}, unconfirmed: pass.unconfirmed,
+		runs: map[string]*run{}}
 	if rr, _, ok, err := getJSON[Rerun](ctx, s.Objects, rerunKey(repo, runID)); err != nil {
 		return false, err
 	} else if ok {
@@ -313,7 +315,29 @@ func (s *Service) supersede(ctx context.Context, rec Image) error {
 		return nil
 	}
 	slices.SortFunc(older, func(x, y record[Image]) int { return strings.Compare(x.v.Image, y.v.Image) })
+	// GitHub must still show the repository as the organization's when its
+	// images are marked, under the lease: it's read again once, before the
+	// first. If it doesn't, nothing is replaced now; a pass replaces it
+	// once GitHub shows the repository again.
+	checked, shown := false, false
 	marked, err := s.mark(ctx, rec.RepositoryID, older, nil, func(ctx context.Context, _ Image) (bool, error) {
+		if !checked {
+			repo, err := s.GitHub.RepositoryByID(ctx, rec.RepositoryID)
+			switch {
+			case errors.Is(err, github.ErrNotFound):
+				_ = s.notShown(rec.RepositoryID, "GitHub answers 404 for it: it's deleted, or the App can't read it")
+			case err != nil:
+				return false, err
+			case repo.OwnerID != s.Config.Organization.ID:
+				_ = s.notShown(rec.RepositoryID, "GitHub shows it as another owner's: it's been transferred")
+			default:
+				shown = true
+			}
+			checked = true
+		}
+		if !shown {
+			return false, nil
+		}
 		if _, pr := isPullRequest(rec.Scope); !pr {
 			return true, nil
 		}

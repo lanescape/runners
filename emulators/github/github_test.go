@@ -117,6 +117,33 @@ func TestInstallationSeesItsAccountAndPublicRepositories(t *testing.T) {
 	}
 }
 
+func TestADeletedRepositoryIsNotFound(t *testing.T) {
+	ctx := context.Background()
+	emu := ghemu.New()
+	defer emu.Close()
+	org := emu.Org(1, "org")
+	app := emu.NewApp(5)
+	in := emu.Install(app, org)
+	r := emu.Repo(org, 10, "app")
+	emu.Delete(r)
+	tr, err := ghinstallation.New(http.DefaultTransport, app.ID, in.ID, app.PrivateKeyPEM())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr.BaseURL = emu.URL
+	base := emu.URL + "/"
+	c, err := gh.NewClient(gh.WithHTTPClient(&http.Client{Transport: tr}), gh.WithURLs(&base, &base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, resp, err := c.Repositories.GetByID(ctx, r.ID); err == nil || resp.StatusCode != http.StatusNotFound {
+		t.Errorf("a deleted repository by ID: %v", err)
+	}
+	if _, resp, err := c.Repositories.Get(ctx, "org", "app"); err == nil || resp.StatusCode != http.StatusNotFound {
+		t.Errorf("a deleted repository by name: %v", err)
+	}
+}
+
 func TestDeliveriesAreSigned(t *testing.T) {
 	secret := []byte("s")
 	var got http.Header

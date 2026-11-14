@@ -386,6 +386,27 @@ func TestAResumeImageWaitsForItsRun(t *testing.T) {
 	}
 }
 
+// A resume image of a repository GitHub answers 404 for is kept: its run
+// isn't taken as finished.
+func TestAResumeImageOfARepositoryGitHubDoesntFindIsKept(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+	if err := e.gce.Preempt(jb.in.Zone, jb.in.Name); err != nil {
+		t.Fatal(err)
+	}
+	e.pass()
+	resume := disks.ResumeName(repoID, jb.in.ID)
+	if !e.has(resume) {
+		t.Fatal("no resume image")
+	}
+	e.gh.Delete(e.repo)
+	e.pass()
+	if !e.has(resume) {
+		t.Fatal("a resume image went while GitHub answered 404 for its repository")
+	}
+}
+
 // A resume image that no job resumes from goes once its run has finished
 // with no rerun left.
 func TestAnUnusedResumeImageGoesWithItsRun(t *testing.T) {
