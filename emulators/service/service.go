@@ -393,6 +393,18 @@ func (e *Emulator) active(w http.ResponseWriter, r *http.Request, body any) (req
 		fault.Refuse("the repository is no longer the organization's")(w, r)
 		return request{}, false
 	}
+	// As the service does, a job GitHub shows completed has ended, even
+	// before its machine reports, and one GitHub doesn't show running is
+	// asked again.
+	job, err := e.ghc.Job(r.Context(), repo, m.job)
+	switch {
+	case errors.Is(err, github.ErrNotFound) || err == nil && job.Status == "completed":
+		fault.Refuse("this machine's job has ended")(w, r)
+		return request{}, false
+	case err != nil || job.Status != "in_progress":
+		fault.Unavailable(retryAfter)(w, r)
+		return request{}, false
+	}
 	bd, bound, err := e.binder.Lookup(r.Context(), repo.ID, m.run)
 	if err != nil {
 		fault.Unavailable(retryAfter)(w, r)

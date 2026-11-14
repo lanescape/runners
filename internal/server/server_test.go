@@ -410,6 +410,56 @@ func (e *env) logged() string {
 	return e.logs.String()
 }
 
+// Every delivery the webhook accepts can be pushed to the reconcile
+// endpoint: Pub/Sub's push carries it in base64, a third larger, in a JSON
+// envelope, so a delivery at the webhook's limit is still a push the
+// endpoint reads.
+func TestAnAcceptedDeliveryCanBePushed(t *testing.T) {
+	ctx := context.Background()
+	e := setup(t)
+	repository := e.gh.WorkflowJobPayload(e.gh.PushRun(e.repo, "main"), e.inst, "queued", 1, nil)["repository"]
+	// A signed delivery of exactly n bytes.
+	delivery := func(n int) *ghemu.Delivery {
+		payload := map[string]any{"action": "queued", "padding": "", "repository": repository}
+		base, _ := json.Marshal(payload)
+		payload["padding"] = strings.Repeat("x", n-len(base))
+		d := ghemu.NewDelivery(e.url+server.WebhookPath, secret, "workflow_job", payload)
+		d.Body, _ = json.Marshal(payload)
+		d.Header.Set("X-Hub-Signature-256", ghemu.Sign(secret, d.Body))
+		if len(d.Body) != n {
+			t.Fatalf("a delivery of %d bytes, want %d", len(d.Body), n)
+		}
+		return d
+	}
+	send := func(d *ghemu.Delivery) int {
+		resp, err := d.Send(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := send(delivery(server.DefaultWebhookLimit + 1)); code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("a delivery over the limit: %d", code)
+	}
+	if code := send(delivery(server.DefaultWebhookLimit)); code != http.StatusAccepted || e.pub.count() != 1 {
+		t.Fatalf("a delivery at the limit: %d, %d published", code, e.pub.count())
+	}
+	d := e.pub.got[0]
+	push := google.PushWith("lanescape-dev", "lanescape-runners-webhooks-reconcile", "1", d.Body, map[string]string{"event": d.Event})
+	if code, _ := e.post(server.ReconcilePath, e.gg.Token(pusher, audience), string(push)); code != http.StatusNoContent {
+		t.Fatalf("its push, of %d bytes: %d", len(push), code)
+	}
+	if e.ev.count() != 1 || len(e.ev.got[0]) != server.DefaultWebhookLimit {
+		t.Fatal("the pushed delivery wasn't read whole")
+	}
+	// A push larger than any delivery's is still refused.
+	big := `{"message": {"data": "` + strings.Repeat("A", int(server.PushLimit(server.DefaultWebhookLimit))) + `"}}`
+	if code, _ := e.post(server.ReconcilePath, e.gg.Token(pusher, audience), big); code != http.StatusBadRequest {
+		t.Fatalf("a push over the limit: %d", code)
+	}
+}
+
 func TestReconcile(t *testing.T) {
 	e := setup(t)
 	for _, acct := range []string{scheduler, pusher} {

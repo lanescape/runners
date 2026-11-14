@@ -81,6 +81,11 @@ type World interface {
 	// success and its run's scope saves (specs/0003-disks.md). The
 	// service refuses its machine's requests from then on.
 	FinishJob(job Job, conclusion string)
+	// CompleteJob records a job's conclusion in GitHub alone, as its runner
+	// reports it, without its machine's supervisor reporting, as when the
+	// supervisor has died: the service refuses its machine's requests from
+	// then on all the same, since GitHub shows the job ended.
+	CompleteJob(job Job, conclusion string)
 
 	// Unavailable makes GitHub unavailable to the service while on, as when
 	// it can't be reached or limits the service's requests: the service

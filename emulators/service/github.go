@@ -344,6 +344,17 @@ func (e *Emulator) cancel(gr *ghemu.Run, reason string) (Job, error) {
 	return Job{}, &Refused{Reason: reason}
 }
 
+// CompleteJob implements World: GitHub records the job's conclusion, and
+// the machine reports nothing.
+func (e *Emulator) CompleteJob(j Job, conclusion string) {
+	e.mu.Lock()
+	js := e.jobs[j.ID]
+	e.mu.Unlock()
+	if js != nil {
+		e.gh.CompleteJob(js.wj, conclusion)
+	}
+}
+
 // FinishJob implements World: GitHub records the job's conclusion, and the
 // emulator, as the service does on its machine's report, saves its work
 // disk if it was attached, the job asked to save it, its conclusion is
