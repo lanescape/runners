@@ -91,38 +91,72 @@ ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt
 
 # The runner's user, as on GitHub's runners: UID and GID 1001, with
 # passwordless sudo, in no other group. Google's guest agent makes groups of
-# its own at boot, before this script runs, each only if no group of its
-# name exists, with groupadd's next free GID from 1000: google-sudoers, then
-# those of the groups it puts the accounts it makes in that Debian's image
-# lacks, docker and lxd, so docker holds GID 1001. A group holding GID 1001
-# that has no members, is no user's primary group and owns no file on the
-# boot disk, as one just made at boot, moves to the highest free GID of the
-# system groups' range, 101 to 999, as groupadd --system would have made it,
-# and as Docker's own package makes its group. It keeps its name, so at
-# every boot of a machine made from the image the guest agent finds it and
-# makes nothing. Anything else holding UID or GID 1001 fails the build,
-# naming it.
-make_runner_user() {
+# its own as it starts, each only if no group of its name exists, with
+# groupadd's next free GID from 1000: google-sudoers, then those of the
+# groups it puts the accounts it makes in that Debian's image lacks, docker
+# and lxd, so docker holds GID 1001. A group holding GID 1001 that has no
+# members, is no user's primary group and owns no file on the boot disk, as
+# one just made at boot, moves to the highest free GID of the system groups'
+# range, 101 to 999, as groupadd --system would have made it, and as
+# Debian's Docker package makes its group. It keeps its name, so at every
+# boot of a machine made from the image the guest agent finds it and makes
+# nothing. Anything else holding UID or GID 1001 fails the build, naming it.
+
+# lookup DB KEY sets entry to the account database's entry for KEY, or to
+# nothing if it has none; any other failure fails the build.
+lookup() {
+	local status=0
+	entry=$(getent "$1" "$2") || status=$?
+	[ "$status" -eq 0 ] || [ "$status" -eq 2 ] || fail "getent $1 $2 exited $status"
+}
+
+# free_gid_1001 moves the group holding GID 1001, if any and if nothing
+# depends on its number, or fails naming it.
+free_gid_1001() {
 	local entry name members user file gid
-	if entry=$(getent passwd 1001); then
-		fail "UID 1001 is the user ${entry%%:*}'s"
+	lookup group 1001
+	[ -n "$entry" ] || return 0
+	IFS=: read -r name _ _ members <<<"$entry"
+	[ -z "$members" ] || fail "GID 1001 is the group $name's, with members $members"
+	user=$(awk -F: '$4 == 1001 { print $1; exit }' /etc/passwd)
+	[ -z "$user" ] || fail "GID 1001 is the group $name's, the user $user's own group"
+	file=$(find / -xdev -ignore_readdir_race -gid 1001 -print -quit)
+	[ -z "$file" ] || fail "GID 1001 is the group $name's, which owns $file"
+	for ((gid = 999; gid >= 101; gid--)); do
+		lookup group "$gid"
+		[ -n "$entry" ] || break
+	done
+	[ "$gid" -ge 101 ] || fail "GID 1001 is the group $name's, and no system GID is free to move it to"
+	say "moving the group $name from GID 1001 to $gid"
+	groupmod --gid "$gid" "$name"
+}
+
+# make_runner_user makes the runner's user. The guest agent may still be
+# making its groups as this script runs, and may take GID 1001 again once
+# it's freed, which groupadd's 4, a GID that isn't unique, shows: then the
+# group that took it is looked at and moved in turn. The agent makes at most
+# seven groups, google-sudoers and the six of its default list, so eight
+# tries outlast it.
+make_runner_user() {
+	local entry status try
+	lookup passwd 1001
+	[ -z "$entry" ] || fail "UID 1001 is the user ${entry%%:*}'s"
+	for try in 1 2 3 4 5 6 7 8; do
+		free_gid_1001
+		status=0
+		groupadd --gid 1001 runner || status=$?
+		[ "$status" -ne 0 ] || break
+		[ "$status" -eq 4 ] || fail "groupadd --gid 1001 runner exited $status"
+		[ "$try" -lt 8 ] || fail "GID 1001 was taken again each of 8 times it was freed"
+		say "GID 1001 was taken again as it was freed"
+	done
+	status=0
+	useradd --uid 1001 --gid 1001 --create-home --shell /bin/bash runner || status=$?
+	if [ "$status" -ne 0 ]; then
+		lookup passwd 1001
+		[ -z "$entry" ] || fail "useradd --uid 1001 runner exited $status: UID 1001 is the user ${entry%%:*}'s"
+		fail "useradd --uid 1001 runner exited $status"
 	fi
-	if entry=$(getent group 1001); then
-		IFS=: read -r name _ _ members <<<"$entry"
-		[ -z "$members" ] || fail "GID 1001 is the group $name's, with members $members"
-		user=$(awk -F: '$4 == 1001 { print $1; exit }' /etc/passwd)
-		[ -z "$user" ] || fail "GID 1001 is the group $name's, the user $user's own group"
-		file=$(find / -xdev -ignore_readdir_race -gid 1001 -print -quit)
-		[ -z "$file" ] || fail "GID 1001 is the group $name's, which owns $file"
-		for ((gid = 999; gid >= 101; gid--)); do
-			getent group "$gid" >/dev/null || break
-		done
-		[ "$gid" -ge 101 ] || fail "GID 1001 is the group $name's, and no system GID is free to move it to"
-		say "moving the group $name from GID 1001 to $gid"
-		groupmod --gid "$gid" "$name"
-	fi
-	groupadd --gid 1001 runner
-	useradd --uid 1001 --gid 1001 --create-home --shell /bin/bash runner
 }
 say "making the runner's user"
 make_runner_user
