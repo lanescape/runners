@@ -1,0 +1,17 @@
+# ko builds the service's image (specs/0004-deployment.md, CI and CD): for
+# linux/amd64, Cloud Run's, on a base named by digest, so that building the
+# same commit again gives the same image. The base is Google's distroless
+# static image, which holds CA certificates and nothing to run but the
+# service. To move it on, take the digest of the tag's index:
+#   curl -fsSI -H 'Accept: application/vnd.oci.image.index.v1+json' \
+#     https://gcr.io/v2/distroless/static-debian13/manifests/nonroot
+defaultBaseImage: gcr.io/distroless/static-debian13:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864a8c8ef0ef71e5e6480d7f92868329
+defaultPlatforms:
+  - linux/amd64
+builds:
+  - id: runners
+    main: ./cmd/runners
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath

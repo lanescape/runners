@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -74,9 +75,25 @@ func NewGCS(ctx context.Context, bucket string, opts ...option.ClientOption) (*G
 // Close releases the client.
 func (g *GCS) Close() error { return g.client.Close() }
 
+// uploadID is a resumable upload's session in a URI, a credential.
+var uploadID = regexp.MustCompile(`upload_id=[^&\s"']+`)
+
+// redacted is an error with any upload session's ID taken out, so that no
+// caller can log one.
+type redacted struct {
+	msg string
+	err error
+}
+
+func (r *redacted) Error() string { return r.msg }
+func (r *redacted) Unwrap() error { return r.err }
+
 func classify(err error) error {
 	if err == nil {
 		return nil
+	}
+	if msg := err.Error(); uploadID.MatchString(msg) {
+		err = &redacted{msg: uploadID.ReplaceAllString(msg, "upload_id=REDACTED"), err: err}
 	}
 	if errors.Is(err, storage.ErrObjectNotExist) {
 		return fmt.Errorf("%w: %w", ErrNotFound, err)
@@ -113,10 +130,14 @@ func (g *GCS) Get(ctx context.Context, name string) ([]byte, int64, error) {
 func (g *GCS) write(ctx context.Context, obj *storage.ObjectHandle, data []byte) (int64, error) {
 	w := obj.NewWriter(ctx)
 	w.ContentType = "application/json"
-	// Records fit in one chunk, which the SDK buffers and sends as one
+	// An object goes in one chunk, which the SDK buffers and sends as one
 	// request with its checksum, and can retry. With no chunking at all it
-	// streams, and can't. The smallest chunk keeps the buffer small.
-	w.ChunkSize = googleapi.MinUploadChunkSize
+	// streams, and can't. A chunk smaller than the object would start a
+	// resumable upload, whose session URI is a credential that a failed
+	// chunk's error would carry, so the chunk is larger than the object,
+	// in the multiples the SDK takes: the SDK sends one request only if it
+	// reaches the object's end before its buffer is full.
+	w.ChunkSize = (len(data)/googleapi.MinUploadChunkSize + 1) * googleapi.MinUploadChunkSize
 	if _, err := io.Copy(w, bytes.NewReader(data)); err != nil {
 		_ = w.CloseWithError(err)
 		return 0, classify(err)

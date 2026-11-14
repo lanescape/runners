@@ -67,8 +67,13 @@ func (e *Emulator) zoneURL(z string) string {
 func (e *Emulator) instanceURL(in *instance) string {
 	return e.zoneURL(in.zone) + "/instances/" + in.name
 }
-func (e *Emulator) diskURL(d *disk) string    { return e.zoneURL(d.zone) + "/disks/" + d.name }
-func (e *Emulator) imageURL(im *image) string { return e.projectURL() + "/global/images/" + im.name }
+func (e *Emulator) diskURL(d *disk) string { return e.zoneURL(d.zone) + "/disks/" + d.name }
+func (e *Emulator) imageURL(im *image) string {
+	if im.project != "" {
+		return e.URL + "/compute/v1/projects/" + im.project + "/global/images/" + im.name
+	}
+	return e.projectURL() + "/global/images/" + im.name
+}
 
 func last(s string) string { return s[strings.LastIndex(s, "/")+1:] }
 
@@ -503,6 +508,17 @@ func (e *Emulator) resolveImage(name string) (*image, *apiError) {
 		return nil, invalid("Invalid value for field 'sourceImage': '%s'.", name)
 	}
 	rest := name[i+len("global/images/"):]
+	// Another project's image, named projects/<project>/global/images/,
+	// is one of its public images.
+	if j := strings.LastIndex(name[:i], "projects/"); j >= 0 {
+		if p := strings.Trim(name[j+len("projects/"):i], "/"); p != e.Project {
+			im := e.public[p+"/"+rest]
+			if im == nil {
+				return nil, notFound("projects/" + p + "/global/images/" + rest)
+			}
+			return im, nil
+		}
+	}
 	if fam, ok := strings.CutPrefix(rest, "family/"); ok {
 		var best *image
 		for _, im := range e.images {
@@ -1063,6 +1079,9 @@ func (e *Emulator) insertImage(r *http.Request, _ string) (*operation, *apiError
 		im.status = "FAILED"
 		e.images[im.name] = im
 		return op.fail(http.StatusInternalServerError, code, "The operation failed."), nil
+	}
+	if e.pendingImages {
+		im.status = "PENDING"
 	}
 	e.images[im.name] = im
 	return op, nil

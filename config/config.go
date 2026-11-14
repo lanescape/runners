@@ -1,5 +1,5 @@
 // Package config is the service's configuration: the organization's ID,
-// shapes and the runner version. The YAML files beside this one are
+// shapes, the runner version and what goes into the base images. The YAML files beside this one are
 // embedded into the service's binary, and validated when it starts.
 package config
 
@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -24,6 +25,7 @@ type Config struct {
 	Organization Organization
 	Shapes       Shapes
 	Runner       Runner
+	Base         Base
 }
 
 // Organization is the one organization the service serves.
@@ -77,6 +79,29 @@ type Runner struct {
 	SHA256  map[string]string `yaml:"sha256"`
 }
 
+// Base is what goes into the base images besides the runner, and the
+// machines that build them (specs/0003-disks.md, Base images).
+type Base struct {
+	// Debian is each architecture's Debian 13 image in Google's
+	// debian-cloud project, by its exact name.
+	Debian map[string]string `yaml:"debian"`
+	// Go is the Go release the images install: go.mod's toolchain.
+	Go GoRelease `yaml:"go"`
+	// Builders are the machine types a builder of each architecture may
+	// be, in order of preference.
+	Builders map[string][]string `yaml:"builders"`
+}
+
+// GoRelease is a Go release, with the SHA-256 of each architecture's
+// archive, as Go publishes them.
+type GoRelease struct {
+	Version string            `yaml:"version"`
+	SHA256  map[string]string `yaml:"sha256"`
+}
+
+// DebianProject is the project Debian's images are in.
+const DebianProject = "debian-cloud"
+
 // Arches are the architectures machines have.
 var Arches = []string{"amd64", "arm64"}
 
@@ -93,6 +118,7 @@ func Load(fsys fs.FS) (*Config, error) {
 		{"organization.yaml", &c.Organization},
 		{"shapes.yaml", &c.Shapes},
 		{"runner.yaml", &c.Runner},
+		{"base.yaml", &c.Base},
 	} {
 		if err := decode(fsys, f.name, f.v); err != nil {
 			return nil, err
@@ -156,6 +182,7 @@ var (
 	zoneName    = regexp.MustCompile(`^[a-z]+-[a-z]+[0-9]+-[a-z]$`)
 	version     = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
 	sha256Hex   = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	debianImage = regexp.MustCompile(`^debian-13-[a-z0-9-]*v[0-9]{8}[a-z0-9-]*$`)
 )
 
 // armFamilies are Compute Engine's Arm machine families; every other family
@@ -240,6 +267,46 @@ func (c *Config) Validate() error {
 	for a := range c.Runner.SHA256 {
 		if a != "amd64" && a != "arm64" {
 			bad("runner.yaml: sha256 for unknown architecture %q", a)
+		}
+	}
+	b := &c.Base
+	for _, a := range Arches {
+		name := b.Debian[a]
+		if !debianImage.MatchString(name) || len(name) > 63 {
+			bad("base.yaml: debian for %s must be a Debian 13 image's name, such as debian-13-trixie-v20261109", a)
+		} else if strings.Contains(name, "-arm64-") != (a == "arm64") {
+			bad("base.yaml: debian for %s names %s, an image of another architecture", a, name)
+		}
+		if !sha256Hex.MatchString(b.Go.SHA256[a]) {
+			bad("base.yaml: go's sha256 for %s must be 64 lowercase hex digits", a)
+		}
+		if len(b.Builders[a]) == 0 {
+			bad("base.yaml: no builders for %s", a)
+		}
+		for _, mt := range b.Builders[a] {
+			mm := machineType.FindStringSubmatch(mt)
+			if mm == nil {
+				bad("base.yaml: builders for %s: %q isn't a predefined machine type", a, mt)
+				continue
+			}
+			if arch := archOf(mm[1]); arch != a {
+				bad("base.yaml: builders for %s: %s is %s", a, mt, arch)
+			}
+		}
+	}
+	if !version.MatchString(b.Go.Version) || !strings.HasPrefix(b.Go.Version, "1.") {
+		bad("base.yaml: go's version %q isn't a Go release such as 1.27.3", b.Go.Version)
+	}
+	for _, m := range []map[string]string{b.Debian, b.Go.SHA256} {
+		for a := range m {
+			if a != "amd64" && a != "arm64" {
+				bad("base.yaml: unknown architecture %q", a)
+			}
+		}
+	}
+	for a := range b.Builders {
+		if a != "amd64" && a != "arm64" {
+			bad("base.yaml: unknown architecture %q", a)
 		}
 	}
 	return errors.Join(errs...)

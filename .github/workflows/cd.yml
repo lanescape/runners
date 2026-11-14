@@ -1,0 +1,150 @@
+name: CD
+
+# Every push to main is checked as a pull request is, then deployed: ko
+# builds the service's image and pushes it to Artifact Registry, and
+# Infrastructure Manager previews and applies infra/ from this repository at
+# the commit, with the image's digest (specs/0004-deployment.md, CI and CD).
+#
+# Nothing deploys until the maintainer has set the repository's variables
+# below, after applying bootstrap/ (bootstrap/README.md, After the first
+# apply): until then the deploy is skipped, with a notice saying which are
+# missing, and only the checks run.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One run at a time, each in its turn, in the order they began to wait,
+# and none cancelled, waiting or running. A run's deploy goes ahead only if
+# its commit is still main's head when its turn comes (the gate below), so
+# an older commit never deploys over a newer one, and main's head always
+# has a run of its own to deploy it.
+concurrency:
+  group: cd
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  checks:
+    name: Checks
+    uses: ./.github/workflows/ci.yml
+
+  gate:
+    name: May deploy
+    needs: checks
+    runs-on: ${{ github.repository_owner_id == '303994381' && 'blacksmith-2vcpu-ubuntu-2604' || 'ubuntu-24.04' }}
+    outputs:
+      deploy: ${{ steps.gate.outputs.deploy }}
+    steps:
+      - name: Check the repository, the variables and main's head
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNNERS_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.RUNNERS_WORKLOAD_IDENTITY_PROVIDER }}
+          RUNNERS_DEPLOYER: ${{ vars.RUNNERS_DEPLOYER }}
+          RUNNERS_IMAGE_REPOSITORY: ${{ vars.RUNNERS_IMAGE_REPOSITORY }}
+          RUNNERS_INFRA_MANAGER_BUCKET: ${{ vars.RUNNERS_INFRA_MANAGER_BUCKET }}
+          RUNNERS_GITHUB_APP_ID: ${{ vars.RUNNERS_GITHUB_APP_ID }}
+        run: |
+          set -euo pipefail
+          skip() {
+            echo "::notice title=Deploy skipped::$1"
+            echo "deploy=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          }
+          # This repository alone, by its ID and its owner's.
+          if [ "$GITHUB_REPOSITORY_ID" != 1450359106 ] || [ "$GITHUB_REPOSITORY_OWNER_ID" != 303994381 ]; then
+            skip "CD deploys only lanescape/runners."
+          fi
+          # Each variable, and what a value must look like: bootstrap/'s
+          # outputs, which name nothing but the service's own.
+          declare -A pattern=(
+            [RUNNERS_WORKLOAD_IDENTITY_PROVIDER]='^projects/[0-9]+/locations/global/workloadIdentityPools/lanescape-runners-github/providers/github$'
+            [RUNNERS_DEPLOYER]='^lanescape-runners-deployer@lanescape-dev\.iam\.gserviceaccount\.com$'
+            [RUNNERS_IMAGE_REPOSITORY]='^northamerica-northeast1-docker\.pkg\.dev/lanescape-dev/lanescape-runners$'
+            [RUNNERS_INFRA_MANAGER_BUCKET]='^gs://lanescape-runners-infra-manager$'
+            [RUNNERS_GITHUB_APP_ID]='^[1-9][0-9]*$'
+          )
+          missing=() bad=()
+          for name in RUNNERS_WORKLOAD_IDENTITY_PROVIDER RUNNERS_DEPLOYER RUNNERS_IMAGE_REPOSITORY RUNNERS_INFRA_MANAGER_BUCKET RUNNERS_GITHUB_APP_ID; do
+            value=${!name}
+            if [ -z "$value" ]; then
+              missing+=("$name")
+            elif ! [[ $value =~ ${pattern[$name]} ]]; then
+              bad+=("$name")
+            fi
+          done
+          if [ ${#bad[@]} -gt 0 ]; then
+            echo "::error title=CD's variables::${bad[*]} don't look like bootstrap/'s outputs: see bootstrap/README.md, After the first apply."
+            exit 1
+          fi
+          if [ ${#missing[@]} -gt 0 ]; then
+            skip "The repository's variables ${missing[*]} aren't set yet. The maintainer sets them after applying bootstrap/ (bootstrap/README.md, After the first apply); until then nothing deploys."
+          fi
+          # An older commit never deploys over a newer one: main's head has
+          # a run of its own, waiting behind this one, which deploys it.
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            skip "main has moved on to $head since $GITHUB_SHA; the run for a later push deploys it."
+          fi
+          echo "deploy=true" >>"$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy
+    needs: gate
+    if: needs.gate.outputs.deploy == 'true'
+    runs-on: blacksmith-2vcpu-ubuntu-2604
+    # Signing in to Google needs GitHub's token, which only a push to main
+    # by this workflow's own jobs can use (bootstrap/cd.tf).
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PROJECT: lanescape-dev
+      REGION: northamerica-northeast1
+      DEPLOYMENT: projects/lanescape-dev/locations/northamerica-northeast1/deployments/lanescape-runners
+      INFRA_ACCOUNT: projects/lanescape-dev/serviceAccounts/lanescape-runners-infra@lanescape-dev.iam.gserviceaccount.com
+      SOURCE: https://github.com/lanescape/runners.git
+      # Infrastructure Manager's newest Terraform, which infra/ must work
+      # with (infra/README.md).
+      TF_VERSION: 1.5.7
+      IMAGE_REPOSITORY: ${{ vars.RUNNERS_IMAGE_REPOSITORY }}
+      INFRA_MANAGER_BUCKET: ${{ vars.RUNNERS_INFRA_MANAGER_BUCKET }}
+      GITHUB_APP_ID: ${{ vars.RUNNERS_GITHUB_APP_ID }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # No cache: what's deployed is built from the commit and the module
+      # proxy alone.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.RUNNERS_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.RUNNERS_DEPLOYER }}
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+      - name: Build and push the image
+        id: image
+        run: |
+          set -euo pipefail
+          # ko signs in to Artifact Registry with the credentials above. The
+          # repository's tags are immutable, so each run's are its own.
+          ref=$(KO_DOCKER_REPO="$IMAGE_REPOSITORY/runners" go run github.com/google/ko@v0.19.1 build ./cmd/runners \
+            --bare --sbom=none --tags="git-$GITHUB_SHA-$GITHUB_RUN_ATTEMPT")
+          digest=${ref##*@}
+          image="$IMAGE_REPOSITORY/runners@$digest"
+          if ! [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::ko gave $ref, not an image by digest"
+            exit 1
+          fi
+          echo "image=$image" >>"$GITHUB_OUTPUT"
+          echo "Image: \`$image\`" >>"$GITHUB_STEP_SUMMARY"
+      - name: Preview and apply infra/
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: bash cd/apply.sh

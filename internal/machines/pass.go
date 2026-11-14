@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lanescape/runners/internal/bases"
 	"github.com/lanescape/runners/internal/compute"
 	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/pass"
@@ -39,6 +40,9 @@ type record[T any] struct {
 // and disks they describe, since every record is written before what it
 // describes is made.
 type inventory struct {
+	// baseShort are the machine families whose quota a base image's
+	// builder is waiting for.
+	baseShort        []string
 	machines         map[string]Machine
 	machinesComplete bool
 	disks            []compute.Disk
@@ -84,6 +88,12 @@ func (s *Service) Pass(p *pass.Pass) error {
 	}
 	ctx := p.Context()
 	s.stopPastLimit(ctx, inv)
+	if s.Bases != nil {
+		inv.baseShort = s.Bases.Pass(p)
+		if p.Lost() {
+			return context.Cause(p.Context())
+		}
+	}
 	s.followRefusals(ctx, inv)
 	s.give(ctx, inv)
 	s.cleanup(ctx, inv)
@@ -474,7 +484,25 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 	slices.SortStableFunc(all, func(a, b wanted) int {
 		return cmp.Or(a.job.CreatedAt.Compare(b.job.CreatedAt), cmp.Compare(a.repo.ID, b.repo.ID), cmp.Compare(a.job.ID, b.job.ID))
 	})
+	// A base image's builder that couldn't be made is older than every
+	// job: what its machine families free, or for want of quota every job,
+	// goes to it. With none of the service's machines running, nothing of
+	// the service's holds what it lacks, and holding jobs back would only
+	// stop them too.
 	short := map[string]bool{}
+	running := 0
+	for _, m := range inv.machines {
+		if !m.Stopped() {
+			running++
+		}
+	}
+	if running > 0 {
+		for _, f := range inv.baseShort {
+			short[f] = true
+		}
+	} else if len(inv.baseShort) > 0 {
+		s.log().Warn("a base image's builder couldn't be made, and none of the service's machines is running; jobs aren't held back for it")
+	}
 	for _, w := range all {
 		if ctx.Err() != nil {
 			return
@@ -489,8 +517,8 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 		if w.sel.Spot {
 			pools = append(pools, spotPool)
 		}
-		if slices.ContainsFunc(pools, func(f string) bool { return short[f] }) {
-			s.log().Info("a job waits: an older job is waiting for quota or capacity it would draw on", "repository_id", w.repo.ID,
+		if short[bases.AllPools] || slices.ContainsFunc(pools, func(f string) bool { return short[f] }) {
+			s.log().Info("a job waits: an older job, or a base image's builder, is waiting for quota or capacity it would draw on", "repository_id", w.repo.ID,
 				"job_id", w.job.ID, "selector", w.sel.String())
 			continue
 		}
@@ -772,8 +800,9 @@ func (s *Service) group(ctx context.Context, inv *inventory, repo github.Reposit
 	return g, nil
 }
 
-// baseImage is the newest ready base image for an architecture,
-// lsr-base-<arch>-<key> (specs/0003-disks.md).
+// baseImage is the base image machines of an architecture boot,
+// lsr-base-<arch>-<key>: the current key's once it's ready, and until then
+// the previous one (specs/0003-disks.md, Which image machines boot).
 func (s *Service) baseImage(ctx context.Context, inv *inventory, arch string) (string, error) {
 	if im, ok := inv.images[arch]; ok {
 		return im, nil
@@ -782,17 +811,18 @@ func (s *Service) baseImage(ctx context.Context, inv *inventory, arch string) (s
 	if err != nil {
 		return "", err
 	}
-	var best compute.Image
-	for _, im := range ims {
-		if strings.HasPrefix(im.Name, "lsr-base-"+arch+"-") && im.Status == "READY" && (best.Name == "" || im.Created.After(best.Created)) {
-			best = im
-		}
+	var name string
+	var ok bool
+	if s.Bases != nil {
+		name, ok = s.Bases.Boot(ims, arch)
+	} else {
+		name, ok = bases.Boot(ims, arch, "")
 	}
-	if best.Name == "" {
+	if !ok {
 		return "", fmt.Errorf("there's no ready base image for %s", arch)
 	}
-	inv.images[arch] = best.Name
-	return best.Name, nil
+	inv.images[arch] = name
+	return name, nil
 }
 
 // make makes one machine for a job: a just-in-time runner for the selector

@@ -40,6 +40,7 @@ import (
 	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/compute"
 	"github.com/lanescape/runners/internal/github"
+	"github.com/lanescape/runners/internal/pass"
 	"github.com/lanescape/runners/internal/scope"
 	"github.com/lanescape/runners/internal/selector"
 	"github.com/lanescape/runners/internal/store"
@@ -196,6 +197,21 @@ type Service struct {
 	// they're deleted; unset, a boot log is read from Compute Engine
 	// before its machine goes.
 	BootLogs BootLogs
+	// Bases moves the base images on, after the machines past their age
+	// limit are stopped and before queued jobs are given machines
+	// (specs/0001-architecture.md, Passes), and says which base image each
+	// architecture's machines boot. Unset, machines boot the newest ready
+	// base image of their architecture.
+	Bases Bases
+}
+
+// Bases are the base images (specs/0003-disks.md, Base images).
+type Bases interface {
+	// Pass moves them on, and returns the machine families whose quota
+	// a builder is waiting for, which no job draws on for the rest of the
+	// pass.
+	Pass(p *pass.Pass) (short []string)
+	Boot(images []compute.Image, arch string) (string, bool)
 }
 
 // BootLogs reads a machine's serial console, by its numeric ID, from Cloud

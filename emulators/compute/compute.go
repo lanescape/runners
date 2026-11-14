@@ -55,6 +55,7 @@ type Emulator struct {
 	instances map[string]*instance // by zone/name
 	disks     map[string]*disk     // by zone/name
 	images    map[string]*image    // by name
+	public    map[string]*image    // other projects' public images, by project/name
 	ops       map[string]*operation
 	requests  map[string]*operation // by requestId
 	stockouts map[capacityKey]bool
@@ -63,9 +64,11 @@ type Emulator struct {
 	failNext  map[string]string
 	quotas    map[string]int64 // by region/metric
 	opDelay   time.Duration
-	onBoot    func(Machine)
-	onStop    func(Machine)
-	booted    map[uint64]bool
+	// pendingImages makes new images stay PENDING.
+	pendingImages bool
+	onBoot        func(Machine)
+	onStop        func(Machine)
+	booted        map[uint64]bool
 	// logged is each instance's serial console as Cloud Logging keeps it,
 	// by instance ID, line by line, after the instance is gone too.
 	logged map[uint64][]logLine
@@ -147,6 +150,7 @@ type disk struct {
 
 type image struct {
 	id         uint64
+	project    string // another project's, for a public image
 	name       string
 	family     string
 	status     string
@@ -179,7 +183,7 @@ func New(opts ...Option) *Emulator {
 		Project: "lanescape-dev", ProjectNumber: 123456789012,
 		clock:     clockwork.NewRealClock(),
 		zones:     []string{"northamerica-northeast1-a", "northamerica-northeast1-b"},
-		instances: map[string]*instance{}, disks: map[string]*disk{}, images: map[string]*image{},
+		instances: map[string]*instance{}, disks: map[string]*disk{}, images: map[string]*image{}, public: map[string]*image{},
 		ops: map[string]*operation{}, requests: map[string]*operation{},
 		stockouts: map[capacityKey]bool{}, refusing: map[capacityKey]bool{}, diskShort: map[string]bool{}, failNext: map[string]string{}, quotas: map[string]int64{}, booted: map[uint64]bool{},
 	}
@@ -258,6 +262,30 @@ func (e *Emulator) AddImage(name, family, arch string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.images[name] = &image{id: newID(), name: name, family: family, status: "READY", arch: arch, created: e.clock.Now(), sizeGB: 10}
+}
+
+// HoldImages makes images made from now on stay PENDING, as one Compute
+// Engine is slow to finish does, or lets them be READY again, those held
+// included.
+func (e *Emulator) HoldImages(hold bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.pendingImages = hold
+	if !hold {
+		for _, im := range e.images {
+			if im.status == "PENDING" {
+				im.status = "READY"
+			}
+		}
+	}
+}
+
+// AddPublicImage adds a ready image to another project, public, as
+// Debian's own images in debian-cloud are, which any machine may boot.
+func (e *Emulator) AddPublicImage(project, name, arch string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.public[project+"/"+name] = &image{id: newID(), project: project, name: name, status: "READY", arch: arch, created: e.clock.Now(), sizeGB: 10}
 }
 
 // Stockout makes a zone have no capacity for a machine type, standard or

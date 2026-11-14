@@ -23,6 +23,11 @@ resource "google_cloud_run_v2_service" "service" {
   template {
     service_account = local.accounts.service
 
+    # A new revision with every apply (variables.tf).
+    annotations = {
+      "lanescape-runners/deploy" = var.deploy_id
+    }
+
     # Above a pass's 7-minute deadline, as the scheduler's attempt deadline
     # and the subscriptions' acknowledgement deadlines are
     # (specs/0001-architecture.md, Passes).
