@@ -152,14 +152,15 @@ func TestEmbedded(t *testing.T) {
 	// The programs' defaults are the paths the base image gives, and the
 	// script, units and rule name the programs by their full paths
 	// (specs/0002-machines.md, A machine's life). The mount program runs
-	// mkfs.ext4 from the one path machine.MkfsPath names.
+	// mkfs.ext4 and resize2fs from the paths machine.MkfsPath and
+	// machine.Resize2fsPath name.
 	for file, wants := range map[string][]string{
 		"supervisor/main.go":                   {`"` + machine.HookPath + `"`},
 		"job-started.sh":                       {"\nexec " + machine.HookProgramPath + ` "$@"` + "\n"},
 		"lanescape-runners-supervisor.service": {"ExecStart=" + machine.SupervisorPath + "\n", "StandardOutput=journal+console\n"},
 		"lanescape-runners-work-disk.service":  {"ExecStart=" + machine.MountPath + "\n"},
 		"90-lanescape-runners-work.rules":      {`SYSTEMD_WANTS}+="` + filepath.Base(machine.WorkDiskUnitPath) + `"`, `SYMLINK=="disk/by-id/google-work"`},
-		"mountwork/main.go": {`Mkfs: "` + machine.MkfsPath + `"`, `Mountpoint: "` + machine.WorkPath + `"`, `Device: "/dev/disk/by-id/google-work"`,
+		"mountwork/main.go": {`Mkfs: "` + machine.MkfsPath + `"`, `Resize2fs: "` + machine.Resize2fsPath + `"`, `Mountpoint: "` + machine.WorkPath + `"`, `Device: "/dev/disk/by-id/google-work"`,
 			"UID: 1001, GID: 1001"},
 	} {
 		for _, want := range wants {
