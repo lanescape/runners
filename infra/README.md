@@ -11,7 +11,7 @@ The accounts, every project-level grant, the network, Pub/Sub, the scheduler job
 
 ## Who applies it
 
-Only Infrastructure Manager, from CD, as `lanescape-runners-infra`, never anyone by hand. That identity can change nothing but these resources: the bucket and secrets by name, and the Cloud Run service by a grant on it alone. It can't make or delete a Cloud Run service. What it holds that IAM can't limit is in `bootstrap/README.md`, What IAM can't limit. CD starts the apply, from this repository at the commit it has just built, with the image's digest:
+Only Infrastructure Manager, from CD, as `lanescape-runners-infra`, never anyone by hand. That identity can change nothing but these resources: the bucket and secrets by name, and the Cloud Run service by a grant on it alone. It can't make or delete a Cloud Run service. What it holds that IAM can't limit is in `bootstrap/README.md`, What IAM can't limit. CD (`.github/workflows/cd.yml`) first asks for a preview, with the same source and inputs, and prints its logs, then starts the apply, from this repository at the commit it has just built, with the image's digest, and prints its logs too:
 
 ```sh
 gcloud infra-manager deployments apply \
@@ -22,10 +22,10 @@ gcloud infra-manager deployments apply \
   --git-source-ref="$GITHUB_SHA" \
   --artifacts-gcs-bucket=gs://lanescape-runners-infra-manager \
   --tf-version-constraint=1.5.7 \
-  --input-values="github_app_id=<App ID>,service_image=<image>@sha256:<digest>"
+  --input-values="github_app_id=<App ID>,service_image=<image>@sha256:<digest>,deploy_id=<run ID>-<attempt>"
 ```
 
-The source must come from the repository, not be uploaded: uploading needs project-wide Cloud Storage access that CD doesn't have. The image must be in the `lanescape-runners` repository, by digest. Terraform here must work with 1.5.7, Infrastructure Manager's newest; CI validates it with that and the latest.
+`deploy_id`, on the Cloud Run service's template, makes every apply a new revision, even of an image already deployed, so a rerun of a deploy whose revision couldn't start tries again. The source must come from the repository, not be uploaded: uploading needs project-wide Cloud Storage access that CD doesn't have. The image must be in the `lanescape-runners` repository, by digest. Terraform here must work with 1.5.7, Infrastructure Manager's newest; CI validates it with that and the latest.
 
 `check.sh`, which CI runs, refuses provisioners, `local-exec`, `external` data sources and modules here, any network here, any firewall rule or policy here or in `bootstrap/`, and any grant that replaces a policy rather than adding a member.
 
@@ -34,7 +34,7 @@ The source must come from the repository, not be uploaded: uploading needs proje
 - `bootstrap/`, applied, and what its README asks for before and after.
 - The image, pushed by CD.
 
-The first apply makes the App's secrets with no value, so the service can't start. Add the values once, by hand, then let CD apply again:
+CD deploys nothing until the repository's variables that `bootstrap/README.md` lists are set. The first apply makes the App's secrets with no value, so the service can't start, and the apply fails there. Add the values once, by hand, then rerun the failed CD run's deploy:
 
 ```sh
 gcloud secrets versions add lanescape-runners-app-key --data-file=app.pem
