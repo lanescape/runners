@@ -175,6 +175,9 @@ func TestTheBuildersScript(t *testing.T) {
 		`install -d -o root -g root -m 0755 /work`,
 		`systemctl disable --now apt-daily.timer apt-daily-upgrade.timer`,
 		`systemctl mask unattended-upgrades.service`,
+		"\nmake_runner_user\n",
+		`[ "$(id -u runner):$(id -g runner)" = "1001:1001" ]`,
+		`[ "$(id -Gn runner)" = runner ]`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("the script doesn't %s", want)
@@ -232,6 +235,128 @@ func TestTheBuildersScriptSaysWhyItFailed(t *testing.T) {
 			last := lines[len(lines)-1]
 			if !strings.HasPrefix(last, machine.Failed) || !strings.Contains(string(got), tc.want) || strings.Contains(string(got), machine.Built) {
 				t.Fatalf("console = %q; want it to end saying it failed, with %q\noutput:\n%s", got, tc.want, out)
+			}
+		})
+	}
+}
+
+// scriptFunction is the definition of the builder's script's function
+// name, from its first line to its closing brace.
+func scriptFunction(t *testing.T, name string) string {
+	t.Helper()
+	m := regexp.MustCompile(`(?ms)^` + regexp.QuoteMeta(name) + `\(\) \{\n.*?^\}\n`).FindString(machine.BuildScript())
+	if m == "" {
+		t.Fatalf("the script has no function %s", name)
+	}
+	return m
+}
+
+// TestTheBuildersScriptMakesTheRunnersUser runs the script's function that
+// makes the runner's user against account files of the test's own, with
+// Debian's tools that read and write them stood in for: groupadd and
+// useradd fail as Debian's do on an ID that's taken. Google's guest agent
+// makes google-sudoers, docker and lxd at boot with the next free GIDs from
+// 1000, so docker holds GID 1001: a group holding it that nothing depends
+// on moves to the highest free system GID, keeping its name, and anything
+// else holding UID or GID 1001 fails the build, naming it, with nothing
+// changed (specs/0003-disks.md, Making a base image).
+func TestTheBuildersScriptMakesTheRunnersUser(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("no bash")
+	}
+	const (
+		debian = "root:x:0:\nadm:x:4:\nsudo:x:27:\nusers:x:100:\nsystemd-journal:x:999:\nsystemd-network:x:998:\nnogroup:x:65534:\n"
+		passwd = "root:x:0:0:root:/root:/bin/bash\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
+		guest  = "google-sudoers:x:1000:\ndocker:x:1001:\nlxd:x:1002:\n"
+		runner = "runner:x:1001:\n"
+		user   = "runner:x:1001:1001::/home/runner:/bin/bash\n"
+	)
+	var full strings.Builder
+	for gid := 101; gid <= 999; gid++ {
+		fmt.Fprintf(&full, "sys%d:x:%d:\n", gid, gid)
+	}
+	stubs := map[string]string{
+		// getent DB KEY: the entry whose name or ID is KEY, or exit 2.
+		"getent": `awk -F: -v k="$2" '$1 == k || $3 == k { print; found = 1; exit } END { exit !found }' "$DB/$1" || exit 2`,
+		// groupmod --gid GID NAME
+		"groupmod": `echo "groupmod $*" >>"$DB/calls"
+awk -F: -v OFS=: -v g="$2" -v n="$3" '$1 == n { $3 = g } { print }' "$DB/group" >"$DB/group.new" && mv "$DB/group.new" "$DB/group"`,
+		// groupadd --gid GID NAME
+		"groupadd": `echo "groupadd $*" >>"$DB/calls"
+awk -F: -v g="$2" -v n="$3" '$1 == n { exit 9 } $3 == g { exit 4 }' "$DB/group" || exit
+echo "$3:x:$2:" >>"$DB/group"`,
+		// useradd --uid UID --gid GID --create-home --shell SHELL NAME
+		"useradd": `echo "useradd $*" >>"$DB/calls"
+awk -F: -v u="$2" -v n="$8" '$1 == n { exit 9 } $3 == u { exit 4 }' "$DB/passwd" || exit
+echo "$8:x:$2:$4::/home/$8:$7" >>"$DB/passwd"`,
+		// find / ... -gid GID -print -quit: the test's own list of what
+		// GID 1001 owns.
+		"find": `case " $* " in *" -gid 1001 "*) cat "$DB/owned" ;; *) exit 1 ;; esac`,
+	}
+	for _, tc := range []struct {
+		name, group, passwd, owned string
+		// wantGroup and wantPasswd are the files after a success; want,
+		// what a failure says.
+		wantGroup, wantPasswd, want string
+	}{
+		{name: "no group holds GID 1001", group: debian, passwd: passwd,
+			wantGroup: debian + runner, wantPasswd: passwd + user},
+		{name: "the guest agent's docker holds GID 1001", group: debian + guest, passwd: passwd,
+			wantGroup: debian + "google-sudoers:x:1000:\ndocker:x:997:\nlxd:x:1002:\n" + runner, wantPasswd: passwd + user},
+		{name: "a group with members holds GID 1001", group: debian + "google-sudoers:x:1000:\ndocker:x:1001:alice,bob\n", passwd: passwd,
+			want: "GID 1001 is the group docker's, with members alice,bob"},
+		{name: "a user's primary group holds GID 1001", group: debian + "google-sudoers:x:1000:\nalice:x:1001:\n", passwd: passwd + "alice:x:1000:1001::/home/alice:/bin/bash\n",
+			want: "GID 1001 is the group alice's, the user alice's own group"},
+		{name: "a group owning a file holds GID 1001", group: debian + guest, passwd: passwd, owned: "/srv/data\n",
+			want: "GID 1001 is the group docker's, which owns /srv/data"},
+		{name: "no system GID is free", group: "root:x:0:\n" + full.String() + guest, passwd: passwd,
+			want: "GID 1001 is the group docker's, and no system GID is free to move it to"},
+		{name: "a user holds UID 1001", group: debian + guest, passwd: passwd + "bob:x:1001:1003::/home/bob:/bin/bash\n",
+			want: "UID 1001 is the user bob's"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			db, bin := filepath.Join(dir, "db"), filepath.Join(dir, "bin")
+			for _, d := range []string{db, bin} {
+				if err := os.Mkdir(d, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for name, data := range map[string]string{"group": tc.group, "passwd": tc.passwd, "owned": tc.owned} {
+				if err := os.WriteFile(filepath.Join(db, name), []byte(data), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for name, body := range stubs {
+				if err := os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fn := strings.ReplaceAll(scriptFunction(t, "make_runner_user"), "/etc/passwd", filepath.Join(db, "passwd"))
+			cmd := exec.Command(bash, "-c", "set -Eeuo pipefail\n"+
+				`fail() { printf 'failed: %s\n' "$1"; exit 1; }`+"\n"+
+				`say() { printf '%s\n' "$*"; }`+"\n"+
+				fn+"make_runner_user\n")
+			cmd.Env = []string{"PATH=" + bin + ":/usr/bin:/bin", "HOME=" + dir, "DB=" + db}
+			out, err := cmd.CombinedOutput()
+			group, _ := os.ReadFile(filepath.Join(db, "group"))
+			pw, _ := os.ReadFile(filepath.Join(db, "passwd"))
+			calls, _ := os.ReadFile(filepath.Join(db, "calls"))
+			if tc.want != "" {
+				if err == nil || !strings.Contains(string(out), "failed: "+tc.want+"\n") {
+					t.Fatalf("err = %v, output:\n%s\nwant it to fail saying %q", err, out, tc.want)
+				}
+				if string(group) != tc.group || string(pw) != tc.passwd || len(calls) != 0 {
+					t.Errorf("a failure changed the accounts: ran %q, group:\n%s\npasswd:\n%s", calls, group, pw)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("err = %v, output:\n%s", err, out)
+			}
+			if string(group) != tc.wantGroup || string(pw) != tc.wantPasswd {
+				t.Errorf("group:\n%s\npasswd:\n%s\nwant group:\n%s\npasswd:\n%s\noutput:\n%s", group, pw, tc.wantGroup, tc.wantPasswd, out)
 			}
 		})
 	}
