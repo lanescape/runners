@@ -223,9 +223,10 @@ resource "google_project_iam_custom_role" "infra_run" {
 # --- CD ---------------------------------------------------------------------
 
 # Starts applies and previews of the lanescape-runners deployment, and reads
-# their results. Infrastructure Manager can't be limited by name in IAM; the
-# deployer can't delete a deployment, and changing one to run as any account
-# but lanescape-runners-infra needs acting as that account.
+# their results. A preview of a deployment that exists needs its Terraform
+# state, so the deployer may read it. Infrastructure Manager can't be limited
+# by name in IAM; the deployer can't delete a deployment, and changing one to
+# run as any account but lanescape-runners-infra needs acting as that account.
 resource "google_project_iam_custom_role" "deployer" {
   role_id     = "lanescapeRunnersDeployer"
   title       = "Lanescape Runners CD"
@@ -233,6 +234,7 @@ resource "google_project_iam_custom_role" "deployer" {
   permissions = [
     "config.deployments.create",
     "config.deployments.get",
+    "config.deployments.getState",
     "config.deployments.update",
     "config.operations.get",
     "config.previews.create",
