@@ -196,6 +196,19 @@ func (s *Service) confirmed(ctx context.Context, st *state, id int64, err error)
 	return err
 }
 
+// stillShown reads a repository again just before a pass acts on what it
+// decided of it, and reports whether GitHub still shows it as the
+// organization's: a read since that GitHub answered with 404 because the
+// App lost access, confirmed or not, then shows here.
+func (s *Service) stillShown(ctx context.Context, st *state, id int64) bool {
+	if st.unconfirmed[id] != nil {
+		return false
+	}
+	delete(st.repos, id)
+	_, err := s.repository(ctx, st, id)
+	return err == nil
+}
+
 // evidence looks, by instance ID, for evidence that each stopped Spot
 // machine recorded as perhaps preempted was: Compute Engine's recorded
 // event, or a zone operation of type compute.instances.preempted, for a
@@ -265,7 +278,7 @@ func (s *Service) runState(ctx context.Context, st *state, repoID, runID int64) 
 	if r.found && r.finished {
 		jobs, err := s.GitHub.RunJobs(ctx, *repo, runID)
 		if err != nil {
-			return nil, err
+			return nil, s.confirmed(ctx, st, repoID, err)
 		}
 		r.failed = map[int64]bool{}
 		for _, j := range jobs {
@@ -368,7 +381,7 @@ func (s *Service) rerunLocked(ctx context.Context, st *state, repoID, runID int6
 	// What the pass read may have changed while it waited for the lease:
 	// a maintainer may have rerun the run since.
 	if wr, err := s.GitHub.WorkflowRun(ctx, *repo, runID); err != nil {
-		return err
+		return s.confirmed(ctx, st, repoID, err)
 	} else if wr.Attempt != rs.attempt || wr.Status != "completed" {
 		rs.rerun = false
 		return nil
@@ -388,12 +401,14 @@ func (s *Service) rerunLocked(ctx context.Context, st *state, repoID, runID int6
 		}
 		st.reruns[key] = record[Rerun]{rec, gen}
 	}
-	err = s.GitHub.RerunFailedJobs(ctx, *repo, runID)
+	err = s.confirmed(ctx, st, repoID, s.GitHub.RerunFailedJobs(ctx, *repo, runID))
 	if err != nil && github.IsUnavailable(err) {
 		// An answer lost after GitHub began the next attempt is a rerun
 		// all the same.
 		if wr, rerr := s.GitHub.WorkflowRun(ctx, *repo, runID); rerr == nil && wr.Attempt > rs.attempt {
 			err = nil
+		} else if rerr != nil {
+			_ = s.confirmed(ctx, st, repoID, rerr)
 		}
 	}
 	if err != nil {
@@ -680,7 +695,7 @@ func (s *Service) expire(ctx context.Context, st *state) {
 			}
 		}
 		var marked []Image
-		if st.unconfirmed[repo] != nil {
+		if len(due) > 0 && !s.stillShown(ctx, st, repo) {
 			// GitHub stopped showing the repository during the pass.
 			due = nil
 		}
@@ -868,6 +883,9 @@ func (s *Service) seenClosed(ctx context.Context, st *state, repo int64, sc stri
 // tidyScopes drops a consumer's closures once the scope has no images and
 // no run bound before the closure can still be going on.
 func (s *Service) tidyScopes(ctx context.Context, st *state, repo int64, unknown map[string]bool) {
+	if st.unconfirmed[repo] != nil {
+		return
+	}
 	have := map[string]bool{}
 	for _, r := range st.records {
 		v := r.v
@@ -1002,8 +1020,8 @@ func (s *Service) tidy(ctx context.Context, st *state) {
 				expired[c.v.JobID] = true
 			}
 		}
-		if st.unconfirmed[repo] != nil {
-			// GitHub stopped showing the repository as it read the jobs.
+		if !s.stillShown(ctx, st, repo) {
+			// GitHub stopped showing the repository during the pass.
 			continue
 		}
 		var marked []Image
@@ -1054,6 +1072,19 @@ func (s *Service) tidy(ctx context.Context, st *state) {
 			_ = s.Objects.Delete(ctx, key, r.gen)
 		}
 	}
+	// Nothing of a run is let go unless GitHub still shows its repository
+	// as the organization's when it would be.
+	shown := map[int64]bool{}
+	shownNow := func(id int64) bool {
+		if st.unconfirmed[id] != nil {
+			return false
+		}
+		if v, ok := shown[id]; ok {
+			return v
+		}
+		shown[id] = s.stillShown(ctx, st, id)
+		return shown[id]
+	}
 	runsLeft := map[string]bool{}
 	for key, r := range st.preemptions {
 		p := r.v
@@ -1062,7 +1093,7 @@ func (s *Service) tidy(ctx context.Context, st *state) {
 			continue
 		}
 		rs, err := s.runState(ctx, st, p.RepositoryID, p.RunID)
-		if err != nil || !rs.finished || rs.due {
+		if err != nil || !rs.finished || rs.due || !shownNow(p.RepositoryID) {
 			runsLeft[runKey(p.RepositoryID, p.RunID)] = true
 			continue
 		}
@@ -1072,9 +1103,7 @@ func (s *Service) tidy(ctx context.Context, st *state) {
 	}
 	for key, r := range st.reruns {
 		if !runsLeft[runKey(r.v.RepositoryID, r.v.RunID)] {
-			// Nothing of a run is let go while GitHub doesn't show its
-			// repository as the organization's.
-			if _, err := s.repository(ctx, st, r.v.RepositoryID); err != nil {
+			if !shownNow(r.v.RepositoryID) {
 				continue
 			}
 			_ = s.Objects.Delete(ctx, key, r.gen)

@@ -239,21 +239,26 @@ func TestAccessLostDuringAPassDeletesNothing(t *testing.T) {
 	type lost struct {
 		// path is the read from whose nth on GitHub answers 404 for
 		// everything of the repository's, and then gives answer for the
-		// repository itself.
-		path   func(e *env, run *ghemu.Run) string
+		// repository itself: of chose, a finished run with a restore
+		// choice, or of rerun, a run due its rerun.
+		path   func(chose, rerun *ghemu.Run) string
 		nth    int
 		answer func(http.ResponseWriter, *http.Request)
 	}
-	file := func(*env, *ghemu.Run) string { return "/repos/lanescape/app/contents/" + consumer.RunnersFile }
+	runPath := func(run *ghemu.Run) string {
+		return "/repos/lanescape/app/actions/runs/" + strconv.FormatInt(run.ID, 10)
+	}
+	file := func(_, _ *ghemu.Run) string { return "/repos/lanescape/app/contents/" + consumer.RunnersFile }
 	badGateway := fault.Status(http.StatusBadGateway, nil, `{"message": "Bad Gateway"}`)
 	for name, c := range map[string]lost{
-		"a pull request":                        {func(e *env, _ *ghemu.Run) string { return "/repos/lanescape/app/pulls/" }, 1, notFound},
-		"the default branch's file":             {file, 1, notFound},
-		"the default branch's file, then a 502": {file, 1, badGateway},
-		"the default branch":                    {func(*env, *ghemu.Run) string { return "/repos/lanescape/app/git/ref/heads/main" }, 1, notFound},
-		"a run, read again under the disks' lease": {func(_ *env, run *ghemu.Run) string {
-			return "/repos/lanescape/app/actions/runs/" + strconv.FormatInt(run.ID, 10)
-		}, 2, notFound},
+		"a pull request":                           {func(_, _ *ghemu.Run) string { return "/repos/lanescape/app/pulls/" }, 1, notFound},
+		"the default branch's file":                {file, 1, notFound},
+		"the default branch's file, then a 502":    {file, 1, badGateway},
+		"the default branch":                       {func(_, _ *ghemu.Run) string { return "/repos/lanescape/app/git/ref/heads/main" }, 1, notFound},
+		"a run, read again under the disks' lease": {func(chose, _ *ghemu.Run) string { return runPath(chose) }, 2, notFound},
+		"a run's jobs":                             {func(chose, _ *ghemu.Run) string { return runPath(chose) + "/jobs" }, 1, notFound},
+		"a run read again before its rerun":        {func(_, rerun *ghemu.Run) string { return runPath(rerun) }, 2, notFound},
+		"a rerun":                                  {func(_, rerun *ghemu.Run) string { return runPath(rerun) + "/rerun-failed-jobs" }, 1, notFound},
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := setup(t)
@@ -269,6 +274,8 @@ func TestAccessLostDuringAPassDeletesNothing(t *testing.T) {
 			if restored.source() != m {
 				t.Fatal("no restore")
 			}
+			rerun := e.mainRun()
+			lostJob := e.start(rerun, ghemu.JobSpec{Name: "test", Labels: []string{spot}})
 			run := e.mainRun()
 			jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{"lanescape-2vcpu-linux-amd64-spot-disk-build-" + key1 + "-main"}})
 			if err := e.gce.Preempt(jb.in.Zone, jb.in.Name); err != nil {
@@ -294,8 +301,9 @@ func TestAccessLostDuringAPassDeletesNothing(t *testing.T) {
 				t.Fatal(err)
 			}
 			e.closeByDelivery(closed)
+			lostJob.preempt()
 
-			path, seen := c.path(e, chose), 0
+			path, seen := c.path(chose, rerun), 0
 			var gone atomic.Bool
 			e.gh.Faults().Add(fault.Rule{PathPrefix: "/repositories/", Respond: c.answer, Match: func(*http.Request) bool { return gone.Load() }})
 			e.gh.Faults().Add(fault.Rule{PathPrefix: "/repos", Respond: notFound, Match: func(r *http.Request) bool {
@@ -332,15 +340,64 @@ func TestAccessLostDuringAPassDeletesNothing(t *testing.T) {
 	}
 }
 
-// A repository GitHub can't be read for deletes nothing, not even what a
-// recorded closing would: once it can be, that goes.
+// Access lost at a pass's last read of a repository's, with nothing read of
+// it after, deletes nothing either: the pass reads the repository again
+// before it acts.
+func TestAccessLostAtThePassesLastReadDeletesNothing(t *testing.T) {
+	for name, setup1 := range map[string]func(e *env) string{
+		// A finished run with a restore choice: its jobs are read before
+		// the choice is dropped.
+		"a run's jobs": func(e *env) string {
+			run := e.mainRun()
+			jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}})
+			e.gh.CompleteJobByID(jb.j.ID, "success")
+			e.eventually("the run is finished", func() bool { s, _ := e.gh.RunState(run); return s == "completed" })
+			return "/repos/lanescape/app/actions/runs/" + strconv.FormatInt(run.ID, 10) + "/jobs"
+		},
+		// A run that lost a job, rerun in the pass.
+		"a rerun": func(e *env) string {
+			run := e.mainRun()
+			e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{spot}}).preempt()
+			return "/repos/lanescape/app/actions/runs/" + strconv.FormatInt(run.ID, 10) + "/rerun-failed-jobs"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := setup(t)
+			// Of a family no run here chooses, so no choice keeps it.
+			orphan := e.saveMainLabel("lanescape-2vcpu-linux-amd64-disk-other-" + key1 + "-main")
+			path := setup1(e)
+			if err := e.objects.Delete(context.Background(), "images/5001/"+orphan+".json", mustGen(t, e, "images/5001/"+orphan+".json")); err != nil {
+				t.Fatal(err)
+			}
+			var gone atomic.Bool
+			e.gh.Faults().Add(fault.Rule{PathPrefix: "/repos", Respond: notFound, Match: func(r *http.Request) bool {
+				if r.URL.Path == path {
+					gone.Store(true)
+				}
+				return gone.Load()
+			}})
+			e.pass()
+			e.gh.Faults().Reset()
+			if !gone.Load() {
+				t.Fatalf("the pass never read %s", path)
+			}
+			if !e.has(orphan) {
+				t.Fatal("an image with no record went once access was lost")
+			}
+		})
+	}
+}
+
+// A repository GitHub can't be read for once in a pass deletes nothing that
+// pass, even once it can be read again, not even what a recorded closing
+// would: the next pass deletes it.
 func TestAnUnreadableRepositoryDeletesNothing(t *testing.T) {
 	e := setup(t)
 	p, _ := e.pull()
 	pr := "pr" + strconv.Itoa(p.Number)
 	img := e.savePull(p, sel(key1, pr))
 	e.closeByDelivery(p)
-	e.gh.Faults().Add(fault.Rule{PathPrefix: "/repositories/", Respond: fault.Status(http.StatusBadGateway, nil, `{"message": "Bad Gateway"}`)})
+	e.gh.Faults().Add(fault.Rule{PathPrefix: "/repositories/", Times: 1, Respond: fault.Status(http.StatusBadGateway, nil, `{"message": "Bad Gateway"}`)})
 	e.pass()
 	e.gh.Faults().Reset()
 	if !e.has(img) {
@@ -352,6 +409,26 @@ func TestAnUnreadableRepositoryDeletesNothing(t *testing.T) {
 	e.pass()
 	if e.has(img) {
 		t.Fatal("a disk saved before its pull request's closing outlived it")
+	}
+}
+
+// A recorded closing is kept while GitHub answers 404 for its repository,
+// however long ago its scope's disks went.
+func TestAClosureIsKeptWhileGitHubDoesntFindItsRepository(t *testing.T) {
+	e := setup(t)
+	p, _ := e.pull()
+	e.closeByDelivery(p)
+	closure := "closures/5001/pr" + strconv.Itoa(p.Number) + ".json"
+	e.clock.Advance(disks.RunLimit)
+	e.gh.Faults().Add(fault.Rule{PathPrefix: "/repos", Respond: notFound})
+	e.pass()
+	e.gh.Faults().Reset()
+	if _, ok := e.record(closure); !ok {
+		t.Fatal("a closure went while GitHub answered 404 for its repository")
+	}
+	e.pass()
+	if _, ok := e.record(closure); ok {
+		t.Fatal("a closure with no disks outlived its runs once GitHub showed its repository again")
 	}
 }
 
