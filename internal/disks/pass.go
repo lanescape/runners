@@ -37,13 +37,15 @@ type state struct {
 	complete    bool
 
 	repos map[int64]*github.Repository
-	// notShown are the errors of the repositories GitHub doesn't show as
-	// the organization's, read once a pass.
-	notShown  map[int64]error
-	runs      map[string]*run
-	pulls     map[string]*github.PullRequest
-	jobs      map[int64]*github.Job
-	preempted map[string][]uint64
+	// unconfirmed are the repositories GitHub didn't show as the
+	// organization's when last read in the pass, with why: GitHub's 404,
+	// another owner, or a failure to read it. For the rest of the pass,
+	// none of their images is marked, and nothing of their runs decided.
+	unconfirmed map[int64]error
+	runs        map[string]*run
+	pulls       map[string]*github.PullRequest
+	jobs        map[int64]*github.Job
+	preempted   map[string][]uint64
 	// live are the runs with an admitted machine that hasn't reported,
 	// read once a pass when first needed.
 	live map[int64]bool
@@ -97,7 +99,8 @@ func (s *Service) Pass(p *pass.Pass) error {
 }
 
 func (s *Service) read(ctx context.Context) *state {
-	st := &state{images: map[string]compute.Image{}, complete: true, repos: map[int64]*github.Repository{}, runs: map[string]*run{},
+	st := &state{images: map[string]compute.Image{}, complete: true, repos: map[int64]*github.Repository{}, unconfirmed: map[int64]error{},
+		runs:  map[string]*run{},
 		pulls: map[string]*github.PullRequest{}, jobs: map[int64]*github.Job{}, preempted: map[string][]uint64{}}
 	ims, err := s.Compute.Images(ctx)
 	if err != nil {
@@ -143,34 +146,38 @@ var errNotShown = errors.New("GitHub doesn't show the repository as the organiza
 
 // repository is a consumer's repository, read once a pass. A repository
 // GitHub doesn't show as the organization's gives errNotShown, and a
-// warning naming it and why, once a pass.
+// warning naming it and why. Once a read of it fails, every later one in
+// the pass gives the same error, even after one succeeded before.
 func (s *Service) repository(ctx context.Context, st *state, id int64) (*github.Repository, error) {
+	if err := st.unconfirmed[id]; err != nil {
+		return nil, err
+	}
 	if r, ok := st.repos[id]; ok {
 		return r, nil
 	}
-	if err, ok := st.notShown[id]; ok {
-		return nil, err
-	}
 	r, err := s.GitHub.RepositoryByID(ctx, id)
-	var why string
 	switch {
 	case errors.Is(err, github.ErrNotFound):
-		why = "GitHub answers 404 for it: it's deleted, or the App can't read it"
+		err = s.notShown(id, "GitHub answers 404 for it: it's deleted, or the App can't read it")
 	case err != nil:
-		return nil, err
 	case r.OwnerID != s.Config.Organization.ID:
-		why = "GitHub shows it as another owner's: it's been transferred"
+		err = s.notShown(id, "GitHub shows it as another owner's: it's been transferred")
 	default:
 		st.repos[id] = &r
 		return &r, nil
 	}
-	err = fmt.Errorf("repository %d: %w: %s", id, errNotShown, why)
-	if st.notShown == nil {
-		st.notShown = map[int64]error{}
+	delete(st.repos, id)
+	if st.unconfirmed == nil {
+		st.unconfirmed = map[int64]error{}
 	}
-	st.notShown[id] = err
-	s.log().Warn("a repository with records isn't the organization's by GitHub's answer", "repository_id", id, "why", why)
+	st.unconfirmed[id] = err
 	return nil, err
+}
+
+// notShown is errNotShown for a repository, and why, which it logs.
+func (s *Service) notShown(id int64, why string) error {
+	s.log().Warn("a repository with records isn't the organization's by GitHub's answer", "repository_id", id, "why", why)
+	return fmt.Errorf("repository %d: %w: %s", id, errNotShown, why)
 }
 
 // confirmed is a 404 for something of a repository's, such as a run, a pull
@@ -234,6 +241,9 @@ func (s *Service) evidence(ctx context.Context, st *state) {
 // admitted is still unreported. An
 // error means GitHub gave no confirmed answer.
 func (s *Service) runState(ctx context.Context, st *state, repoID, runID int64) (*run, error) {
+	if err := st.unconfirmed[repoID]; err != nil {
+		return nil, err
+	}
 	key := runKey(repoID, runID)
 	if r, ok := st.runs[key]; ok {
 		return r, nil
@@ -418,7 +428,7 @@ func (s *Service) dropChoices(ctx context.Context, st *state) {
 			}
 			for _, key := range keys {
 				r := st.choices[key]
-				if ok, err := s.settled(ctx, repo, r.v.RunID, live); err != nil || !ok {
+				if ok, err := s.settled(ctx, st, repo, r.v.RunID, live); err != nil || !ok {
 					continue
 				}
 				if err := s.Objects.Delete(ctx, key, r.gen); err == nil || errors.Is(err, store.ErrNotFound) {
@@ -436,6 +446,9 @@ func (s *Service) dropChoices(ctx context.Context, st *state) {
 // pull is a pull request, read once a pass; nil if GitHub has none of that
 // number.
 func (s *Service) pull(ctx context.Context, st *state, repoID int64, sc string) (*github.PullRequest, error) {
+	if err := st.unconfirmed[repoID]; err != nil {
+		return nil, err
+	}
 	key := strconv.FormatInt(repoID, 10) + "/" + sc
 	if p, ok := st.pulls[key]; ok {
 		return p, nil
@@ -464,6 +477,9 @@ func (s *Service) pull(ctx context.Context, st *state, repoID int64, sc string) 
 
 // finishedJob reports whether GitHub shows a job finished.
 func (s *Service) finishedJob(ctx context.Context, st *state, repoID, jobID int64) (bool, error) {
+	if err := st.unconfirmed[repoID]; err != nil {
+		return false, err
+	}
 	j, ok := st.jobs[jobID]
 	if !ok {
 		repo, err := s.repository(ctx, st, repoID)
@@ -664,7 +680,7 @@ func (s *Service) expire(ctx context.Context, st *state) {
 			}
 		}
 		var marked []Image
-		if _, lost := st.notShown[repo]; lost {
+		if st.unconfirmed[repo] != nil {
 			// GitHub stopped showing the repository during the pass.
 			due = nil
 		}
@@ -754,7 +770,7 @@ func readDeclarations(ctx context.Context, gh github.API, log *slog.Logger, repo
 	confirm func(error) error) (map[string]declared, error) {
 	out := map[string]declared{}
 	tip, err := gh.BranchHead(ctx, repo, repo.DefaultBranch)
-	if err != nil {
+	if err = confirm(err); err != nil {
 		return out, fmt.Errorf("reading the default branch: %w", err)
 	}
 	f, err := readRunnersFile(ctx, gh, repo, tip, confirm)
@@ -985,6 +1001,10 @@ func (s *Service) tidy(ctx context.Context, st *state) {
 			if startedFrom || (err == nil && done) {
 				expired[c.v.JobID] = true
 			}
+		}
+		if st.unconfirmed[repo] != nil {
+			// GitHub stopped showing the repository as it read the jobs.
+			continue
 		}
 		var marked []Image
 		err := s.step(ctx, repo, func(ctx context.Context) error {

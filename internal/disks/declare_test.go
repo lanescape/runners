@@ -13,6 +13,7 @@ import (
 	"github.com/lanescape/runners/emulators/fault"
 	ghemu "github.com/lanescape/runners/emulators/github"
 	"github.com/lanescape/runners/internal/consumer"
+	"github.com/lanescape/runners/internal/disks"
 )
 
 // armBuild is a label of the arm64 shape whose job asks for the family
@@ -215,38 +216,117 @@ func TestARepositoryGitHubDoesntFindDeletesNothing(t *testing.T) {
 	}
 }
 
-// Access lost during a pass deletes nothing: a 404 for a pull request, or
-// for the default branch's file, counts as its absence only if GitHub,
-// asked again, still shows the repository.
+// closeByDelivery records a pull request's closing from GitHub's delivery,
+// as the service does, without closing it on GitHub.
+func (e *env) closeByDelivery(p *ghemu.Pull) {
+	e.t.Helper()
+	delivery, _ := json.Marshal(map[string]any{"action": "closed",
+		"pull_request": map[string]any{"number": p.Number, "closed_at": e.clock.Now().UTC().Add(time.Second).Format(time.RFC3339)},
+		"repository":   map[string]any{"id": repoID, "owner": map[string]any{"id": orgID}}})
+	if err := e.disks.RecordEvent(context.Background(), map[string]string{"event": "pull_request"}, delivery); err != nil {
+		e.t.Fatal(err)
+	}
+	e.clock.Advance(time.Minute)
+}
+
+// Access lost during a pass deletes nothing more of the repository's: a 404
+// for a pull request, a run, the default branch or its file counts as its
+// absence only if GitHub, asked again, still shows the repository, and
+// once it doesn't, or can't be read, nothing the pass would have deleted
+// goes: not a family no longer declared, a disk a recorded closing retires,
+// an image with no record, nor a lost job's record.
 func TestAccessLostDuringAPassDeletesNothing(t *testing.T) {
-	for name, path := range map[string]string{
-		"a pull request":            "/repos/lanescape/app/pulls/",
-		"the default branch's file": "/repos/lanescape/app/contents/" + consumer.RunnersFile,
+	type lost struct {
+		// path is the read from whose nth on GitHub answers 404 for
+		// everything of the repository's, and then gives answer for the
+		// repository itself.
+		path   func(e *env, run *ghemu.Run) string
+		nth    int
+		answer func(http.ResponseWriter, *http.Request)
+	}
+	file := func(*env, *ghemu.Run) string { return "/repos/lanescape/app/contents/" + consumer.RunnersFile }
+	badGateway := fault.Status(http.StatusBadGateway, nil, `{"message": "Bad Gateway"}`)
+	for name, c := range map[string]lost{
+		"a pull request":                        {func(e *env, _ *ghemu.Run) string { return "/repos/lanescape/app/pulls/" }, 1, notFound},
+		"the default branch's file":             {file, 1, notFound},
+		"the default branch's file, then a 502": {file, 1, badGateway},
+		"the default branch":                    {func(*env, *ghemu.Run) string { return "/repos/lanescape/app/git/ref/heads/main" }, 1, notFound},
+		"a run, read again under the disks' lease": {func(_ *env, run *ghemu.Run) string {
+			return "/repos/lanescape/app/actions/runs/" + strconv.FormatInt(run.ID, 10)
+		}, 2, notFound},
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := setup(t)
 			m := e.saveMain(key1)
+			orphan := e.saveMainLabel(tools(key1, "main"))
 			p, _ := e.pull()
 			pr := e.savePull(p, sel(key1, "pr"+strconv.Itoa(p.Number)))
-			// From the first read of path on, GitHub answers 404 for
-			// everything of the repository's.
-			var lost atomic.Bool
+			closed, _ := e.pull()
+			retired := e.savePull(closed, sel(key1, "pr"+strconv.Itoa(closed.Number)))
+			// A run that chose main's disk, and a run's lost job.
+			chose := e.mainRun()
+			restored := e.start(chose, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}})
+			if restored.source() != m {
+				t.Fatal("no restore")
+			}
+			run := e.mainRun()
+			jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{"lanescape-2vcpu-linux-amd64-spot-disk-build-" + key1 + "-main"}})
+			if err := e.gce.Preempt(jb.in.Zone, jb.in.Name); err != nil {
+				t.Fatal(err)
+			}
+			e.gh.CompleteJobByID(jb.j.ID, "success")
+			e.eventually("the run is finished", func() bool { s, _ := e.gh.RunState(run); return s == "completed" })
+			e.pass()
+			preemption := "preemptions/5001/" + strconv.FormatInt(run.ID, 10) + "/" + strconv.FormatUint(jb.in.ID, 10) + ".json"
+			if _, ok := e.record(preemption); !ok {
+				t.Fatal("no record of the lost job")
+			}
+			// The run that chose finishes, and the lost job's record is past
+			// its day.
+			e.gh.CompleteJobByID(restored.j.ID, "success")
+			e.eventually("the run is finished", func() bool { s, _ := e.gh.RunState(chose); return s == "completed" })
+			e.clock.Advance(2 * disks.ResumeKept)
+			// What a pass that GitHub showed the repository to would delete:
+			// a family no longer declared, an image with no record, and a
+			// disk saved before its pull request's recorded closing.
+			e.repo.Commit("main", map[string]string{consumer.RunnersFile: `{"disks": {"other": {}}}`})
+			if err := e.objects.Delete(context.Background(), "images/5001/"+orphan+".json", mustGen(t, e, "images/5001/"+orphan+".json")); err != nil {
+				t.Fatal(err)
+			}
+			e.closeByDelivery(closed)
+
+			path, seen := c.path(e, chose), 0
+			var gone atomic.Bool
+			e.gh.Faults().Add(fault.Rule{PathPrefix: "/repositories/", Respond: c.answer, Match: func(*http.Request) bool { return gone.Load() }})
 			e.gh.Faults().Add(fault.Rule{PathPrefix: "/repos", Respond: notFound, Match: func(r *http.Request) bool {
-				if strings.HasPrefix(r.URL.Path, path) {
-					lost.Store(true)
+				if !gone.Load() && strings.HasPrefix(r.URL.Path, path) && (c.nth == 1 || r.URL.Path == path) {
+					if seen++; seen >= c.nth {
+						gone.Store(true)
+					}
 				}
-				return lost.Load()
+				return gone.Load()
 			}})
 			e.pass()
 			e.gh.Faults().Reset()
-			if !lost.Load() {
-				t.Fatalf("the pass never read %s", path)
+			if !gone.Load() {
+				t.Fatalf("the pass read %s only %d times", path, seen)
 			}
-			if !e.has(m) || !e.has(pr) {
-				t.Fatalf("main's %v, the pull request's %v; want both kept", e.has(m), e.has(pr))
+			for what, img := range map[string]string{"main's": m, "the open pull request's": pr, "the closed pull request's": retired,
+				"the image with no record": orphan} {
+				if !e.has(img) {
+					t.Errorf("%s disk went once access was lost", what)
+				}
 			}
 			if _, ok := e.record("closures/5001/pr" + strconv.Itoa(p.Number) + ".json"); ok {
-				t.Fatal("a pull request was recorded closed once access was lost")
+				t.Error("a pull request was recorded closed once access was lost")
+			}
+			if _, ok := e.record(preemption); !ok {
+				t.Error("a lost job's record went once access was lost")
+			}
+			// A choice dropped before access was lost, with GitHub's
+			// answer, went rightly; one read under the lease after isn't.
+			if _, ok := e.record("choices/5001/" + strconv.FormatInt(chose.ID, 10) + "/" + choiceHash(sel(key1, "main")) + ".json"); !ok && c.nth > 1 {
+				t.Error("a finished run's choice was dropped once access was lost")
 			}
 		})
 	}
@@ -259,13 +339,7 @@ func TestAnUnreadableRepositoryDeletesNothing(t *testing.T) {
 	p, _ := e.pull()
 	pr := "pr" + strconv.Itoa(p.Number)
 	img := e.savePull(p, sel(key1, pr))
-	delivery, _ := json.Marshal(map[string]any{"action": "closed",
-		"pull_request": map[string]any{"number": p.Number, "closed_at": e.clock.Now().UTC().Add(time.Second).Format(time.RFC3339)},
-		"repository":   map[string]any{"id": repoID, "owner": map[string]any{"id": orgID}}})
-	if err := e.disks.RecordEvent(context.Background(), map[string]string{"event": "pull_request"}, delivery); err != nil {
-		t.Fatal(err)
-	}
-	e.clock.Advance(time.Minute)
+	e.closeByDelivery(p)
 	e.gh.Faults().Add(fault.Rule{PathPrefix: "/repositories/", Respond: fault.Status(http.StatusBadGateway, nil, `{"message": "Bad Gateway"}`)})
 	e.pass()
 	e.gh.Faults().Reset()
