@@ -388,6 +388,84 @@ func TestAccessLostAtThePassesLastReadDeletesNothing(t *testing.T) {
 	}
 }
 
+// A transfer just before a pass would act deletes nothing: as it takes the
+// disks' lease to mark images, or as it reads, under the lease, the last of
+// a run whose choice it would drop. The pass reads the repository again
+// under the lease.
+func TestATransferJustBeforeAPassActsDeletesNothing(t *testing.T) {
+	transferred := func(e *env, done *atomic.Bool) {
+		if done.CompareAndSwap(false, true) {
+			e.gh.Transfer(e.repo, e.gh.Org(1234, "elsewhere"))
+		}
+	}
+	asItLeases := func(e *env, done *atomic.Bool) {
+		e.gcs.Faults().Add(fault.Rule{Method: http.MethodPost, Match: func(r *http.Request) bool {
+			if strings.HasPrefix(r.URL.Query().Get("name"), "leases/disks/") {
+				transferred(e, done)
+			}
+			return false
+		}})
+	}
+	for name, c := range map[string]func(e *env, done *atomic.Bool) (kept func() bool){
+		"a family no longer declared": func(e *env, done *atomic.Bool) func() bool {
+			m := e.saveMain(key1)
+			e.repo.Commit("main", map[string]string{consumer.RunnersFile: `{"disks": {"tools": {}}}`})
+			asItLeases(e, done)
+			return func() bool { return e.has(m) }
+		},
+		"an image with no record": func(e *env, done *atomic.Bool) func() bool {
+			orphan := e.saveMain(key1)
+			if err := e.objects.Delete(context.Background(), "images/5001/"+orphan+".json", mustGen(t, e, "images/5001/"+orphan+".json")); err != nil {
+				t.Fatal(err)
+			}
+			asItLeases(e, done)
+			return func() bool { return e.has(orphan) }
+		},
+		"a finished run's choice": func(e *env, done *atomic.Bool) func() bool {
+			run := e.mainRun()
+			jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{tools(key1, "main")}})
+			jobs := "/repos/lanescape/app/actions/runs/" + strconv.FormatInt(run.ID, 10) + "/jobs"
+			// The pass that follows the job's end reads the run's jobs,
+			// then again under the lease; it's transferred once GitHub has
+			// answered that read, before any other.
+			var leased, read atomic.Bool
+			e.gcs.Faults().Add(fault.Rule{Method: http.MethodPost, Match: func(r *http.Request) bool {
+				if strings.HasPrefix(r.URL.Query().Get("name"), "leases/disks/") {
+					leased.Store(true)
+				}
+				return false
+			}})
+			e.gh.Faults().Add(fault.Rule{Match: func(r *http.Request) bool {
+				if read.Load() {
+					transferred(e, done)
+				}
+				if r.URL.Path == jobs && leased.Load() {
+					read.Store(true)
+				}
+				return false
+			}})
+			jb.finish(false)
+			choice := "choices/5001/" + strconv.FormatInt(run.ID, 10) + "/" + choiceHash(tools(key1, "main")) + ".json"
+			return func() bool { _, ok := e.record(choice); return ok }
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := setup(t)
+			var done atomic.Bool
+			kept := c(e, &done)
+			e.pass()
+			e.gh.Faults().Reset()
+			e.gcs.Faults().Reset()
+			if !done.Load() {
+				t.Fatal("the repository was never transferred")
+			}
+			if !kept() {
+				t.Fatal("deleted once the repository was transferred")
+			}
+		})
+	}
+}
+
 // A repository GitHub can't be read for once in a pass deletes nothing that
 // pass, even once it can be read again, not even what a recorded closing
 // would: the next pass deletes it.

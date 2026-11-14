@@ -441,12 +441,20 @@ func (s *Service) dropChoices(ctx context.Context, st *state) {
 			if err != nil {
 				return err
 			}
+			var drop []string
 			for _, key := range keys {
-				r := st.choices[key]
-				if ok, err := s.settled(ctx, st, repo, r.v.RunID, live); err != nil || !ok {
-					continue
+				if ok, err := s.settled(ctx, st, repo, st.choices[key].v.RunID, live); err == nil && ok {
+					drop = append(drop, key)
 				}
-				if err := s.Objects.Delete(ctx, key, r.gen); err == nil || errors.Is(err, store.ErrNotFound) {
+			}
+			// GitHub must still show the repository as the organization's
+			// once its runs have been read: it's read again, under the
+			// lease, before any choice is dropped.
+			if len(drop) == 0 || !s.stillShown(ctx, st, repo) {
+				return nil
+			}
+			for _, key := range drop {
+				if err := s.Objects.Delete(ctx, key, st.choices[key].gen); err == nil || errors.Is(err, store.ErrNotFound) {
 					delete(st.choices, key)
 				}
 			}
@@ -695,14 +703,21 @@ func (s *Service) expire(ctx context.Context, st *state) {
 			}
 		}
 		var marked []Image
-		if len(due) > 0 && !s.stillShown(ctx, st, repo) {
-			// GitHub stopped showing the repository during the pass.
-			due = nil
-		}
 		if len(due) > 0 {
 			slices.SortFunc(due, func(x, y record[Image]) int { return strings.Compare(x.v.Image, y.v.Image) })
 			var err error
+			// GitHub must still show the repository as the organization's
+			// when its images are marked, under the lease: it's read again
+			// once, before the first.
+			checked := false
 			recheck := func(ctx context.Context, v Image) (bool, error) {
+				if !checked {
+					checked = true
+					s.stillShown(ctx, st, repo)
+				}
+				if st.unconfirmed[repo] != nil {
+					return false, nil
+				}
 				by, ok := replacedBy[v.Image]
 				if !ok {
 					return true, nil
@@ -1020,15 +1035,16 @@ func (s *Service) tidy(ctx context.Context, st *state) {
 				expired[c.v.JobID] = true
 			}
 		}
-		if !s.stillShown(ctx, st, repo) {
-			// GitHub stopped showing the repository during the pass.
-			continue
-		}
 		var marked []Image
 		err := s.step(ctx, repo, func(ctx context.Context) error {
 			named, err := s.named(ctx, repo, expired)
 			if err != nil {
 				return err
+			}
+			// GitHub must still show the repository as the organization's
+			// when its images are marked, under the lease.
+			if !s.stillShown(ctx, st, repo) {
+				return nil
 			}
 			for _, name := range names {
 				if named[name] {
@@ -1072,8 +1088,24 @@ func (s *Service) tidy(ctx context.Context, st *state) {
 			_ = s.Objects.Delete(ctx, key, r.gen)
 		}
 	}
+	runsLeft := map[string]bool{}
+	var done []string
+	for key, r := range st.preemptions {
+		p := r.v
+		if s.now().Sub(p.StoppedAt) < ResumeKept || (p.ResumeImage != "" && present[imageKey(p.RepositoryID, p.ResumeImage)]) {
+			runsLeft[runKey(p.RepositoryID, p.RunID)] = true
+			continue
+		}
+		rs, err := s.runState(ctx, st, p.RepositoryID, p.RunID)
+		if err != nil || !rs.finished || rs.due {
+			runsLeft[runKey(p.RepositoryID, p.RunID)] = true
+			continue
+		}
+		done = append(done, key)
+	}
 	// Nothing of a run is let go unless GitHub still shows its repository
-	// as the organization's when it would be.
+	// as the organization's once everything of its runs has been read: it's
+	// read again then, once.
 	shown := map[int64]bool{}
 	shownNow := func(id int64) bool {
 		if st.unconfirmed[id] != nil {
@@ -1085,15 +1117,10 @@ func (s *Service) tidy(ctx context.Context, st *state) {
 		shown[id] = s.stillShown(ctx, st, id)
 		return shown[id]
 	}
-	runsLeft := map[string]bool{}
-	for key, r := range st.preemptions {
+	for _, key := range done {
+		r := st.preemptions[key]
 		p := r.v
-		if s.now().Sub(p.StoppedAt) < ResumeKept || (p.ResumeImage != "" && present[imageKey(p.RepositoryID, p.ResumeImage)]) {
-			runsLeft[runKey(p.RepositoryID, p.RunID)] = true
-			continue
-		}
-		rs, err := s.runState(ctx, st, p.RepositoryID, p.RunID)
-		if err != nil || !rs.finished || rs.due || !shownNow(p.RepositoryID) {
+		if !shownNow(p.RepositoryID) {
 			runsLeft[runKey(p.RepositoryID, p.RunID)] = true
 			continue
 		}
