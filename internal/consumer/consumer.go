@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"slices"
 	"strings"
@@ -197,11 +198,30 @@ func Key(family string, files []PathContents, declared bool) string {
 	if !declared {
 		return NoKey
 	}
-	h := sha256.New()
-	part(h, []byte(family))
+	k := NewKeyHash(family)
 	for _, f := range files {
-		part(h, []byte(f.Path))
-		part(h, f.Contents)
+		k.Add(f.Path, f.Contents)
 	}
-	return hex.EncodeToString(h.Sum(nil))[:20]
+	return k.Sum()
 }
+
+// KeyHash makes a declared family's key one file at a time, so that no
+// file's contents need be kept once it's added: a family may list many
+// large files, and Key's list would hold them all at once.
+type KeyHash struct{ h hash.Hash }
+
+// NewKeyHash starts the key of a family declared with "from".
+func NewKeyHash(family string) *KeyHash {
+	k := &KeyHash{h: sha256.New()}
+	part(k.h, []byte(family))
+	return k
+}
+
+// Add adds the next listed path and its contents.
+func (k *KeyHash) Add(path string, contents []byte) {
+	part(k.h, []byte(path))
+	part(k.h, contents)
+}
+
+// Sum is the key of the family and the files added so far.
+func (k *KeyHash) Sum() string { return hex.EncodeToString(k.h.Sum(nil))[:20] }

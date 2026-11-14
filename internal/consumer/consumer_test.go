@@ -28,6 +28,20 @@ func TestTheSpecsKeyExample(t *testing.T) {
 	}
 }
 
+// A key made one file at a time is the key made from the list.
+func TestAKeyMadeFileByFile(t *testing.T) {
+	k := consumer.NewKeyHash("build")
+	k.Add("deps/versions.json", []byte("café 1.0\n"))
+	k.Add("rust-toolchain.toml", nil)
+	if got := k.Sum(); got != "be05417a720fa890bf52" {
+		t.Fatalf("key = %s, want be05417a720fa890bf52 (specs/0003-disks.md, Keys)", got)
+	}
+	// A family that lists no files has a key of its name alone.
+	if consumer.NewKeyHash("build").Sum() != consumer.Key("build", nil, true) {
+		t.Fatal("an empty list's key differs")
+	}
+}
+
 func TestParse(t *testing.T) {
 	f, err := consumer.Parse([]byte(`{"branches": {"support/v1": "v1"}, "disks": {"build": {"from": ["a/b", "c"]}, "tools": {}}}`))
 	if err != nil {
