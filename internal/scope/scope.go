@@ -62,8 +62,8 @@ func (s Scope) IsRead() bool { return s == Read }
 func (s Scope) Saves() bool { return s.main || s.pr > 0 || s.branch != "" }
 
 // Lasting reports whether the scope is main's or a long-lived branch's:
-// one that keeps its two newest keys of each family, and whose families go
-// once unused for 90 days (specs/0003-disks.md, Expiry).
+// one whose families are kept while its branch's .github/runners.json
+// declares them (specs/0003-disks.md, Deletion).
 func (s Scope) Lasting() bool { return s.main || s.branch != "" }
 
 func (s Scope) String() string {

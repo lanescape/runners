@@ -114,7 +114,7 @@ func (s *Service) Stopped(ctx context.Context, m machines.Machine, a machines.Ad
 	ikey := imageKey(repo, rec.ResumeImage)
 	im, igen, err := createOnce(ctx, s.Objects, ikey, Image{Image: rec.ResumeImage, RepositoryID: repo, Kind: KindResume, State: ImageMaking,
 		Arch: rec.Arch, Family: rec.Family, Machine: m.Name, Zone: m.Zone, InstanceID: m.ID, JobID: a.JobID, JobName: a.JobName, RunID: a.RunID,
-		RunAttempt: a.RunAttempt, Selector: a.Selector, SizeGB: 0, SavedAt: rec.StoppedAt, LastUsed: rec.StoppedAt})
+		RunAttempt: a.RunAttempt, Selector: a.Selector, SizeGB: 0, SavedAt: rec.StoppedAt})
 	if err != nil {
 		return err
 	}

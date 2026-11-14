@@ -227,8 +227,18 @@ func TestFile(t *testing.T) {
 	if err != nil || string(got) != long {
 		t.Fatalf("file = %q, %v", got, err)
 	}
-	if _, err := e.c.File(ctx, repo, ".github/absent.json", sha); !errors.Is(err, github.ErrNotFound) {
+	if _, err := e.c.File(ctx, repo, ".github/absent.json", sha); !errors.Is(err, github.ErrNotFound) || errors.Is(err, github.ErrDirectory) {
 		t.Fatalf("missing file: %v", err)
+	}
+	// A commit GitHub has no record of says nothing of the file.
+	if _, err := e.c.File(ctx, repo, ".github/runners.json", "0123456789abcdef0123456789abcdef01234567"); errors.Is(err, github.ErrNotFound) || !github.IsUnavailable(err) {
+		t.Fatalf("a file at a commit that isn't there: %v, want unavailable", err)
+	}
+	// A directory is no such file, and says it's a directory.
+	e.emu.Faults().Add(fault.Rule{PathPrefix: "/repos/lanescape/app/contents/.github", Times: 1,
+		Respond: fault.Status(http.StatusOK, nil, `[{"type": "file", "name": "x", "path": ".github/x"}]`)})
+	if _, err := e.c.File(ctx, repo, ".github", sha); !errors.Is(err, github.ErrNotFound) || !errors.Is(err, github.ErrDirectory) {
+		t.Fatalf("a directory: %v", err)
 	}
 }
 
@@ -241,6 +251,12 @@ func TestALargeFileIsReadAsABlob(t *testing.T) {
 	got, err := e.c.File(ctx, repo, "Cargo.lock", sha)
 	if err != nil || string(got) != big {
 		t.Fatalf("large file: %d bytes, %v", len(got), err)
+	}
+	// A blob GitHub doesn't find, of a file it showed, confirms nothing.
+	e.emu.Faults().Add(fault.Rule{PathPrefix: "/repos/lanescape/app/git/blobs/", Times: 1,
+		Respond: fault.Status(http.StatusNotFound, nil, `{"message": "Not Found"}`)})
+	if _, err := e.c.File(ctx, repo, "Cargo.lock", sha); errors.Is(err, github.ErrNotFound) || !github.IsUnavailable(err) {
+		t.Fatalf("a large file whose blob isn't found: %v, want unavailable", err)
 	}
 }
 

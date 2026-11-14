@@ -277,14 +277,15 @@ func TestATransferredRepositoryDoesntSave(t *testing.T) {
 func TestTheNewestThatsThereIsKept(t *testing.T) {
 	e := setup(t)
 	old := e.saveMain(key1)
+	// A newer disk of the family, recorded ready, whose image is gone.
 	e.clock.Advance(time.Minute)
-	gone := e.saveMain(key2)
-	e.gce.DeleteImageNow(gone)
-	e.clock.Advance(time.Minute)
-	newest := e.saveMain(key3)
+	gone := disks.SavedName(repoID, disks.Series("main", "amd64", "build", key2), e.clock.Now(), "lsr-5001-goneaway")
+	b, _ := json.Marshal(disks.Image{Image: gone, RepositoryID: repoID, Kind: disks.KindSaved, State: disks.ImageReady, Scope: "main",
+		Arch: "amd64", Family: "build", Key: key2, Machine: "lsr-5001-goneaway", SavedAt: e.clock.Now().UTC()})
+	e.gcs.Put("state", "images/5001/"+gone+".json", b)
 	e.pass()
-	if !e.has(old) || !e.has(newest) {
-		t.Fatal("a family's two newest disks that are there weren't both kept")
+	if !e.has(old) {
+		t.Fatal("a family's newest disk that's there went, replaced by one that's gone")
 	}
 }
 

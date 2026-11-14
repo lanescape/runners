@@ -41,7 +41,7 @@ func TestSavingAndRestoring(t *testing.T) {
 		if im.Labels[disks.LabelRepository] != "5001" || im.Labels[disks.LabelKind] != disks.KindSaved ||
 			im.Labels[disks.LabelScope] != selector.Hash("main") || im.Labels[disks.LabelFamily] != selector.Hash("build") ||
 			im.Labels[disks.LabelKey] != selector.Hash(key1) || im.Labels[disks.LabelArch] != "amd64" ||
-			im.Labels[disks.LabelSaved] == "" || im.Labels[disks.LabelLastUsed] == "" || im.SourceDisk != first.in.Name+"-work" {
+			im.Labels[disks.LabelSaved] == "" || im.SourceDisk != first.in.Name+"-work" {
 			t.Fatalf("image = %+v", im)
 		}
 	}
@@ -107,14 +107,14 @@ func TestSavingAndRestoring(t *testing.T) {
 func TestTheRestoreOrder(t *testing.T) {
 	e := setup(t)
 	main1 := e.saveMain(key1)
-	e.clock.Advance(time.Minute)
-	main2 := e.saveMain(key2)
 	p, run := e.pull()
 	pr := "pr" + strconv.Itoa(p.Number)
 	// Main's for the key, then main's newest for the family.
 	if src := e.start(run, ghemu.JobSpec{Name: "a", Labels: []string{sel(key1, pr)}}).source(); src != main1 {
 		t.Fatalf("main's for the key: %s, want %s", src, main1)
 	}
+	e.clock.Advance(time.Minute)
+	main2 := e.saveMain(key2)
 	brun := e.pullRun(p)
 	if src := e.start(brun, ghemu.JobSpec{Name: "b", Labels: []string{sel(zero, pr)}}).source(); src != main2 {
 		t.Fatalf("main's newest: %s, want %s", src, main2)

@@ -1011,6 +1011,34 @@ func TestAPullRequestsRunThroughToItsSaves(t *testing.T) {
 	w.noCredentials()
 }
 
+// specs/0003-disks.md, Deletion: main's saved disk is kept while the default
+// branch's .github/runners.json declares its family, a file that isn't
+// valid deletes nothing, and removing the declaration deletes it at the
+// next pass; declared again, the family starts afresh.
+func TestRemovingADeclarationDeletesItsDisks(t *testing.T) {
+	w := newWorld(t)
+	build := ghemu.JobSpec{Name: "build", Labels: []string{w.act.selector(small, false)},
+		Steps: w.act.steps(w.act.diskStep("build"), w.act.saveStep())}
+	w.runJob(w.gh.PushRun(w.repo, "main"), build)
+	if len(w.saved()) != 1 {
+		t.Fatalf("images %v, want main's", w.saved())
+	}
+	w.repo.Commit("main", map[string]string{".github/runners.json": `{"disks": {"build": {}}, "images": {}}`})
+	w.pass()
+	if len(w.saved()) != 1 {
+		t.Fatalf("images %v; a file that isn't valid deleted main's disk", w.saved())
+	}
+	w.repo.Commit("main", map[string]string{".github/runners.json": `{"disks": {}}`})
+	w.pass()
+	if len(w.saved()) != 0 {
+		t.Fatalf("images %v; main's disk outlived its family's declaration", w.saved())
+	}
+	w.repo.Commit("main", files)
+	if got := w.diskAnswer(w.runJob(w.gh.PushRun(w.repo, "main"), build)); got != "none" {
+		t.Fatalf("a family declared again restored from %q", got)
+	}
+}
+
 // specs/0002-machines.md, Preemption: a Spot machine preempted mid-job
 // leaves a resume image of its work disk, its run is rerun, and the rerun's
 // job's disk request is answered from the resume image.

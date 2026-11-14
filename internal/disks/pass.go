@@ -3,6 +3,7 @@ package disks
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
 	"slices"
@@ -10,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/compute"
+	"github.com/lanescape/runners/internal/consumer"
 	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/machines"
 	"github.com/lanescape/runners/internal/pass"
@@ -26,8 +27,6 @@ type state struct {
 	images      map[string]compute.Image
 	imagesRead  bool
 	records     map[string]record[Image]
-	recents     map[string]record[Recent]
-	families    map[string]record[Family]
 	closures    map[string]record[Closure]
 	workDisks   map[string]record[machines.DiskRecord]
 	choices     map[string]record[Choice]
@@ -70,8 +69,9 @@ func runKey(repo, id int64) string {
 // after the machines': it looks for evidence that stopped Spot machines
 // were preempted, reruns runs that lost a job to a preemption or to the age
 // limit once they've finished, drops the restore choices of runs that need them no
-// more, and deletes saved disks and resume images that are superseded,
-// expired or orphaned. A failure on one image or run doesn't stop the rest.
+// more, and deletes saved disks that are replaced or no longer declared,
+// resume images nothing can use, and images that are orphaned. A failure on
+// one image or run doesn't stop the rest.
 func (s *Service) Pass(p *pass.Pass) error {
 	ctx := p.Context()
 	st := s.read(ctx)
@@ -115,12 +115,6 @@ func (s *Service) read(ctx context.Context) *state {
 		}
 	}
 	list("images/", func() (err error) { st.records, err = listJSON[Image](ctx, s.Objects, "images/"); return })
-	// After the images' records: a choice writes its pull request's recent
-	// record before it touches the image it chose.
-	list("recent/", func() (err error) { st.recents, err = listJSON[Recent](ctx, s.Objects, "recent/"); return })
-	// After the images' records too: a use marks its family before it
-	// touches the image.
-	list("families/", func() (err error) { st.families, err = listJSON[Family](ctx, s.Objects, "families/"); return })
 	list("closures/", func() (err error) { st.closures, err = listJSON[Closure](ctx, s.Objects, "closures/"); return })
 	list("disks/", func() (err error) {
 		st.workDisks, err = listJSON[machines.DiskRecord](ctx, s.Objects, "disks/")
@@ -450,18 +444,16 @@ func (s *Service) finishedJob(ctx context.Context, st *state, repoID, jobID int6
 	return j == nil || j.Status == "completed", nil
 }
 
-// expire marks and deletes what no longer needs keeping, as early as the
-// rules allow (specs/0003-disks.md, Expiry): older versions of a saved disk
-// once a newer one is ready; in a pull request's scope, its other disks of
-// a family once it saves one, all of them once it has closed, and any
-// unused for 14 days; in main's and each long-lived branch's, every key of
-// a family but the two newest and any an open pull request's most recent
-// choice names, all of a family unused for 90 days, and all of a branch's
-// once it's no longer listed or no longer exists; and resume images once
-// their job has started from one, or has finished, or their run has
-// finished with no rerun left.
-// Marking leaves alone any image an unfinished run's choice names, and a
-// resume image a job has claimed and not yet started from.
+// expire marks and deletes what its rules say goes (specs/0003-disks.md,
+// Deletion): in main's scope and each long-lived branch's, every disk of a
+// family the scope's branch no longer declares, and all of a branch's once
+// it's no longer listed or no longer exists; in every scope, its older
+// disks of a family on an architecture once a newer one is ready, whatever
+// their key; in a pull request's, all of it once it has closed; and resume
+// images once their job has started from one, or has finished, or their
+// run has finished with no rerun left. Nothing goes for want of use or for
+// its age. Marking leaves alone any image an unfinished run's choice
+// names, and a resume image a job has claimed and not yet started from.
 func (s *Service) expire(ctx context.Context, st *state) {
 	byRepo := map[int64]map[string]record[Image]{}
 	for _, r := range st.records {
@@ -470,14 +462,7 @@ func (s *Service) expire(ctx context.Context, st *state) {
 		}
 		byRepo[r.v.RepositoryID][r.v.Image] = r
 	}
-	// A consumer with pull requests' recent choices and no images still has
-	// its closed pull requests' choices dropped, and one with closures
-	// still has them tidied.
-	for _, r := range st.recents {
-		if byRepo[r.v.RepositoryID] == nil {
-			byRepo[r.v.RepositoryID] = map[string]record[Image]{}
-		}
-	}
+	// A consumer with closures and no images still has them tidied.
 	for _, r := range st.closures {
 		if byRepo[r.v.RepositoryID] == nil {
 			byRepo[r.v.RepositoryID] = map[string]record[Image]{}
@@ -501,10 +486,9 @@ func (s *Service) expire(ctx context.Context, st *state) {
 			return
 		}
 		recs := byRepo[repo]
-		// Which version is newest, of a series or of a main family, is
-		// read only from images Compute Engine has, ready: a record of
-		// one that's gone mustn't stand in for it, and leave the one
-		// that's there unprotected.
+		// Which disk of a scope's family is newest is read only from images
+		// Compute Engine has, ready: a record of one that's gone mustn't
+		// stand in for it, and leave the one that's there unprotected.
 		there := map[string]record[Image]{}
 		for n, r := range recs {
 			if im, ok := st.images[r.v.Image]; ok && im.Status == "READY" && matches(im, r.v) {
@@ -514,9 +498,9 @@ func (s *Service) expire(ctx context.Context, st *state) {
 		finished := map[int64]bool{}
 		var due []record[Image]
 		why := map[string]string{}
-		// The disk that replaces a pull request's, by which a pass decided
-		// it goes: that it isn't itself retired is read again under the
-		// lease, since a closing may be recorded meanwhile.
+		// The disk that replaces another, by which a pass decided the other
+		// goes: that it isn't itself retired is read again under the lease,
+		// since a closing may be recorded meanwhile.
 		replacedBy := map[string]Image{}
 		add := func(image, reason string) {
 			if _, ok := why[image]; !ok {
@@ -524,19 +508,13 @@ func (s *Service) expire(ctx context.Context, st *state) {
 				why[image] = reason
 			}
 		}
-		// Every pull request whose disks or most recent choices this
-		// consumer holds is read once; one seen closed is recorded as
-		// closed before anything else, so that, reopened, it never chooses
-		// what its earlier runs saved.
+		// Every pull request whose disks this consumer holds is read once;
+		// one seen closed is recorded as closed before anything else, so
+		// that, reopened, it never chooses what its earlier runs saved.
 		closed := map[string]bool{}
 		scopes := map[string]bool{}
 		for _, r := range there {
 			if _, pr := isPullRequest(r.v.Scope); pr && r.v.Kind == KindSaved {
-				scopes[r.v.Scope] = true
-			}
-		}
-		for _, r := range st.recents {
-			if r.v.RepositoryID == repo {
 				scopes[r.v.Scope] = true
 			}
 		}
@@ -556,73 +534,20 @@ func (s *Service) expire(ctx context.Context, st *state) {
 			}
 			return nil
 		}
-		delisted := s.delisted(ctx, st, repo, there)
-		latest, lineage := map[string]Image{}, map[string]Image{}
-		mainKeys := map[string][]Image{}
-		mainUsed := map[string]time.Time{}
-		for _, r := range st.families {
-			if f := r.v; f.RepositoryID == repo {
-				mainUsed[f.Scope+"\x00"+f.Arch+"\x00"+f.Family] = f.LastUsed
-			}
-		}
+		decl := s.declarations(ctx, st, repo, there)
+		// Each scope keeps one disk of each family and architecture: its
+		// newest save, whatever its key.
+		lineage := map[string]Image{}
 		for _, r := range there {
 			v := r.v
-			if v.Kind != KindSaved || v.State != ImageReady {
-				continue
-			}
 			// A retired disk of a pull request's replaces nothing: it goes
 			// itself.
-			if retired(v, closure(v.Scope)) {
+			if v.Kind != KindSaved || v.State != ImageReady || retired(v, closure(v.Scope)) {
 				continue
-			}
-			k := Series(v.Scope, v.Arch, v.Family, v.Key)
-			if b, ok := latest[k]; !ok || olderThan(b, v) {
-				latest[k] = v
 			}
 			f := v.Scope + "\x00" + v.Arch + "\x00" + v.Family
 			if b, ok := lineage[f]; !ok || olderThan(b, v) {
 				lineage[f] = v
-			}
-			if lasting(v.Scope) && v.LastUsed.After(mainUsed[f]) {
-				mainUsed[f] = v.LastUsed
-			}
-		}
-		for _, v := range latest {
-			if lasting(v.Scope) {
-				f := v.Scope + "\x00" + v.Arch + "\x00" + v.Family
-				mainKeys[f] = append(mainKeys[f], v)
-			}
-		}
-		// Main keeps its two newest keys of each family, by their newest
-		// versions.
-		keep := map[string]bool{}
-		for _, vs := range mainKeys {
-			slices.SortFunc(vs, func(x, y Image) int {
-				if olderThan(y, x) {
-					return -1
-				}
-				return 1
-			})
-			for _, v := range vs[:min(MainKeys, len(vs))] {
-				keep[Series(v.Scope, v.Arch, v.Family, v.Key)] = true
-			}
-		}
-		// And any key an open pull request's most recent choice names. A
-		// closed pull request's recent choices go; one whose state can't
-		// be read keeps what it names.
-		for key, r := range st.recents {
-			c := r.v
-			if c.RepositoryID != repo {
-				continue
-			}
-			if closed[c.Scope] {
-				if err := s.Objects.Delete(ctx, key, r.gen); err == nil || errors.Is(err, store.ErrNotFound) {
-					delete(st.recents, key)
-				}
-				continue
-			}
-			if lasting(c.ImageScope) {
-				keep[Series(c.ImageScope, c.Arch, c.Family, c.Key)] = true
 			}
 		}
 		for _, r := range there {
@@ -632,24 +557,17 @@ func (s *Service) expire(ctx context.Context, st *state) {
 			}
 			switch v.Kind {
 			case KindSaved:
-				if l, ok := latest[Series(v.Scope, v.Arch, v.Family, v.Key)]; ok && l.Image != v.Image {
-					add(v.Image, "superseded by "+l.Image)
-					replacedBy[v.Image] = l
-					continue
-				}
-				f := v.Scope + "\x00" + v.Arch + "\x00" + v.Family
-				if delisted[v.Scope] {
-					add(v.Image, "its long-lived branch is no longer listed, or no longer exists")
-					continue
-				}
-				if lasting(v.Scope) {
-					switch {
-					case s.now().Sub(mainUsed[f]) >= MainUnused:
-						add(v.Image, familyUnused)
-					case !keep[Series(v.Scope, v.Arch, v.Family, v.Key)]:
-						add(v.Image, "not among its family's two newest keys, nor named by an open pull request's most recent choice")
+				// What a scope's branch declares, where GitHub confirmed it:
+				// a scope it couldn't confirm loses nothing by it.
+				if d, ok := decl[v.Scope]; ok {
+					if d.gone != "" {
+						add(v.Image, d.gone)
+						continue
 					}
-					continue
+					if !d.families[v.Family] {
+						add(v.Image, "its family is no longer declared in "+consumer.RunnersFile+" at its scope's branch's head")
+						continue
+					}
 				}
 				if closed[v.Scope] {
 					add(v.Image, "its pull request closed")
@@ -659,13 +577,9 @@ func (s *Service) expire(ctx context.Context, st *state) {
 					add(v.Image, "saved by a run from before its pull request closed")
 					continue
 				}
-				if l, ok := lineage[f]; ok && l.Image != v.Image {
-					add(v.Image, "its pull request saved "+l.Image+" of the family since")
+				if l, ok := lineage[v.Scope+"\x00"+v.Arch+"\x00"+v.Family]; ok && l.Image != v.Image {
+					add(v.Image, "its scope saved "+l.Image+" of the family since")
 					replacedBy[v.Image] = l
-					continue
-				}
-				if s.now().Sub(v.LastUsed) >= PullRequestUnused {
-					add(v.Image, "unused for 14 days")
 				}
 			case KindResume:
 				if c, claimed := st.claims[claimKey(repo, v.Image)]; claimed {
@@ -702,28 +616,19 @@ func (s *Service) expire(ctx context.Context, st *state) {
 		if len(due) > 0 {
 			slices.SortFunc(due, func(x, y record[Image]) int { return strings.Compare(x.v.Image, y.v.Image) })
 			var err error
-			// A family's retirement rests on its other versions' use too,
-			// which a choice of one of them marks in the family's record:
-			// that's read again under the lease.
 			recheck := func(ctx context.Context, v Image) (bool, error) {
-				if by, ok := replacedBy[v.Image]; ok {
-					if _, pr := isPullRequest(by.Scope); !pr {
-						return true, nil
-					}
-					c, _, found, err := getJSON[Closure](ctx, s.Objects, closureKey(repo, by.Scope))
-					if err != nil || !found {
-						return err == nil, err
-					}
-					return !retired(by, &c), nil
-				}
-				if why[v.Image] != familyUnused {
+				by, ok := replacedBy[v.Image]
+				if !ok {
 					return true, nil
 				}
-				f, _, found, err := getJSON[Family](ctx, s.Objects, familyKey(repo, v.Scope, v.Arch, v.Family))
+				if _, pr := isPullRequest(by.Scope); !pr {
+					return true, nil
+				}
+				c, _, found, err := getJSON[Closure](ctx, s.Objects, closureKey(repo, by.Scope))
 				if err != nil || !found {
 					return err == nil, err
 				}
-				return s.now().Sub(f.LastUsed) >= MainUnused, nil
+				return !retired(by, &c), nil
 			}
 			if marked, err = s.mark(ctx, repo, due, finished, recheck); err != nil {
 				s.log().Warn("marking images for deletion", "repository_id", repo, "err", err.Error())
@@ -745,14 +650,22 @@ func (s *Service) expire(ctx context.Context, st *state) {
 	}
 }
 
-// delisted are the long-lived branches' scopes, of those a consumer's
-// images hold, whose branches are no longer listed in the default branch's
-// .github/runners.json, or no longer exist, by GitHub's confirmed answers.
-// What GitHub can't confirm is kept.
-func (s *Service) delisted(ctx context.Context, st *state, repo int64, there map[string]record[Image]) map[string]bool {
+// declared is what a pass confirmed of a scope of main's or a long-lived
+// branch's: that all of it goes, and why, or else the families its
+// branch's .github/runners.json declares at its head.
+type declared struct {
+	gone     string
+	families map[string]bool
+}
+
+// declarations reads what keeps the disks of each of main's and long-lived
+// branches' scopes that a consumer's images hold, by GitHub's confirmed
+// answers, once a pass. A scope left out is one GitHub couldn't confirm,
+// which loses nothing by its declarations this pass.
+func (s *Service) declarations(ctx context.Context, st *state, repo int64, there map[string]record[Image]) map[string]declared {
 	scopes := map[string]bool{}
 	for _, r := range there {
-		if r.v.Kind == KindSaved && lasting(r.v.Scope) && r.v.Scope != "main" {
+		if r.v.Kind == KindSaved && lasting(r.v.Scope) {
 			scopes[r.v.Scope] = true
 		}
 	}
@@ -761,52 +674,100 @@ func (s *Service) delisted(ctx context.Context, st *state, repo int64, there map
 	}
 	rp, err := s.repository(ctx, st, repo)
 	if err != nil {
-		s.log().Warn("reading a consumer with long-lived branches", "repository_id", repo, "err", err.Error())
+		s.log().Warn("reading a consumer with saved disks; deleting nothing by its declarations this pass", "repository_id", repo, "err", err.Error())
 		return nil
 	}
-	out, err := Delisted(ctx, s.GitHub, rp, s.log(), slices.Sorted(maps.Keys(scopes)))
+	out, err := readDeclarations(ctx, s.GitHub, s.log(), rp, slices.Sorted(maps.Keys(scopes)))
 	if err != nil {
-		s.log().Warn("reading a consumer's long-lived branches", "repository_id", repo, "err", err.Error())
+		s.log().Warn("reading a consumer's declarations; deleting nothing by them where they couldn't be read", "repository_id", repo,
+			"err", err.Error())
 	}
 	return out
 }
 
-// Delisted reports which of a consumer's long-lived branches' scopes have
-// lost their branch: no longer listed in the default branch's
-// .github/runners.json, or no longer there. A repository that's gone, or
-// no longer the organization's, delists nothing: nothing of it is decided.
-// Scopes GitHub couldn't confirm are left out, with the error.
-func Delisted(ctx context.Context, gh github.API, repo *github.Repository, log *slog.Logger, scopes []string) (map[string]bool, error) {
-	out := map[string]bool{}
+// readDeclarations reads, for each of a consumer's scopes of main's and
+// long-lived branches', what its branch's .github/runners.json declares at
+// its head: the default branch's for main's, and each listed branch's own
+// for its scope. A file that's absent declares nothing. A scope whose
+// branch is no longer listed, or no longer exists, goes; so does every
+// scope of a repository that's gone, or no longer the organization's. What
+// GitHub couldn't confirm, and a file that isn't valid, is left out, with
+// the error: a default branch's file that isn't valid confirms nothing, for
+// main's scope or any branch's.
+func readDeclarations(ctx context.Context, gh github.API, log *slog.Logger, repo *github.Repository, scopes []string) (map[string]declared, error) {
+	out := map[string]declared{}
 	if repo == nil {
+		for _, sc := range scopes {
+			out[sc] = declared{gone: "its repository is gone, or no longer the organization's"}
+		}
 		return out, nil
 	}
-	// A file that isn't valid lists nothing, as it binds nothing; any
-	// other failure to read it confirms nothing.
-	branches, err := binding.ReadBranches(ctx, gh, *repo, log)
+	tip, err := gh.BranchHead(ctx, *repo, repo.DefaultBranch)
 	if err != nil {
-		return out, err
+		return out, fmt.Errorf("reading the default branch: %w", err)
 	}
-	byName := map[string]string{}
-	for branch, name := range branches {
-		byName["branch-"+name] = branch
+	f, err := readRunnersFile(ctx, gh, *repo, tip)
+	if err != nil {
+		return out, fmt.Errorf("the default branch's %s: %w", consumer.RunnersFile, err)
+	}
+	listed, problems := f.BranchScopes(repo.DefaultBranch)
+	for _, p := range problems {
+		log.Warn("an entry of the default branch's "+consumer.RunnersFile+" is ignored", "repository_id", repo.ID, "why", p)
+	}
+	byScope := map[string]string{}
+	for branch, name := range listed {
+		byScope["branch-"+name] = branch
 	}
 	var errs []error
 	for _, sc := range scopes {
-		branch, ok := byName[sc]
-		if !ok {
-			out[sc] = true
+		if sc == "main" {
+			out[sc] = declared{families: families(f)}
 			continue
 		}
-		_, err := gh.BranchHead(ctx, *repo, branch)
-		switch {
-		case errors.Is(err, github.ErrNotFound):
-			out[sc] = true
-		case err != nil:
-			errs = append(errs, err)
+		branch, ok := byScope[sc]
+		if !ok {
+			out[sc] = declared{gone: "its long-lived branch is no longer listed"}
+			continue
 		}
+		head, err := gh.BranchHead(ctx, *repo, branch)
+		if errors.Is(err, github.ErrNotFound) {
+			out[sc] = declared{gone: "its long-lived branch no longer exists"}
+			continue
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("reading %s's branch: %w", sc, err))
+			continue
+		}
+		bf, err := readRunnersFile(ctx, gh, *repo, head)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s's branch's %s: %w", sc, consumer.RunnersFile, err))
+			continue
+		}
+		out[sc] = declared{families: families(bf)}
 	}
 	return out, errors.Join(errs...)
+}
+
+// readRunnersFile reads and parses a consumer's .github/runners.json at a
+// commit; one that's absent declares nothing. A directory in its place
+// confirms nothing, as a file that isn't valid doesn't.
+func readRunnersFile(ctx context.Context, gh github.API, repo github.Repository, commit string) (consumer.File, error) {
+	data, err := gh.File(ctx, repo, consumer.RunnersFile, commit)
+	if errors.Is(err, github.ErrNotFound) && !errors.Is(err, github.ErrDirectory) {
+		data = []byte("{}")
+	} else if err != nil {
+		return consumer.File{}, err
+	}
+	return consumer.Parse(data)
+}
+
+// families are the families a file declares.
+func families(f consumer.File) map[string]bool {
+	out := map[string]bool{}
+	for family := range f.Disks {
+		out[family] = true
+	}
+	return out
 }
 
 // seenClosed reports whether a pull request scope's pull request is closed,
@@ -832,22 +793,14 @@ func (s *Service) seenClosed(ctx context.Context, st *state, repo int64, sc stri
 	return true, nil
 }
 
-// tidyScopes drops a consumer's family records once the family has no
-// images left, and its closures once the scope has none and no run bound
-// before the closure can still be going on.
+// tidyScopes drops a consumer's closures once the scope has no images and
+// no run bound before the closure can still be going on.
 func (s *Service) tidyScopes(ctx context.Context, st *state, repo int64, unknown map[string]bool) {
 	have := map[string]bool{}
 	for _, r := range st.records {
 		v := r.v
 		if v.RepositoryID == repo && v.Kind == KindSaved {
 			have[v.Scope] = true
-			have[v.Scope+"\x00"+v.Arch+"\x00"+v.Family] = true
-		}
-	}
-	for key, r := range st.families {
-		f := r.v
-		if f.RepositoryID == repo && !have[f.Scope+"\x00"+f.Arch+"\x00"+f.Family] {
-			_ = s.Objects.Delete(ctx, key, r.gen)
 		}
 	}
 	for key, r := range st.closures {
@@ -859,9 +812,6 @@ func (s *Service) tidyScopes(ctx context.Context, st *state, repo int64, unknown
 		}
 	}
 }
-
-// familyUnused is why every disk of a retired family of main's goes.
-const familyUnused = "its family unused for 90 days"
 
 // runSettled reports whether a run has finished with no automatic rerun it
 // is, or may yet be, due, counting a run with an admitted machine that
