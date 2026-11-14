@@ -67,6 +67,8 @@ func Cases() []Case {
 const (
 	// Small is the smallest shape, which most of the suite's jobs name.
 	Small = "lanescape-2vcpu-linux-amd64"
+	// Mid is the amd64 shape between the smallest and the largest.
+	Mid = "lanescape-16vcpu-linux-amd64"
 	// Arm is a shape of the other architecture.
 	Arm = "lanescape-16vcpu-linux-arm64"
 )
@@ -257,7 +259,7 @@ func selectors(t T, w *world) {
 		w.refused(w.Push(repo, "main"), label)
 	}
 	// Every offered shape, standard or Spot, gets one.
-	for _, sel := range []string{Small, Small + "-spot", Arm, Arm + "-spot"} {
+	for _, sel := range []string{Small, Small + "-spot", Mid, Mid + "-spot", Arm, Arm + "-spot"} {
 		run := w.Push(repo, "main")
 		j := w.start(run, sel)
 		if j.Selector != sel {

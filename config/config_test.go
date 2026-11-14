@@ -32,6 +32,12 @@ func TestDefaultConfig(t *testing.T) {
 	if arm == nil || !slices.Equal(arm.MachineTypes, []string{"c4a-highcpu-16"}) || arm.Arch != "arm64" {
 		t.Errorf("arm64 shape = %+v", arm)
 	}
+	// The 16-vCPU amd64 shape promises what the 16-vCPU arm64 shape does.
+	mid := c.Shapes.Shapes["lanescape-16vcpu-linux-amd64"]
+	if mid == nil || !slices.Equal(mid.MachineTypes, []string{"n4-highcpu-16", "c4-highcpu-16"}) || mid.VCPUs != 16 || mid.Arch != "amd64" ||
+		arm == nil || mid.MemoryGB != arm.MemoryGB || mid.WorkDiskGB != arm.WorkDiskGB {
+		t.Errorf("16-vCPU amd64 shape = %+v", mid)
+	}
 	if c.Shapes.Shapes["lanescape-2vcpu-linux-amd64"] == nil {
 		t.Error("no 2-vCPU shape, which the specs' runners.json example uses")
 	}

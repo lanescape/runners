@@ -16,6 +16,10 @@ shapes:
     machine_types: [n4-highcpu-2, c4-highcpu-2]
     memory_gb: 4
     work_disk_gb: 50
+  lanescape-16vcpu-linux-amd64:
+    machine_types: [n4-highcpu-16, c4-highcpu-16]
+    memory_gb: 32
+    work_disk_gb: 200
   lanescape-80vcpu-linux-amd64:
     machine_types: [n4-highcpu-80, c4-highcpu-96]
     memory_gb: 160
