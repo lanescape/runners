@@ -70,7 +70,12 @@ func (s *Service) runFiles(ctx context.Context, repo github.Repository, bd bindi
 		slices.Sort(names)
 		for _, family := range names {
 			d := f.Disks[family]
-			var files []consumer.PathContents
+			// Each file is hashed as it's read, so no more than one file's
+			// contents is held at a time, however many the family lists.
+			var kh *consumer.KeyHash
+			if d.From != nil {
+				kh = consumer.NewKeyHash(family)
+			}
 			missing := ""
 			for _, p := range d.From {
 				b, err := s.GitHub.File(ctx, repo, p, bd.Commit)
@@ -85,13 +90,17 @@ func (s *Service) runFiles(ctx context.Context, repo github.Repository, bd bindi
 					missing = p + ": " + err.Error()
 					break
 				}
-				files = append(files, consumer.PathContents{Path: p, Contents: b})
+				kh.Add(p, b)
 			}
 			if missing != "" {
 				rf.Families[family] = FamilyKey{Missing: missing}
 				continue
 			}
-			rf.Families[family] = FamilyKey{Key: consumer.Key(family, files, d.From != nil)}
+			key := consumer.NoKey
+			if kh != nil {
+				key = kh.Sum()
+			}
+			rf.Families[family] = FamilyKey{Key: key}
 		}
 	}
 	got, _, err := createOnce(ctx, s.Objects, key, rf)
