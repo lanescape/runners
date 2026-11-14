@@ -272,6 +272,8 @@ func TestOldestFirst(t *testing.T) {
 func TestPlacement(t *testing.T) {
 	big := "lanescape-80vcpu-linux-amd64"
 	bigSpot := "lanescape-80vcpu-linux-amd64-spot"
+	mid := "lanescape-16vcpu-linux-amd64"
+	midSpot := "lanescape-16vcpu-linux-amd64-spot"
 	for _, tc := range []struct {
 		name       string
 		sel        string
@@ -307,6 +309,13 @@ func TestPlacement(t *testing.T) {
 			}
 		}, zoneA, "n4-highcpu-80", false, false},
 		{"no spot quota", bigSpot, func(e *env) { e.gce.SetQuota("northamerica-northeast1", "PREEMPTIBLE_CPUS", 8) }, zoneA, "n4-highcpu-80", false, false},
+		{"16 vCPUs", mid, func(*env) {}, zoneA, "n4-highcpu-16", false, false},
+		{"16 vCPUs without N4 quota", mid, func(e *env) { e.gce.SetQuota("northamerica-northeast1", "N4_CPUS", 8) }, zoneA, "c4-highcpu-16", false, false},
+		{"16 vCPUs, spot", midSpot, func(*env) {}, zoneA, "n4-highcpu-16", true, false},
+		{"16 vCPUs, spot without N4 capacity", midSpot, func(e *env) {
+			e.gce.Stockout(zoneA, "n4-highcpu-16", true)
+			e.gce.Stockout(zoneB, "n4-highcpu-16", true)
+		}, zoneA, "c4-highcpu-16", true, false},
 		{"Compute Engine failing", big, func(e *env) { e.gce.ServerError(http.MethodPost, "/instances", http.StatusInternalServerError, 0) }, "", "", false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

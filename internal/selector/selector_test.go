@@ -130,7 +130,7 @@ func TestPlain(t *testing.T) {
 	if !p.Plain(cfg.Shapes.Smallest()) {
 		t.Fatal("the smallest shape, standard, isn't plain")
 	}
-	for _, l := range []string{"lanescape-2vcpu-linux-amd64-spot", "lanescape-80vcpu-linux-amd64", "lanescape-16vcpu-linux-arm64"} {
+	for _, l := range []string{"lanescape-2vcpu-linux-amd64-spot", "lanescape-16vcpu-linux-amd64", "lanescape-80vcpu-linux-amd64", "lanescape-16vcpu-linux-arm64"} {
 		q, _ := selector.Parse(l)
 		if q.Plain(cfg.Shapes.Smallest()) {
 			t.Errorf("%s is plain", l)
