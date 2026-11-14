@@ -38,11 +38,23 @@ trap 'fail "line $LINENO exited $?: $BASH_COMMAND"' ERR
 
 say() { printf 'lanescape-runners base image: %s\n' "$*"; }
 
+# lookup DB KEY sets entry to the account database's entry for KEY, or to
+# nothing if it has none; any other failure fails the build.
+lookup() {
+	local status=0
+	entry=$(getent "$1" "$2") || status=$?
+	[ "$status" -eq 0 ] || [ "$status" -eq 2 ] || fail "getent $1 $2 exited $status"
+}
+
 # A builder's disk is fresh: a second run, such as after a restart, would
 # start from what the first left, so it fails instead.
-if [ -e /opt/lanescape-runners ] || [ -e /opt/actions-runner ] || getent passwd runner >/dev/null || getent group runner >/dev/null; then
+if [ -e /opt/lanescape-runners ] || [ -e /opt/actions-runner ]; then
 	fail "the builder's disk isn't fresh from Debian's image"
 fi
+for db in passwd group; do
+	lookup "$db" runner
+	[ -z "$entry" ] || fail "the builder's disk isn't fresh from Debian's image"
+done
 
 # Debian's own updates while a machine lives would hold the package
 # manager's lock while a job's first step installs what it needs; they go
@@ -101,14 +113,6 @@ ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt
 # Debian's Docker package makes its group. It keeps its name, so at every
 # boot of a machine made from the image the guest agent finds it and makes
 # nothing. Anything else holding UID or GID 1001 fails the build, naming it.
-
-# lookup DB KEY sets entry to the account database's entry for KEY, or to
-# nothing if it has none; any other failure fails the build.
-lookup() {
-	local status=0
-	entry=$(getent "$1" "$2") || status=$?
-	[ "$status" -eq 0 ] || [ "$status" -eq 2 ] || fail "getent $1 $2 exited $status"
-}
 
 # free_gid_1001 moves each group but runner that holds GID 1001 in
 # /etc/group, where groupadd looks, if nothing depends on its number, or

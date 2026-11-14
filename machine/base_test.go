@@ -201,10 +201,12 @@ func TestTheBuildersScriptSaysWhyItFailed(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		name, aptGet, curl, want string
+		getent                   string
 	}{
-		{"apt fails inside its function", "exit 100", "exit 0", "exited 100: apt-get -q"},
-		{"the metadata server fails in a command substitution", "exit 0", "exit 22", "exited 22"},
-		{"a setting isn't valid", "exit 0", `case "$*" in *lsr-files) printf AAAA ;; *lsr-arch) printf x86 ;; *) printf 0 ;; esac`, "lsr-arch isn't amd64 or arm64"},
+		{"apt fails inside its function", "exit 100", "exit 0", "exited 100: apt-get -q", ""},
+		{"the metadata server fails in a command substitution", "exit 0", "exit 22", "exited 22", ""},
+		{"a setting isn't valid", "exit 0", `case "$*" in *lsr-files) printf AAAA ;; *lsr-arch) printf x86 ;; *) printf 0 ;; esac`, "lsr-arch isn't amd64 or arm64", ""},
+		{"looking for the runner's user fails", "exit 0", "exit 0", "getent passwd runner exited 1", "exit 1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -217,8 +219,12 @@ func TestTheBuildersScriptSaysWhyItFailed(t *testing.T) {
 			if err := os.Mkdir(stubs, 0o755); err != nil {
 				t.Fatal(err)
 			}
+			getent := "exit 2"
+			if tc.getent != "" {
+				getent = tc.getent
+			}
 			for name, body := range map[string]string{
-				"systemctl": "exit 0", "getent": "exit 2", "apt-get": tc.aptGet, "curl": tc.curl, "dpkg": "echo amd64",
+				"systemctl": "exit 0", "getent": getent, "apt-get": tc.aptGet, "curl": tc.curl, "dpkg": "echo amd64",
 			} {
 				if err := os.WriteFile(filepath.Join(stubs, name), []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
 					t.Fatal(err)
