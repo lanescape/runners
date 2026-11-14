@@ -315,7 +315,29 @@ func (s *Service) supersede(ctx context.Context, rec Image) error {
 		return nil
 	}
 	slices.SortFunc(older, func(x, y record[Image]) int { return strings.Compare(x.v.Image, y.v.Image) })
+	// GitHub must still show the repository as the organization's when its
+	// images are marked, under the lease: it's read again once, before the
+	// first. If it doesn't, nothing is replaced now; a pass replaces it
+	// once GitHub shows the repository again.
+	checked, shown := false, false
 	marked, err := s.mark(ctx, rec.RepositoryID, older, nil, func(ctx context.Context, _ Image) (bool, error) {
+		if !checked {
+			repo, err := s.GitHub.RepositoryByID(ctx, rec.RepositoryID)
+			switch {
+			case errors.Is(err, github.ErrNotFound):
+				_ = s.notShown(rec.RepositoryID, "GitHub answers 404 for it: it's deleted, or the App can't read it")
+			case err != nil:
+				return false, err
+			case repo.OwnerID != s.Config.Organization.ID:
+				_ = s.notShown(rec.RepositoryID, "GitHub shows it as another owner's: it's been transferred")
+			default:
+				shown = true
+			}
+			checked = true
+		}
+		if !shown {
+			return false, nil
+		}
 		if _, pr := isPullRequest(rec.Scope); !pr {
 			return true, nil
 		}

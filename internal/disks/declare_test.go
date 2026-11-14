@@ -421,6 +421,28 @@ func TestATransferJustBeforeAPassActsDeletesNothing(t *testing.T) {
 			asItLeases(e, done)
 			return func() bool { return e.has(orphan) }
 		},
+		// The save itself is made, then the older disk it replaces is
+		// marked under the lease. The saving job started before the older
+		// disk was saved, so no choice of its keeps it.
+		"a disk a save replaces": func(e *env, done *atomic.Bool) func() bool {
+			jb := e.start(e.mainRun(), ghemu.JobSpec{Name: "build", Labels: []string{sel(key2, "main")}})
+			m := e.saveMain(key1)
+			e.clock.Advance(time.Minute)
+			before := e.images()
+			e.gcs.Faults().Add(fault.Rule{Method: http.MethodPost, Match: func(r *http.Request) bool {
+				if !strings.HasPrefix(r.URL.Query().Get("name"), "leases/disks/") {
+					return false
+				}
+				for n, im := range e.images() {
+					if _, had := before[n]; !had && im.Status == "READY" {
+						transferred(e, done)
+					}
+				}
+				return false
+			}})
+			jb.finish(true)
+			return func() bool { return e.has(m) }
+		},
 		"a finished run's choice": func(e *env, done *atomic.Bool) func() bool {
 			run := e.mainRun()
 			jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{tools(key1, "main")}})

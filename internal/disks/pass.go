@@ -441,20 +441,18 @@ func (s *Service) dropChoices(ctx context.Context, st *state) {
 			if err != nil {
 				return err
 			}
-			var drop []string
 			for _, key := range keys {
-				if ok, err := s.settled(ctx, st, repo, st.choices[key].v.RunID, live); err == nil && ok {
-					drop = append(drop, key)
+				r := st.choices[key]
+				if ok, err := s.settled(ctx, st, repo, r.v.RunID, live); err != nil || !ok {
+					continue
 				}
-			}
-			// GitHub must still show the repository as the organization's
-			// once its runs have been read: it's read again, under the
-			// lease, before any choice is dropped.
-			if len(drop) == 0 || !s.stillShown(ctx, st, repo) {
-				return nil
-			}
-			for _, key := range drop {
-				if err := s.Objects.Delete(ctx, key, st.choices[key].gen); err == nil || errors.Is(err, store.ErrNotFound) {
+				// GitHub must still show the repository as the
+				// organization's once the run has been read: it's read
+				// again before its choice is dropped.
+				if !s.stillShown(ctx, st, repo) {
+					return nil
+				}
+				if err := s.Objects.Delete(ctx, key, r.gen); err == nil || errors.Is(err, store.ErrNotFound) {
 					delete(st.choices, key)
 				}
 			}
