@@ -222,6 +222,7 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 		Passes:           passes,
 		Reconciler:       reconciler(body),
 		Events:           dks,
+		Closings:         dks,
 		JobStarted:       svc.JobStarted(),
 		JobFinished:      svc.JobFinished(),
 		Disks:            svc.DiskRequest(),

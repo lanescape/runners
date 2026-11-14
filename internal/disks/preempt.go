@@ -183,7 +183,7 @@ func (s *Service) ParseEvent(data []byte) (Event, bool) {
 // shows it once the pull request is reopened.
 func (s *Service) RecordEvent(ctx context.Context, attributes map[string]string, data []byte) error {
 	if attributes["event"] == "pull_request" {
-		return s.recordClosing(ctx, data)
+		return s.RecordClosing(ctx, data)
 	}
 	ev, ok := s.ParseEvent(data)
 	if !ok {
@@ -212,13 +212,17 @@ type closing struct {
 	} `json:"repository"`
 }
 
-// recordClosing records a pull request's closing, from GitHub's signed
+// RecordClosing records a pull request's closing, from GitHub's signed
 // delivery, as the last time it was seen closed: the second after GitHub's
 // closed_at, which it gives to the second, so a run bound in that second
 // counts as bound before. A pass may see the pull request open again by the
 // time it runs; its disks saved by runs bound before are retired all the
-// same.
-func (s *Service) recordClosing(ctx context.Context, data []byte) error {
+// same. The webhook calls it before it publishes the delivery, and the
+// reconcile endpoint again before it acknowledges the push; a closure only
+// moves forward, so the second changes nothing. Anything but a closing of a
+// pull request of a repository the organization owns, by ID, records
+// nothing.
+func (s *Service) RecordClosing(ctx context.Context, data []byte) error {
 	var c closing
 	if json.Unmarshal(data, &c) != nil || c.Action != "closed" || c.PullRequest == nil || c.PullRequest.Number <= 0 ||
 		c.PullRequest.ClosedAt.IsZero() || c.Repository == nil || c.Repository.Owner == nil ||

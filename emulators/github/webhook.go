@@ -79,3 +79,23 @@ func (e *Emulator) WorkflowJobPayload(run *Run, in *Installation, action string,
 		"installation": map[string]any{"id": in.ID},
 	}
 }
+
+// PullRequestPayload is a pull_request event for p as it is now, such as
+// its closing just after ClosePull, for the App's installation in, if
+// it's given.
+func (e *Emulator) PullRequestPayload(p *Pull, in *Installation, action string) map[string]any {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := map[string]any{
+		"action":       action,
+		"number":       p.Number,
+		"pull_request": e.pullJSON(p),
+		"repository":   e.repoJSON(p.Base),
+		"organization": accountJSON(p.Base.Owner),
+		"sender":       accountJSON(p.Author),
+	}
+	if in != nil {
+		out["installation"] = map[string]any{"id": in.ID}
+	}
+	return out
+}

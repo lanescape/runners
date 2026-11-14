@@ -104,9 +104,39 @@ func (ev *events) count() int {
 	return len(ev.got)
 }
 
+// closings records pull requests' closings at the webhook, as the service's
+// closing recorder does, failing while fail is set, and notes how many
+// deliveries had been published when each was recorded.
+type closings struct {
+	mu        sync.Mutex
+	pub       *publisher
+	got       [][]byte
+	published []int
+	fail      bool
+}
+
+func (c *closings) RecordClosing(_ context.Context, data []byte) error {
+	n := c.pub.count()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.fail {
+		return errors.New("bucket down")
+	}
+	c.got = append(c.got, data)
+	c.published = append(c.published, n)
+	return nil
+}
+
+func (c *closings) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.got)
+}
+
 type env struct {
 	t     *testing.T
 	ev    *events
+	cl    *closings
 	gh    *ghemu.Emulator
 	gg    *google.Issuer
 	gcs   *gcsemu.Emulator
@@ -166,8 +196,10 @@ func setupPass(t *testing.T, deadline time.Duration) *env {
 	pub := &publisher{}
 	rec := &reconciler{}
 	ev := &events{}
+	cl := &closings{pub: pub}
 	h, err := server.New(server.Config{
 		Events:           ev,
+		Closings:         cl,
 		Logger:           log,
 		OrganizationID:   orgID,
 		WebhookSecret:    secret,
@@ -181,7 +213,7 @@ func setupPass(t *testing.T, deadline time.Duration) *env {
 	}
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
-	return &env{t: t, ev: ev, gh: gh, gg: gg, gcs: gcs, org: org, repo: repo, inst: inst, pub: pub, rec: rec, url: srv.URL, logs: logs, logMu: logMu}
+	return &env{t: t, ev: ev, cl: cl, gh: gh, gg: gg, gcs: gcs, org: org, repo: repo, inst: inst, pub: pub, rec: rec, url: srv.URL, logs: logs, logMu: logMu}
 }
 
 func (e *env) post(path, token, body string) (int, map[string]any) {
@@ -286,18 +318,30 @@ func TestWebhook(t *testing.T) {
 		{"another event", func() *ghemu.Delivery {
 			return ghemu.NewDelivery(e.url+server.WebhookPath, secret, "push", payload)
 		}, http.StatusNoContent},
+		{"a closing with the wrong secret", func() *ghemu.Delivery {
+			return ghemu.NewDelivery(e.url+server.WebhookPath, []byte("guess"), "pull_request", closed)
+		}, http.StatusUnauthorized},
+		{"another organization's closing", func() *ghemu.Delivery {
+			other := e.gh.Repo(e.gh.Org(1234, "lanescape-lookalike"), 6002, "app")
+			p := e.gh.WorkflowJobPayload(e.gh.PushRun(other, "main"), e.inst, "queued", 4, nil)
+			return ghemu.NewDelivery(e.url+server.WebhookPath, secret, "pull_request",
+				map[string]any{"action": "closed", "number": 7, "repository": p["repository"]})
+		}, http.StatusNoContent},
 		{"a pull request that opens", func() *ghemu.Delivery {
 			return ghemu.NewDelivery(e.url+server.WebhookPath, secret, "pull_request",
 				map[string]any{"action": "opened", "number": 7, "repository": payload["repository"]})
 		}, http.StatusNoContent},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			before := e.pub.count()
+			before, closed := e.pub.count(), e.cl.count()
 			if code := send(tc.d()); code != tc.status {
 				t.Fatalf("status = %d, want %d", code, tc.status)
 			}
 			if e.pub.count() != before {
 				t.Fatal("delivery was published")
+			}
+			if e.cl.count() != closed {
+				t.Fatal("a delivery that isn't an authenticated closing of the organization's was recorded")
 			}
 		})
 	}
@@ -308,8 +352,62 @@ func TestWebhook(t *testing.T) {
 		if code := send(ghemu.NewDelivery(e.url+server.WebhookPath, secret, "workflow_run", payload)); code != http.StatusServiceUnavailable {
 			t.Fatalf("status = %d, want 503", code)
 		}
+		if e.cl.count() != 1 {
+			t.Fatal("a workflow_run delivery was recorded as a closing")
+		}
 	})
 	e.noSecrets(string(secret))
+}
+
+// A pull request's closing is recorded at the webhook before it's
+// published, so a delivery Pub/Sub refuses, which GitHub doesn't send again,
+// still leaves it recorded (specs/0003-disks.md, Deletion); and one that
+// can't be recorded there is still published, for its push to record.
+func TestAClosingIsRecordedBeforeItsPublished(t *testing.T) {
+	ctx := context.Background()
+	e := setup(t)
+	run := e.gh.PushRun(e.repo, "main")
+	repository := e.gh.WorkflowJobPayload(run, e.inst, "queued", 1, nil)["repository"]
+	closing := func(n int) *ghemu.Delivery {
+		return ghemu.NewDelivery(e.url+server.WebhookPath, secret, "pull_request", map[string]any{"action": "closed", "number": n,
+			"pull_request": map[string]any{"number": n, "closed_at": time.Now().UTC().Format(time.RFC3339)}, "repository": repository})
+	}
+	send := func(d *ghemu.Delivery) int {
+		resp, err := d.Send(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := send(closing(7)); code != http.StatusAccepted || e.cl.count() != 1 || e.pub.count() != 1 {
+		t.Fatalf("a closing: %d, %d recorded, %d published", code, e.cl.count(), e.pub.count())
+	}
+	if e.cl.published[0] != 0 || !bytes.Contains(e.cl.got[0], []byte(`"closed"`)) {
+		t.Fatalf("recorded %s after %d were published; want it recorded first", e.cl.got[0], e.cl.published[0])
+	}
+	// Pub/Sub down: the delivery fails, but its closing is recorded.
+	e.pub.fail = true
+	if code := send(closing(8)); code != http.StatusServiceUnavailable || e.cl.count() != 2 || e.pub.count() != 1 {
+		t.Fatalf("Pub/Sub down: %d, %d recorded, %d published", code, e.cl.count(), e.pub.count())
+	}
+	e.pub.fail = false
+	// The bucket down: the closing is published all the same, and its push
+	// records it.
+	e.cl.fail = true
+	if code := send(closing(9)); code != http.StatusAccepted || e.pub.count() != 2 {
+		t.Fatalf("bucket down: %d, %d published", code, e.pub.count())
+	}
+	if !strings.Contains(e.logged(), "pull request closing not recorded at the webhook") {
+		t.Fatal("a closing not recorded wasn't logged")
+	}
+	e.noSecrets(string(secret))
+}
+
+func (e *env) logged() string {
+	e.logMu.Lock()
+	defer e.logMu.Unlock()
+	return e.logs.String()
 }
 
 func TestReconcile(t *testing.T) {

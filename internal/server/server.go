@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/lanescape/runners/internal/auth"
 	"github.com/lanescape/runners/internal/pass"
@@ -61,6 +62,22 @@ type EventRecorder interface {
 	RecordEvent(ctx context.Context, attributes map[string]string, data []byte) error
 }
 
+// ClosingRecorder records a pull request's closing from GitHub's delivery,
+// whose signature and organization the webhook has checked: GitHub doesn't
+// retry a delivery that failed, and a pass can't see a closing once the pull
+// request is reopened, so the webhook records it itself before it publishes
+// the delivery, rather than leave it to the push alone.
+type ClosingRecorder interface {
+	RecordClosing(ctx context.Context, data []byte) error
+}
+
+// closingDeadline bounds how long the webhook waits for a closing to be
+// recorded, well within the 10 seconds GitHub waits for an answer, so a slow
+// bucket or a busy lease still leaves time to publish the delivery, whose
+// push records it again. The recording has as long, and goes on, releasing
+// the disks' lease, once the webhook has stopped waiting for it.
+const closingDeadline = 5 * time.Second
+
 // Config is what the server needs.
 type Config struct {
 	Logger         *slog.Logger
@@ -76,6 +93,9 @@ type Config struct {
 	// Events records pushed messages before they're acknowledged; unset,
 	// nothing is.
 	Events EventRecorder
+	// Closings records pull requests' closings at the webhook, before
+	// they're published; unset, only their pushes record them.
+	Closings ClosingRecorder
 
 	// JobStarted and JobFinished are the machines' endpoints, which check
 	// a Compute Engine identity token themselves; unset, they aren't
@@ -211,12 +231,48 @@ func (s *server) webhook(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	// A closing is recorded before it's published, so that a delivery
+	// Pub/Sub refuses still leaves it recorded: GitHub doesn't send it again,
+	// and once the pull request is reopened no pass can see it. If it can't
+	// be recorded here, it's still published, and its push records it.
+	recorded := false
+	if event == "pull_request" && s.Closings != nil {
+		recorded = s.recordClosing(r.Context(), id, body)
+	}
 	if err := s.Publisher.Publish(r.Context(), Delivery{Event: event, ID: id, Body: body}); err != nil {
-		s.log.Error("publishing webhook delivery", "event", event, "delivery", id, "err", err)
+		s.log.Error("publishing webhook delivery", "event", event, "delivery", id, "closing_recorded", recorded, "err", err)
 		retryLater(w, "delivery not published")
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// recordClosing records a closing, waiting for it no longer than
+// closingDeadline, and reports whether it was recorded by then. The
+// recording outlives the request, so that what it holds, the disks' lease,
+// is released even if GitHub has hung up.
+func (s *server) recordClosing(ctx context.Context, id string, body []byte) bool {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), closingDeadline)
+	done := make(chan error, 1)
+	go func() {
+		defer cancel()
+		done <- s.Closings.RecordClosing(rctx, body)
+	}()
+	t := time.NewTimer(closingDeadline)
+	defer t.Stop()
+	select {
+	case err := <-done:
+		if err != nil {
+			s.log.Warn("pull request closing not recorded at the webhook; its push records it", "delivery", id, "err", err)
+			return false
+		}
+		return true
+	case <-t.C:
+		s.log.Warn("pull request closing not yet recorded at the webhook; it's published meanwhile, and its push records it", "delivery", id)
+		return false
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func (s *server) reconcile(w http.ResponseWriter, r *http.Request) {
