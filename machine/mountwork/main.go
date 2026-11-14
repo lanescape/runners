@@ -4,14 +4,17 @@
 // job, once Compute Engine has attached the disk the job's disk action asked
 // for. It formats the disk if it's empty, as a new disk is, and keeps the
 // filesystem of one made from a saved disk; it mounts the disk out of sight
-// first, at a staging directory, where its root is given to the runner's
-// user, as a saved disk's may not be if its job changed it, and only then
-// binds it onto /work, so a job never sees it there with another owner. Run
-// again, it finds the disk mounted and only repairs its owner.
+// first, at a staging directory, where it grows a kept filesystem to the
+// whole disk, which can be larger than the disk it was saved from, and
+// gives its root to the runner's user, as a saved disk's may not be if its
+// job changed it, and only then binds it onto /work, so a job never sees it
+// there smaller than its disk or with another owner. Run again, it finds the
+// disk mounted and only repairs its owner.
 //
-// The one tool it runs is mkfs.ext4, Debian's, at a path its settings name.
-// Its settings come from the base image; the only argument, which the base
-// image's unit never passes, is another settings file, for tests.
+// The tools it runs are mkfs.ext4 and resize2fs, Debian's, at the paths its
+// settings name. Its settings come from the base image; the only argument,
+// which the base image's unit never passes, is another settings file, for
+// tests.
 //
 // It uses only Go's standard library, so that it builds from its own source
 // alone, statically, wherever the base image is made.
@@ -42,6 +45,8 @@ type Config struct {
 	Wait time.Duration
 	// Mkfs is mkfs.ext4's path.
 	Mkfs string
+	// Resize2fs is resize2fs's path.
+	Resize2fs string
 	// Mountinfo lists what's mounted in the program's mount namespace.
 	Mountinfo string
 }
@@ -49,7 +54,8 @@ type Config struct {
 // Defaults are the base image's.
 func Defaults() Config {
 	return Config{Device: "/dev/disk/by-id/google-work", Mountpoint: "/work", Staging: "/run/lanescape-runners/work-disk",
-		UID: 1001, GID: 1001, Wait: 120 * time.Second, Mkfs: "/usr/sbin/mkfs.ext4", Mountinfo: "/proc/self/mountinfo"}
+		UID: 1001, GID: 1001, Wait: 120 * time.Second, Mkfs: "/usr/sbin/mkfs.ext4", Resize2fs: "/usr/sbin/resize2fs",
+		Mountinfo: "/proc/self/mountinfo"}
 }
 
 func main() {
@@ -62,7 +68,7 @@ func main() {
 		say(os.Stderr, "settings %s: %v", settings, err)
 		os.Exit(1)
 	}
-	if err := mountWork(cfg, realSystem{mkfs: cfg.Mkfs}, os.Stderr); err != nil {
+	if err := mountWork(cfg, realSystem{mkfs: cfg.Mkfs, resize2fs: cfg.Resize2fs}, os.Stderr); err != nil {
 		say(os.Stderr, "%v", err)
 		os.Exit(1)
 	}
@@ -107,6 +113,8 @@ func readSettings(path string, cfg *Config) error {
 			cfg.Wait = d
 		case "mkfs":
 			cfg.Mkfs = v
+		case "resize2fs":
+			cfg.Resize2fs = v
 		case "mountinfo":
 			cfg.Mountinfo = v
 		}
@@ -125,6 +133,9 @@ type system interface {
 	Format(device string, uid, gid int) error
 	// Mount mounts the device's ext4 filesystem at target.
 	Mount(device, target string) error
+	// Grow grows the device's mounted ext4 filesystem to the whole device,
+	// online; one that's already as large is left as it is.
+	Grow(device string) error
 	// Bind binds source onto target.
 	Bind(source, target string) error
 	Unmount(target string) error
@@ -132,10 +143,21 @@ type system interface {
 }
 
 // realSystem is the machine's.
-type realSystem struct{ mkfs string }
+type realSystem struct{ mkfs, resize2fs string }
 
 func (s realSystem) Format(device string, uid, gid int) error {
-	cmd := exec.Command(s.mkfs, "-q", "-m", "0", "-L", "work", "-E", fmt.Sprintf("root_owner=%d:%d", uid, gid), device)
+	return run(s.mkfs, "-q", "-m", "0", "-L", "work", "-E", fmt.Sprintf("root_owner=%d:%d", uid, gid), device)
+}
+
+// Grow runs resize2fs with no size, which grows the filesystem to the
+// device's size: while it's mounted, online, through the kernel, which needs
+// no check of the filesystem first. A filesystem already that size is left
+// as it is, and resize2fs exits 0.
+func (s realSystem) Grow(device string) error { return run(s.resize2fs, device) }
+
+// run runs one of Debian's tools, saying what it said if it fails.
+func run(tool string, args ...string) error {
+	cmd := exec.Command(tool, args...)
 	cmd.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C"}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%v: %s", err, bytes.TrimSpace(out))
@@ -264,6 +286,7 @@ func mountWork(cfg Config, sys system, out io.Writer) error {
 		}
 		staged = staged || m.target == cfg.Staging
 	}
+	formatted := false
 	if !staged {
 		what, err := contents(cfg.Device)
 		switch {
@@ -275,12 +298,23 @@ func mountWork(cfg Config, sys system, out io.Writer) error {
 			if err := sys.Format(cfg.Device, cfg.UID, cfg.GID); err != nil {
 				return fmt.Errorf("formatting the work disk: %v", err)
 			}
+			formatted = true
 		}
 		if err := os.MkdirAll(cfg.Staging, 0o700); err != nil {
 			return fmt.Errorf("making %s: %v", cfg.Staging, err)
 		}
 		if err := sys.Mount(cfg.Device, cfg.Staging); err != nil {
 			return fmt.Errorf("mounting the work disk at %s: %v", cfg.Staging, err)
+		}
+	}
+	// A disk made from a saved one is as large as the job's shape asks, which
+	// can be larger than the disk it was saved from, but its filesystem is
+	// the saved disk's size until it's grown. A new disk's filesystem was
+	// just made as large as the disk. Growing it fails the mount: a /work
+	// smaller than the job asked for would fail it later, and more obscurely.
+	if !formatted {
+		if err := sys.Grow(real); err != nil {
+			return fmt.Errorf("growing the work disk's filesystem to the whole disk: %v", err)
 		}
 	}
 	if err := sys.Chown(cfg.Staging, cfg.UID, cfg.GID); err != nil {

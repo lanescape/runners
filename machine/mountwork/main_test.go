@@ -31,6 +31,7 @@ func (f *fake) Format(device string, uid, gid int) error {
 	return f.do("format", fmt.Sprintf("%s %d:%d", device, uid, gid))
 }
 func (f *fake) Mount(device, target string) error { return f.do("mount", device+" "+target) }
+func (f *fake) Grow(device string) error          { return f.do("grow", device) }
 func (f *fake) Bind(source, target string) error  { return f.do("bind", source+" "+target) }
 func (f *fake) Unmount(target string) error       { return f.do("unmount", target) }
 func (f *fake) Chown(path string, uid, gid int) error {
@@ -112,7 +113,8 @@ func TestTheWorkDiskIsFormattedAndMounted(t *testing.T) {
 	}
 }
 
-// A saved disk keeps its filesystem, and its root, whatever its job made
+// A saved disk keeps its filesystem, grown to the whole disk, which can be
+// larger than the one it was saved from, and its root, whatever its job made
 // of it, is the runner's user's before it's seen at /work.
 func TestAWorkDiskWithAFilesystemIsKept(t *testing.T) {
 	e := newEnv(t, ext4Disk())
@@ -121,6 +123,7 @@ func TestAWorkDiskWithAFilesystemIsKept(t *testing.T) {
 	}
 	want := []string{
 		"mount " + e.cfg.Device + " " + e.cfg.Staging,
+		"grow " + e.real,
 		"chown " + e.cfg.Staging + " 1001:1001",
 		"bind " + e.cfg.Staging + " " + e.cfg.Mountpoint,
 		"unmount " + e.cfg.Staging,
@@ -148,7 +151,7 @@ func TestAStagedWorkDiskIsPublished(t *testing.T) {
 	if err, out := e.run(); err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
-	want := []string{"chown " + e.cfg.Staging + " 1001:1001", "bind " + e.cfg.Staging + " " + e.cfg.Mountpoint, "unmount " + e.cfg.Staging}
+	want := []string{"grow " + e.real, "chown " + e.cfg.Staging + " 1001:1001", "bind " + e.cfg.Staging + " " + e.cfg.Mountpoint, "unmount " + e.cfg.Staging}
 	if !slices.Equal(e.sys.did, want) {
 		t.Fatalf("did %q, want %q", e.sys.did, want)
 	}
@@ -173,6 +176,14 @@ func TestAWorkDiskThatFailsIsntMounted(t *testing.T) {
 	e.sys.fail["mount"] = true
 	if err, _ := e.run(); err == nil || slices.ContainsFunc(e.sys.did, func(l string) bool { return strings.HasPrefix(l, "chown") }) {
 		t.Fatalf("a disk that wasn't mounted was given away: %v, did %q", err, e.sys.did)
+	}
+	// A filesystem that couldn't be grown to its disk is never published at
+	// /work, where the job would find less room than it asked for.
+	e = newEnv(t, ext4Disk())
+	e.sys.fail["grow"] = true
+	if err, _ := e.run(); err == nil || !strings.Contains(err.Error(), "growing") ||
+		slices.ContainsFunc(e.sys.did, func(l string) bool { return strings.HasPrefix(l, "chown") || strings.HasPrefix(l, "bind") }) {
+		t.Fatalf("a filesystem that wasn't grown was published: %v, did %q", err, e.sys.did)
 	}
 }
 
@@ -209,10 +220,10 @@ func TestMountinfo(t *testing.T) {
 
 func TestSettings(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "mount-work.conf")
-	_ = os.WriteFile(path, []byte("device=/dev/x\nowner=5:6\nwait=3s\nmkfs=/sbin/mkfs.ext4\n"), 0o644)
+	_ = os.WriteFile(path, []byte("device=/dev/x\nowner=5:6\nwait=3s\nmkfs=/sbin/mkfs.ext4\nresize2fs=/sbin/resize2fs\n"), 0o644)
 	cfg := Defaults()
 	if err := readSettings(path, &cfg); err != nil || cfg.Device != "/dev/x" || cfg.UID != 5 || cfg.GID != 6 || cfg.Wait != 3*time.Second ||
-		cfg.Mkfs != "/sbin/mkfs.ext4" || cfg.Mountpoint != "/work" {
+		cfg.Mkfs != "/sbin/mkfs.ext4" || cfg.Resize2fs != "/sbin/resize2fs" || cfg.Mountpoint != "/work" {
 		t.Fatalf("settings = %+v, %v", cfg, err)
 	}
 	_ = os.WriteFile(path, []byte("owner=runner\n"), 0o644)

@@ -67,10 +67,11 @@ const (
 	WorkDiskUnitPath   = "/etc/systemd/system/lanescape-runners-work-disk.service"
 	WorkDiskRulePath   = "/etc/udev/rules.d/90-lanescape-runners-work.rules"
 
-	// MkfsPath is the one tool the mount program runs: Debian's
-	// mkfs.ext4, from the base image's e2fsprogs, updated with each
-	// rebuild of the base image.
-	MkfsPath = "/usr/sbin/mkfs.ext4"
+	// MkfsPath and Resize2fsPath are the tools the mount program runs:
+	// Debian's mkfs.ext4 and resize2fs, from the base image's e2fsprogs,
+	// updated with each rebuild of the base image.
+	MkfsPath      = "/usr/sbin/mkfs.ext4"
+	Resize2fsPath = "/usr/sbin/resize2fs"
 
 	// WorkPath is where a work disk is mounted: until it is, an empty
 	// directory of the base image's, owned by root and mode 0755, which
