@@ -96,6 +96,14 @@ func (e *Emulator) Transfer(r *Repo, to *Account) {
 	r.Owner = to
 }
 
+// Delete deletes a repository: GitHub answers 404 for it from then on, by
+// its ID or its name.
+func (e *Emulator) Delete(r *Repo) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.repos, r.ID)
+}
+
 // Commit is a commit and the whole tree it records, as path to contents.
 type Commit struct {
 	SHA     string

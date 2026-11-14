@@ -36,7 +36,10 @@ type state struct {
 	reruns      map[string]record[Rerun]
 	complete    bool
 
-	repos     map[int64]*github.Repository
+	repos map[int64]*github.Repository
+	// notShown are the errors of the repositories GitHub doesn't show as
+	// the organization's, read once a pass.
+	notShown  map[int64]error
 	runs      map[string]*run
 	pulls     map[string]*github.PullRequest
 	jobs      map[int64]*github.Job
@@ -128,27 +131,47 @@ func (s *Service) read(ctx context.Context) *state {
 	return st
 }
 
+// errNotShown is the answer for a repository that GitHub doesn't show as
+// the organization's: it answers 404 for it, as it does for a deleted
+// repository and for one the App can no longer read, or it shows it as
+// another owner's, transferred. Such a repository confirms nothing, as
+// GitHub being unavailable doesn't: none of its images goes, none of its
+// pull requests counts as closed, and nothing of its runs is decided or
+// rerun, until GitHub shows it as the organization's again
+// (specs/0003-disks.md, Deletion).
+var errNotShown = errors.New("GitHub doesn't show the repository as the organization's")
+
+// repository is a consumer's repository, read once a pass. A repository
+// GitHub doesn't show as the organization's gives errNotShown, and a
+// warning naming it and why, once a pass.
 func (s *Service) repository(ctx context.Context, st *state, id int64) (*github.Repository, error) {
 	if r, ok := st.repos[id]; ok {
 		return r, nil
 	}
-	r, err := s.GitHub.RepositoryByID(ctx, id)
-	if errors.Is(err, github.ErrNotFound) {
-		st.repos[id] = nil
-		return nil, nil
-	}
-	if err != nil {
+	if err, ok := st.notShown[id]; ok {
 		return nil, err
 	}
-	if r.OwnerID != s.Config.Organization.ID {
-		// Transferred away: no longer a consumer, so nothing of it is
-		// read or rerun.
-		s.log().Warn("a repository with records is no longer the organization's", "repository_id", id)
-		st.repos[id] = nil
-		return nil, nil
+	r, err := s.GitHub.RepositoryByID(ctx, id)
+	var why string
+	switch {
+	case errors.Is(err, github.ErrNotFound):
+		why = "GitHub answers 404 for it: it's deleted, or the App can't read it"
+	case err != nil:
+		return nil, err
+	case r.OwnerID != s.Config.Organization.ID:
+		why = "GitHub shows it as another owner's: it's been transferred"
+	default:
+		st.repos[id] = &r
+		return &r, nil
 	}
-	st.repos[id] = &r
-	return &r, nil
+	err = fmt.Errorf("repository %d: %w: %s", id, errNotShown, why)
+	if st.notShown == nil {
+		st.notShown = map[int64]error{}
+	}
+	st.notShown[id] = err
+	s.log().Warn("a repository with records isn't the organization's by GitHub's answer; none of its images is deleted, "+
+		"and nothing of it is rerun, until it is", "repository_id", id, "why", why)
+	return nil, err
 }
 
 // evidence looks, by instance ID, for evidence that each stopped Spot
@@ -205,15 +228,13 @@ func (s *Service) runState(ctx context.Context, st *state, repoID, runID int64) 
 		return nil, err
 	}
 	r := &run{finished: true}
-	if repo != nil {
-		wr, err := s.GitHub.WorkflowRun(ctx, *repo, runID)
-		switch {
-		case errors.Is(err, github.ErrNotFound):
-		case err != nil:
-			return nil, err
-		default:
-			r.found, r.finished, r.attempt = true, wr.Status == "completed", wr.Attempt
-		}
+	wr, err := s.GitHub.WorkflowRun(ctx, *repo, runID)
+	switch {
+	case errors.Is(err, github.ErrNotFound):
+	case err != nil:
+		return nil, err
+	default:
+		r.found, r.finished, r.attempt = true, wr.Status == "completed", wr.Attempt
 	}
 	if r.found && r.finished {
 		jobs, err := s.GitHub.RunJobs(ctx, *repo, runID)
@@ -406,7 +427,7 @@ func (s *Service) pull(ctx context.Context, st *state, repoID int64, sc string) 
 	}
 	n, _ := parsed.PullRequestNumber()
 	repo, err := s.repository(ctx, st, repoID)
-	if err != nil || repo == nil {
+	if err != nil {
 		return nil, err
 	}
 	pr, err := s.GitHub.PullRequest(ctx, *repo, n)
@@ -429,15 +450,13 @@ func (s *Service) finishedJob(ctx context.Context, st *state, repoID, jobID int6
 		if err != nil {
 			return false, err
 		}
-		if repo != nil {
-			got, err := s.GitHub.Job(ctx, *repo, jobID)
-			switch {
-			case errors.Is(err, github.ErrNotFound):
-			case err != nil:
-				return false, err
-			default:
-				j = &got
-			}
+		got, err := s.GitHub.Job(ctx, *repo, jobID)
+		switch {
+		case errors.Is(err, github.ErrNotFound):
+		case err != nil:
+			return false, err
+		default:
+			j = &got
 		}
 		st.jobs[jobID] = j
 	}
@@ -452,7 +471,8 @@ func (s *Service) finishedJob(ctx context.Context, st *state, repoID, jobID int6
 // their key; in a pull request's, all of it once it has closed; and resume
 // images once their job has started from one, or has finished, or their
 // run has finished with no rerun left. Nothing goes for want of use or for
-// its age. Marking leaves alone any image an unfinished run's choice
+// its age, nor while GitHub doesn't show its repository as the
+// organization's. Marking leaves alone any image an unfinished run's choice
 // names, and a resume image a job has claimed and not yet started from.
 func (s *Service) expire(ctx context.Context, st *state) {
 	byRepo := map[int64]map[string]record[Image]{}
@@ -486,12 +506,17 @@ func (s *Service) expire(ctx context.Context, st *state) {
 			return
 		}
 		recs := byRepo[repo]
+		// A repository GitHub doesn't show as the organization's confirms
+		// nothing: none of its images goes by these rules until GitHub
+		// shows it again. What a pass marked before still goes.
+		_, err := s.repository(ctx, st, repo)
+		shown := !errors.Is(err, errNotShown)
 		// Which disk of a scope's family is newest is read only from images
 		// Compute Engine has, ready: a record of one that's gone mustn't
 		// stand in for it, and leave the one that's there unprotected.
 		there := map[string]record[Image]{}
 		for n, r := range recs {
-			if im, ok := st.images[r.v.Image]; ok && im.Status == "READY" && matches(im, r.v) {
+			if im, ok := st.images[r.v.Image]; shown && ok && im.Status == "READY" && matches(im, r.v) {
 				there[n] = r
 			}
 		}
@@ -677,7 +702,7 @@ func (s *Service) declarations(ctx context.Context, st *state, repo int64, there
 		s.log().Warn("reading a consumer with saved disks; deleting nothing by its declarations this pass", "repository_id", repo, "err", err.Error())
 		return nil
 	}
-	out, err := readDeclarations(ctx, s.GitHub, s.log(), rp, slices.Sorted(maps.Keys(scopes)))
+	out, err := readDeclarations(ctx, s.GitHub, s.log(), *rp, slices.Sorted(maps.Keys(scopes)))
 	if err != nil {
 		s.log().Warn("reading a consumer's declarations; deleting nothing by them where they couldn't be read", "repository_id", repo,
 			"err", err.Error())
@@ -689,24 +714,17 @@ func (s *Service) declarations(ctx context.Context, st *state, repo int64, there
 // long-lived branches', what its branch's .github/runners.json declares at
 // its head: the default branch's for main's, and each listed branch's own
 // for its scope. A file that's absent declares nothing. A scope whose
-// branch is no longer listed, or no longer exists, goes; so does every
-// scope of a repository that's gone, or no longer the organization's. What
-// GitHub couldn't confirm, and a file that isn't valid, is left out, with
-// the error: a default branch's file that isn't valid confirms nothing, for
+// branch is no longer listed, or no longer exists, goes. What GitHub
+// couldn't confirm, and a file that isn't valid, is left out, with the
+// error: a default branch's file that isn't valid confirms nothing, for
 // main's scope or any branch's.
-func readDeclarations(ctx context.Context, gh github.API, log *slog.Logger, repo *github.Repository, scopes []string) (map[string]declared, error) {
+func readDeclarations(ctx context.Context, gh github.API, log *slog.Logger, repo github.Repository, scopes []string) (map[string]declared, error) {
 	out := map[string]declared{}
-	if repo == nil {
-		for _, sc := range scopes {
-			out[sc] = declared{gone: "its repository is gone, or no longer the organization's"}
-		}
-		return out, nil
-	}
-	tip, err := gh.BranchHead(ctx, *repo, repo.DefaultBranch)
+	tip, err := gh.BranchHead(ctx, repo, repo.DefaultBranch)
 	if err != nil {
 		return out, fmt.Errorf("reading the default branch: %w", err)
 	}
-	f, err := readRunnersFile(ctx, gh, *repo, tip)
+	f, err := readRunnersFile(ctx, gh, repo, tip)
 	if err != nil {
 		return out, fmt.Errorf("the default branch's %s: %w", consumer.RunnersFile, err)
 	}
@@ -729,7 +747,7 @@ func readDeclarations(ctx context.Context, gh github.API, log *slog.Logger, repo
 			out[sc] = declared{gone: "its long-lived branch is no longer listed"}
 			continue
 		}
-		head, err := gh.BranchHead(ctx, *repo, branch)
+		head, err := gh.BranchHead(ctx, repo, branch)
 		if errors.Is(err, github.ErrNotFound) {
 			out[sc] = declared{gone: "its long-lived branch no longer exists"}
 			continue
@@ -738,7 +756,7 @@ func readDeclarations(ctx context.Context, gh github.API, log *slog.Logger, repo
 			errs = append(errs, fmt.Errorf("reading %s's branch: %w", sc, err))
 			continue
 		}
-		bf, err := readRunnersFile(ctx, gh, *repo, head)
+		bf, err := readRunnersFile(ctx, gh, repo, head)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s's branch's %s: %w", sc, consumer.RunnersFile, err))
 			continue
@@ -904,6 +922,11 @@ func (s *Service) tidy(ctx context.Context, st *state) {
 		}
 	}
 	for repo, names := range orphans {
+		// Nor does any go while GitHub doesn't show its repository as the
+		// organization's.
+		if _, err := s.repository(ctx, st, repo); errors.Is(err, errNotShown) {
+			continue
+		}
 		slices.Sort(names)
 		// A claim keeps an orphaned resume image only while it would keep
 		// one with a record: until its job has started from it, or has

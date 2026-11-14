@@ -1,6 +1,7 @@
 package disks_test
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"strings"
@@ -159,16 +160,82 @@ func TestRemovingADeclarationKeepsWhatAnUnfinishedRunChose(t *testing.T) {
 	}
 }
 
-// A repository no longer the organization's declares nothing: its disks go.
-func TestATransferredRepositorysDisksGo(t *testing.T) {
+// A repository GitHub answers 404 for, as it does once the App can no
+// longer read it, deletes nothing: not main's disks, a long-lived branch's
+// or a pull request's, nor a family whose declaration was removed
+// meanwhile, and its pull request isn't taken as closed. Once GitHub shows
+// it again, its declarations decide as before.
+func TestARepositoryGitHubDoesntFindDeletesNothing(t *testing.T) {
 	e := setup(t)
-	k1 := e.saveMain(key1)
+	e.listV1()
+	m := e.saveMain(key1)
+	b := e.saveBranch(key1)
 	p, _ := e.pull()
 	pr := e.savePull(p, sel(key1, "pr"+strconv.Itoa(p.Number)))
+	e.repo.Commit("main", map[string]string{consumer.RunnersFile: `{"branches": {"support/v1": "v1"}, "disks": {"tools": {}}}`})
+	e.gh.Faults().Add(fault.Rule{PathPrefix: "/repos", Respond: fault.Status(http.StatusNotFound, nil, `{"message": "Not Found"}`)})
+	e.pass()
+	e.pass()
+	e.gh.Faults().Reset()
+	if !e.has(m) || !e.has(b) || !e.has(pr) {
+		t.Fatalf("main's %v, the branch's %v, the pull request's %v; want all kept while GitHub answered 404", e.has(m), e.has(b), e.has(pr))
+	}
+	if !e.logged("GitHub answers 404 for it") {
+		t.Fatal("no warning naming the repository GitHub doesn't find")
+	}
+	e.pass()
+	if e.has(m) {
+		t.Fatal("a family no longer declared kept its disk once GitHub showed its repository again")
+	}
+	if !e.has(b) || !e.has(pr) {
+		t.Fatalf("the branch's %v, the pull request's %v; want both kept", e.has(b), e.has(pr))
+	}
+}
+
+// A deleted repository's disks are kept, for a maintainer to remove by
+// hand: GitHub's 404 for it is the same answer as for one the App can't
+// read. So is an image of its with no record.
+func TestADeletedRepositorysDisksAreKept(t *testing.T) {
+	e := setup(t)
+	m := e.saveMain(key1)
+	orphan := e.saveMainLabel(tools(key1, "main"))
+	p, _ := e.pull()
+	pr := e.savePull(p, sel(key1, "pr"+strconv.Itoa(p.Number)))
+	if err := e.objects.Delete(context.Background(), "images/5001/"+orphan+".json", mustGen(t, e, "images/5001/"+orphan+".json")); err != nil {
+		t.Fatal(err)
+	}
+	e.gh.Delete(e.repo)
+	e.pass()
+	if !e.has(m) || !e.has(pr) || !e.has(orphan) {
+		t.Fatalf("main's %v, the pull request's %v, the image with no record %v; a deleted repository's images went", e.has(m), e.has(pr),
+			e.has(orphan))
+	}
+	if !e.logged("GitHub answers 404 for it") {
+		t.Fatal("no warning naming the deleted repository")
+	}
+}
+
+// A repository GitHub shows as another owner's, transferred, deletes
+// nothing either; transferred back, it's the same consumer, with its disks.
+func TestATransferredRepositorysDisksAreKept(t *testing.T) {
+	e := setup(t)
+	m := e.saveMain(key1)
+	p, _ := e.pull()
+	pr := e.savePull(p, sel(key1, "pr"+strconv.Itoa(p.Number)))
+	e.repo.Commit("main", map[string]string{consumer.RunnersFile: `{"disks": {"tools": {}}}`})
 	e.gh.Transfer(e.repo, e.gh.Org(1234, "elsewhere"))
 	e.pass()
-	if e.has(k1) || e.has(pr) {
-		t.Fatalf("main's %v, the pull request's %v; a transferred repository's disks were kept", e.has(k1), e.has(pr))
+	if !e.has(m) || !e.has(pr) {
+		t.Fatalf("main's %v, the pull request's %v; a transferred repository's disks went", e.has(m), e.has(pr))
+	}
+	if !e.logged("another owner's") {
+		t.Fatal("no warning naming the transferred repository")
+	}
+	e.gh.Transfer(e.repo, e.org)
+	e.repo.Commit("main", map[string]string{consumer.RunnersFile: declares})
+	e.pass()
+	if !e.has(m) || !e.has(pr) {
+		t.Fatalf("main's %v, the pull request's %v; want both kept once transferred back", e.has(m), e.has(pr))
 	}
 }
 
