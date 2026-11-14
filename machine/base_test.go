@@ -262,7 +262,7 @@ func scriptFunction(t *testing.T, name string) string {
 // account files of the test's own, with Debian's tools that read and write
 // them stood in for: groupadd and useradd fail as Debian's do on an ID
 // that's taken. Google's guest agent makes google-sudoers, docker and lxd as
-// it starts with the next free GIDs from 1000, so docker holds GID 1001: a
+// it starts with groupadd's next GIDs from 1000, so docker holds GID 1001: a
 // group holding it that nothing depends on moves to the highest free system
 // GID, keeping its name, as does one the agent makes at 1001 once it's
 // freed, whether before groupadd looks for GID 1001 or after, when both

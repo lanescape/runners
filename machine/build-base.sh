@@ -104,9 +104,9 @@ ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt
 # The runner's user, as on GitHub's runners: UID and GID 1001, with
 # passwordless sudo, in no other group. Google's guest agent makes groups of
 # its own as it starts, each only if no group of its name exists, with
-# groupadd's next free GID from 1000: google-sudoers, then those of the
-# groups it puts the accounts it makes in that Debian's image lacks, docker
-# and lxd, so docker holds GID 1001. A group holding GID 1001 that has no
+# groupadd's next GID from 1000, above the highest in use: google-sudoers,
+# then those of the groups it puts the accounts it makes in that Debian's
+# image lacks, docker and lxd, so docker holds GID 1001. A group holding GID 1001 that has no
 # members, is no user's primary group and owns no file on the boot disk, as
 # one just made at boot, moves to the highest free GID of the system groups'
 # range, 101 to 999, as groupadd --system would have made it, and as
