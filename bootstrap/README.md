@@ -20,7 +20,7 @@ The network, Pub/Sub, the scheduler job and the Cloud Run service's shell are he
 ## What must exist first
 
 - **Your access:** Owner of `lanescape-dev`, or enough to enable APIs, make service accounts, custom roles, project-level grants and log sinks.
-- **The "Lanescape Runners" GitHub App,** private to the organization (installable only on its owner's account), installed on it, with the permissions specs/0001-architecture.md describes, Pull requests: read among them, and its webhook at `<service_url>/v1/webhook` delivering `workflow_job`, `workflow_run` and `pull_request` (specs/0004-deployment.md, The GitHub App). The service's URL is Cloud Run's deterministic one, `https://lanescape-runners-<project number>.northamerica-northeast1.run.app`, which `terraform output service_url` also gives. Keep its private key and webhook secret for after the first deploy (`infra/README.md`).
+- **The "Lanescape Runners" GitHub App,** private to the organization (installable only on its owner's account), installed on it, with the permissions specs/0004-deployment.md lists (The GitHub App), Administration: read and Pull requests: read among them, and its webhook at `<service_url>/v1/webhook` delivering `workflow_job`, `workflow_run` and `pull_request` (specs/0004-deployment.md, The GitHub App). The service's URL is Cloud Run's deterministic one, `https://lanescape-runners-<project number>.northamerica-northeast1.run.app`, which `terraform output service_url` also gives. Keep its private key and webhook secret for after the first deploy (`infra/README.md`).
 - **The state bucket,** made by hand once, since this configuration's state lives in it:
 
   ```sh
