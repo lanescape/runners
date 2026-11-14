@@ -12,6 +12,7 @@ import (
 
 	"github.com/lanescape/runners/config"
 	gceemu "github.com/lanescape/runners/emulators/compute"
+	"github.com/lanescape/runners/emulators/fault"
 	ghemu "github.com/lanescape/runners/emulators/github"
 	"github.com/lanescape/runners/internal/bases"
 	"github.com/lanescape/runners/internal/compute"
@@ -405,6 +406,141 @@ func TestAYoungerSpotJobWaitsForAnOlderOne(t *testing.T) {
 	if e.gh.Job(big.ID).Status != "queued" || e.gh.Job(arm.ID).Status != "queued" {
 		t.Fatal("a job held back by quota isn't queued")
 	}
+}
+
+// The project's vCPUs in every region, CPUS_ALL_REGIONS, are a quota every
+// machine draws on, of whatever family: an older job waiting for it holds
+// back every younger job, a smaller one of another family included, so that
+// what machines free builds up for it, however Compute Engine reports the
+// quota (specs/0002-machines.md, One pool).
+func TestAnOlderJobWaitingForAllCPUsHoldsEveryYoungerJob(t *testing.T) {
+	const big, arm = "lanescape-80vcpu-linux-amd64", "lanescape-16vcpu-linux-arm64"
+	for _, inOp := range []bool{false, true} {
+		t.Run(map[bool]string{false: "at once", true: "in the operation"}[inOp], func(t *testing.T) {
+			e := setup(t)
+			e.gce.ReportQuotaInOperation(inOp)
+			e.gce.SetGlobalQuota("CPUS_ALL_REGIONS", 96)
+			// A machine of the service's takes 80 of the 96.
+			e.queue(e.mainRun(), big)
+			e.pass()
+			e.wantMachines(1)
+			older := e.queue(e.mainRun(), big)
+			time.Sleep(1100 * time.Millisecond)
+			younger := e.queue(e.mainRun(), arm)
+			e.pass()
+			// The Arm job's 16 would fit, but the older job could have had them.
+			e.wantMachines(1)
+			if e.gh.Job(older.ID).Status != "queued" || e.gh.Job(younger.ID).Status != "queued" {
+				t.Fatal("a job held back by quota isn't queued")
+			}
+			if !strings.Contains(e.logs.String(), "is waiting for quota or capacity it would draw on") ||
+				!strings.Contains(e.logs.String(), "CPUS_ALL_REGIONS") {
+				t.Error("why the younger job waits isn't logged")
+			}
+			// Room for the older job, but not yet for both.
+			e.gce.SetGlobalQuota("CPUS_ALL_REGIONS", 160)
+			e.pass()
+			ms := e.wantMachines(2)
+			if !slices.ContainsFunc(ms, func(m gceemu.InstanceState) bool {
+				return m.Labels[machines.LabelJob] == strconv.FormatInt(older.ID, 10)
+			}) {
+				t.Fatal("the older job didn't get the room first")
+			}
+			e.gce.SetGlobalQuota("CPUS_ALL_REGIONS", 176)
+			e.pass()
+			e.wantMachines(3)
+		})
+	}
+}
+
+// A machine made earlier in the same pass counts as running: an older job
+// that then finds no CPUS_ALL_REGIONS quota holds every younger job back.
+func TestAMachineMadeThisPassCountsForAHold(t *testing.T) {
+	e := setup(t)
+	e.gce.SetGlobalQuota("CPUS_ALL_REGIONS", 96)
+	e.queue(e.mainRun(), "lanescape-80vcpu-linux-amd64")
+	time.Sleep(1100 * time.Millisecond)
+	older := e.queue(e.mainRun(), "lanescape-80vcpu-linux-amd64")
+	time.Sleep(1100 * time.Millisecond)
+	younger := e.queue(e.mainRun(), "lanescape-16vcpu-linux-arm64")
+	e.pass()
+	e.wantMachines(1)
+	if e.gh.Job(older.ID).Status != "queued" || e.gh.Job(younger.ID).Status != "queued" {
+		t.Fatal("a job held back by quota isn't queued")
+	}
+}
+
+// A quota every machine draws on holds no job back while none of the
+// service's machines runs: nothing of the service's then holds it, or the
+// older job asks for more than all of it, and holding the others back would
+// only stop them too.
+func TestNoHoldForAllCPUsWithNothingRunning(t *testing.T) {
+	e := setup(t)
+	e.gce.SetGlobalQuota("CPUS_ALL_REGIONS", 64)
+	never := e.queue(e.mainRun(), "lanescape-80vcpu-linux-amd64")
+	time.Sleep(1100 * time.Millisecond)
+	// Younger jobs of another family, and of the older job's own: what it
+	// lacks isn't its families' quota or capacity.
+	e.queue(e.mainRun(), "lanescape-16vcpu-linux-arm64")
+	e.queue(e.mainRun(), "lanescape-16vcpu-linux-amd64")
+	e.pass()
+	ms := e.wantMachines(2)
+	if e.gh.Job(never.ID).Status != "queued" ||
+		!slices.ContainsFunc(ms, func(m gceemu.InstanceState) bool { return m.MachineType == "c4a-highcpu-16" }) ||
+		!slices.ContainsFunc(ms, func(m gceemu.InstanceState) bool { return m.MachineType == "n4-highcpu-16" }) {
+		t.Fatalf("machines = %+v; want the younger jobs'", ms)
+	}
+	if !strings.Contains(e.logs.String(), "younger jobs aren't held back for that quota") {
+		t.Error("not logged")
+	}
+}
+
+// Every placement that found no quota counts, not only the last: an older
+// job whose N4 machines lack the project's vCPUs in every region, and whose
+// C4 machines lack C4's own quota, still holds every younger job back.
+func TestEveryPlacementsShortageHolds(t *testing.T) {
+	e := setup(t)
+	e.gce.SetGlobalQuota("CPUS_ALL_REGIONS", 96)
+	e.gce.SetQuota("northamerica-northeast1", "C4_CPUS", 0)
+	e.queue(e.mainRun(), "lanescape-80vcpu-linux-amd64")
+	e.pass()
+	e.wantMachines(1)
+	older := e.queue(e.mainRun(), "lanescape-80vcpu-linux-amd64")
+	time.Sleep(1100 * time.Millisecond)
+	younger := e.queue(e.mainRun(), "lanescape-16vcpu-linux-arm64")
+	e.pass()
+	e.wantMachines(1)
+	if e.gh.Job(older.ID).Status != "queued" || e.gh.Job(younger.ID).Status != "queued" {
+		t.Fatal("a job held back by quota isn't queued")
+	}
+}
+
+// A quota error that doesn't say which quota could be one every machine
+// draws on: an older job waiting for it holds back every younger job.
+func TestAnUnnamedQuotaHoldsEveryYoungerJob(t *testing.T) {
+	e := setup(t)
+	e.queue(e.mainRun(), sel2)
+	e.pass()
+	e.wantMachines(1)
+	unnamed := func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error": {"code": 403, "message": "Quota exceeded.", "errors": [{"reason": "quotaExceeded", "message": "Quota exceeded."}]}}`))
+	}
+	// Each of the older job's four placements, its two machine types in two
+	// zones.
+	e.gce.Faults().Add(fault.Rule{Method: http.MethodPost, Times: 4, Respond: unnamed,
+		Match: func(r *http.Request) bool { return strings.HasSuffix(r.URL.Path, "/instances") }})
+	older := e.queue(e.mainRun(), "lanescape-80vcpu-linux-amd64")
+	time.Sleep(1100 * time.Millisecond)
+	younger := e.queue(e.mainRun(), "lanescape-16vcpu-linux-arm64")
+	e.pass()
+	e.wantMachines(1)
+	if e.gh.Job(older.ID).Status != "queued" || e.gh.Job(younger.ID).Status != "queued" {
+		t.Fatal("a job held back by quota isn't queued")
+	}
+	e.pass()
+	e.wantMachines(3)
 }
 
 func TestARunnerWithOtherLabelsGetsNoMachine(t *testing.T) {

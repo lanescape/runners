@@ -5,7 +5,9 @@
 // operations. It provisions standard and Spot machines, preempts Spot ones as
 // Compute Engine does, with a compute.instances.preempted zone operation
 // whose targetId is the instance's numeric ID, and fails as Compute Engine
-// does: stockouts and quota errors per zone and machine type, duplicate
+// does: stockouts per zone and machine type, quota errors of a region's
+// machine family or Spot machines and of the project's vCPUs in every
+// region, reported at once or in the request's operation, duplicate
 // requests answered by their requestId, and responses lost after the work was
 // done (through Faults).
 //
@@ -63,7 +65,12 @@ type Emulator struct {
 	diskShort map[string]bool
 	failNext  map[string]string
 	quotas    map[string]int64 // by region/metric
-	opDelay   time.Duration
+	// globalQuotas are quotas of the whole project, by metric, such as
+	// CPUS_ALL_REGIONS.
+	globalQuotas map[string]int64
+	// quotaInOperation reports quota errors in the request's operation.
+	quotaInOperation bool
+	opDelay          time.Duration
 	// pendingImages makes new images stay PENDING.
 	pendingImages bool
 	onBoot        func(Machine)
@@ -185,7 +192,7 @@ func New(opts ...Option) *Emulator {
 		zones:     []string{"northamerica-northeast1-a", "northamerica-northeast1-b"},
 		instances: map[string]*instance{}, disks: map[string]*disk{}, images: map[string]*image{}, public: map[string]*image{},
 		ops: map[string]*operation{}, requests: map[string]*operation{},
-		stockouts: map[capacityKey]bool{}, refusing: map[capacityKey]bool{}, diskShort: map[string]bool{}, failNext: map[string]string{}, quotas: map[string]int64{}, booted: map[uint64]bool{},
+		stockouts: map[capacityKey]bool{}, refusing: map[capacityKey]bool{}, diskShort: map[string]bool{}, failNext: map[string]string{}, quotas: map[string]int64{}, globalQuotas: map[string]int64{}, booted: map[uint64]bool{},
 	}
 	for _, o := range opts {
 		o(e)
@@ -339,12 +346,85 @@ func (e *Emulator) ClearStockout(zone, machineType string, spot bool) {
 	delete(e.refusing, capacityKey{zone, machineType, spot})
 }
 
-// SetQuota limits a region's metric, such as N4_CPUS, C4A_CPUS or
-// PREEMPTIBLE_CPUS, which Spot machines count against when it's set.
+// SetQuota limits a region's metric: a machine family's vCPUs, such as
+// N4_CPUS or C4A_CPUS, which Compute Engine reports as CPUS_PER_VM_FAMILY,
+// with the family as the quota's vm_family; or PREEMPTIBLE_CPUS, which Spot
+// machines count against when it's set.
 func (e *Emulator) SetQuota(region, metric string, limit int64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.quotas[region+"/"+metric] = limit
+}
+
+// SetGlobalQuota limits a metric of the whole project. The one there is is
+// CPUS_ALL_REGIONS, the vCPUs of every machine in every region, of every
+// family, Spot or not, that isn't stopped.
+func (e *Emulator) SetGlobalQuota(metric string, limit int64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.globalQuotas[metric] = limit
+}
+
+// ReportQuotaInOperation makes a quota error come in the request's
+// operation, as QUOTA_EXCEEDED with the quota's details, as Compute Engine
+// sometimes reports it, rather than at once.
+func (e *Emulator) ReportQuotaInOperation(on bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.quotaInOperation = on
+}
+
+// quota is a quota a machine would exceed.
+type quota struct {
+	metric, limitName, message string
+	limit                      int64
+	dimensions                 map[string]string
+}
+
+// quotaShort reports the first quota that a new machine of family and
+// vCPUs, in zone, would exceed: its family's in the region, or the region's
+// PREEMPTIBLE_CPUS in its place for a Spot machine when that's set; then
+// the project's in every region. Stopped machines count against none.
+func (e *Emulator) quotaShort(zone, family string, vcpus int64, spot bool) (quota, bool) {
+	metric := strings.ToUpper(family) + "_CPUS"
+	if _, ok := e.quotas[region(zone)+"/PREEMPTIBLE_CPUS"]; ok && spot {
+		metric = "PREEMPTIBLE_CPUS"
+	}
+	if limit, ok := e.quotas[region(zone)+"/"+metric]; ok {
+		used := vcpus
+		for _, other := range e.instances {
+			f, n, _ := machineShape(other.machineType)
+			om := strings.ToUpper(f) + "_CPUS"
+			if metric == "PREEMPTIBLE_CPUS" {
+				om = map[bool]string{true: "PREEMPTIBLE_CPUS", false: ""}[other.provisioning == "SPOT"]
+			}
+			if region(other.zone) == region(zone) && om == metric && other.status != "TERMINATED" {
+				used += n
+			}
+		}
+		if used > limit {
+			q := quota{metric: metric, limit: limit, limitName: metric + "-per-project-region", dimensions: map[string]string{"region": region(zone)}}
+			if metric != "PREEMPTIBLE_CPUS" {
+				q.metric, q.limitName = "CPUS_PER_VM_FAMILY", "CPUS-PER-VM-FAMILY-per-project-region"
+				q.dimensions["vm_family"] = strings.ToUpper(family)
+			}
+			q.message = fmt.Sprintf("Quota '%s' exceeded.  Limit: %d.0 in region %s.", q.metric, limit, region(zone))
+			return q, true
+		}
+	}
+	if limit, ok := e.globalQuotas["CPUS_ALL_REGIONS"]; ok {
+		used := vcpus
+		for _, other := range e.instances {
+			if _, n, _ := machineShape(other.machineType); other.status != "TERMINATED" {
+				used += n
+			}
+		}
+		if used > limit {
+			return quota{metric: "CPUS_ALL_REGIONS", limit: limit, limitName: "CPUS-ALL-REGIONS-per-project",
+				message: fmt.Sprintf("Quota 'CPUS_ALL_REGIONS' exceeded.  Limit: %d.0 globally.", limit)}, true
+		}
+	}
+	return quota{}, false
 }
 
 // SetOperationDelay makes operations take d, in real time, before they're

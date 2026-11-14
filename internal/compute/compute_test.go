@@ -113,9 +113,45 @@ func TestCapacity(t *testing.T) {
 	if !errors.As(err, &ce) || ce.Stockout {
 		t.Fatalf("quota: %v", err)
 	}
+	if ce.Quota != "CPUS_PER_VM_FAMILY" {
+		t.Fatalf("the quota is %q, want CPUS_PER_VM_FAMILY", ce.Quota)
+	}
 	// C4's quota is apart.
 	if err := c.CreateInstance(ctx, zoneB, spec("lsr-5001-bbbbbbbb", "c4-highcpu-2", false), compute.RequestID("4")); err != nil {
 		t.Fatalf("another family: %v", err)
+	}
+}
+
+// The project's vCPUs in every region are one quota, CPUS_ALL_REGIONS, which
+// every machine draws on, of any family, Spot or not, until it's stopped;
+// Compute Engine names it whether it reports it at once or in the request's
+// operation.
+func TestAQuotaOfEveryMachine(t *testing.T) {
+	for _, inOp := range []bool{false, true} {
+		t.Run(map[bool]string{false: "at once", true: "in the operation"}[inOp], func(t *testing.T) {
+			ctx := context.Background()
+			emu, c := setup(t)
+			emu.ReportQuotaInOperation(inOp)
+			emu.SetGlobalQuota("CPUS_ALL_REGIONS", 20)
+			if err := c.CreateInstance(ctx, zoneA, spec("lsr-5001-aaaaaaaa", "n4-highcpu-16", false), compute.RequestID("1")); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.CreateInstance(ctx, zoneB, spec("lsr-5001-bbbbbbbb", "c4-highcpu-2", true), compute.RequestID("2")); err != nil {
+				t.Fatal(err)
+			}
+			for i, mt := range []string{"c4-highcpu-4", "n4-highcpu-4"} {
+				err := c.CreateInstance(ctx, zoneB, spec("lsr-5001-cccccccc", mt, i == 0), compute.RequestID("3", mt))
+				var ce *compute.CapacityError
+				if !errors.As(err, &ce) || ce.Stockout || ce.Quota != "CPUS_ALL_REGIONS" {
+					t.Fatalf("%s: %v; want the quota CPUS_ALL_REGIONS", mt, err)
+				}
+			}
+			// A stopped machine draws on it no more.
+			emu.Shutdown(zoneA, "lsr-5001-aaaaaaaa")
+			if err := c.CreateInstance(ctx, zoneB, spec("lsr-5001-cccccccc", "n4-highcpu-4", false), compute.RequestID("4")); err != nil {
+				t.Fatalf("after a machine stopped: %v", err)
+			}
+		})
 	}
 }
 

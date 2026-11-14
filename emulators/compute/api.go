@@ -657,26 +657,17 @@ func (e *Emulator) insertInstance(r *http.Request, zone string) (*operation, *ap
 	}
 
 	// Quota is checked as the request arrives; capacity once it's accepted.
-	metric := strings.ToUpper(family) + "_CPUS"
-	if _, ok := e.quotas[region(zone)+"/PREEMPTIBLE_CPUS"]; ok && prov == "SPOT" {
-		metric = "PREEMPTIBLE_CPUS"
-	}
-	if limit, ok := e.quotas[region(zone)+"/"+metric]; ok {
-		used := vcpus
-		for _, other := range e.instances {
-			f, n, _ := machineShape(other.machineType)
-			om := strings.ToUpper(f) + "_CPUS"
-			if metric == "PREEMPTIBLE_CPUS" {
-				om = map[bool]string{true: "PREEMPTIBLE_CPUS", false: ""}[other.provisioning == "SPOT"]
-			}
-			if region(other.zone) == region(zone) && om == metric && other.status != "TERMINATED" {
-				used += n
-			}
+	// Compute Engine reports a quota it's out of by name, either at once or
+	// in the request's operation, with the quota's details.
+	if q, short := e.quotaShort(zone, family, vcpus, prov == "SPOT"); short {
+		if !e.quotaInOperation {
+			return nil, &apiError{http.StatusForbidden, "quotaExceeded", q.message}
 		}
-		if used > limit {
-			return nil, &apiError{http.StatusForbidden, "quotaExceeded",
-				fmt.Sprintf("Quota '%s' exceeded.  Limit: %d.0 in region %s.", metric, limit, region(zone))}
-		}
+		op := e.newOp(zone, "insert", e.zoneURL(zone)+"/instances/"+body.Name, 0).fail(http.StatusForbidden, "QUOTA_EXCEEDED", q.message)
+		op.op.Error.Errors[0].ErrorDetails = []*gce.OperationErrorErrorsErrorDetails{{QuotaInfo: &gce.QuotaExceededInfo{
+			MetricName: "compute.googleapis.com/" + strings.ToLower(q.metric), LimitName: q.limitName, Limit: float64(q.limit),
+			Dimensions: q.dimensions}}}
+		return op, nil
 	}
 	if e.refusing[capacityKey{zone, mt, prov == "SPOT"}] {
 		return nil, &apiError{http.StatusServiceUnavailable, "insufficientCapacity",
