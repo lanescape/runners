@@ -14,7 +14,7 @@
 //	machines/<machine>/facts.json      what a machine's first check reported GitHub told its runner
 //	machines/<machine>/admission.json  the job a machine's runner took, and the check's decision
 //	machines/<machine>/answered.json   when a failed job's hook was answered with its reason
-//	machines/<machine>/report.json     the supervisor's report
+//	machines/<machine>/report.json     the supervisor's report, with what the machine used
 //	machines/<machine>/save-request.json  the job's request to save its work disk
 //	disks/<disk>.json                  a work disk, with its family, recorded before it's made
 //	refusals/<repository>/<run>-<attempt>.json  a run attempt refused or cancelled, until GitHub shows it finished
@@ -390,12 +390,24 @@ func (a Admission) Resolve(m Machine, d *DiskRecord) Machine {
 	return m
 }
 
-// Report is the supervisor's report that its machine's job is done. It says
-// nothing else: a job asks to save its work disk itself, and no report
-// means no save.
+// Report is the supervisor's report that its machine's job is done, with
+// what the machine used, if it said, and what its log needs of the machine
+// and the job its check admitted (specs/0002-machines.md, What a job used). Nothing in it decides
+// anything: a job asks to save its work disk itself, and no report means no
+// save.
 type Report struct {
-	Machine string    `json:"machine"`
-	At      time.Time `json:"at"`
+	Machine      string    `json:"machine"`
+	At           time.Time `json:"at"`
+	Usage        *Usage    `json:"usage,omitempty"`
+	Zone         string    `json:"zone,omitempty"`
+	MachineType  string    `json:"machine_type,omitempty"`
+	Spot         bool      `json:"spot,omitempty"`
+	Selector     string    `json:"selector,omitempty"`
+	RepositoryID int64     `json:"repository_id,omitempty"`
+	RunID        int64     `json:"run_id,omitempty"`
+	RunAttempt   int       `json:"run_attempt,omitempty"`
+	JobID        int64     `json:"job_id,omitempty"`
+	JobName      string    `json:"job_name,omitempty"`
 }
 
 // SaveRequest is a job's request, through the save-disk action, that its

@@ -27,7 +27,8 @@ import (
 // The programs' sources are named one by one: their tests aren't the
 // programs, and import more than the standard library.
 //
-//go:embed supervisor/main.go hook/main.go mountwork/main.go mountwork/sys_linux.go mountwork/sys_other.go
+//go:embed supervisor/main.go supervisor/usage.go supervisor/usage_linux.go supervisor/usage_other.go
+//go:embed hook/main.go mountwork/main.go mountwork/sys_linux.go mountwork/sys_other.go
 //go:embed job-started.sh lanescape-runners-supervisor.service lanescape-runners-work-disk.service
 //go:embed 90-lanescape-runners-work.rules
 var files embed.FS

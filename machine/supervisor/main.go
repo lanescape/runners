@@ -1,10 +1,11 @@
 // Command supervisor is the service's own program on every machine
 // (specs/0002-machines.md, A machine's life). It registers the machine's
 // one-job GitHub runner from the just-in-time configuration the service put
-// in the machine's metadata, starts it, and waits for it to exit. Then it
-// reports to the service that the job is done, and powers the machine off.
-// The report says nothing else: a job asks for its own save, from its steps,
-// and the service decides it from GitHub's records.
+// in the machine's metadata, starts it, and measures the machine until it
+// exits. Then it reports to the service that the job is done, with what the
+// machine used, and powers the machine off. The report decides nothing: a
+// job asks for its own save, from its steps, and the service decides it from
+// GitHub's records.
 //
 // It runs outside every job, as its own user, with its own environment and
 // paths: nothing a job sets reaches it, and it acts only after the runner
@@ -57,6 +58,16 @@ type Config struct {
 	// metadata, and to report.
 	MetadataFor duration `json:"metadata_for"`
 	ReportFor   duration `json:"report_for"`
+	// Proc is where procfs is mounted; Root and Work are the boot disk's
+	// filesystem and where the work disk is mounted; SampleEvery is how
+	// often memory and filesystems are sampled while the runner runs, and
+	// MeasureFor how long the measurements may take to finish once it has
+	// exited, before the report goes without them.
+	Proc        string   `json:"proc"`
+	Root        string   `json:"root"`
+	Work        string   `json:"work"`
+	SampleEvery duration `json:"sample_every"`
+	MeasureFor  duration `json:"measure_for"`
 }
 
 type duration time.Duration
@@ -83,6 +94,11 @@ func Defaults() Config {
 		PowerOff:    []string{"systemctl", "poweroff"},
 		MetadataFor: duration(5 * time.Minute),
 		ReportFor:   duration(5 * time.Minute),
+		Proc:        "/proc",
+		Root:        "/",
+		Work:        "/work",
+		SampleEvery: duration(time.Second),
+		MeasureFor:  duration(10 * time.Second),
 	}
 }
 
@@ -221,19 +237,43 @@ func supervise(ctx context.Context, cfg Config, logger *log.Logger, out io.Write
 	if err != nil {
 		logger.Printf("no runner configuration: %v", err)
 		md.state(ctx, "reporting")
-		report(ctx, md, service, cfg, logger)
+		report(ctx, md, service, cfg, logger, nil)
 		return
 	}
 	md.state(ctx, "running")
 	logger.Printf("starting the runner")
-	if err := runRunner(ctx, cfg, jit, out); err != nil {
+	measuring, stopMeasuring := context.WithCancel(ctx)
+	used := make(chan Usage, 1)
+	go newMeter(cfg.Proc, cfg.Root, cfg.Work, time.Duration(cfg.SampleEvery)).measure(measuring, used)
+	err = runRunner(ctx, cfg, jit, out)
+	stopMeasuring()
+	if err != nil {
 		logger.Printf("the runner exited: %v", err)
 	} else {
 		logger.Printf("the runner exited")
 	}
+	var usage *Usage
+	wait := time.NewTimer(time.Duration(cfg.MeasureFor))
+	select {
+	case u := <-used:
+		usage = &u
+		// The same numbers go to the boot log, which the service keeps
+		// even if the report never arrives.
+		if b, err := json.Marshal(u); err == nil {
+			logger.Printf("used: %s", b)
+		}
+	case <-wait.C:
+		logger.Printf("what the machine used wasn't measured in time; reporting without it")
+	}
+	wait.Stop()
 	md.state(ctx, "reporting")
-	report(ctx, md, service, cfg, logger)
+	report(ctx, md, service, cfg, logger, usage)
 	md.state(ctx, "done")
+}
+
+// finished is the report's body.
+type finished struct {
+	Usage *Usage `json:"usage,omitempty"`
 }
 
 // noProxy is a transport that goes straight to its address: the metadata
@@ -284,20 +324,28 @@ func runRunner(ctx context.Context, cfg Config, jit string, out io.Writer) error
 	return cmd.Run()
 }
 
-// report tells the service the job is done, trying again while the service
-// has no answer, for as long as the settings allow. It says nothing more:
-// whether the work disk is saved is the job's to ask from its steps, and
-// the service's to decide (specs/0005-interface.md, Work disks).
-func report(ctx context.Context, md metadata, service string, cfg Config, logger *log.Logger) {
+// report tells the service the job is done, with what the machine used,
+// trying again while the service has no answer, for as long as the settings
+// allow. Nothing in it decides anything: whether the work disk is saved is
+// the job's to ask from its steps, and the service's to decide
+// (specs/0005-interface.md, Work disks).
+func report(ctx context.Context, md metadata, service string, cfg Config, logger *log.Logger, usage *Usage) {
 	end := time.Now().Add(time.Duration(cfg.ReportFor))
 	hc := &http.Client{Timeout: 30 * time.Second, Transport: noProxy()}
 	wait := time.Second
+	body := finished{Usage: usage}
 	for {
-		code, err := send(ctx, md, hc, service)
+		code, err := send(ctx, md, hc, service, body)
 		switch {
 		case err == nil && code/100 == 2:
 			logger.Printf("reported")
 			return
+		case err == nil && code == http.StatusBadRequest && body.Usage != nil:
+			// A service that doesn't read usage refuses it as a field it
+			// doesn't know; the report itself mustn't be lost with it.
+			logger.Printf("the service refused the report's usage; reporting without it")
+			body.Usage = nil
+			continue
 		case err == nil && code/100 == 4 && code != http.StatusTooManyRequests:
 			logger.Printf("the service refused the report: %d", code)
 			return
@@ -315,12 +363,16 @@ func report(ctx context.Context, md metadata, service string, cfg Config, logger
 	}
 }
 
-func send(ctx context.Context, md metadata, hc *http.Client, service string) (int, error) {
+func send(ctx context.Context, md metadata, hc *http.Client, service string, body finished) (int, error) {
+	b, err := json.Marshal(body)
+	if err != nil {
+		return 0, err
+	}
 	tok, err := md.identity(ctx, service)
 	if err != nil {
 		return 0, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(service, "/")+finishedPath, strings.NewReader("{}"))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(service, "/")+finishedPath, bytes.NewReader(b))
 	if err != nil {
 		return 0, err
 	}
