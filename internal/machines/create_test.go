@@ -14,6 +14,7 @@ import (
 	gceemu "github.com/lanescape/runners/emulators/compute"
 	"github.com/lanescape/runners/emulators/fault"
 	ghemu "github.com/lanescape/runners/emulators/github"
+	gcsemu "github.com/lanescape/runners/emulators/storage"
 	"github.com/lanescape/runners/internal/bases"
 	"github.com/lanescape/runners/internal/compute"
 	"github.com/lanescape/runners/internal/machines"
@@ -836,12 +837,13 @@ func TestJobsWaitForABaseImageOfTheServicesPrograms(t *testing.T) {
 	}
 }
 
-// TestAJobsWaitForABaseImageDoesntCountTowardsItsHour: a job whose first
-// machine stopped before its job started, and that then waits for a base
-// image its machine may boot, isn't refused for the wait: the hour its
-// machines have to start leaves the wait out, which its record keeps, and
-// it gets its machine once the image is ready.
-func TestAJobsWaitForABaseImageDoesntCountTowardsItsHour(t *testing.T) {
+// aJobWithAFirstMachine is a job whose first machine, booted from an earlier
+// image of the service's programs, stopped before its job started, and
+// whose next must wait for the base image: the earlier image turns out to
+// be of other programs, as one of a deploy since replaced, and the new one
+// is built but slow to be made.
+func aJobWithAFirstMachine(t *testing.T) (*env, map[string]string, *ghemu.Run, *ghemu.WorkflowJob) {
+	t.Helper()
 	e, keys := newKey(t, map[string]string{bases.LabelKind: bases.KindBase, bases.LabelPrograms: programs()})
 	run := e.mainRun()
 	job := e.queue(run, sel2)
@@ -850,15 +852,32 @@ func TestAJobsWaitForABaseImageDoesntCountTowardsItsHour(t *testing.T) {
 	if got := e.source(first.Name); got != earlierImage {
 		t.Fatalf("the first machine boots %s", got)
 	}
-	// The earlier image turns out to be of other programs, as one of a
-	// deploy since replaced; the new one is slow to be made.
 	e.gce.DeleteImageNow(earlierImage)
 	e.gce.AddLabelledImage(earlierImage, "", "X86_64", map[string]string{bases.LabelKind: bases.KindBase, bases.LabelPrograms: "ffffffffffffffffffff"})
-	builder := bases.BuilderName("amd64", keys["amd64"])
 	e.gce.HoldImages(true)
-	e.gce.WriteSerial(zoneA, builder, baseimage.Built+"amd64-"+keys["amd64"]+"\n")
-	// The first machine stops before its job starts.
+	e.gce.WriteSerial(zoneA, bases.BuilderName("amd64", keys["amd64"]), baseimage.Built+"amd64-"+keys["amd64"]+"\n")
 	e.gce.Shutdown(first.Zone, first.Name)
+	return e, keys, run, job
+}
+
+// jobWrites fails the bucket's writes of job records, n of them or, with 0,
+// every one until the faults are reset; lost, the write is done and its
+// answer lost.
+func (e *env) jobWrites(n int, lost bool) {
+	e.gcs.Faults().Add(fault.Rule{Method: http.MethodPost, Times: n, After: lost,
+		Match: func(r *http.Request) bool {
+			return strings.Contains(r.URL.RawQuery, "jobs") || strings.Contains(r.URL.Path, "jobs")
+		},
+		Respond: gcsemu.JSONError(http.StatusForbidden, "forbidden", "Forbidden")})
+}
+
+// TestAJobsWaitForABaseImageDoesntCountTowardsItsHour: a job whose first
+// machine stopped before its job started, and that then waits for a base
+// image its machine may boot, isn't refused for the wait: the hour its
+// machines have to start leaves the wait out, which its record keeps, and
+// it gets its machine once the image is ready.
+func TestAJobsWaitForABaseImageDoesntCountTowardsItsHour(t *testing.T) {
+	e, keys, run, job := aJobWithAFirstMachine(t)
 	e.clock.Advance(10 * time.Minute)
 	e.pass()
 	key := "jobs/5001/" + strconv.FormatInt(job.ID, 10) + ".json"
@@ -894,6 +913,71 @@ func TestAJobsWaitForABaseImageDoesntCountTowardsItsHour(t *testing.T) {
 	if rf, ok := e.record("refusals/5001/" + strconv.FormatInt(run.ID, 10) + "-1.json"); !ok ||
 		!strings.Contains(fmt.Sprint(rf["reason"]), "it waited for a base image") {
 		t.Fatalf("refusal = %v; want the run refused once the rest of its hour ran out", rf)
+	}
+}
+
+// TestAJobWaitingForABaseImageIsntRefusedWhenItsRecordCantSaySo: a job
+// that waits for a base image isn't refused, even when its hour has run out
+// by its record because the record couldn't take its wait; once the bucket
+// takes it, the wait is recorded.
+func TestAJobWaitingForABaseImageIsntRefusedWhenItsRecordCantSaySo(t *testing.T) {
+	e, _, run, job := aJobWithAFirstMachine(t)
+	e.clock.Advance(55 * time.Minute)
+	e.jobWrites(0, false)
+	e.pass()
+	e.clock.Advance(10 * time.Minute)
+	e.pass()
+	e.pass()
+	if _, ok := e.record("refusals/5001/" + strconv.FormatInt(run.ID, 10) + "-1.json"); ok {
+		t.Fatal("the waiting job's run was refused")
+	}
+	key := "jobs/5001/" + strconv.FormatInt(job.ID, 10) + ".json"
+	if rec, _ := e.record(key); rec["waiting_since"] != nil {
+		t.Fatalf("job record = %v; its writes were to fail", rec)
+	}
+	e.gcs.Faults().Reset()
+	e.pass()
+	if rec, _ := e.record(key); rec["waiting_since"] == nil {
+		t.Fatalf("job record = %v; want its wait recorded", rec)
+	}
+	if _, ok := e.record("refusals/5001/" + strconv.FormatInt(run.ID, 10) + "-1.json"); ok {
+		t.Fatal("the waiting job's run was refused")
+	}
+}
+
+// TestAJobGetsNoMachineUntilItsRecordSaysItsWaitEnded: once the base image
+// is ready, a job whose record still says it waits gets no machine until
+// the record says the wait has ended, so its hour runs again before it has
+// one; a write whose answer was lost is read back.
+func TestAJobGetsNoMachineUntilItsRecordSaysItsWaitEnded(t *testing.T) {
+	e, keys, _, job := aJobWithAFirstMachine(t)
+	e.clock.Advance(10 * time.Minute)
+	e.pass()
+	key := "jobs/5001/" + strconv.FormatInt(job.ID, 10) + ".json"
+	if rec, _ := e.record(key); rec["waiting_since"] == nil {
+		t.Fatalf("job record = %v; want its wait recorded", rec)
+	}
+	e.clock.Advance(10 * time.Minute)
+	e.gce.HoldImages(false)
+	e.jobWrites(0, false)
+	e.pass()
+	e.pass()
+	if ms := e.ours(); len(ms) != 0 {
+		t.Fatalf("machines = %+v; the job's record still says it waits", ms)
+	}
+	if !e.logged("until its record says its wait for a base image has ended") {
+		t.Fatal("why the job gets no machine isn't logged")
+	}
+	e.gcs.Faults().Reset()
+	e.jobWrites(1, true)
+	e.pass()
+	m := e.one()
+	if got := e.source(m.Name); got != bases.ImageName("amd64", keys["amd64"]) {
+		t.Fatalf("the job's machine boots %s", got)
+	}
+	rec, _ := e.record(key)
+	if rec["waiting_since"] != nil || time.Duration(rec["waited"].(float64)) != 10*time.Minute {
+		t.Fatalf("job record = %v; want 10 minutes waited", rec)
 	}
 }
 
