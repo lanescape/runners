@@ -255,12 +255,26 @@ func (s *Service) settleRunner(ctx context.Context, inv *inventory, m Machine, a
 		return true
 	}
 	log := s.log().With("machine", m.Name, "repository_id", m.RepositoryID, "runner_id", m.RunnerID)
-	err := s.GitHub.DeleteRunner(ctx, m.RunnerID)
+	// What an earlier pass learnt of the runner: that it removed it, with
+	// no job then, or that GitHub refused, as it had one.
+	was, err := s.runnerState(ctx, m)
+	if err != nil {
+		log.Warn("reading what's known of a retired machine's runner; the machine waits for it", "err", err.Error())
+		return false
+	}
+	err = s.GitHub.DeleteRunner(ctx, m.RunnerID)
 	busy, gone := errors.Is(err, github.ErrRefused), errors.Is(err, github.ErrNotFound)
-	// removed says this service removed the runner, which had no job then.
-	removed := err == nil
 	if err != nil && !busy && !gone {
 		log.Warn("removing a retired machine's runner; the machine waits for it", "err", err.Error())
+		return false
+	}
+	// removed says this service removed the runner, which had no job then;
+	// hadJob, that GitHub refused to remove it, now or before, as it had
+	// one, which it may have ended since.
+	removed := err == nil || gone && was.Removed
+	hadJob := busy || gone && was.Busy
+	if (err == nil || busy) && !s.noteRunner(ctx, inv, m, RunnerState{Removed: err == nil, Busy: busy}) {
+		log.Warn("recording what's known of a retired machine's runner; the machine waits for it")
 		return false
 	}
 	repo, err := s.GitHub.RepositoryByID(ctx, m.RepositoryID)
@@ -287,9 +301,8 @@ func (s *Service) settleRunner(ctx context.Context, inv *inventory, m Machine, a
 	case err != nil:
 		log.Warn("looking for a job on a retired machine's runner; the machine waits for it", "err", err.Error())
 		return false
-	case !found && !busy:
-		// Removed now with no job, or gone with none GitHub shows, in
-		// progress or ended.
+	case !found && !hadJob:
+		// Removed with no job, or gone with none GitHub shows.
 		return true
 	case !found:
 		log.Warn("a retired machine's runner had a job, which GitHub doesn't show yet; the machine waits for it", "busy", busy)
@@ -345,6 +358,56 @@ func (s *Service) settleRunner(ctx context.Context, inv *inventory, m Machine, a
 	return true
 }
 
+// RunnerState is what a pass learnt of a retired machine's runner, in
+// machines/<machine>/runner.json, which goes with the machine: Removed,
+// that it removed it, with no job then; Busy, that GitHub refused to, as it
+// had one.
+type RunnerState struct {
+	Machine  string    `json:"machine"`
+	RunnerID int64     `json:"runner_id"`
+	Removed  bool      `json:"removed,omitempty"`
+	Busy     bool      `json:"busy,omitempty"`
+	At       time.Time `json:"at"`
+}
+
+func runnerKey(machine string) string { return "machines/" + machine + "/runner.json" }
+
+func (s *Service) runnerState(ctx context.Context, m Machine) (RunnerState, error) {
+	st, _, _, err := getJSON[RunnerState](ctx, s.Objects, runnerKey(m.Name))
+	return st, err
+}
+
+// noteRunner adds what a pass learnt of a retired machine's runner to its
+// record, as one of the machine's records.
+func (s *Service) noteRunner(ctx context.Context, inv *inventory, m Machine, add RunnerState) bool {
+	key := runnerKey(m.Name)
+	for range 3 {
+		st, gen, found, err := getJSON[RunnerState](ctx, s.Objects, key)
+		if err != nil {
+			return false
+		}
+		want := RunnerState{Machine: m.Name, RunnerID: m.RunnerID, Removed: st.Removed || add.Removed, Busy: st.Busy || add.Busy, At: s.now()}
+		if found && want.Removed == st.Removed && want.Busy == st.Busy {
+			return true
+		}
+		if found {
+			gen, err = replaceJSON(ctx, s.Objects, key, want, gen)
+		} else {
+			gen, err = createJSON(ctx, s.Objects, key, want)
+		}
+		if errors.Is(err, store.ErrPrecondition) {
+			continue
+		}
+		if err != nil {
+			return false
+		}
+		inv.machineKeys[m.Name] = append(slices.DeleteFunc(inv.machineKeys[m.Name], func(o store.Object) bool { return o.Name == key }),
+			store.Object{Name: key, Generation: gen})
+		return true
+	}
+	return false
+}
+
 // runnerJob is the job GitHub shows on a machine's runner, by the runner's
 // ID and name, whatever the job's status, read afresh, never from what an
 // earlier lookup read before the runner's removal: the job the machine was
@@ -373,21 +436,18 @@ func (s *Service) runnerJob(ctx context.Context, repo github.Repository, m Machi
 		}
 		return none(nil)
 	}
-	runs, err := s.runsInProgress(ctx, repo, m)
+	// Runs of every status, since a run whose job the runner took may be
+	// in progress, finished, or waiting on another of its jobs: those in
+	// progress, and the rest updated since the machine was made, as a run
+	// was when the job it lost ended. GitHub's clock and the service's may
+	// differ a little.
+	runs, err := s.GitHub.RunsCreated(ctx, repo, "", m.CreatedAt.Add(-RunLimit-clockSkew), s.now().Add(clockSkew))
 	if err != nil {
 		return none(err)
 	}
-	if job, run, ok, err := s.jobAmong(ctx, repo, m, runs); err != nil || ok {
-		return job, run, ok, err
-	}
-	done, err := s.GitHub.RunsCreated(ctx, repo, "completed", m.CreatedAt.Add(-RunLimit-clockSkew), s.now().Add(clockSkew))
-	if err != nil {
-		return none(err)
-	}
-	// GitHub's clock and the service's may differ a little.
 	since := m.CreatedAt.Add(-clockSkew)
-	done = slices.DeleteFunc(done, func(r github.WorkflowRun) bool { return r.UpdatedAt.Before(since) })
-	return s.jobAmong(ctx, repo, m, done)
+	runs = slices.DeleteFunc(runs, func(r github.WorkflowRun) bool { return r.Status != "in_progress" && r.UpdatedAt.Before(since) })
+	return s.jobAmong(ctx, repo, m, runs)
 }
 
 // madeFor is the job a machine was made for, read by its ID, if GitHub

@@ -160,12 +160,21 @@ func TestAJobThatEndedWhileTheMachineWaitedIsFound(t *testing.T) {
 	if !e.exists(m.in.Name) {
 		t.Fatal("the machine didn't wait")
 	}
-	// GitHub ends the job, its runner gone, and the run with it.
-	e.gh.HideAssignment(j, 0)
+	// GitHub ends the job, its runner gone, and the run with it, and
+	// removes the runner, still not showing the job's assignment: the
+	// machine, whose runner GitHub refused to remove as busy, waits on.
 	e.gh.CompleteJobByID(j.ID, "failure")
 	if st, _ := e.gh.RunState(run); st != "completed" {
 		t.Fatalf("run %s", st)
 	}
+	if e.registered(m.in.Name) {
+		t.Fatal("GitHub kept the runner")
+	}
+	e.pass()
+	if !e.exists(m.in.Name) {
+		t.Fatal("a machine whose runner had a job GitHub doesn't show went, once the runner was gone")
+	}
+	e.gh.HideAssignment(j, 0)
 	e.pass()
 	if lost, ok := p.lostOn(m.in.Name); !ok || lost.JobID != j.ID {
 		t.Fatalf("lost = %+v, %v", lost, ok)
@@ -380,6 +389,28 @@ func TestAnEndedJobInARunStillInProgressIsFound(t *testing.T) {
 		r := e.gh.PushRun(e.repo, "main")
 		r.Created = time.Now().Add(time.Duration(i+1) * time.Second)
 	}
+	e.pass()
+	if lost, ok := p.lostOn(m.in.Name); !ok || lost.JobID != j.ID {
+		t.Fatalf("lost = %+v, %v", lost, ok)
+	}
+}
+
+// TestAnEndedJobInAWaitingRunIsFound: a job, not the one the machine was
+// made for, that GitHub ended after the runner took it, whose run now waits
+// on another job's approval, is found among runs of every status.
+func TestAnEndedJobInAWaitingRunIsFound(t *testing.T) {
+	e := setup(t)
+	p := e.withLost()
+	made := e.queue(e.mainRun(), sel2)
+	e.pass()
+	e.gh.CompleteJobByID(made.ID, "cancelled")
+	run := e.mainRun()
+	j := e.queue(run, sel2)
+	m := e.boot(e.one())
+	m.taken(j)
+	e.gce.Shutdown(m.in.Zone, m.in.Name)
+	e.gh.CompleteJobByID(j.ID, "failure")
+	e.gh.SetRunStatus(run, "waiting")
 	e.pass()
 	if lost, ok := p.lostOn(m.in.Name); !ok || lost.JobID != j.ID {
 		t.Fatalf("lost = %+v, %v", lost, ok)
