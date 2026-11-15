@@ -97,6 +97,15 @@ func (s *Service) refresh(ctx context.Context, inv *inventory, m Machine) error 
 	if ok {
 		inv.reports[m.Name] = rep
 	}
+	// A job that asked to save, and reported, while the pass went on keeps
+	// its save (The age limit).
+	sr, _, ok, err := getJSON[SaveRequest](ctx, s.Objects, saveRequestKey(m.Name))
+	if err != nil {
+		return err
+	}
+	if ok {
+		inv.saves[m.Name] = sr
+	}
 	disk := WorkDisk(m.Name)
 	d, gen, ok, err := getJSON[DiskRecord](ctx, s.Objects, diskKey(disk))
 	if err != nil {
@@ -166,11 +175,25 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 			}
 			preempted := m.Spot && s.preempted(ctx, m)
 			if err := s.Preemptions.Stopped(ctx, a.Resolve(m, inv.disk(m.Name)), a, preempted, true); err != nil {
-				s.log().Warn("recording a machine stopped at its age limit; it waits for its record", "machine", m.Name, "err", err.Error())
+				s.pending(err, "recording a machine stopped at its age limit; it waits for its record", "machine", m.Name)
 				return
 			}
 			s.finish(ctx, inv, m, "past "+MaxAge.String()+", its job recorded to resume, saving nothing", nil)
 			return
+		}
+		// A job that finished before the limit, by its supervisor's report,
+		// had its save asked for, or under way, when the limit came: the
+		// machine waits for it, for a while, stopped, as finish stops it
+		// if the inventory doesn't show it stopped yet.
+		if rep, reported := inv.reports[m.Name]; reported && a.Allowed && rep.At.Before(m.CreatedAt.Add(MaxAge)) {
+			if _, asked := inv.saves[m.Name]; asked {
+				if age < MaxAge+SaveGrace {
+					s.finish(ctx, inv, m, "its supervisor reported before its age limit", &rep)
+					return
+				}
+				s.log().Warn("a work disk wasn't saved within "+SaveGrace.String()+" of its machine's age limit; the machine goes, saving nothing",
+					"machine", m.Name, "repository_id", m.RepositoryID)
+			}
 		}
 		// A retired machine settles its runner first, if it can: at the
 		// age limit it goes all the same, and says what may be lost.
@@ -561,7 +584,7 @@ func (s *Service) stoppedSpot(ctx context.Context, inv *inventory, m Machine, a 
 	preempted := s.preempted(ctx, m)
 	if s.Preemptions != nil {
 		if err := s.Preemptions.Stopped(ctx, a.Resolve(m, inv.disk(m.Name)), a, preempted, false); err != nil {
-			s.log().Warn("recording a stopped Spot machine", "machine", m.Name, "err", err.Error())
+			s.pending(err, "recording a stopped Spot machine; it waits for its record", "machine", m.Name)
 			return
 		}
 	}
@@ -570,6 +593,18 @@ func (s *Service) stoppedSpot(ctx context.Context, inv *inventory, m Machine, a 
 		why = "its Spot machine was preempted"
 	}
 	s.finish(ctx, inv, m, why, nil)
+}
+
+// pending logs why a machine waits for a later pass: as information while
+// what it waits for is only not done yet, such as an image Compute Engine is
+// still making, and as a warning when something went wrong.
+func (s *Service) pending(err error, msg string, args ...any) {
+	args = append(args, "err", err.Error())
+	if errors.Is(err, ErrPending) {
+		s.log().Info(msg, args...)
+		return
+	}
+	s.log().Warn(msg, args...)
 }
 
 // preempted reports whether Compute Engine's zone operations show it
@@ -605,7 +640,7 @@ func (s *Service) finish(ctx context.Context, inv *inventory, m Machine, why str
 				}
 				a := inv.admissions[m.Name]
 				if err := s.Saves.Save(ctx, a.Resolve(m, inv.disk(m.Name)), a); err != nil {
-					log.Warn("saving a work disk", "err", err.Error())
+					s.pending(err, "saving a work disk; the machine waits for it", "machine", m.Name, "repository_id", m.RepositoryID)
 					return
 				}
 			}

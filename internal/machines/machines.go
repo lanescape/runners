@@ -75,11 +75,17 @@ const (
 	// MaxAge is the most a machine lives, from its creation: a job on the
 	// service should take under 30 minutes, 60 at worst, and this is the
 	// absolute maximum. A machine past it is stopped, even mid-job, and
-	// deleted, saving nothing; a job it cut short is recorded first, with a
+	// deleted, saving nothing, but for the save of a job that finished
+	// before it (SaveGrace); a job it cut short is recorded first, with a
 	// resume image of its work disk, and resumes in its run's rerun, as from
 	// a preemption (specs/0002-machines.md, The age limit). It's the one
 	// constant that says so.
 	MaxAge = 90 * time.Minute
+	// SaveGrace is how long past MaxAge the stopped machine of a job that
+	// finished before it, and asked to save its work disk, waits for the
+	// save, which spans passes while Compute Engine makes its image; then
+	// it goes, saving nothing.
+	SaveGrace = time.Hour
 	// MaxRunDuration is when Compute Engine itself stops a machine, the
 	// backstop for when the service can't. Its margin over MaxAge covers
 	// the service's own stop, so the backstop never races it: a pass runs
@@ -143,8 +149,15 @@ type DiskSource interface {
 // Resumed is where a work disk made from a resume image came from.
 const Resumed = "resume"
 
+// ErrPending is what a Saver or Preemptions returns while something it
+// asked for, such as an image Compute Engine is still making, isn't done:
+// the machine waits for a later pass to go on with it, as after any error,
+// but nothing has gone wrong.
+var ErrPending = errors.New("not done yet; a later pass goes on")
+
 // Saver saves a finished job's work disk, from its stopped machine
-// (specs/0003-disks.md).
+// (specs/0003-disks.md). It returns ErrPending while the disk's image is
+// being made.
 type Saver interface {
 	Save(ctx context.Context, m Machine, a Admission) error
 }
@@ -153,8 +166,9 @@ type Saver interface {
 // unfinished: a Spot machine, preempted or perhaps, or any machine the
 // service stopped at its age limit (specs/0002-machines.md, Preemption). It
 // records the job, so that its run is rerun, and makes a resume image of its
-// work disk, and returns once the machine may be deleted. ageLimit says the
-// service stopped it at its age limit.
+// work disk, and returns once the machine may be deleted, ErrPending while
+// that image is being made. ageLimit says the service stopped it at its age
+// limit.
 type Preemptions interface {
 	Stopped(ctx context.Context, m Machine, a Admission, preempted, ageLimit bool) error
 	// Lost records the job a retired machine's runner took before the
