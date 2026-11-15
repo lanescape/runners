@@ -366,6 +366,15 @@ func diskRequests(t T, w *world) {
 	if a.Status != http.StatusUnauthorized {
 		t.Fatalf("a work disk request with a token that isn't one answered %d", a.Status)
 	}
+	// A job GitHub shows completed can ask for nothing, even before its
+	// machine reports, as when its supervisor has died.
+	jc := w.start(run, Small)
+	w.restored(jc, "build", service.StepNone)
+	w.CompleteJob(jc, "success")
+	a, _ = w.c.Disk(w.Token(jc), "build")
+	w.status("a completed job's work disk request, before its machine reports", a, http.StatusForbidden)
+	a, _ = w.c.Save(w.Token(jc))
+	w.status("a completed job's save, before its machine reports", a, http.StatusForbidden)
 	// A machine whose job has finished can ask for nothing.
 	w.FinishJob(j, "success")
 	a, _ = w.c.Disk(w.Token(j), "build")

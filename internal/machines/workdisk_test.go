@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lanescape/runners/emulators/fault"
 	ghemu "github.com/lanescape/runners/emulators/github"
 	"github.com/lanescape/runners/internal/machines"
 )
@@ -193,6 +194,12 @@ func TestAJobsRequestsAreAnsweredOnlyWhileItMayHaveThem(t *testing.T) {
 			}
 			return m
 		}, "has ended"},
+		"a job GitHub shows completed, before its machine reports": {func(e *env) *machine {
+			m := e.admit(e.mainRun(), sel2)
+			j, _, _ := e.gh.JobOnRunner(m.in.Name)
+			e.gh.CompleteJobByID(j.ID, "success")
+			return m
+		}, "has ended"},
 		"a transferred repository": {func(e *env) *machine {
 			m := e.admit(e.mainRun(), sel2)
 			e.gh.Transfer(e.repo, e.gh.Org(4242, "elsewhere"))
@@ -215,6 +222,52 @@ func TestAJobsRequestsAreAnsweredOnlyWhileItMayHaveThem(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A job's requests are answered only once GitHub confirms that the job is
+// still running: while GitHub can't say, the caller is told to try again.
+func TestAJobsRequestsWaitForGitHubToConfirmItRuns(t *testing.T) {
+	e := setup(t)
+	e.repo.Commit("main", map[string]string{".github/runners.json": declares})
+	m := e.admit(e.mainRun(), sel2)
+	e.gh.Faults().Add(fault.Rule{Method: http.MethodGet, Times: 2, Respond: fault.Status(http.StatusBadGateway, nil, `{"message": "Bad Gateway"}`),
+		Match: func(r *http.Request) bool { return strings.Contains(r.URL.Path, "/actions/jobs/") }})
+	for _, ask := range []func() (int, map[string]any){func() (int, map[string]any) { return m.disk("build") }, m.save} {
+		if code, body := ask(); code != http.StatusServiceUnavailable || body["retryable"] != true {
+			t.Fatalf("with GitHub failing: %d %v; want 503, retryable", code, body)
+		}
+	}
+	// GitHub showing the job queued, behind what the machine's check saw,
+	// confirms nothing either.
+	j, run, _ := e.gh.JobOnRunner(m.in.Name)
+	queued := fmt.Sprintf(`{"id": %d, "run_id": %d, "status": "queued"}`, j.ID, run.ID)
+	e.gh.Faults().Add(fault.Rule{Method: http.MethodGet, Times: 2, Respond: fault.Status(http.StatusOK, http.Header{"Content-Type": {"application/json"}}, queued),
+		Match: func(r *http.Request) bool { return strings.Contains(r.URL.Path, "/actions/jobs/") }})
+	for _, ask := range []func() (int, map[string]any){func() (int, map[string]any) { return m.disk("build") }, m.save} {
+		if code, body := ask(); code != http.StatusServiceUnavailable || body["retryable"] != true {
+			t.Fatalf("with GitHub showing the job queued: %d %v; want 503, retryable", code, body)
+		}
+	}
+	if _, ok := e.record("disks/" + machines.WorkDisk(m.in.Name) + ".json"); ok {
+		t.Fatal("a request GitHub didn't confirm made a work disk")
+	}
+	if _, ok := e.record("machines/" + m.in.Name + "/save-request.json"); ok {
+		t.Fatal("a request GitHub didn't confirm recorded a save")
+	}
+	if restored := m.diskReady("build"); restored != "none" {
+		t.Fatalf("restored = %q", restored)
+	}
+	if code, body := m.save(); code != http.StatusOK || body["saves"] != true {
+		t.Fatalf("save: %d %v", code, body)
+	}
+	// A job GitHub doesn't show at all, in a repository it shows as the
+	// organization's, has gone.
+	e.gh.Faults().Add(fault.Rule{Method: http.MethodGet, Times: 2, Respond: fault.Status(http.StatusNotFound, nil, `{"message": "Not Found"}`),
+		Match: func(r *http.Request) bool { return strings.Contains(r.URL.Path, "/actions/jobs/") }})
+	code, body := m.disk("build")
+	refusedFor(t, "a work disk request for a job GitHub doesn't show", code, body, "has ended")
+	code, body = m.save()
+	refusedFor(t, "a save for a job GitHub doesn't show", code, body, "has ended")
 }
 
 func TestASaveRequest(t *testing.T) {

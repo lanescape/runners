@@ -61,7 +61,8 @@ type runningJob struct {
 
 // activeJob authenticates a request from a job, signed with its machine's
 // identity token, and reads its body. The service answers only a machine of
-// its own whose job it admitted, while that job runs, for that job's run
+// its own whose job it admitted, while that job runs, by its machine's
+// state, its report and GitHub's record of the job, for that job's run
 // once it's bound, and of a repository that's still the organization's
 // (specs/0005-interface.md, Requests from a job); activeJob answers any
 // other request itself, and reports whether the caller should go on.
@@ -101,6 +102,22 @@ func (s *Service) activeJob(ctx context.Context, w http.ResponseWriter, r *http.
 	}
 	if repo.OwnerID != s.Config.Organization.ID {
 		refuse(w, "the repository is no longer the organization's")
+		return runningJob{}, false
+	}
+	// A job GitHub shows completed has ended, even if its machine hasn't
+	// reported yet, such as when its supervisor died: what's left on the
+	// machine is no longer the job. A job GitHub doesn't show, in a
+	// repository it shows as the organization's, has gone too.
+	job, err := s.GitHub.Job(ctx, repo, a.JobID)
+	switch {
+	case errors.Is(err, github.ErrNotFound) || err == nil && job.Status == "completed":
+		refuse(w, "this machine's job has ended")
+		return runningJob{}, false
+	case err != nil:
+		retryLater(w, "GitHub couldn't confirm the job; try again")
+		return runningJob{}, false
+	case job.Status != "in_progress":
+		retryLater(w, "GitHub doesn't show the job running yet; try again")
 		return runningJob{}, false
 	}
 	bd, bound, err := s.Binder.Lookup(ctx, repo.ID, a.RunID)

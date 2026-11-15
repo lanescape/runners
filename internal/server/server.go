@@ -6,6 +6,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -32,8 +33,20 @@ const (
 	// GitHub's workflow_job, workflow_run and pull_request deliveries are
 	// tens of kilobytes; anything near this is not one of them.
 	DefaultWebhookLimit = 1 << 20
-	pushLimit           = 1 << 20
+	// PushEnvelope is what a push may hold besides its message's data: the
+	// message's attributes, IDs and publish time, and the subscription's
+	// name, in Pub/Sub's JSON, with room to spare.
+	PushEnvelope = 64 << 10
 )
+
+// PushLimit is the largest push the reconcile endpoint reads, for a webhook
+// that accepts deliveries of up to webhookLimit bytes: Pub/Sub's push
+// carries the message's data in base64, which is a third larger, in a JSON
+// envelope, so every delivery the webhook accepts and publishes can be
+// pushed.
+func PushLimit(webhookLimit int64) int64 {
+	return int64(base64.StdEncoding.EncodedLen(int(webhookLimit))) + PushEnvelope
+}
 
 // Delivery is a webhook delivery whose signature has been checked.
 type Delivery struct {
@@ -111,7 +124,8 @@ type Config struct {
 
 type server struct {
 	Config
-	log *slog.Logger
+	log       *slog.Logger
+	pushLimit int64
 }
 
 // New returns the service's handler.
@@ -123,7 +137,7 @@ func New(c Config) (http.Handler, error) {
 	if c.WebhookLimit == 0 {
 		c.WebhookLimit = DefaultWebhookLimit
 	}
-	s := &server{Config: c, log: c.Logger}
+	s := &server{Config: c, log: c.Logger, pushLimit: PushLimit(c.WebhookLimit)}
 	if s.log == nil {
 		s.log = slog.Default()
 	}
@@ -288,8 +302,8 @@ func (s *server) reconcile(w http.ResponseWriter, r *http.Request) {
 	// runs, never from the message that started it; but what a message
 	// says that can't be read back later is recorded first, whether or not
 	// a pass can run now, so it's recorded before it's acknowledged.
-	body, err := io.ReadAll(io.LimitReader(r.Body, pushLimit+1))
-	if err != nil || len(body) > pushLimit {
+	body, err := io.ReadAll(io.LimitReader(r.Body, s.pushLimit+1))
+	if err != nil || int64(len(body)) > s.pushLimit {
 		writeError(w, http.StatusBadRequest, "body unreadable or too large")
 		return
 	}

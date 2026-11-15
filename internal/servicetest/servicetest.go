@@ -515,6 +515,17 @@ func (w *World) WorkflowJob(j service.Job) *ghemu.WorkflowJob {
 	return w.jobs[j.ID]
 }
 
+// CompleteJob implements service.World: GitHub records the job's
+// conclusion, and the machine's supervisor reports nothing.
+func (w *World) CompleteJob(j service.Job, conclusion string) {
+	w.T.Helper()
+	wj := w.WorkflowJob(j)
+	if wj == nil {
+		w.T.Fatalf("job %d isn't known", j.ID)
+	}
+	w.GitHub.CompleteJob(wj, conclusion)
+}
+
 // FinishJob implements service.World: GitHub records the job's conclusion
 // and delivers its workflow_job event, the machine's supervisor reports,
 // and the machine powers off; passes then save its work disk, if they
