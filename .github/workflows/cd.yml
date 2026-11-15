@@ -132,10 +132,11 @@ jobs:
         id: image
         run: |
           set -euo pipefail
-          # ko signs in to Artifact Registry with the credentials above. The
-          # repository's tags are immutable, so each run's are its own.
+          # ko signs in to Artifact Registry with the credentials above. Each
+          # push's tag is its own, of its commit, run and attempt; what's
+          # deployed is the digest alone.
           ref=$(KO_DOCKER_REPO="$IMAGE_REPOSITORY/runners" go run github.com/google/ko@v0.19.1 build ./cmd/runners \
-            --bare --sbom=none --tags="git-$GITHUB_SHA-$GITHUB_RUN_ATTEMPT")
+            --bare --sbom=none --tags="git-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT")
           digest=${ref##*@}
           image="$IMAGE_REPOSITORY/runners@$digest"
           if ! [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
