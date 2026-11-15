@@ -151,9 +151,12 @@ type disk struct {
 	throughput  int64
 	labels      map[string]string
 	sourceImage string
-	arch        string
-	created     time.Time
-	users       []*instance
+	// source is the image it was made from, by which its sourceImageId
+	// is answered, and its sourceImage only while that image is there.
+	source  *image
+	arch    string
+	created time.Time
+	users   []*instance
 }
 
 type image struct {

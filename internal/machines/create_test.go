@@ -630,13 +630,10 @@ func (f *fakeBases) Boot(ims []compute.Image, arch string) (string, error) {
 	return bases.Boot(ims, arch, f.key, programs())
 }
 
-func (f *fakeBases) Ours(ims []compute.Image, arch, image string) bool {
-	if image == bases.ImageName(arch, f.key) {
-		return true
-	}
+func (f *fakeBases) Ours(ims []compute.Image, arch string, id uint64) bool {
 	for _, im := range ims {
-		if im.Name == image {
-			return im.Labels[bases.LabelPrograms] == programs()
+		if im.ID == id {
+			return im.Name == bases.ImageName(arch, f.key) || im.Labels[bases.LabelPrograms] == programs()
 		}
 	}
 	return false

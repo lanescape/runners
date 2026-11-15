@@ -152,30 +152,65 @@ func TestARevisionWithNoDeployIDRecordsNothing(t *testing.T) {
 	}
 }
 
-// TestRacingRevisionsKeepTheLatest: two revisions recording at once, each
-// at the generation it read, leave the later deploy recorded.
-func TestRacingRevisionsKeepTheLatest(t *testing.T) {
+// paused is a bucket whose first read lets another revision act before
+// the reader goes on, as one paused between its read and its write.
+type paused struct {
+	store.Objects
+	then func()
+}
+
+func (p *paused) Get(ctx context.Context, name string) ([]byte, int64, error) {
+	data, gen, err := p.Objects.Get(ctx, name)
+	if f := p.then; f != nil {
+		p.then = nil
+		f()
+	}
+	return data, gen, err
+}
+
+// TestAnEarlierRevisionNeverWritesOverALater: an earlier deploy's revision
+// that read the record before a later one wrote it, whether there was none
+// yet or an even earlier one, leaves the later one recorded.
+func TestAnEarlierRevisionNeverWritesOverALater(t *testing.T) {
+	for name, first := range map[string]deploy.ID{"no record yet": {}, "an earlier record": {Run: 1, Attempt: 1}} {
+		t.Run(name, func(t *testing.T) {
+			e := setup(t)
+			ctx := context.Background()
+			if !first.IsZero() {
+				if err := e.fence(first).Serving(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			later := e.fence(deploy.ID{Run: 9, Attempt: 1})
+			earlier := &deploy.Fence{Own: deploy.ID{Run: 5, Attempt: 1}, Clock: e.clock,
+				Objects: &paused{Objects: e.objects, then: func() {
+					if err := later.Serving(ctx); err != nil {
+						t.Error(err)
+					}
+				}}}
+			if err := earlier.Serving(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if r, _ := e.latest(t); r.RunID != 9 {
+				t.Fatalf("latest = %+v; the earlier revision wrote over the later", r)
+			}
+			if _, replaced, _ := earlier.Newer(ctx); !replaced {
+				t.Fatal("the earlier revision isn't replaced")
+			}
+		})
+	}
+}
+
+// TestARecordThatCantBeReadIsAnError: a revision that can't read the record
+// isn't told it's the latest.
+func TestARecordThatCantBeReadIsAnError(t *testing.T) {
 	e := setup(t)
-	ctx := context.Background()
-	if err := e.fence(deploy.ID{Run: 1, Attempt: 1}).Serving(ctx); err != nil {
-		t.Fatal(err)
-	}
-	// The later one's first write finds the record changed by the earlier,
-	// which wrote after it read: it reads again and writes over it.
-	later := e.fence(deploy.ID{Run: 3, Attempt: 1})
-	e.gcs.Faults().Add(fault.Rule{Method: http.MethodPost, Times: 1,
-		Respond: gcsemu.JSONError(http.StatusPreconditionFailed, "conditionNotMet", "Precondition Failed")})
-	if err := later.Serving(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if r, _ := e.latest(t); r.RunID != 3 {
-		t.Fatalf("latest = %+v", r)
-	}
-	// One that can't read the record says so, and isn't told it's the
-	// latest.
 	e.gcs.Faults().Add(fault.Rule{Method: http.MethodGet, Times: 0,
 		Respond: gcsemu.JSONError(http.StatusForbidden, "forbidden", "Forbidden")})
-	if _, _, err := later.Newer(ctx); err == nil {
+	if _, _, err := e.fence(deploy.ID{Run: 3, Attempt: 1}).Newer(context.Background()); err == nil {
 		t.Fatal("a record that can't be read wasn't an error")
+	}
+	if err := e.fence(deploy.ID{Run: 3, Attempt: 1}).Serving(context.Background()); err == nil {
+		t.Fatal("a record that can't be read was written over")
 	}
 }

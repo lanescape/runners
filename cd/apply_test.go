@@ -56,6 +56,15 @@ case "$*" in
 esac
 `
 
+// gh stands in for GitHub's CLI: main's head is HEAD_SHA.
+const gh = `#!/bin/bash
+echo "gh $*" >>"$CALLS"
+case "$*" in
+  "api repos/lanescape/runners/commits/main --jq .sha") [ "$GH_FAIL" = 1 ] && exit 1; echo "$HEAD_SHA" ;;
+  *) echo "unexpected: gh $*" >&2; exit 2 ;;
+esac
+`
+
 // bash is a Bash of at least 4.4, which the script needs, as Ubuntu's is.
 func bash(t *testing.T) string {
 	t.Helper()
@@ -94,7 +103,7 @@ func apply(t *testing.T, env ...string) result {
 	if err := os.Mkdir(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for name, body := range map[string]string{"gcloud": gcloud, "curl": curl, "sleep": "#!/bin/sh\nexit 0\n"} {
+	for name, body := range map[string]string{"gcloud": gcloud, "curl": curl, "gh": gh, "sleep": "#!/bin/sh\nexit 0\n"} {
 		if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -107,6 +116,8 @@ func apply(t *testing.T, env ...string) result {
 	cmd.Env = append([]string{
 		"PATH=" + bin + ":/usr/bin:/bin", "CALLS=" + calls, "GITHUB_STEP_SUMMARY=" + summary,
 		"GITHUB_SHA=0123456789abcdef0123456789abcdef01234567", "GITHUB_RUN_ID=111", "GITHUB_RUN_ATTEMPT=2",
+		"GITHUB_REPOSITORY=lanescape/runners", "GH_TOKEN=GH-SECRET",
+		"HEAD_SHA=0123456789abcdef0123456789abcdef01234567",
 		"PROJECT=lanescape-dev", "REGION=northamerica-northeast1",
 		"DEPLOYMENT=projects/lanescape-dev/locations/northamerica-northeast1/deployments/lanescape-runners",
 		"INFRA_ACCOUNT=projects/lanescape-dev/serviceAccounts/lanescape-runners-infra@lanescape-dev.iam.gserviceaccount.com",
@@ -218,5 +229,29 @@ func TestEveryFailureFailsTheDeploy(t *testing.T) {
 	r := apply(t, "EXISTS=1", "PREVIEW_STATE=FAILED")
 	if strings.Contains(r.calls, "PATCH") || strings.Contains(r.calls, "POST") {
 		t.Fatal("applied after a failed preview")
+	}
+}
+
+// TestAnAttemptOfACommitNoLongerMainsHeadAppliesNothing: main's head is
+// asked again at every attempt, since a rerun of the deploy job alone keeps
+// the gate's answer; a commit that's no longer main's head applies nothing,
+// and one whose head can't be read fails.
+func TestAnAttemptOfACommitNoLongerMainsHeadAppliesNothing(t *testing.T) {
+	r := apply(t, "EXISTS=1", "HEAD_SHA=fedcba9876543210fedcba9876543210fedcba98")
+	if r.err != nil {
+		t.Fatalf("a skipped deploy failed: %v\n%s", r.err, r.out)
+	}
+	if strings.Contains(r.calls, "gcloud") || strings.Contains(r.calls, "curl") {
+		t.Fatalf("a commit no longer main's head was previewed or applied:\n%s", r.calls)
+	}
+	if !strings.Contains(r.out, "main has moved on to fedcba9876543210fedcba9876543210fedcba98") {
+		t.Fatalf("output:\n%s", r.out)
+	}
+	r = apply(t, "EXISTS=1", "GH_FAIL=1")
+	if r.err == nil || strings.Contains(r.calls, "gcloud") {
+		t.Fatalf("a head that couldn't be read didn't fail the deploy before anything was applied:\n%s", r.calls)
+	}
+	if strings.Contains(r.out, "GH-SECRET") || strings.Contains(r.calls, "GH-SECRET") {
+		t.Fatal("GitHub's token was printed or passed as an argument")
 	}
 }

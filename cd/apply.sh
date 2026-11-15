@@ -10,10 +10,23 @@
 #
 # It takes, from the environment: PROJECT, REGION, DEPLOYMENT,
 # INFRA_ACCOUNT, SOURCE, TF_VERSION, INFRA_MANAGER_BUCKET, GITHUB_APP_ID,
-# IMAGE, and GitHub's GITHUB_SHA, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT and
-# GITHUB_STEP_SUMMARY.
+# IMAGE, GH_TOKEN, and GitHub's GITHUB_REPOSITORY, GITHUB_SHA,
+# GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT and GITHUB_STEP_SUMMARY.
 set -euo pipefail
 : "${PROJECT:?}" "${REGION:?}" "${DEPLOYMENT:?}" "${INFRA_ACCOUNT:?}" "${SOURCE:?}" "${TF_VERSION:?}" "${INFRA_MANAGER_BUCKET:?}" "${GITHUB_APP_ID:?}" "${IMAGE:?}"
+: "${GITHUB_REPOSITORY:?}" "${GH_TOKEN:?}"
+
+# main's head, asked again at every attempt, just before anything is
+# applied: a rerun of this job alone keeps the gate's answer from the run's
+# first attempt, and an older commit must never deploy over a newer one,
+# nor, as a later attempt of an earlier run, deploy a revision that a
+# later run's deploy has replaced, which would make no machines
+# (specs/0004-deployment.md, Which revision makes machines).
+head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+if [ "$head" != "$GITHUB_SHA" ]; then
+  echo "::notice title=Deploy skipped::main has moved on to $head since $GITHUB_SHA; the run for a later push deploys it."
+  exit 0
+fi
 deploy_id="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
 inputs="github_app_id=$GITHUB_APP_ID,service_image=$IMAGE,deploy_id=$deploy_id"
 source_flags=(--service-account="$INFRA_ACCOUNT" --git-source-repo="$SOURCE" --git-source-directory=infra

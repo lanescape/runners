@@ -312,19 +312,16 @@ func (s *Service) Boot(images []compute.Image, arch string) (string, error) {
 	return Boot(images, arch, s.keys()[arch], s.programs())
 }
 
-// Ours reports whether a machine of an architecture booted from image runs
-// the service's own programs: image is the current key's, whose key covers
-// them, or has the service's programs' label, by images, the project's
-// images as listed. An image that isn't listed, such as one since deleted,
-// isn't known to.
-func (s *Service) Ours(images []compute.Image, arch, image string) bool {
-	if image == ImageName(arch, s.keys()[arch]) {
-		return true
-	}
+// Ours reports whether a machine of an architecture booted from the image
+// of ID runs the service's own programs, by images, the project's images as
+// listed: the image is the current key's, whose key covers them, or has the
+// service's programs' label. An image that isn't listed, such as one since
+// deleted, isn't known to.
+func (s *Service) Ours(images []compute.Image, arch string, id uint64) bool {
 	for _, im := range images {
-		if im.Name == image {
+		if im.ID == id {
 			p := im.Labels[LabelPrograms]
-			return p != "" && p == s.programs()
+			return im.Name == ImageName(arch, s.keys()[arch]) || p != "" && p == s.programs()
 		}
 	}
 	return false

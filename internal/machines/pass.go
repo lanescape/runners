@@ -483,6 +483,13 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 		s.log().Error("making no machines", "err", err.Error())
 		return
 	}
+	// A later deploy's revision gives jobs their machines, and keeps their
+	// records: a replaced one neither makes machines nor decides anything
+	// of queued jobs, such as whether they wait for a base image, which
+	// its own images can't tell.
+	if s.replaced(ctx) {
+		return
+	}
 	var all []wanted
 	for _, q := range inv.queues {
 		if ctx.Err() != nil {
@@ -551,7 +558,8 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 				"job_id", w.job.ID, "selector", w.sel.String())
 			continue
 		}
-		// A later deploy's revision makes the machines from now on.
+		// A later deploy's revision makes the machines from now on, even
+		// one recorded during this pass.
 		if s.replaced(ctx) {
 			return
 		}
@@ -1019,10 +1027,11 @@ func (s *Service) replaced(ctx context.Context) bool {
 }
 
 // staleImage is the base image an unadmitted machine booted from, if that
-// image doesn't run the service's own programs, by the machine's boot
+// image doesn't run the service's own programs, by the ID of its boot
 // disk's source image (specs/0003-disks.md, Which image machines boot), and
 // this revision, not replaced by a later deploy's, retires such machines.
-// A machine whose image isn't known, such as when the disks or the images
+// An image no longer listed, deleted since, isn't known to run them. A
+// machine whose boot disk isn't known, such as when the disks or the images
 // couldn't be listed, isn't retired for it.
 func (s *Service) staleImage(ctx context.Context, inv *inventory, m Machine) (string, bool) {
 	if s.Bases == nil || !inv.disksComplete {
@@ -1037,18 +1046,22 @@ func (s *Service) staleImage(ctx context.Context, inv *inventory, m Machine) (st
 			boot = d.Disk
 		}
 	}
-	image := ""
+	var image string
+	var id uint64
 	for _, d := range inv.disks {
 		if d.Name == boot && d.Zone == m.Zone {
-			image = d.SourceImage
+			image, id = d.SourceImage, d.SourceImageID
 		}
 	}
-	if image == "" {
+	if id == 0 {
 		return "", false
 	}
 	ims, err := s.images(ctx, inv)
-	if err != nil || s.Bases.Ours(ims, m.Selector.Arch, image) {
+	if err != nil || s.Bases.Ours(ims, m.Selector.Arch, id) {
 		return "", false
+	}
+	if image == "" {
+		image = "image " + strconv.FormatUint(id, 10) + ", since deleted"
 	}
 	if inv.retiring == nil {
 		// A replaced revision's own programs aren't the service's: it

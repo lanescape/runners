@@ -16,11 +16,16 @@ import (
 	baseimage "github.com/lanescape/runners/machine"
 )
 
-// otherPrograms relabels the earlier image as made with other programs than
-// the service's, as a deploy that changes the programs leaves it.
-func (e *env) otherPrograms() {
-	e.gce.DeleteImageNow(earlierImage)
-	e.gce.AddLabelledImage(earlierImage, "", "X86_64", map[string]string{bases.LabelKind: bases.KindBase, bases.LabelPrograms: "ffffffffffffffffffff"})
+// otherPrograms deploys other programs than those the earlier image was
+// made with: the service's base images' service is replaced by one of
+// another amd64 key, whose image isn't made yet, and other programs. It
+// returns the new keys.
+func (e *env) otherPrograms() map[string]string {
+	old := e.svc.Bases.(*bases.Service)
+	keys := map[string]string{"amd64": strings.Repeat("e", 20), "arm64": old.Keys["arm64"]}
+	e.svc.Bases = &bases.Service{Config: old.Config, Compute: old.Compute, Objects: old.Objects, Clock: old.Clock, Logger: old.Logger,
+		Network: old.Network, Subnetwork: old.Subnetwork, DiskType: old.DiskType, Keys: keys, Programs: strings.Repeat("e", 64)}
+	return keys
 }
 
 func (e *env) admission(name string) (map[string]any, bool) {
@@ -34,7 +39,7 @@ func (e *env) admission(name string) (map[string]any, bool) {
 // queued job waits for the new image and gets a machine on it, which isn't
 // retired (specs/0002-machines.md, A machine's life).
 func TestIdleMachinesOfOtherProgramsAreRetired(t *testing.T) {
-	e, keys := newKey(t, map[string]string{bases.LabelKind: bases.KindBase, bases.LabelPrograms: programs()})
+	e, _ := newKey(t, map[string]string{bases.LabelKind: bases.KindBase, bases.LabelPrograms: programs()})
 	run := e.mainRun()
 	e.queue(run, sel2)
 	e.queue(run, sel2)
@@ -56,7 +61,7 @@ func TestIdleMachinesOfOtherProgramsAreRetired(t *testing.T) {
 	e.pass()
 	e.wantMachines(2)
 
-	e.otherPrograms()
+	keys := e.otherPrograms()
 	e.pass()
 	adm, ok := e.admission(idle.Name)
 	if !ok || adm["allowed"] == true || !strings.Contains(fmt.Sprint(adm["reason"]), "retired: its base image, "+earlierImage+
@@ -94,6 +99,63 @@ func TestIdleMachinesOfOtherProgramsAreRetired(t *testing.T) {
 	}
 	if _, ok := e.admission(fresh); ok {
 		t.Fatal("a machine of the current key's image was claimed")
+	}
+}
+
+// TestAMachineWhoseImageWasDeletedIsRetired: a machine no job was admitted
+// on whose base image has since been deleted, so that its programs can't be
+// known, is retired; one whose disks couldn't be listed isn't.
+func TestAMachineWhoseImageWasDeletedIsRetired(t *testing.T) {
+	e, _ := newKey(t, map[string]string{bases.LabelKind: bases.KindBase, bases.LabelPrograms: programs()})
+	e.queue(e.mainRun(), sel2)
+	e.pass()
+	m := e.one()
+	e.gce.DeleteImageNow(earlierImage)
+	e.gce.ServerError(http.MethodGet, "/disks", http.StatusForbidden, 0)
+	e.pass()
+	if !e.exists(m.Name) {
+		t.Fatal("a machine whose disks couldn't be listed was retired")
+	}
+	e.gce.Faults().Reset()
+	e.pass()
+	adm, _ := e.admission(m.Name)
+	if !strings.Contains(fmt.Sprint(adm["reason"]), ", since deleted, wasn't made with the service's programs") || e.exists(m.Name) {
+		t.Fatalf("admission = %v; the machine whose image was deleted wasn't retired", adm)
+	}
+}
+
+// TestAReplacedRevisionLeavesJobsAlone: a replaced revision decides nothing
+// of queued jobs: a job whose record says it waits for the latest
+// revision's base image keeps its wait, however that revision's own images
+// look to the replaced one.
+func TestAReplacedRevisionLeavesJobsAlone(t *testing.T) {
+	e, _, run, job := aJobWithAFirstMachine(t)
+	e.clock.Advance(10 * time.Minute)
+	e.pass()
+	key := "jobs/5001/" + strconv.FormatInt(job.ID, 10) + ".json"
+	before, _ := e.record(key)
+	if before["waiting_since"] == nil {
+		t.Fatalf("job record = %v; want its wait recorded", before)
+	}
+	ctx := context.Background()
+	e.svc.Fence = &deploy.Fence{Own: deploy.ID{Run: 1, Attempt: 1}, Objects: e.svc.Objects, Clock: e.clock}
+	if err := (&deploy.Fence{Own: deploy.ID{Run: 2, Attempt: 1}, Objects: e.svc.Objects, Clock: e.clock}).Serving(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// To the replaced revision, an image is ready, and the job's hour has
+	// run out by its record.
+	e.gce.HoldImages(false)
+	e.clock.Advance(machines.RetryLimit)
+	e.pass()
+	e.pass()
+	if after, _ := e.record(key); fmt.Sprint(after) != fmt.Sprint(before) {
+		t.Fatalf("job record = %v; the replaced revision changed it from %v", after, before)
+	}
+	if _, ok := e.record("refusals/5001/" + strconv.FormatInt(run.ID, 10) + "-1.json"); ok {
+		t.Fatal("the replaced revision refused the run")
+	}
+	if len(e.ours()) != 0 {
+		t.Fatalf("machines = %+v", e.ours())
 	}
 }
 
@@ -179,6 +241,7 @@ func TestAReplacedRevisionMakesNoMachines(t *testing.T) {
 		t.Fatalf("machines = %+v; the replaced revision makes none", ms)
 	}
 	// Nor does it retire one for its programs, which aren't the service's.
+	orig := e.svc.Bases
 	e.otherPrograms()
 	if err := e.runner.Run(ctx, pass.All(own.Pass, e.svc.Pass)); err != nil {
 		t.Fatal(err)
@@ -202,9 +265,7 @@ func TestAReplacedRevisionMakesNoMachines(t *testing.T) {
 		t.Fatal("the replaced revision's cleanup stopped")
 	}
 	// The later revision makes the machines.
-	e.svc.Fence = later
-	e.gce.DeleteImageNow(earlierImage)
-	e.gce.AddLabelledImage(earlierImage, "", "X86_64", map[string]string{bases.LabelKind: bases.KindBase, bases.LabelPrograms: programs()})
+	e.svc.Fence, e.svc.Bases = later, orig
 	e.pass()
 	if len(e.ours()) == 0 {
 		t.Fatal("the latest revision made no machine")

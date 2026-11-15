@@ -220,9 +220,9 @@ type Bases interface {
 	// Boot is the base image an architecture's machines boot now, or, as
 	// a bases.ErrNoImage, why there's none they may.
 	Boot(images []compute.Image, arch string) (string, error)
-	// Ours reports whether a machine of an architecture booted from image
-	// runs the service's own programs.
-	Ours(images []compute.Image, arch, image string) bool
+	// Ours reports whether a machine of an architecture booted from the
+	// image of ID runs the service's own programs.
+	Ours(images []compute.Image, arch string, id uint64) bool
 }
 
 // BootLogs reads a machine's serial console, by its numeric ID, from Cloud
