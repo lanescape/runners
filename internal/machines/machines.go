@@ -95,9 +95,9 @@ const (
 	CancelEvery    = time.Minute
 	ForceCancel    = 5 * time.Minute
 	QueueDeadline  = 2 * time.Minute
-	// JobQueueLimit is how long GitHub lets a job wait for a self-hosted
-	// runner before it ends it.
-	JobQueueLimit   = 24 * time.Hour
+	// RunLimit is how long GitHub lets a run last, its reruns included,
+	// before it ends it.
+	RunLimit        = 35 * 24 * time.Hour
 	assignmentWait  = 20 * time.Second
 	assignmentRetry = 2 * time.Second
 	recordsKept     = 24 * time.Hour

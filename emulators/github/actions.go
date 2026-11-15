@@ -188,6 +188,7 @@ func (e *Emulator) Queue(r *Run, spec JobSpec) *WorkflowJob {
 	r.Jobs = append(r.Jobs, j)
 	if r.Status == "completed" {
 		r.Status, r.Conclusion = "in_progress", ""
+		r.Updated = e.clock.Now()
 	}
 	e.notify()
 	return j
@@ -247,6 +248,7 @@ func (e *Emulator) RerunAs(r *Run, by *Account) {
 	}
 	r.Triggers[r.Attempt] = by
 	r.Status, r.Conclusion = "in_progress", ""
+	r.Updated = e.clock.Now()
 	e.notify()
 }
 
@@ -320,6 +322,7 @@ func (e *Emulator) settle(r *Run) {
 		}
 	}
 	r.Status, r.Conclusion = "completed", conclusion
+	r.Updated = e.clock.Now()
 }
 
 // SetGroupRepositories changes which repositories may use a runner group,
@@ -869,25 +872,52 @@ func (e *Emulator) listRuns(w http.ResponseWriter, r *http.Request, rp *Repo) {
 		if sha := q.Get("head_sha"); sha != "" && run.HeadSHA != sha {
 			continue
 		}
-		// created takes >=<time>, which is all the service asks.
+		// created takes >=<time> or <time>..<time>, inclusive.
 		if c := q.Get("created"); c != "" {
-			since, err := time.Parse(time.RFC3339, strings.TrimPrefix(c, ">="))
-			if err != nil || !strings.HasPrefix(c, ">=") {
+			from, to, ok := createdSpan(c)
+			if !ok {
 				writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"message": "Invalid created", "status": "422"})
 				return
 			}
-			if run.Created.Before(since) {
+			at := run.Created.UTC().Truncate(time.Second)
+			if at.Before(from) || !to.IsZero() && at.After(to) {
 				continue
 			}
 		}
 		runs = append(runs, run)
 	}
 	slices.SortFunc(runs, func(a, b *Run) int { return cmp.Compare(b.ID, a.ID) })
+	total := len(runs)
+	// GitHub lists at most 1,000 runs for a filtered list, whatever its
+	// count says.
+	if q.Get("status") != "" || q.Get("created") != "" {
+		limit := e.RunSearchLimit
+		if limit == 0 {
+			limit = 1000
+		}
+		runs = runs[:min(len(runs), limit)]
+	}
 	out := []map[string]any{}
 	for _, run := range page(w, r, runs, e.URL) {
 		out = append(out, e.runJSON(run))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"total_count": len(runs), "workflow_runs": out})
+	writeJSON(w, http.StatusOK, map[string]any{"total_count": total, "workflow_runs": out})
+}
+
+// createdSpan reads a runs list's created filter: >=<time>, whose to is
+// zero, or <time>..<time>.
+func createdSpan(c string) (from, to time.Time, ok bool) {
+	if s, found := strings.CutPrefix(c, ">="); found {
+		from, err := time.Parse(time.RFC3339, s)
+		return from.UTC(), time.Time{}, err == nil
+	}
+	a, b, found := strings.Cut(c, "..")
+	if !found {
+		return time.Time{}, time.Time{}, false
+	}
+	from, ferr := time.Parse(time.RFC3339, a)
+	to, terr := time.Parse(time.RFC3339, b)
+	return from.UTC(), to.UTC(), ferr == nil && terr == nil
 }
 
 func (e *Emulator) jobJSON(j *WorkflowJob) map[string]any {
@@ -1030,6 +1060,7 @@ func (e *Emulator) cancelRun(w http.ResponseWriter, r *http.Request, rp *Repo) {
 	}
 	if len(run.Jobs) == 0 {
 		run.Status, run.Conclusion = "completed", "cancelled"
+		run.Updated = e.clock.Now()
 	}
 	e.notify()
 	writeJSON(w, http.StatusAccepted, map[string]any{})
@@ -1046,6 +1077,7 @@ func (e *Emulator) forceCancelRun(w http.ResponseWriter, r *http.Request, rp *Re
 		e.complete(j, "cancelled")
 	}
 	run.Status, run.Conclusion = "completed", "cancelled"
+	run.Updated = e.clock.Now()
 	e.notify()
 	writeJSON(w, http.StatusAccepted, map[string]any{})
 }
@@ -1084,6 +1116,7 @@ func (e *Emulator) rerunFailedJobs(w http.ResponseWriter, r *http.Request, rp *R
 	}
 	run.Attempt++
 	run.Status, run.Conclusion = "in_progress", ""
+	run.Updated = e.clock.Now()
 	if run.Triggers == nil {
 		run.Triggers = map[int]*Account{}
 	}

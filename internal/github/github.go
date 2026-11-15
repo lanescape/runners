@@ -66,6 +66,8 @@ type WorkflowRun struct {
 	// head is the run's. GitHub lists none for a fork's.
 	PullRequests []int
 	CreatedAt    time.Time
+	// UpdatedAt is when GitHub last changed it, such as when it finished.
+	UpdatedAt time.Time
 }
 
 // PullRequest is a pull request. HeadRepositoryID is 0 once the head
@@ -319,6 +321,7 @@ func runOf(r *gh.WorkflowRun) WorkflowRun {
 		HeadRepositoryID: r.GetHeadRepository().GetID(),
 		PullRequests:     pullNumbers(r.PullRequests),
 		CreatedAt:        r.GetCreatedAt().Time,
+		UpdatedAt:        r.GetUpdatedAt().Time,
 	}
 }
 

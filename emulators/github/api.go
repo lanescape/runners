@@ -180,7 +180,7 @@ func (e *Emulator) attemptJSON(run *Run, attempt int) map[string]any {
 		"repository":       e.repoJSON(run.Repo),
 		"head_repository":  e.repoJSON(run.HeadRepo),
 		"created_at":       run.Created.UTC().Format(time.RFC3339),
-		"updated_at":       e.clock.Now().UTC().Format(time.RFC3339),
+		"updated_at":       run.updated().UTC().Format(time.RFC3339),
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lanescape/runners/emulators/fault"
 	"github.com/lanescape/runners/internal/deploy"
@@ -184,10 +185,10 @@ func TestARetiredMachineWaitsWhileGitHubCantBeRead(t *testing.T) {
 				Match:   func(r *http.Request) bool { return strings.Contains(r.URL.Path, "/actions/runners/") },
 				Respond: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusBadGateway) }})
 		},
-		"the runs are rate limited": func(e *env) {
+		"the repository is rate limited": func(e *env) {
 			// Resetting at once, so that the client, which keeps the limit's
 			// reset, tries again once the faults go.
-			e.gh.RateLimit("/repos/lanescape/app/actions/runs", 1000, 0)
+			e.gh.RateLimit("/repos/lanescape/app/", 1000, 0)
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -293,5 +294,48 @@ func TestARetiredMachineGoesAtItsAgeLimit(t *testing.T) {
 	}
 	if !e.logged("a job it took may be lost") {
 		t.Fatal("not logged")
+	}
+}
+
+// TestAStoppedMachinesEndedJobIsFound: a machine that stopped after its
+// runner took a job, not the one it was made for, of a run created days
+// before and rerun since, whose job GitHub ended before the machine's first
+// retirement, and so removed the runner, 404: the job is found among the
+// finished runs, and recorded.
+func TestAStoppedMachinesEndedJobIsFound(t *testing.T) {
+	e := setup(t)
+	p := e.withLost()
+	made := e.queue(e.mainRun(), sel2)
+	e.pass()
+	// The job the machine was made for is cancelled, and another, of an
+	// older run's second attempt, takes it.
+	e.gh.CompleteJobByID(made.ID, "cancelled")
+	old := e.mainRun()
+	first := e.queue(old, sel2)
+	e.gh.CompleteJobByID(first.ID, "failure")
+	e.gh.Rerun(old)
+	old.Created = time.Now().Add(-72 * time.Hour)
+	j := e.queue(old, sel2)
+	m := e.boot(e.one())
+	e.eventually("the rerun's job is on "+m.in.Name, func() bool {
+		got := e.gh.Job(j.ID)
+		return got.Status == "in_progress" && got.Runner != nil && got.Runner.Name == m.in.Name
+	})
+	// The machine stops; GitHub ends the job, and the run.
+	e.gce.Shutdown(m.in.Zone, m.in.Name)
+	e.gh.CompleteJobByID(j.ID, "failure")
+	if st, _ := e.gh.RunState(old); st != "completed" {
+		t.Fatalf("run %s", st)
+	}
+	if e.registered(m.in.Name) {
+		t.Fatal("GitHub kept the runner of an ended job")
+	}
+	e.pass()
+	lost, ok := p.lostOn(m.in.Name)
+	if !ok || lost.JobID != j.ID || lost.RunID != old.ID || lost.RunAttempt != 2 {
+		t.Fatalf("lost = %+v, %v", lost, ok)
+	}
+	if e.exists(m.in.Name) {
+		t.Fatal("the machine wasn't deleted")
 	}
 }
