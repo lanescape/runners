@@ -430,7 +430,8 @@ type Refusal struct {
 }
 
 // JobRecord is when a queued job's first machine was made: another is made
-// while it's still queued, for up to RetryLimit from then. It's written
+// while it's still queued, for up to RetryLimit from then, not counting
+// while it waited for a base image its machine may boot. It's written
 // before the machine is made, tentative until the machine is known to have
 // been: a tentative record doesn't start the hour.
 type JobRecord struct {
@@ -439,6 +440,21 @@ type JobRecord struct {
 	FirstMachineAt time.Time `json:"first_machine_at"`
 	Machine        string    `json:"machine"`
 	Tentative      bool      `json:"tentative,omitempty"`
+	// WaitingSince is when the job began to wait for a base image its
+	// machine may boot, while it still does, and Waited how long it waited
+	// so before.
+	WaitingSince time.Time     `json:"waiting_since,omitzero"`
+	Waited       time.Duration `json:"waited,omitempty"`
+}
+
+// spent is how much of its RetryLimit a job has spent by now: the time
+// since its first machine, but for its waits for a base image.
+func (r JobRecord) spent(now time.Time) time.Duration {
+	d := now.Sub(r.FirstMachineAt) - r.Waited
+	if !r.WaitingSince.IsZero() {
+		d -= now.Sub(r.WaitingSince)
+	}
+	return d
 }
 
 func admissionKey(machine string) string { return "machines/" + machine + "/admission.json" }

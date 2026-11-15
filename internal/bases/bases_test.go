@@ -643,6 +643,19 @@ func TestTheCurrentImageIsLabelledWithItsPrograms(t *testing.T) {
 	if !strings.Contains(e.logs.String(), "base image labelled with its programs") {
 		t.Error("labelling not logged")
 	}
+	// A label of other programs on the current key's image, which its key
+	// says are the service's, is set right.
+	got, err := e.gcec.Image(context.Background(), cur)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.gcec.SetImageLabels(context.Background(), cur, labelled(cur, "ffffffffffffffffffff"), got.LabelFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	e.pass()
+	if im, _ := e.image(cur); im.Labels[bases.LabelPrograms] != programs() {
+		t.Fatalf("labels = %v; want the service's programs", im.Labels)
+	}
 	ims, err := e.gcec.Images(context.Background())
 	if err != nil {
 		t.Fatal(err)

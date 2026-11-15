@@ -836,6 +836,67 @@ func TestJobsWaitForABaseImageOfTheServicesPrograms(t *testing.T) {
 	}
 }
 
+// TestAJobsWaitForABaseImageDoesntCountTowardsItsHour: a job whose first
+// machine stopped before its job started, and that then waits for a base
+// image its machine may boot, isn't refused for the wait: the hour its
+// machines have to start leaves the wait out, which its record keeps, and
+// it gets its machine once the image is ready.
+func TestAJobsWaitForABaseImageDoesntCountTowardsItsHour(t *testing.T) {
+	e, keys := newKey(t, map[string]string{bases.LabelKind: bases.KindBase, bases.LabelPrograms: programs()})
+	run := e.mainRun()
+	job := e.queue(run, sel2)
+	e.pass()
+	first := e.one()
+	if got := e.source(first.Name); got != earlierImage {
+		t.Fatalf("the first machine boots %s", got)
+	}
+	// The earlier image turns out to be of other programs, as one of a
+	// deploy since replaced; the new one is slow to be made.
+	e.gce.DeleteImageNow(earlierImage)
+	e.gce.AddLabelledImage(earlierImage, "", "X86_64", map[string]string{bases.LabelKind: bases.KindBase, bases.LabelPrograms: "ffffffffffffffffffff"})
+	builder := bases.BuilderName("amd64", keys["amd64"])
+	e.gce.HoldImages(true)
+	e.gce.WriteSerial(zoneA, builder, baseimage.Built+"amd64-"+keys["amd64"]+"\n")
+	// The first machine stops before its job starts.
+	e.gce.Shutdown(first.Zone, first.Name)
+	e.clock.Advance(10 * time.Minute)
+	e.pass()
+	key := "jobs/5001/" + strconv.FormatInt(job.ID, 10) + ".json"
+	rec, ok := e.record(key)
+	if !ok || rec["waiting_since"] == nil || rec["tentative"] == true {
+		t.Fatalf("job record = %v; want its wait recorded", rec)
+	}
+	e.clock.Advance(machines.RetryLimit)
+	e.pass()
+	e.pass()
+	if _, ok := e.record("refusals/5001/" + strconv.FormatInt(run.ID, 10) + "-1.json"); ok {
+		t.Fatal("the job's run was refused for waiting for a base image")
+	}
+	if ms := e.ours(); len(ms) != 0 {
+		t.Fatalf("machines = %+v", ms)
+	}
+	e.gce.HoldImages(false)
+	e.pass()
+	m := e.one()
+	if got := e.source(m.Name); got != bases.ImageName("amd64", keys["amd64"]) || m.Labels[machines.LabelJob] != strconv.FormatInt(job.ID, 10) {
+		t.Fatalf("machine %s of job %s boots %s", m.Name, m.Labels[machines.LabelJob], got)
+	}
+	rec, _ = e.record(key)
+	if rec["waiting_since"] != nil || rec["waited"] == nil || time.Duration(rec["waited"].(float64)) < machines.RetryLimit {
+		t.Fatalf("job record = %v; want the wait counted as waited", rec)
+	}
+	// What's left of its hour still runs out, from its first machine but
+	// for its wait.
+	e.gce.Shutdown(m.Zone, m.Name)
+	e.clock.Advance(machines.RetryLimit - 10*time.Minute)
+	e.pass()
+	e.pass()
+	if rf, ok := e.record("refusals/5001/" + strconv.FormatInt(run.ID, 10) + "-1.json"); !ok ||
+		!strings.Contains(fmt.Sprint(rf["reason"]), "it waited for a base image") {
+		t.Fatalf("refusal = %v; want the run refused once the rest of its hour ran out", rf)
+	}
+}
+
 // TestJobsBootAnEarlierImageOfTheSamePrograms: after a deploy that changes
 // the base images' key but not the service's programs, such as Debian's
 // image alone, jobs' machines boot the earlier image until the new one is
