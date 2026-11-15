@@ -869,6 +869,17 @@ func (e *Emulator) listRuns(w http.ResponseWriter, r *http.Request, rp *Repo) {
 		if sha := q.Get("head_sha"); sha != "" && run.HeadSHA != sha {
 			continue
 		}
+		// created takes >=<time>, which is all the service asks.
+		if c := q.Get("created"); c != "" {
+			since, err := time.Parse(time.RFC3339, strings.TrimPrefix(c, ">="))
+			if err != nil || !strings.HasPrefix(c, ">=") {
+				writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"message": "Invalid created", "status": "422"})
+				return
+			}
+			if run.Created.Before(since) {
+				continue
+			}
+		}
 		runs = append(runs, run)
 	}
 	slices.SortFunc(runs, func(a, b *Run) int { return cmp.Compare(b.ID, a.ID) })

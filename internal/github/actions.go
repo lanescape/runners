@@ -71,6 +71,9 @@ type Actions interface {
 	Repositories(ctx context.Context) ([]Repository, error)
 	// Runs lists a repository's runs with a status, such as queued.
 	Runs(ctx context.Context, repo Repository, status string) ([]WorkflowRun, error)
+	// RunsSince lists a repository's runs with a status that were created
+	// at since or later.
+	RunsSince(ctx context.Context, repo Repository, status string, since time.Time) ([]WorkflowRun, error)
 	// RunJobs lists the jobs of a run's latest attempt.
 	RunJobs(ctx context.Context, repo Repository, runID int64) ([]Job, error)
 	// AttemptJobs lists the jobs of one of a run's attempts.
@@ -167,7 +170,16 @@ func (c *Client) Repositories(ctx context.Context) ([]Repository, error) {
 
 // Runs implements Actions.
 func (c *Client) Runs(ctx context.Context, repo Repository, status string) ([]WorkflowRun, error) {
-	opts := &gh.ListWorkflowRunsOptions{Status: status, ListOptions: gh.ListOptions{PerPage: 100}}
+	return c.runs(ctx, repo, &gh.ListWorkflowRunsOptions{Status: status, ListOptions: gh.ListOptions{PerPage: 100}})
+}
+
+// RunsSince implements Actions.
+func (c *Client) RunsSince(ctx context.Context, repo Repository, status string, since time.Time) ([]WorkflowRun, error) {
+	return c.runs(ctx, repo, &gh.ListWorkflowRunsOptions{Status: status, Created: ">=" + since.UTC().Format(time.RFC3339),
+		ListOptions: gh.ListOptions{PerPage: 100}})
+}
+
+func (c *Client) runs(ctx context.Context, repo Repository, opts *gh.ListWorkflowRunsOptions) ([]WorkflowRun, error) {
 	var out []WorkflowRun
 	for {
 		rs, resp, err := c.gh.Actions.ListRepositoryWorkflowRuns(ctx, repo.Owner, repo.Name, opts)

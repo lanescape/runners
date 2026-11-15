@@ -68,6 +68,9 @@ type inventory struct {
 	noImage   map[string]error
 	imageList []compute.Image
 	listed    bool
+	// runJobs are runs and their jobs read to find a retired machine's
+	// runner's job, by repository, status and since.
+	runJobs map[string][]runJobs
 	// retiring is whether this revision retires machines for their
 	// programs this pass, once known.
 	retiring  *bool

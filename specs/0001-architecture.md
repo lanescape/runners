@@ -56,7 +56,7 @@ A pass:
 3. Moves each architecture's base image for the current key on, if it isn't ready, and deletes base images it no longer needs (specs/0003-disks.md, Making a base image), before queued jobs take what capacity there is. A builder that can't be made holds back queued jobs for that pass, as an older job does (specs/0002-machines.md, One pool), so that what jobs free builds up for it and a busy pool never starves it: for want of quota, which machines of every family may share, such as external addresses or all CPUs, every job; for want of capacity alone, a stockout, the jobs of its machine families. No hold applies while none of the service's machines is running, since then nothing of the service's holds what the builder lacks, and holding jobs back would only stop them too.
 4. Gives queued jobs machines, in one order, oldest first, from one pool for every consumer (specs/0002-machines.md, One pool).
 5. Saves the work disks of jobs that asked, and makes resume images for jobs lost to a preemption or to the age limit (specs/0003-disks.md).
-6. Reruns runs that lost a job to a preemption or to the age limit, once they've finished.
+6. Reruns runs that lost a job to a preemption, to the age limit or on a retired machine, once they've finished.
 7. Deletes what's finished, replaced, no longer declared or orphaned, and removes offline runner registrations named after its machines.
 
 A failure on one machine, job or disk doesn't stop the rest of a pass. If the service itself fails, Compute Engine still stops every machine at its maximum run duration, leaving only its disks to pay for, and deletes a running base image's builder at its own.

@@ -159,15 +159,15 @@ func TestAReplacedRevisionLeavesJobsAlone(t *testing.T) {
 	}
 }
 
-// TestARetiredMachinesTakenJobIsLost: a machine retired for its programs
-// after its runner took a job, but before the job's check, refuses the job
-// when the check comes, and stops: the job is GitHub's to end, as its
-// runner went, and the service neither makes it another machine, since it
-// isn't queued, nor reruns or cancels its run. So the job fails. It's the
-// same as for a machine retired after 20 minutes idle (cleanup_test.go,
-// TestCleanupClaimsAMachineBeforeACheckCan).
-func TestARetiredMachinesTakenJobIsLost(t *testing.T) {
+// TestARetiredMachinesTakenJobIsRecordedLost: a machine retired for its
+// programs after its runner took a job, but before the job's check, has
+// its runner's job recorded as lost, so that its run is rerun; the check,
+// coming later, is refused, and the machine goes (specs/0002-machines.md,
+// Retiring a machine).
+func TestARetiredMachinesTakenJobIsRecordedLost(t *testing.T) {
 	e, _ := newKey(t, map[string]string{bases.LabelKind: bases.KindBase, bases.LabelPrograms: programs()})
+	p := &preemptions{calls: map[string]bool{}}
+	e.svc.Preemptions = p
 	run := e.mainRun()
 	j := e.queue(run, sel2)
 	e.pass()
@@ -178,14 +178,17 @@ func TestARetiredMachinesTakenJobIsLost(t *testing.T) {
 	// which comes later, finds it there.
 	e.gce.ServerError(http.MethodDelete, "/instances/"+m.in.Name, http.StatusInternalServerError, 0)
 	e.pass()
-	if adm, _ := e.admission(m.in.Name); !strings.Contains(fmt.Sprint(adm["reason"]), "retired: its base image") {
+	if adm, _ := e.admission(m.in.Name); !strings.Contains(fmt.Sprint(adm["reason"]), "retired: its base image") || adm["retired"] != true {
 		t.Fatalf("admission = %v", adm)
+	}
+	lost, ok := p.lostOn(m.in.Name)
+	if !ok || lost.JobID != j.ID || lost.RunID != run.ID || lost.RunAttempt != 1 || lost.JobName == "" || !lost.Allowed {
+		t.Fatalf("lost = %+v, %v; want the job recorded as its check would have allowed it", lost, ok)
 	}
 	if code := m.started(run.ID); code != http.StatusForbidden {
 		t.Fatalf("the check after the machine was retired: %d, want 403", code)
 	}
 	e.gce.Faults().Reset()
-	e.pass()
 	e.pass()
 	if e.exists(m.in.Name) {
 		t.Fatal("the retired machine is still there")
@@ -193,17 +196,8 @@ func TestARetiredMachinesTakenJobIsLost(t *testing.T) {
 	if len(e.ours()) != 0 {
 		t.Fatalf("machines = %+v; the job isn't queued, so it gets none", e.ours())
 	}
-	if got := e.gh.Job(j.ID); got.Status != "in_progress" {
-		t.Fatalf("job = %s; GitHub ends it once it finds its runner gone", got.Status)
-	}
 	if _, ok := e.record("refusals/5001/" + strconv.FormatInt(run.ID, 10) + "-1.json"); ok {
 		t.Fatal("the run was refused")
-	}
-	if _, ok := e.record("reruns/5001/" + strconv.FormatInt(run.ID, 10) + ".json"); ok {
-		t.Fatal("the run was rerun")
-	}
-	if st, _ := e.gh.RunState(run); st == "completed" {
-		t.Fatal("the run was ended by the service")
 	}
 }
 

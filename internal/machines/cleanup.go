@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -172,6 +173,12 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 			s.finish(ctx, inv, m, "past "+MaxAge.String()+", its job recorded to resume, saving nothing", nil)
 			return
 		}
+		// A retired machine settles its runner first, if it can: at the
+		// age limit it goes all the same, and says what may be lost.
+		if ra, ok := inv.admissions[m.Name]; ok && ra.retiredClaim() && !s.settleRunner(ctx, inv, m, ra, true) {
+			s.log().Error("deleting a retired machine at its age limit, though its runner's job couldn't be settled; a job it took may be lost",
+				"machine", m.Name, "repository_id", m.RepositoryID, "runner_id", m.RunnerID)
+		}
 		s.finish(ctx, inv, m, "past "+MaxAge.String()+", saving nothing", nil)
 	case !inv.recordsComplete:
 		return
@@ -181,6 +188,15 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 		if inv.unrecorded(m.Name) {
 			// Its admission is the only record that its run must be
 			// cancelled: the machine waits for the refusal.
+			return
+		}
+		// A machine an earlier pass retired, but didn't delete, settles
+		// its runner first.
+		if a.retiredClaim() {
+			if !s.settleRunner(ctx, inv, m, a, true) {
+				return
+			}
+			s.finish(ctx, inv, m, strings.TrimPrefix(a.Reason, "retired: "), nil)
 			return
 		}
 		s.finish(ctx, inv, m, "its job was refused", nil)
@@ -200,20 +216,173 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 			s.finish(ctx, inv, m, "its job finished "+ReportWait.String()+" ago with no report; going on without saving", nil)
 		}
 	case m.Stopped():
-		if s.retire(ctx, m, "it stopped before its job started") {
-			s.finish(ctx, inv, m, "it stopped before its job started", nil)
-		}
+		s.retireAndFinish(ctx, inv, m, "it stopped before its job started")
 	case s.retiresForImage(ctx, inv, m):
 		image, _ := s.staleImage(ctx, inv, m)
-		why := "its base image, " + image + ", wasn't made with the service's programs"
-		if s.retire(ctx, m, why) {
-			s.finish(ctx, inv, m, why, nil)
-		}
+		s.retireAndFinish(ctx, inv, m, "its base image, "+image+", wasn't made with the service's programs")
 	case age >= IdleLimit:
-		if s.retire(ctx, m, "it hasn't picked up a job after "+IdleLimit.String()) {
-			s.finish(ctx, inv, m, "it hasn't picked up a job after "+IdleLimit.String(), nil)
+		s.retireAndFinish(ctx, inv, m, "it hasn't picked up a job after "+IdleLimit.String())
+	}
+}
+
+// retireAndFinish retires a machine no job was admitted on, settles its
+// runner, and deletes it, unless a check decided first: one that refused
+// leaves it to be deleted, and one that allowed keeps it for its job.
+func (s *Service) retireAndFinish(ctx context.Context, inv *inventory, m Machine, why string) {
+	a, ok := s.retire(ctx, m, why)
+	if !ok || !s.settleRunner(ctx, inv, m, a, false) {
+		return
+	}
+	s.finish(ctx, inv, m, why, nil)
+}
+
+// settleRunner deals with the runner of a machine a pass retired, before
+// the machine goes (specs/0002-machines.md, Retiring a machine). It removes
+// the runner's registration, so that GitHub gives it no further job, then
+// asks GitHub for a job on it: GitHub hands a runner its job before the
+// hook asks, so it may have taken one just before the claim, whose check
+// the claim refuses. Such a job is lost, and is recorded, if the check
+// would have allowed it, so that its run is rerun as a preempted job's is.
+// It reports whether the machine may go: not while GitHub can't be read,
+// nor while it refuses to remove the runner as running a job it doesn't
+// show yet. later says an earlier pass retired the machine, so a job it
+// took may have finished since: runs finished since a day before the claim
+// are looked through too, as a job waits at most a day for a runner. A
+// claim that isn't a retirement, such as a check's refusal, settles
+// nothing.
+func (s *Service) settleRunner(ctx context.Context, inv *inventory, m Machine, a Admission, later bool) bool {
+	if !a.retiredClaim() || m.RunnerID == 0 {
+		return true
+	}
+	log := s.log().With("machine", m.Name, "repository_id", m.RepositoryID, "runner_id", m.RunnerID)
+	err := s.GitHub.DeleteRunner(ctx, m.RunnerID)
+	busy := errors.Is(err, github.ErrRefused)
+	if err != nil && !busy && !errors.Is(err, github.ErrNotFound) {
+		log.Warn("removing a retired machine's runner; the machine waits for it", "err", err.Error())
+		return false
+	}
+	repo, err := s.GitHub.RepositoryByID(ctx, m.RepositoryID)
+	if errors.Is(err, github.ErrNotFound) {
+		// Nothing of a repository GitHub doesn't show is rerun.
+		log.Warn("a retired machine's repository isn't shown; a job its runner took isn't looked for")
+		return true
+	}
+	if err != nil {
+		log.Warn("reading a retired machine's repository; the machine waits for it", "err", err.Error())
+		return false
+	}
+	job, run, found, err := s.runnerJob(ctx, inv, repo, m, a, busy, later)
+	switch {
+	case err != nil:
+		log.Warn("looking for a job on a retired machine's runner; the machine waits for it", "err", err.Error())
+		return false
+	case !found && busy:
+		log.Warn("GitHub refused to remove a retired machine's runner as running a job, which it doesn't show yet; the machine waits for it")
+		return false
+	case !found:
+		return true
+	}
+	log = log.With("run_id", run.ID, "job_id", job.ID)
+	lost, decided, bd, bound, err := s.judge(ctx, repo, m, job, run)
+	if err != nil {
+		log.Warn("judging a job lost on a retired machine; the machine waits for it", "err", err.Error())
+		return false
+	}
+	if !decided && (bound || run.Event == "pull_request_target") {
+		lost = s.conclude(lost, m, run, bd, bound)
+		decided = !lost.Allowed
+	}
+	// An unbound run's job would have bound it at its check, from what
+	// GitHub told the runner, which a rerun's job reports instead.
+	if decided {
+		log.Info("a job lost on a retired machine isn't rerun: its check would have refused it", "reason", lost.Reason)
+		return true
+	}
+	if s.Preemptions == nil {
+		log.Warn("a job lost on a retired machine can't be recorded to be rerun")
+		return true
+	}
+	if err := s.Preemptions.Lost(ctx, m, lost); err != nil {
+		log.Warn("recording a job lost on a retired machine; the machine waits for it", "err", err.Error())
+		return false
+	}
+	log.Info("a job lost on a retired machine is recorded, so that its run is rerun")
+	return true
+}
+
+// runnerJob is the job GitHub shows on a machine's runner, of the
+// repository's runs in progress, and, later, of those finished since a day
+// before the claim. A runner GitHub refused to remove as busy has a job,
+// which GitHub may not show yet: it's looked for again for a while, as the
+// check does. Otherwise the runs in progress are read once a pass.
+func (s *Service) runnerJob(ctx context.Context, inv *inventory, repo github.Repository, m Machine, a Admission, busy, later bool) (github.Job, github.WorkflowRun, bool, error) {
+	if busy {
+		job, run, err := s.findJob(ctx, repo, m, 0)
+		switch {
+		case err == nil:
+			return job, run, true, nil
+		case !errors.Is(err, errNoAssignment):
+			return github.Job{}, github.WorkflowRun{}, false, err
+		}
+	} else if job, run, ok, err := s.onRunner(ctx, inv, repo, m, "in_progress", time.Time{}); err != nil || ok {
+		return job, run, ok, err
+	}
+	if !later {
+		return github.Job{}, github.WorkflowRun{}, false, nil
+	}
+	return s.onRunner(ctx, inv, repo, m, "completed", a.At.Add(-JobQueueLimit))
+}
+
+// onRunner looks through a repository's runs of a status, those created at
+// since or later if it's given, for a job on a machine's runner, by the
+// runner's ID and name, whatever the job's status. Runs in progress are
+// read once a pass.
+func (s *Service) onRunner(ctx context.Context, inv *inventory, repo github.Repository, m Machine, status string, since time.Time) (github.Job, github.WorkflowRun, bool, error) {
+	key := fmt.Sprint(repo.ID, "/", status, "/", since.Unix())
+	rj, ok := inv.runJobs[key]
+	if !ok {
+		var runs []github.WorkflowRun
+		var err error
+		if since.IsZero() {
+			runs, err = s.GitHub.Runs(ctx, repo, status)
+		} else {
+			runs, err = s.GitHub.RunsSince(ctx, repo, status, since)
+		}
+		if err != nil {
+			return github.Job{}, github.WorkflowRun{}, false, err
+		}
+		for _, run := range runs {
+			if run.RepositoryID != repo.ID {
+				continue
+			}
+			jobs, err := s.GitHub.RunJobs(ctx, repo, run.ID)
+			if errors.Is(err, github.ErrNotFound) {
+				continue
+			}
+			if err != nil {
+				return github.Job{}, github.WorkflowRun{}, false, err
+			}
+			rj = append(rj, runJobs{run, jobs})
+		}
+		if inv.runJobs == nil {
+			inv.runJobs = map[string][]runJobs{}
+		}
+		inv.runJobs[key] = rj
+	}
+	for _, r := range rj {
+		for _, j := range r.jobs {
+			if j.RunnerID == m.RunnerID && strings.EqualFold(j.RunnerName, m.Name) && j.RunID == r.run.ID {
+				return j, r.run, true, nil
+			}
 		}
 	}
+	return github.Job{}, github.WorkflowRun{}, false, nil
+}
+
+// runJobs are a run and its latest attempt's jobs.
+type runJobs struct {
+	run  github.WorkflowRun
+	jobs []github.Job
 }
 
 // retiresForImage reports whether an unadmitted machine is retired for its
@@ -236,14 +405,15 @@ func (s *Service) requestID(parts ...string) string {
 // retire claims an unadmitted machine for cleanup through its admission
 // record, created only if absent, as the job-started check's decision is: a
 // check that decides first keeps the machine, and one that comes later finds
-// it refused. It reports whether the machine may be deleted.
-func (s *Service) retire(ctx context.Context, m Machine, why string) bool {
+// it refused. It returns the admission, the claim or the check's, and
+// reports whether the machine may be deleted.
+func (s *Service) retire(ctx context.Context, m Machine, why string) (Admission, bool) {
 	a, err := s.claim(ctx, m, why)
 	if err != nil {
 		s.log().Warn("retiring a machine", "machine", m.Name, "err", err.Error())
-		return false
+		return Admission{}, false
 	}
-	return !a.Allowed
+	return a, !a.Allowed
 }
 
 // claim writes a machine's admission as retired, only if it has none, and
@@ -251,7 +421,7 @@ func (s *Service) retire(ctx context.Context, m Machine, why string) bool {
 // first.
 func (s *Service) claim(ctx context.Context, m Machine, why string) (Admission, error) {
 	a, _, err := createOnce(ctx, s.Objects, admissionKey(m.Name), Admission{Machine: m.Name, Zone: m.Zone,
-		RepositoryID: m.RepositoryID, Selector: m.Selector.String(), Reason: "retired: " + why, At: s.now()})
+		RepositoryID: m.RepositoryID, Selector: m.Selector.String(), Reason: "retired: " + why, Retired: true, At: s.now()})
 	return a, err
 }
 

@@ -31,6 +31,7 @@ import (
 	"log/slog"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jonboulle/clockwork"
@@ -87,13 +88,16 @@ const (
 	// before anything else, within its 7; that's under 25 minutes. Recording
 	// the machine's job and making its resume image come after the stop, and
 	// take as many passes as they need.
-	MaxRunDuration  = MaxAge + 30*time.Minute
-	IdleLimit       = 20 * time.Minute
-	ReportWait      = 10 * time.Minute
-	RetryLimit      = time.Hour
-	CancelEvery     = time.Minute
-	ForceCancel     = 5 * time.Minute
-	QueueDeadline   = 2 * time.Minute
+	MaxRunDuration = MaxAge + 30*time.Minute
+	IdleLimit      = 20 * time.Minute
+	ReportWait     = 10 * time.Minute
+	RetryLimit     = time.Hour
+	CancelEvery    = time.Minute
+	ForceCancel    = 5 * time.Minute
+	QueueDeadline  = 2 * time.Minute
+	// JobQueueLimit is how long GitHub lets a job wait for a self-hosted
+	// runner before it ends it.
+	JobQueueLimit   = 24 * time.Hour
 	assignmentWait  = 20 * time.Second
 	assignmentRetry = 2 * time.Second
 	recordsKept     = 24 * time.Hour
@@ -153,6 +157,12 @@ type Saver interface {
 // service stopped it at its age limit.
 type Preemptions interface {
 	Stopped(ctx context.Context, m Machine, a Admission, preempted, ageLimit bool) error
+	// Lost records the job a retired machine's runner took before the
+	// machine was claimed, by a, what the job-started check would have
+	// decided of it, so that its run is rerun, as a preempted job's is
+	// (specs/0002-machines.md, Retiring a machine). The job was never
+	// admitted, so it has no work disk to resume from.
+	Lost(ctx context.Context, m Machine, a Admission) error
 }
 
 // Service is the machines' part of the service.
@@ -353,8 +363,18 @@ type Admission struct {
 	Commit string      `json:"commit,omitempty"`
 	// Unbound says the job was allowed on an unbound pull_request_target
 	// run: the smallest shape, standard, with no work disk.
-	Unbound bool      `json:"unbound,omitempty"`
+	Unbound bool `json:"unbound,omitempty"`
+	// Retired says a pass claimed the machine for cleanup before any
+	// check decided (claim).
+	Retired bool      `json:"retired,omitempty"`
 	At      time.Time `json:"at"`
+}
+
+// retiredClaim reports whether an admission is a pass's claim of the
+// machine for cleanup, not a check's decision; claims made before they
+// were marked so say so in their reason.
+func (a Admission) retiredClaim() bool {
+	return !a.Allowed && (a.Retired || a.JobID == 0 && strings.HasPrefix(a.Reason, "retired: "))
 }
 
 // Resolve is the machine as its admitted job resolved it: with the run's

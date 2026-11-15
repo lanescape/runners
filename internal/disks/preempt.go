@@ -13,6 +13,29 @@ import (
 	"github.com/lanescape/runners/internal/scope"
 )
 
+// Lost records the job a retired machine's runner took before the machine
+// was claimed, whose check the claim refused, before the machine is
+// deleted (specs/0002-machines.md, Retiring a machine): a, the job's
+// admission as the check would have decided it, gives its run, attempt,
+// name and selector. A job is never given a work disk before it's
+// admitted, so it has none to resume from: the record is done at once, and
+// its run is rerun once it has finished, as a preempted job's is. It
+// implements machines.Preemptions, and is called again until it returns
+// nil.
+func (s *Service) Lost(ctx context.Context, m machines.Machine, a machines.Admission) error {
+	stopped := s.now()
+	key := preemptionKey(m.RepositoryID, a.RunID, m.ID)
+	rec, _, err := createOnce(ctx, s.Objects, key, Preemption{InstanceID: m.ID, Machine: m.Name, Zone: m.Zone, RepositoryID: m.RepositoryID,
+		JobID: a.JobID, RunnerID: m.RunnerID, JobName: a.JobName, RunID: a.RunID, RunAttempt: a.RunAttempt, Selector: a.Selector,
+		Arch: m.Selector.Arch, Preempted: NotPreempted, Retired: true, StoppedAt: stopped, NoDisk: true, Done: true})
+	if err != nil {
+		return err
+	}
+	s.log().Info("job lost on a retired machine recorded", "machine", m.Name, "instance_id", m.ID, "run_id", rec.RunID, "job_id", rec.JobID,
+		"attempt", rec.RunAttempt)
+	return nil
+}
+
 // Stopped records a machine that stopped with its job admitted and
 // unfinished, before it's deleted (specs/0002-machines.md, Preemption): a
 // Spot machine, preempted or perhaps, or any machine the service stopped at

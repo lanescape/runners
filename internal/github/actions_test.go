@@ -73,6 +73,27 @@ func TestRunsAndJobs(t *testing.T) {
 	}
 }
 
+// TestRunsSince: runs of a status created at a time or later, by GitHub's
+// created filter.
+func TestRunsSince(t *testing.T) {
+	ctx := context.Background()
+	e := setup(t)
+	repo := e.repository(t)
+	old := e.emu.PushRun(e.repo, "main")
+	e.emu.SetRunStatus(old, "completed")
+	old.Created = time.Now().Add(-48 * time.Hour)
+	recent := e.emu.PushRun(e.repo, "main")
+	e.emu.SetRunStatus(recent, "completed")
+	runs, err := e.c.RunsSince(ctx, repo, "completed", time.Now().Add(-24*time.Hour))
+	if err != nil || len(runs) != 1 || runs[0].ID != recent.ID {
+		t.Fatalf("runs since a day ago = %+v, %v", runs, err)
+	}
+	all, err := e.c.Runs(ctx, repo, "completed")
+	if err != nil || len(all) != 2 {
+		t.Fatalf("completed runs = %+v, %v", all, err)
+	}
+}
+
 func TestApprovals(t *testing.T) {
 	ctx := context.Background()
 	e := setup(t)

@@ -217,7 +217,7 @@ func (s *Service) stillShown(ctx context.Context, st *state, id int64) bool {
 func (s *Service) evidence(ctx context.Context, st *state) {
 	for key, r := range st.preemptions {
 		p := r.v
-		if p.Preempted != Unknown || p.AgeLimit || s.now().Sub(p.StoppedAt) >= ResumeKept {
+		if p.Preempted != Unknown || p.AgeLimit || p.Retired || s.now().Sub(p.StoppedAt) >= ResumeKept {
 			continue
 		}
 		_, found := st.events[eventKey(p.InstanceID)]
@@ -308,7 +308,7 @@ func (s *Service) runState(ctx context.Context, st *state, repoID, runID int64) 
 					unready = true
 				}
 				switch {
-				case v.Preempted == Preempted || v.AgeLimit:
+				case v.Preempted == Preempted || v.AgeLimit || v.Retired:
 					r.due, r.rerun = true, true
 				case v.Preempted == Unknown && s.now().Sub(v.StoppedAt) < ResumeKept:
 					r.due = true
@@ -415,7 +415,7 @@ func (s *Service) rerunLocked(ctx context.Context, st *state, repoID, runID int6
 		return err
 	}
 	rs.finished, rs.rerun = false, false
-	s.log().Info("run rerun: a job was lost to a preemption or to the age limit", "repository_id", repoID, "run_id", runID, "attempt", rs.attempt+1)
+	s.log().Info("run rerun: a job was lost to a preemption, to the age limit, or on a retired machine", "repository_id", repoID, "run_id", runID, "attempt", rs.attempt+1)
 	return nil
 }
 
