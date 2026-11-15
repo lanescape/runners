@@ -527,7 +527,7 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 		// gets no machine until its record says so, so that its hour
 		// runs again before it has one.
 		if _, err := s.noteWait(ctx, inv, w.repo.ID, w.job.ID, w.sel.Arch); err != nil {
-			s.log().Warn("no machine made; the job stays queued until its record says its wait for a base image has ended",
+			s.log().Warn("no machine made; the job stays queued until its record says whether it waits for a base image",
 				"repository_id", w.repo.ID, "job_id", w.job.ID, "selector", w.sel.String(), "err", err.Error())
 			continue
 		}
@@ -581,9 +581,10 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 // when it began to wait, and once it no longer does, how long it waited, so
 // that its waits don't count towards its RetryLimit (specs/0003-disks.md,
 // Which image machines boot). A record not yet confirmed is left as it is.
-// The error says the record couldn't be brought up to date; it's tried
-// again at the next call, and meanwhile the record's hour runs as it last
-// said. A write whose answer was lost is read back.
+// The error says whether the job waits isn't known, since the images
+// couldn't be listed, or the record couldn't be brought up to date; it's
+// tried again at the next call, and meanwhile the record's hour runs as it
+// last said. A write whose answer was lost is read back.
 func (s *Service) noteWait(ctx context.Context, inv *inventory, repoID, jobID int64, arch string) (bool, error) {
 	key := jobKey(repoID, jobID)
 	r, ok := inv.jobRecords[key]
@@ -592,7 +593,10 @@ func (s *Service) noteWait(ctx context.Context, inv *inventory, repoID, jobID in
 	}
 	_, err := s.baseImage(ctx, inv, arch)
 	waiting := errors.Is(err, bases.ErrNoImage)
-	if err != nil && !waiting || r.v.Tentative || waiting == !r.v.WaitingSince.IsZero() {
+	if err != nil && !waiting {
+		return false, fmt.Errorf("reading whether its base image is ready: %w", err)
+	}
+	if r.v.Tentative || waiting == !r.v.WaitingSince.IsZero() {
 		return waiting, nil
 	}
 	rec := r.v
@@ -733,15 +737,15 @@ func (s *Service) wants(ctx context.Context, inv *inventory, q *queue) []wanted 
 		}
 		if jr, ok := s.jobRecord(ctx, inv, repo.ID, job.ID); ok {
 			// A job that waits for a base image isn't refused, even if
-			// its record couldn't say so.
+			// its record couldn't say so, nor one that might.
 			waiting, err := s.noteWait(ctx, inv, repo.ID, job.ID, sel.Arch)
 			if err != nil {
-				log.Warn("recording a job's wait for a base image", "err", err.Error())
+				log.Warn("not deciding this pass whether a job's machines are out of time", "err", err.Error())
 			}
 			if r, ok := inv.jobRecords[jobKey(repo.ID, job.ID)]; ok && !r.v.Tentative {
 				jr = r.v
 			}
-			if !waiting && jr.spent(s.now()) >= RetryLimit {
+			if err == nil && !waiting && jr.spent(s.now()) >= RetryLimit {
 				waited := ""
 				if jr.Waited > 0 {
 					waited = fmt.Sprintf(", not counting %s it waited for a base image", jr.Waited.Round(time.Second))

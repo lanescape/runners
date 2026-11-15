@@ -965,7 +965,7 @@ func TestAJobGetsNoMachineUntilItsRecordSaysItsWaitEnded(t *testing.T) {
 	if ms := e.ours(); len(ms) != 0 {
 		t.Fatalf("machines = %+v; the job's record still says it waits", ms)
 	}
-	if !e.logged("until its record says its wait for a base image has ended") {
+	if !e.logged("until its record says whether it waits for a base image") {
 		t.Fatal("why the job gets no machine isn't logged")
 	}
 	e.gcs.Faults().Reset()
@@ -979,6 +979,51 @@ func TestAJobGetsNoMachineUntilItsRecordSaysItsWaitEnded(t *testing.T) {
 	if rec["waiting_since"] != nil || time.Duration(rec["waited"].(float64)) != 10*time.Minute {
 		t.Fatalf("job record = %v; want 10 minutes waited", rec)
 	}
+}
+
+// TestAJobsWaitIsLeftAsItIsWhileTheImagesCantBeListed: while the images
+// can't be listed, so whether a job with a first machine's record waits
+// for a base image isn't known, the job is neither refused nor given a
+// machine.
+func TestAJobsWaitIsLeftAsItIsWhileTheImagesCantBeListed(t *testing.T) {
+	t.Run("its hour has run out by its record", func(t *testing.T) {
+		e, _, run, _ := aJobWithAFirstMachine(t)
+		e.clock.Advance(55 * time.Minute)
+		e.jobWrites(0, false)
+		e.pass()
+		e.clock.Advance(10 * time.Minute)
+		e.gce.ServerError(http.MethodGet, "/global/images", http.StatusForbidden, 0)
+		e.pass()
+		if _, ok := e.record("refusals/5001/" + strconv.FormatInt(run.ID, 10) + "-1.json"); ok {
+			t.Fatal("a job that might wait for a base image was refused")
+		}
+	})
+	t.Run("its image is ready", func(t *testing.T) {
+		e, _, _, job := aJobWithAFirstMachine(t)
+		e.clock.Advance(10 * time.Minute)
+		e.pass()
+		key := "jobs/5001/" + strconv.FormatInt(job.ID, 10) + ".json"
+		if rec, _ := e.record(key); rec["waiting_since"] == nil {
+			t.Fatalf("job record = %v; want its wait recorded", rec)
+		}
+		e.clock.Advance(5 * time.Minute)
+		e.gce.HoldImages(false)
+		// The images can't be listed by the base images' part of the
+		// pass, nor for the job, until its machine would be made.
+		e.gce.ServerError(http.MethodGet, "/global/images", http.StatusForbidden, 3)
+		e.pass()
+		if ms := e.ours(); len(ms) != 0 {
+			t.Fatalf("machines = %+v; whether the job waits wasn't known", ms)
+		}
+		if rec, _ := e.record(key); rec["waiting_since"] == nil {
+			t.Fatalf("job record = %v; its wait was to be left as it is", rec)
+		}
+		e.pass()
+		e.one()
+		if rec, _ := e.record(key); rec["waiting_since"] != nil || rec["waited"] == nil {
+			t.Fatalf("job record = %v; want its wait ended", rec)
+		}
+	})
 }
 
 // TestJobsBootAnEarlierImageOfTheSamePrograms: after a deploy that changes
