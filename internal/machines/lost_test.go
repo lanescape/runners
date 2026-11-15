@@ -53,23 +53,59 @@ func TestAnIdleMachinesRunnerIsRemovedBeforeItGoes(t *testing.T) {
 	}
 }
 
-// TestARunnerAlreadyGoneCountsAsRemoved: a runner GitHub no longer has, 404,
-// is removed already.
-func TestARunnerAlreadyGoneCountsAsRemoved(t *testing.T) {
-	e := setup(t)
-	e.withLost()
-	e.queue(e.mainRun(), sel2)
-	e.pass()
-	m := e.one()
-	runner, _ := strconv.ParseInt(m.Metadata[machines.MetaRunnerID], 10, 64)
-	if err := e.svc.GitHub.DeleteRunner(context.Background(), runner); err != nil {
-		t.Fatal(err)
-	}
-	e.clock.Advance(machines.IdleLimit)
-	e.pass()
-	if e.exists(m.Name) {
-		t.Fatal("a machine whose runner was gone wasn't deleted")
-	}
+// TestARunnerAlreadyGone: a runner GitHub no longer has, 404, needs no
+// removal; but this service didn't remove it, and GitHub removes a
+// just-in-time runner once its job ends, so the machine waits for a job
+// GitHub shows, up to its age limit, when it goes, and an error says a job
+// may be lost. One this service removed had none, and its machine goes.
+func TestARunnerAlreadyGone(t *testing.T) {
+	t.Run("by someone else", func(t *testing.T) {
+		e := setup(t)
+		e.withLost()
+		e.queue(e.mainRun(), sel2)
+		e.pass()
+		m := e.one()
+		runner, _ := strconv.ParseInt(m.Metadata[machines.MetaRunnerID], 10, 64)
+		if err := e.svc.GitHub.DeleteRunner(context.Background(), runner); err != nil {
+			t.Fatal(err)
+		}
+		e.clock.Advance(machines.IdleLimit)
+		e.pass()
+		if !e.exists(m.Name) || !e.logged("is gone, and GitHub shows no job it had") {
+			t.Fatal("a machine whose runner went, not by the service's hand, didn't wait for its job")
+		}
+		e.clock.Advance(machines.MaxAge)
+		e.pass()
+		if e.exists(m.Name) || !e.logged("a job it took may be lost") {
+			t.Fatal("not deleted at its age limit, saying so")
+		}
+	})
+	t.Run("by the service", func(t *testing.T) {
+		e := setup(t)
+		e.withLost()
+		e.queue(e.mainRun(), sel2)
+		e.pass()
+		m := e.one()
+		// The service removes the runner, and the machine's deletion
+		// fails; the next pass finds the runner gone.
+		e.gce.ServerError(http.MethodDelete, "/instances/"+m.Name, http.StatusInternalServerError, 0)
+		e.clock.Advance(machines.IdleLimit)
+		e.pass()
+		if !e.exists(m.Name) || e.registered(m.Name) {
+			t.Fatal("the runner wasn't removed, or the machine was deleted")
+		}
+		if rec, ok := e.record("machines/" + m.Name + "/runner.json"); !ok || rec["removed"] != true {
+			t.Fatalf("runner record = %v", rec)
+		}
+		e.gce.Faults().Reset()
+		e.pass()
+		if e.exists(m.Name) {
+			t.Fatal("a machine whose runner the service removed didn't go")
+		}
+		if _, ok := e.record("machines/" + m.Name + "/runner.json"); ok {
+			t.Fatal("the runner record outlived its machine")
+		}
+	})
 }
 
 // TestAnIdleMachinesTakenJobIsRecordedLost: a machine retired after 20
@@ -357,6 +393,31 @@ func TestAStoppedMachinesEndedJobIsFound(t *testing.T) {
 	}
 	if e.exists(m.in.Name) {
 		t.Fatal("the machine wasn't deleted")
+	}
+}
+
+// TestAJobEndedBeforeTheFirstLookIsWaitedFor: a runner GitHub removed once
+// it ended its job, which GitHub doesn't show on it yet, keeps its machine
+// waiting until it does.
+func TestAJobEndedBeforeTheFirstLookIsWaitedFor(t *testing.T) {
+	e := setup(t)
+	p := e.withLost()
+	run := e.mainRun()
+	j := e.queue(run, sel2)
+	e.pass()
+	m := e.boot(e.one())
+	m.taken(j)
+	e.gce.Shutdown(m.in.Zone, m.in.Name)
+	e.gh.HideAssignment(j, 1000000)
+	e.gh.CompleteJobByID(j.ID, "failure")
+	e.pass()
+	if !e.exists(m.in.Name) {
+		t.Fatal("the machine didn't wait for its runner's job")
+	}
+	e.gh.HideAssignment(j, 0)
+	e.pass()
+	if lost, ok := p.lostOn(m.in.Name); !ok || lost.JobID != j.ID || e.exists(m.in.Name) {
+		t.Fatalf("lost = %+v, %v; want it recorded and the machine gone", lost, ok)
 	}
 }
 

@@ -301,11 +301,17 @@ func (s *Service) settleRunner(ctx context.Context, inv *inventory, m Machine, a
 	case err != nil:
 		log.Warn("looking for a job on a retired machine's runner; the machine waits for it", "err", err.Error())
 		return false
-	case !found && !hadJob:
-		// Removed with no job, or gone with none GitHub shows.
+	case !found && removed:
+		// Removed by this service, with no job.
 		return true
-	case !found:
+	case !found && hadJob:
 		log.Warn("a retired machine's runner had a job, which GitHub doesn't show yet; the machine waits for it", "busy", busy)
+		return false
+	case !found:
+		// Gone, not by this service's hand: GitHub removes a just-in-time
+		// runner once its job ends, so it had one, unless someone else
+		// removed it.
+		log.Warn("a retired machine's runner is gone, and GitHub shows no job it had; the machine waits for one")
 		return false
 	}
 	log = log.With("run_id", run.ID, "job_id", job.ID)
