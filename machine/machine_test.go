@@ -155,7 +155,7 @@ func TestEmbedded(t *testing.T) {
 	// mkfs.ext4 and resize2fs from the paths machine.MkfsPath and
 	// machine.Resize2fsPath name.
 	for file, wants := range map[string][]string{
-		"supervisor/main.go":                   {`"` + machine.HookPath + `"`},
+		"supervisor/main.go":                   {`"` + machine.HookPath + `"`, `Work:        "` + machine.WorkPath + `"`},
 		"job-started.sh":                       {"\nexec " + machine.HookProgramPath + ` "$@"` + "\n"},
 		"lanescape-runners-supervisor.service": {"ExecStart=" + machine.SupervisorPath + "\n", "StandardOutput=journal+console\n"},
 		"lanescape-runners-work-disk.service":  {"ExecStart=" + machine.MountPath + "\n"},

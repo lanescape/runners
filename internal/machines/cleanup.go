@@ -707,11 +707,19 @@ func (s *Service) saves(ctx context.Context, inv *inventory, m Machine) (bool, e
 }
 
 // dropRecords removes a deleted machine's records, and its work disk's,
-// except a refused admission whose run's refusal isn't yet recorded.
+// except a refused admission whose run's refusal isn't yet recorded, and a
+// report that couldn't be read. What its report says the machine used is
+// logged first, from the report alone, so that every report recorded is
+// logged, however its request went; one that couldn't be read is left for
+// a later pass, which logs it and drops it once it can.
 func (s *Service) dropRecords(ctx context.Context, inv *inventory, machine string) {
+	r, read := inv.reports[machine]
+	if read && r.Usage != nil {
+		s.logUsage(r)
+	}
 	keep := inv.unrecorded(machine)
 	for _, o := range inv.machineKeys[machine] {
-		if keep && o.Name == admissionKey(machine) {
+		if keep && o.Name == admissionKey(machine) || !read && o.Name == reportKey(machine) {
 			continue
 		}
 		if err := s.Objects.Delete(ctx, o.Name, o.Generation); err != nil && !errors.Is(err, store.ErrNotFound) {

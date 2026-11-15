@@ -48,9 +48,12 @@ type FailedAnswer struct {
 	Reason string `json:"reason"`
 }
 
-// FinishedRequest is the supervisor's report, which says only that the job
-// is done.
-type FinishedRequest struct{}
+// FinishedRequest is the supervisor's report that the job is done, with
+// what its machine used, which the service records and logs, and decides
+// nothing from.
+type FinishedRequest struct {
+	Usage *Usage `json:"usage,omitempty"`
+}
 
 // errNotOurs means the caller isn't a machine the service made.
 var errNotOurs = errors.New("not one of the service's machines")
@@ -573,7 +576,46 @@ func (s *Service) jobFinished(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if _, _, err := createOnce(ctx, s.Objects, reportKey(m.Name), Report{Machine: m.Name, At: s.now()}); err != nil {
+	rep := Report{Machine: m.Name, At: s.now()}
+	if u := req.Usage; u != nil {
+		if u.valid() {
+			// With what the usage's log needs of the machine and its job,
+			// which may be gone, records and all, by the time it's logged.
+			rep.Usage, rep.Zone, rep.MachineType, rep.Spot = u, m.Zone, m.MachineType, m.Spot
+			rep.Selector, rep.RepositoryID = m.Selector.String(), m.RepositoryID
+			a, _, ok, err := getJSON[Admission](ctx, s.Objects, admissionKey(m.Name))
+			if err != nil {
+				s.log().Warn("reading the admission of a machine that reported", "machine", m.Name, "err", err.Error())
+				retryLater(w, "the report wasn't recorded; send it again")
+				return
+			}
+			if ok && a.Allowed {
+				rep.RunID, rep.RunAttempt, rep.JobID, rep.JobName = a.RunID, a.RunAttempt, a.JobID, a.JobName
+			}
+			if !ok {
+				// A pass deletes a machine before its records, so one with
+				// no admission either had no job admitted, or is gone, and
+				// this report outlived it: recorded now, it would be logged
+				// without the job it was for.
+				in, err := s.Compute.Instance(ctx, m.Zone, m.Name)
+				switch {
+				case errors.Is(err, compute.ErrNotFound) || err == nil && in.ID != m.ID:
+					s.log().Info("a report outlived its machine; not recorded", "machine", m.Name)
+					refuse(w, "not one of the service's machines")
+					return
+				case err != nil:
+					s.log().Warn("looking for a machine that reported", "machine", m.Name, "err", err.Error())
+					retryLater(w, "the report wasn't recorded; send it again")
+					return
+				}
+			}
+		} else {
+			s.log().Warn("a report's usage isn't one a machine could have measured; recording the report without it", "machine", m.Name)
+		}
+	}
+	// The first report recorded is the record: one sent again after its
+	// answer was lost, or a job's own, changes nothing.
+	if _, _, err := createOnce(ctx, s.Objects, reportKey(m.Name), rep); err != nil {
 		s.log().Warn("recording a report", "machine", m.Name, "err", err.Error())
 		retryLater(w, "the report wasn't recorded; send it again")
 		return

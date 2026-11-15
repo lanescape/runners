@@ -124,6 +124,11 @@ func setup(t *testing.T, jitConfig, steps string) *env {
 	cfg.PowerOff = []string{"curl", "-fsS", "-X", "POST", md + "/_emulator/poweroff"}
 	cfg.MetadataFor = duration(time.Second)
 	cfg.ReportFor = duration(10 * time.Second)
+	// A procfs of the test's own, which the runner's steps can change.
+	cfg.Proc = filepath.Join(dir, "proc")
+	writeProc(t, cfg.Proc, startProc)
+	cfg.Env = append(cfg.Env, "PROC="+cfg.Proc)
+	cfg.SampleEvery = duration(20 * time.Millisecond)
 	return &env{t: t, emu: emu, svc: svc, url: srv.URL, dir: dir, cfg: cfg, out: &lockedBuffer{}}
 }
 
@@ -154,9 +159,9 @@ func (e *env) runnerEnv() map[string]string {
 	return out
 }
 
-// The report says only that the job is done: an empty object, signed with
-// the machine's identity token. Whether the disk is saved is the job's to
-// ask from its steps (specs/0005-interface.md, Work disks).
+// The report says that the job is done, with what the machine used, signed
+// with the machine's identity token. Whether the disk is saved is the job's
+// to ask from its steps (specs/0005-interface.md, Work disks).
 func TestAJobsReport(t *testing.T) {
 	t.Setenv("SUPERVISOR_SECRET", "not for the runner")
 	e := setup(t, jit, `echo '{"save": true}' > "$PWD/save"`)
@@ -168,8 +173,8 @@ func TestAJobsReport(t *testing.T) {
 	if _, ok := env["SUPERVISOR_SECRET"]; ok {
 		t.Fatal("the supervisor's own environment reached the runner")
 	}
-	if len(e.svc.reports) != 1 || e.svc.reports[0] != "{}" {
-		t.Fatalf("reports = %q, want one empty object", e.svc.reports)
+	if len(e.svc.reports) != 1 || e.usage(0) == nil {
+		t.Fatalf("reports = %q, want one with its usage", e.svc.reports)
 	}
 	if !e.poweredOff() {
 		t.Fatal("the machine wasn't powered off")
@@ -208,7 +213,7 @@ func (e *env) guest() (string, bool) {
 func TestAFailedJobIsReported(t *testing.T) {
 	e := setup(t, jit, "exit 3")
 	e.supervise()
-	if len(e.svc.reports) != 1 || e.svc.reports[0] != "{}" {
+	if len(e.svc.reports) != 1 || e.usage(0) == nil {
 		t.Fatalf("reports = %q", e.svc.reports)
 	}
 	if !e.poweredOff() {
