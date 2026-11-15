@@ -216,6 +216,10 @@ func (e *Emulator) mutating(do func(r *http.Request, zone string) (*operation, *
 				return
 			}
 			if op := e.requests[rid]; op != nil {
+				if first := e.firstAnswers[rid]; e.staleReplays && first != nil {
+					writeJSON(w, http.StatusOK, first)
+					return
+				}
 				writeJSON(w, http.StatusOK, e.opJSON(op))
 				return
 			}
@@ -225,10 +229,11 @@ func (e *Emulator) mutating(do func(r *http.Request, zone string) (*operation, *
 			writeError(w, err)
 			return
 		}
+		answer := e.opJSON(op)
 		if rid != "" {
-			e.requests[rid] = op
+			e.requests[rid], e.firstAnswers[rid] = op, answer
 		}
-		writeJSON(w, http.StatusOK, e.opJSON(op))
+		writeJSON(w, http.StatusOK, answer)
 	}
 }
 
@@ -1081,6 +1086,7 @@ func (e *Emulator) insertImage(r *http.Request, _ string) (*operation, *apiError
 	}
 	if e.pendingImages {
 		im.status = "PENDING"
+		op.doneAt, im.making = time.Now().Add(100*365*24*time.Hour), op
 	}
 	e.images[im.name] = im
 	return op, nil

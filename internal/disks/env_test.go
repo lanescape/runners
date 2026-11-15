@@ -466,11 +466,27 @@ func (jb *job) started() int {
 // does, and runs a pass.
 func (jb *job) finish(save bool) {
 	jb.e.t.Helper()
+	jb.report(save)
+	jb.e.gce.Shutdown(jb.in.Zone, jb.in.Name)
+	jb.e.pass()
+}
+
+// report is finish up to the supervisor's report: the machine is still
+// running.
+func (jb *job) report(save bool) {
+	jb.e.t.Helper()
 	if save && jb.e.familyOf(jb.j.ID) != "" {
 		if code := jb.call("/v1/disks/save", map[string]bool{"save": true}, nil); code != http.StatusOK {
 			jb.e.t.Fatalf("save request: %d", code)
 		}
 	}
+	jb.runSteps()
+	jb.sendReport()
+}
+
+// runSteps lets the job's steps run, and waits for its runner to exit.
+func (jb *job) runSteps() {
+	jb.e.t.Helper()
 	_ = os.WriteFile(jb.gate, []byte("ok"), 0o644)
 	select {
 	case err := <-jb.done:
@@ -480,6 +496,11 @@ func (jb *job) finish(save bool) {
 	case <-time.After(10 * time.Second):
 		jb.e.t.Fatal("the runner never finished")
 	}
+}
+
+// sendReport sends the supervisor's report.
+func (jb *job) sendReport() {
+	jb.e.t.Helper()
 	tok := jb.e.gce.Identity.Mint(jb.e.gce.IdentityClaims(jb.in.Zone, jb.in.Name, audience, true))
 	b, _ := json.Marshal(machines.FinishedRequest{})
 	req, _ := http.NewRequest(http.MethodPost, jb.e.url+"/v1/jobs/finished", bytes.NewReader(b))
@@ -492,8 +513,6 @@ func (jb *job) finish(save bool) {
 	if resp.StatusCode != http.StatusNoContent {
 		jb.e.t.Fatalf("report: %d", resp.StatusCode)
 	}
-	jb.e.gce.Shutdown(jb.in.Zone, jb.in.Name)
-	jb.e.pass()
 }
 
 // source is the image the job's work disk was made from, or "".

@@ -74,10 +74,7 @@ const (
 	// Kept is how long base images other than the current one, and
 	// records of other keys, stay: longer than any pass of a revision of
 	// the service a deploy replaced can run.
-	Kept = 24 * time.Hour
-	// imageWait is as long as a pass waits for an image to be made; one
-	// still being made is seen at the next pass.
-	imageWait    = 30 * time.Second
+	Kept         = 24 * time.Hour
 	consoleLimit = 4 << 20
 	reasonLimit  = 500
 )
@@ -781,8 +778,11 @@ func (s *Service) stopAndMake(ctx context.Context, arch, key string, b compute.I
 	s.makeImage(ctx, arch, key, got)
 }
 
-// makeImage makes the base image from a stopped builder's boot disk. A pass
-// waits only a short while for it; the next sees it ready.
+// makeImage asks for the base image from a stopped builder's boot disk. A
+// pass never waits for it, since Compute Engine can take minutes to make it,
+// and the pass's lease would hold up every queued job meanwhile; a later
+// pass sees it ready. Asked again while it's being made, Compute Engine
+// answers with the same operation.
 func (s *Service) makeImage(ctx context.Context, arch, key string, b compute.Instance) {
 	disk := b.Name
 	for _, d := range b.Disks {
@@ -791,17 +791,13 @@ func (s *Service) makeImage(ctx context.Context, arch, key string, b compute.Ins
 		}
 	}
 	name := ImageName(arch, key)
-	ictx, cancel := context.WithTimeout(ctx, imageWait)
-	defer cancel()
-	err := s.Compute.CreateImage(ictx, compute.ImageSpec{Name: name, SourceZone: b.Zone, SourceDisk: disk,
+	_, err := s.Compute.StartImage(ctx, compute.ImageSpec{Name: name, SourceZone: b.Zone, SourceDisk: disk,
 		Labels: map[string]string{LabelKind: KindBase, LabelArch: arch, LabelKey: key, LabelPrograms: s.programs()}},
 		requestID("base image", name))
 	switch {
 	case err == nil:
-		s.log().Info("base image made", "image", name, "arch", arch, "key", key, "builder", b.Name)
+		s.log().Info("base image being made", "image", name, "arch", arch, "key", key, "builder", b.Name)
 	case errors.Is(err, compute.ErrExists):
-	case compute.IsUnavailable(err):
-		s.log().Info("base image still being made", "image", name, "err", err.Error())
 	default:
 		s.log().Warn("making a base image", "image", name, "err", err.Error())
 	}

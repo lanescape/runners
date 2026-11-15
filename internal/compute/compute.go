@@ -219,7 +219,11 @@ type API interface {
 	DeleteDisk(ctx context.Context, zone, name, requestID string) error
 	Images(ctx context.Context) ([]Image, error)
 	Image(ctx context.Context, name string) (Image, error)
-	CreateImage(ctx context.Context, spec ImageSpec, requestID string) error
+	// StartImage asks for an image and returns without waiting for it
+	// to be made, which can take minutes: the caller sees it made, or
+	// failed, by its status, later. done reports that the request's
+	// operation has finished, without an error.
+	StartImage(ctx context.Context, spec ImageSpec, requestID string) (done bool, err error)
 	DeleteImage(ctx context.Context, name, requestID string) error
 	// SetImageLabels replaces an image's labels, if they're still those
 	// fingerprint names.
@@ -352,23 +356,27 @@ func opError(op *gce.Operation) error {
 // change sends a change, again with the same request ID if no answer came,
 // and waits for its operation.
 func (c *Client) change(ctx context.Context, zone string, send func() (*gce.Operation, error)) error {
-	var op *gce.Operation
-	var err error
+	op, err := c.send(ctx, send)
+	if err != nil {
+		return err
+	}
+	return c.wait(ctx, zone, op)
+}
+
+// send sends a change, again with the same request ID if no answer came,
+// and returns its operation as Compute Engine answered it.
+func (c *Client) send(ctx context.Context, send func() (*gce.Operation, error)) (*gce.Operation, error) {
 	for attempt := 0; ; attempt++ {
-		op, err = send()
+		op, err := send()
 		err = classify(err)
 		if err == nil || !IsUnavailable(err) || attempt >= c.Retries || ctx.Err() != nil {
-			break
+			return op, err
 		}
 		select {
 		case <-ctx.Done():
 		case <-time.After(time.Duration(attempt+1) * 200 * time.Millisecond):
 		}
 	}
-	if err != nil {
-		return err
-	}
-	return c.wait(ctx, zone, op)
 }
 
 // wait waits for an operation to finish, as long as ctx allows.
@@ -615,13 +623,42 @@ func (c *Client) Image(ctx context.Context, name string) (Image, error) {
 	return imageOf(i), nil
 }
 
-// CreateImage implements API. It waits for the image to be made, as long as
-// ctx allows.
-func (c *Client) CreateImage(ctx context.Context, s ImageSpec, requestID string) error {
+// StartImage implements API. It returns once Compute Engine has taken the
+// request: an operation that has already finished with an error is that
+// error. Asked again with the same request ID, Compute Engine makes nothing
+// again and answers with that request's operation; since it doesn't promise
+// the operation as it now stands, the operation is read afresh, once,
+// without waiting, so that a caller that finds no image, and asks again,
+// learns that the request failed, or that its operation is forgotten, or
+// finished with no image left, which someone else deleted, and asks with
+// another ID.
+func (c *Client) StartImage(ctx context.Context, s ImageSpec, requestID string) (bool, error) {
 	im := &gce.Image{Name: s.Name, Labels: s.Labels, SourceDisk: c.zonePath(s.SourceZone) + "/disks/" + s.SourceDisk}
-	return c.change(ctx, "", func() (*gce.Operation, error) {
+	op, err := c.send(ctx, func() (*gce.Operation, error) {
 		return c.svc.Images.Insert(c.project, im).RequestId(requestID).Context(ctx).Do()
 	})
+	if err != nil {
+		return false, err
+	}
+	if op.Status != "DONE" && op.Name != "" {
+		now, err := c.svc.GlobalOperations.Get(c.project, op.Name).Context(ctx).Do()
+		switch err := classify(err); {
+		case err == nil:
+			op = now
+		case IsUnavailable(err):
+			// Read when the caller asks again.
+		default:
+			// Compute Engine forgets a finished operation after as little
+			// as an hour: one it no longer has can't be told apart from a
+			// failure, and the caller asks again with another ID.
+			return false, fmt.Errorf("reading operation %s: %w", op.Name, err)
+		}
+	}
+	if op.Status == "DONE" {
+		err := opError(op)
+		return err == nil, err
+	}
+	return false, nil
 }
 
 // DeleteImage implements API.

@@ -558,34 +558,48 @@ func matches(im compute.Image, rec Image) bool {
 	return true
 }
 
-// make makes a recorded image from its machine's work disk, then records
-// it ready. A confirmed failure is tried again under a new request ID.
+// make moves the making of a recorded image from its machine's work disk
+// on, and records it ready once Compute Engine shows it so. It never waits
+// for Compute Engine to make it, which can take minutes, and the pass's
+// lease would hold up every queued job meanwhile: one asked for, or still
+// being made, is machines.ErrPending, and a later pass finds it ready. A
+// confirmed failure is tried again under a new request ID.
 func (s *Service) make(ctx context.Context, key string, rec Image, gen int64) (Image, int64, error) {
 	if rec.State != ImageMaking {
 		return rec, gen, nil
 	}
-	err := s.Compute.CreateImage(ctx, compute.ImageSpec{Name: rec.Image, SourceZone: rec.Zone, SourceDisk: machines.WorkDisk(rec.Machine),
-		Labels: labels(rec)}, compute.RequestID("image", rec.Image, strconv.Itoa(rec.Attempt)))
-	if err == nil || errors.Is(err, compute.ErrExists) {
-		// Made, or there from an earlier request of ours, since only the
-		// service makes images of these names; but it's made only once
-		// Compute Engine shows it ready. One still being made is waited
-		// for; a failed one is deleted, and made again by the next try.
-		im, ierr := s.Compute.Image(ctx, rec.Image)
-		switch {
-		case ierr != nil:
-			err = ierr
-		case im.Status == "READY" && matches(im, rec):
-			err = nil
-		case im.Status == "PENDING":
-			return rec, gen, fmt.Errorf("image %s is still being made", rec.Image)
-		default:
-			s.log().Warn("an image that failed, or isn't the one recorded, is deleted to be made again", "image", rec.Image, "status", im.Status)
-			if derr := s.Compute.DeleteImage(ctx, rec.Image, freshID("delete image", rec.Image)); derr != nil && !errors.Is(derr, compute.ErrNotFound) {
-				return rec, gen, derr
+	im, err := s.Compute.Image(ctx, rec.Image)
+	if errors.Is(err, compute.ErrNotFound) {
+		var done bool
+		done, err = s.Compute.StartImage(ctx, compute.ImageSpec{Name: rec.Image, SourceZone: rec.Zone, SourceDisk: machines.WorkDisk(rec.Machine),
+			Labels: labels(rec)}, compute.RequestID("image", rec.Image, strconv.Itoa(rec.Attempt)))
+		if err == nil || errors.Is(err, compute.ErrExists) {
+			// Asked for, or there from an earlier request of ours, since
+			// only the service makes images of these names: it's looked
+			// at once, in case it's made already.
+			im, err = s.Compute.Image(ctx, rec.Image)
+			switch {
+			case errors.Is(err, compute.ErrNotFound) && done:
+				// Made, by a request whose answer came back as done, and
+				// deleted since: another request makes it again.
+				err = fmt.Errorf("image %s was made and is gone", rec.Image)
+			case errors.Is(err, compute.ErrNotFound):
+				return rec, gen, fmt.Errorf("image %s asked for: %w", rec.Image, machines.ErrPending)
 			}
-			err = fmt.Errorf("image %s was %s", rec.Image, im.Status)
 		}
+	}
+	switch {
+	case err != nil:
+	case im.Status == "READY" && matches(im, rec):
+	case im.Status == "PENDING":
+		return rec, gen, fmt.Errorf("image %s is still being made: %w", rec.Image, machines.ErrPending)
+	default:
+		// A failed one is deleted, and made again by the next try.
+		s.log().Warn("an image that failed, or isn't the one recorded, is deleted to be made again", "image", rec.Image, "status", im.Status)
+		if derr := s.Compute.DeleteImage(ctx, rec.Image, freshID("delete image", rec.Image)); derr != nil && !errors.Is(derr, compute.ErrNotFound) {
+			return rec, gen, derr
+		}
+		err = fmt.Errorf("image %s was %s", rec.Image, im.Status)
 	}
 	if err != nil {
 		if !compute.IsUnavailable(err) {
