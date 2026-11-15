@@ -211,7 +211,9 @@ type Bases interface {
 	// a builder is waiting for, which no job draws on for the rest of the
 	// pass.
 	Pass(p *pass.Pass) (short []string)
-	Boot(images []compute.Image, arch string) (string, bool)
+	// Boot is the base image an architecture's machines boot now, or, as
+	// a bases.ErrNoImage, why there's none they may.
+	Boot(images []compute.Image, arch string) (string, error)
 }
 
 // BootLogs reads a machine's serial console, by its numeric ID, from Cloud

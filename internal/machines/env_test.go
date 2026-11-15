@@ -21,6 +21,7 @@ import (
 	ghemu "github.com/lanescape/runners/emulators/github"
 	gcsemu "github.com/lanescape/runners/emulators/storage"
 	"github.com/lanescape/runners/internal/auth"
+	"github.com/lanescape/runners/internal/bases"
 	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/compute"
 	"github.com/lanescape/runners/internal/github"
@@ -88,10 +89,12 @@ func setup(t *testing.T) *env {
 	t.Cleanup(gh.Close)
 	gce := gceemu.New(gceemu.WithClock(clock))
 	t.Cleanup(gce.Close)
-	gce.AddImage("lsr-base-amd64-old", "", "X86_64")
+	// Base images made with the service's programs.
+	made := map[string]string{bases.LabelPrograms: programs()}
+	gce.AddLabelledImage("lsr-base-amd64-old", "", "X86_64", made)
 	clock.Advance(time.Second)
-	gce.AddImage("lsr-base-amd64-new", "", "X86_64")
-	gce.AddImage("lsr-base-arm64-1", "", "ARM64")
+	gce.AddLabelledImage("lsr-base-amd64-new", "", "X86_64", made)
+	gce.AddLabelledImage("lsr-base-arm64-1", "", "ARM64", made)
 	gcs := gcsemu.New()
 	t.Cleanup(gcs.Close)
 	gcs.CreateBucket("state")

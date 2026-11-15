@@ -65,6 +65,7 @@ type inventory struct {
 	groups    map[string]github.RunnerGroup
 	checked   map[string]github.RunnerGroup
 	images    map[string]string
+	noImage   map[string]error
 	attempted map[string]bool
 	deleted   map[string]bool
 }
@@ -107,7 +108,7 @@ func (s *Service) Pass(p *pass.Pass) error {
 func (s *Service) inventory(p *pass.Pass) *inventory {
 	ctx := p.Context()
 	inv := &inventory{machines: map[string]Machine{}, repos: map[int64]github.Repository{}, groups: nil,
-		checked: map[string]github.RunnerGroup{}, images: map[string]string{}, attempted: map[string]bool{}, deleted: map[string]bool{}}
+		checked: map[string]github.RunnerGroup{}, images: map[string]string{}, noImage: map[string]error{}, attempted: map[string]bool{}, deleted: map[string]bool{}}
 
 	// Machines and disks first, then records.
 	inv.machinesComplete, inv.disksComplete = true, true
@@ -542,6 +543,15 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 			running++
 			continue
 		}
+		if errors.Is(err, bases.ErrNoImage) {
+			// It waits queued for a base image its machine may boot:
+			// no runner is registered and no machine recorded for it,
+			// and the hour its machines have to start runs only from
+			// its first.
+			s.log().Info("a job waits for a base image its machine may boot", "repository_id", w.repo.ID, "job_id", w.job.ID,
+				"selector", w.sel.String(), "why", err.Error())
+			continue
+		}
 		s.log().Warn("no machine made; the job stays queued", "repository_id", w.repo.ID, "job_id", w.job.ID, "selector", w.sel.String(),
 			"err", err.Error())
 		if compute.IsCapacity(err) {
@@ -861,24 +871,30 @@ func (s *Service) group(ctx context.Context, inv *inventory, repo github.Reposit
 
 // baseImage is the base image machines of an architecture boot,
 // lsr-base-<arch>-<key>: the current key's once it's ready, and until then
-// the previous one (specs/0003-disks.md, Which image machines boot).
+// the previous one, if it was made with the service's own programs
+// (specs/0003-disks.md, Which image machines boot). With none, the error, a
+// bases.ErrNoImage, says why, and the architecture's jobs wait queued; the
+// pass doesn't look again.
 func (s *Service) baseImage(ctx context.Context, inv *inventory, arch string) (string, error) {
 	if im, ok := inv.images[arch]; ok {
 		return im, nil
+	}
+	if err, ok := inv.noImage[arch]; ok {
+		return "", err
 	}
 	ims, err := s.Compute.Images(ctx)
 	if err != nil {
 		return "", err
 	}
 	var name string
-	var ok bool
 	if s.Bases != nil {
-		name, ok = s.Bases.Boot(ims, arch)
+		name, err = s.Bases.Boot(ims, arch)
 	} else {
-		name, ok = bases.Boot(ims, arch, "")
+		name, err = bases.Boot(ims, arch, "", "")
 	}
-	if !ok {
-		return "", fmt.Errorf("there's no ready base image for %s", arch)
+	if err != nil {
+		inv.noImage[arch] = err
+		return "", err
 	}
 	inv.images[arch] = name
 	return name, nil

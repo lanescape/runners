@@ -625,9 +625,12 @@ func (f *fakeBases) Pass(*pass.Pass) []string {
 	return f.short
 }
 
-func (f *fakeBases) Boot(ims []compute.Image, arch string) (string, bool) {
-	return bases.Boot(ims, arch, f.key)
+func (f *fakeBases) Boot(ims []compute.Image, arch string) (string, error) {
+	return bases.Boot(ims, arch, f.key, programs())
 }
+
+// programs is the lsr-programs label of the images this service makes.
+func programs() string { return bases.ProgramsLabel(baseimage.Digest()) }
 
 // TestMachinesBootTheCurrentKeysBaseImage: machines boot the current key's
 // base image once it's ready, even an older one, and the previous until
@@ -705,6 +708,200 @@ func TestTheFirstDeploysJobsWaitForTheBaseImage(t *testing.T) {
 		if d.Name == m.Name && !strings.HasSuffix(d.SourceImage, "/"+bases.ImageName("amd64", keys["amd64"])) {
 			t.Fatalf("the job's machine boots %s", d.SourceImage)
 		}
+	}
+}
+
+// newKey is a test whose base images' key has just changed: amd64's
+// earlier image, made for another key, has the labels given, and arm64's
+// image for the current key is ready. It returns the real base images'
+// service and the keys.
+func newKey(t *testing.T, earlier map[string]string) (*env, map[string]string) {
+	e := setup(t)
+	e.gce.DeleteImageNow("lsr-base-amd64-old")
+	e.gce.DeleteImageNow("lsr-base-amd64-new")
+	e.gce.AddPublicImage(config.DebianProject, e.cfg.Base.Debian["amd64"], "X86_64")
+	keys := bases.Keys(e.cfg)
+	e.gce.AddImage(bases.ImageName("arm64", keys["arm64"]), "", "ARM64")
+	e.gce.AddLabelledImage(earlierImage, "", "X86_64", earlier)
+	gcec, err := compute.New(context.Background(), e.gce.Project, e.gce.ClientOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.svc.Bases = &bases.Service{Config: e.cfg, Compute: gcec, Objects: e.svc.Objects, Clock: e.clock, Logger: e.svc.Logger,
+		Network: machines.Network, Subnetwork: machines.Subnetwork, DiskType: machines.DiskType, Keys: keys}
+	return e, keys
+}
+
+const earlierImage = "lsr-base-amd64-0000000000000000000a"
+
+// source is the image a machine's boot disk was made from.
+func (e *env) source(name string) string {
+	for _, d := range e.gce.Disks() {
+		if d.Name == name {
+			return d.SourceImage[strings.LastIndex(d.SourceImage, "/")+1:]
+		}
+	}
+	return ""
+}
+
+// TestJobsWaitForABaseImageOfTheServicesPrograms: after a deploy that
+// changes the service's programs, a queued job gets no machine from the
+// earlier image, made with other programs, or with none recorded, as images
+// made before they had the label: it waits queued, with no runner
+// registered and nothing recorded of it, for as long as the build takes,
+// even past the hour a job's machines have to start; jobs of the other
+// architecture go on; and the one builder goes on making the image, which
+// the job's machine boots once it's ready (specs/0003-disks.md, Which image
+// machines boot).
+func TestJobsWaitForABaseImageOfTheServicesPrograms(t *testing.T) {
+	for name, earlier := range map[string]map[string]string{
+		"other programs":      {bases.LabelKind: bases.KindBase, bases.LabelPrograms: "ffffffffffffffffffff"},
+		"no programs' record": {bases.LabelKind: bases.KindBase},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e, keys := newKey(t, earlier)
+			run := e.mainRun()
+			job := e.queue(run, sel2)
+			e.pass()
+			e.wantMachines(0)
+			builder := bases.BuilderName("amd64", keys["amd64"])
+			b, ok := e.gce.Instance(zoneA, builder)
+			if !ok {
+				t.Fatal("no builder")
+			}
+			if len(e.gh.Runners()) != 0 {
+				t.Fatalf("runners registered for a job that waits: %+v", e.gh.Runners())
+			}
+			if !e.logged("a job waits for a base image its machine may boot") || !e.logged(earlierImage) ||
+				!e.logged("its jobs wait for "+bases.ImageName("amd64", keys["amd64"])) {
+				t.Fatal("why the job waits isn't logged")
+			}
+			// An arm64 job, whose image is ready, gets its machine.
+			e.queue(e.mainRun(), "lanescape-16vcpu-linux-arm64")
+			e.pass()
+			if m := e.one(); m.MachineType != "c4a-highcpu-16" {
+				t.Fatalf("machine = %+v", m)
+			}
+			// The amd64 job's machines.
+			mine := func() []gceemu.InstanceState {
+				var out []gceemu.InstanceState
+				for _, m := range e.ours() {
+					if m.Labels[machines.LabelJob] == strconv.FormatInt(job.ID, 10) {
+						out = append(out, m)
+					}
+				}
+				return out
+			}
+			// The builder says it built the image, which Compute Engine is
+			// slow to make: the job waits past its machines' hour, and is
+			// neither refused nor given a machine, and no other builder is
+			// made.
+			e.gce.HoldImages(true)
+			e.gce.WriteSerial(zoneA, builder, baseimage.Built+"amd64-"+keys["amd64"]+"\n")
+			e.pass()
+			e.clock.Advance(machines.RetryLimit + time.Minute)
+			e.pass()
+			e.pass()
+			if ms := mine(); len(ms) != 0 {
+				t.Fatalf("the waiting job's machines = %+v", ms)
+			}
+			if _, ok := e.record("refusals/5001/" + strconv.FormatInt(run.ID, 10) + "-1.json"); ok {
+				t.Fatal("the waiting job's run was refused")
+			}
+			if st, _ := e.gh.RunState(run); st == "completed" {
+				t.Fatal("the waiting job's run was ended")
+			}
+			if _, ok := e.record("jobs/5001/" + strconv.FormatInt(job.ID, 10) + ".json"); ok {
+				t.Fatal("a machine was recorded for the waiting job")
+			}
+			if got, ok := e.gce.Instance(zoneA, builder); !ok || got.ID != b.ID {
+				t.Fatalf("builder = %+v, %v; want the one made first", got, ok)
+			}
+			for _, in := range e.gce.Instances() {
+				if strings.HasPrefix(in.Name, bases.BuilderPrefix) && in.Name != builder {
+					t.Fatalf("another builder: %s", in.Name)
+				}
+			}
+			// Once the image is ready, the job's machine boots it.
+			e.gce.HoldImages(false)
+			e.pass()
+			ms := mine()
+			if len(ms) != 1 {
+				t.Fatalf("the job's machines = %+v", ms)
+			}
+			if got := e.source(ms[0].Name); got != bases.ImageName("amd64", keys["amd64"]) {
+				t.Fatalf("the job's machine boots %s", got)
+			}
+		})
+	}
+}
+
+// TestJobsBootAnEarlierImageOfTheSamePrograms: after a deploy that changes
+// the base images' key but not the service's programs, such as Debian's
+// image alone, jobs' machines boot the earlier image until the new one is
+// ready.
+func TestJobsBootAnEarlierImageOfTheSamePrograms(t *testing.T) {
+	e, keys := newKey(t, map[string]string{bases.LabelKind: bases.KindBase, bases.LabelPrograms: programs()})
+	run := e.mainRun()
+	e.queue(run, sel2)
+	e.pass()
+	if got := e.source(e.one().Name); got != earlierImage {
+		t.Fatalf("while the new image is made, the machine boots %s", got)
+	}
+	if _, ok := e.gce.Instance(zoneA, bases.BuilderName("amd64", keys["amd64"])); !ok {
+		t.Fatal("no builder")
+	}
+}
+
+// TestJobsWaitWhileTheBaseImageCantBeMade: once every builder of the key
+// has failed, with no earlier image of the service's programs, a job still
+// waits queued, never refused, while the error logged at every pass says
+// why; once the maintainer deletes the key's record, a new build gives it
+// its machine.
+func TestJobsWaitWhileTheBaseImageCantBeMade(t *testing.T) {
+	e, keys := newKey(t, map[string]string{bases.LabelKind: bases.KindBase, bases.LabelPrograms: "ffffffffffffffffffff"})
+	ctx := context.Background()
+	run := e.mainRun()
+	e.queue(run, sel2)
+	builder := bases.BuilderName("amd64", keys["amd64"])
+	for range bases.Attempts {
+		e.pass()
+		if _, ok := e.gce.Instance(zoneA, builder); !ok {
+			t.Fatal("no builder")
+		}
+		e.gce.WriteSerial(zoneA, builder, baseimage.Failed+"no network\n")
+		e.pass()
+		e.clock.Advance(time.Minute)
+	}
+	e.clock.Advance(machines.RetryLimit)
+	e.pass()
+	e.pass()
+	e.wantMachines(0)
+	if _, ok := e.gce.Instance(zoneA, builder); ok {
+		t.Fatal("a fourth builder")
+	}
+	if !e.logged("no machine of its architecture until a deploy changes the key or the maintainer deletes its record") {
+		t.Fatal("giving up isn't logged as leaving jobs waiting")
+	}
+	if _, ok := e.record("refusals/5001/" + strconv.FormatInt(run.ID, 10) + "-1.json"); ok {
+		t.Fatal("the waiting job's run was refused")
+	}
+	if st, _ := e.gh.RunState(run); st == "completed" {
+		t.Fatal("the waiting job's run was ended")
+	}
+	rec := "bases/amd64-" + keys["amd64"] + ".json"
+	_, gen, err := e.svc.Objects.Get(ctx, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.Objects.Delete(ctx, rec, gen); err != nil {
+		t.Fatal(err)
+	}
+	e.pass()
+	e.gce.WriteSerial(zoneA, builder, baseimage.Built+"amd64-"+keys["amd64"]+"\n")
+	e.pass()
+	if got := e.source(e.one().Name); got != bases.ImageName("amd64", keys["amd64"]) {
+		t.Fatalf("the job's machine boots %s", got)
 	}
 }
 

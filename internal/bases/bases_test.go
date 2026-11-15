@@ -168,6 +168,23 @@ func (e *env) boot(arch string) string {
 	return name
 }
 
+// programs is the lsr-programs label of the images this service makes.
+func programs() string { return bases.ProgramsLabel(machine.Digest()) }
+
+// labelled are an image's labels as one made with programs, for its
+// architecture and key.
+func labelled(name, programs string) map[string]string {
+	rest := strings.TrimPrefix(name, bases.ImagePrefix)
+	arch, key, _ := strings.Cut(rest, "-")
+	l := map[string]string{bases.LabelKind: bases.KindBase, bases.LabelArch: arch, bases.LabelKey: key}
+	if programs != "" {
+		l[bases.LabelPrograms] = programs
+	}
+	return l
+}
+
+func gceArch(arch string) string { return map[string]string{"amd64": "X86_64", "arm64": "ARM64"}[arch] }
+
 // say writes a builder's result to its console, as the script does.
 func (e *env) say(b gceemu.InstanceState, line string) {
 	e.gce.WriteSerial(b.Zone, b.Name, "[   12.000] some boot message\nstartup-script: installing\n\n"+line+"\n")
@@ -258,33 +275,62 @@ func TestResult(t *testing.T) {
 
 func TestBoot(t *testing.T) {
 	t0 := time.Now()
+	const progs = "0123456789abcdef0123"
+	same := map[string]string{bases.LabelPrograms: progs}
+	other := map[string]string{bases.LabelPrograms: "ffffffffffffffffffff"}
 	ims := []compute.Image{
 		{Name: "lsr-base-amd64-aaaa", Status: "READY", Created: t0},
-		{Name: "lsr-base-amd64-bbbb", Status: "READY", Created: t0.Add(time.Hour)},
-		{Name: "lsr-base-amd64-cccc", Status: "PENDING", Created: t0.Add(2 * time.Hour)},
-		{Name: "lsr-base-amd64-dddd", Status: "FAILED", Created: t0.Add(3 * time.Hour)},
-		{Name: "lsr-base-arm64-eeee", Status: "READY", Created: t0.Add(4 * time.Hour)},
-		{Name: "lsr-5001-0123456789abcdef0123-1-abcdefgh", Status: "READY", Created: t0.Add(5 * time.Hour)},
+		{Name: "lsr-base-amd64-bbbb", Status: "READY", Created: t0.Add(time.Hour), Labels: same},
+		{Name: "lsr-base-amd64-cccc", Status: "PENDING", Created: t0.Add(2 * time.Hour), Labels: same},
+		{Name: "lsr-base-amd64-dddd", Status: "FAILED", Created: t0.Add(3 * time.Hour), Labels: same},
+		{Name: "lsr-base-arm64-eeee", Status: "READY", Created: t0.Add(4 * time.Hour), Labels: same},
+		{Name: "lsr-5001-0123456789abcdef0123-1-abcdefgh", Status: "READY", Created: t0.Add(5 * time.Hour), Labels: same},
+		// Newer than bbbb, but made with other programs, or with no record
+		// of them, as images made before they had the label.
+		{Name: "lsr-base-amd64-gggg", Status: "READY", Created: t0.Add(6 * time.Hour), Labels: other},
+		{Name: "lsr-base-amd64-hhhh", Status: "READY", Created: t0.Add(7 * time.Hour)},
+		{Name: "lsr-base-arm64-iiii", Status: "READY", Created: t0.Add(8 * time.Hour), Labels: other},
 	}
 	for _, tc := range []struct {
 		arch, key, want string
-		ok              bool
 	}{
-		{"amd64", "aaaa", "lsr-base-amd64-aaaa", true}, // the current key's, though older
-		{"amd64", "cccc", "lsr-base-amd64-bbbb", true}, // still being made: the newest ready
-		{"amd64", "dddd", "lsr-base-amd64-bbbb", true}, // failed: the newest ready
-		{"amd64", "ffff", "lsr-base-amd64-bbbb", true}, // not made yet
-		{"amd64", "", "lsr-base-amd64-bbbb", true},     // no key: the newest ready
-		{"arm64", "ffff", "lsr-base-arm64-eeee", true}, // never another architecture's
-		{"arm64", "eeee", "lsr-base-arm64-eeee", true},
+		{"amd64", "aaaa", "lsr-base-amd64-aaaa"}, // the current key's, though older and unlabelled
+		{"amd64", "gggg", "lsr-base-amd64-gggg"}, // the current key's, whatever its label says
+		{"amd64", "cccc", "lsr-base-amd64-bbbb"}, // still being made: the newest ready of the same programs
+		{"amd64", "dddd", "lsr-base-amd64-bbbb"}, // failed: the newest ready of the same programs
+		{"amd64", "ffff", "lsr-base-amd64-bbbb"}, // not made yet
+		{"amd64", "", "lsr-base-amd64-hhhh"},     // no key: the newest ready of any
+		{"arm64", "ffff", "lsr-base-arm64-eeee"}, // never another architecture's
+		{"arm64", "eeee", "lsr-base-arm64-eeee"},
 	} {
-		got, ok := bases.Boot(ims, tc.arch, tc.key)
-		if got != tc.want || ok != tc.ok {
-			t.Errorf("Boot(%s, %s) = %s, %v; want %s", tc.arch, tc.key, got, ok, tc.want)
+		got, err := bases.Boot(ims, tc.arch, tc.key, progs)
+		if got != tc.want || err != nil {
+			t.Errorf("Boot(%s, %s) = %s, %v; want %s", tc.arch, tc.key, got, err, tc.want)
 		}
 	}
-	if got, ok := bases.Boot(ims[:1], "arm64", "eeee"); ok || got != "" {
-		t.Errorf("Boot with no arm64 image = %s, %v", got, ok)
+	// With only images of other programs, or none recorded, there's none.
+	for _, tc := range []struct {
+		ims  []compute.Image
+		arch string
+		why  string
+	}{
+		{ims[6:7], "amd64", "lsr-base-amd64-gggg, was made with programs ffffffffffffffffffff, not the service's, " + progs},
+		{ims[:1], "amd64", "lsr-base-amd64-aaaa, was made with no record of its programs"},
+		{ims[2:4], "amd64", "lsr-base-amd64-ffff isn't ready, and there's no other ready base image of amd64"},
+	} {
+		got, err := bases.Boot(tc.ims, tc.arch, "ffff", progs)
+		if got != "" || !errors.Is(err, bases.ErrNoImage) || !strings.Contains(err.Error(), tc.why) {
+			t.Errorf("Boot(%s) of %d images = %s, %v; want none, as %q", tc.arch, len(tc.ims), got, err, tc.why)
+		}
+	}
+	if got, err := bases.Boot(ims[:1], "arm64", "eeee", progs); err == nil || got != "" {
+		t.Errorf("Boot with no arm64 image = %s, %v", got, err)
+	}
+	if got, err := bases.Boot(ims[:1], "arm64", "", ""); !errors.Is(err, bases.ErrNoImage) || got != "" {
+		t.Errorf("Boot with no arm64 image and no key = %s, %v", got, err)
+	}
+	if bases.ProgramsLabel(machine.Digest()) != machine.Digest()[:20] {
+		t.Error("the programs' label isn't the digest's first 20 hex digits")
 	}
 }
 
@@ -294,8 +340,12 @@ func TestBoot(t *testing.T) {
 func TestABaseImageIsMadeWhenTheKeyChanges(t *testing.T) {
 	e := setup(t)
 	ctx := context.Background()
-	e.gce.AddImage("lsr-base-amd64-0000000000000000000a", "", "X86_64")
-	e.gce.AddImage("lsr-base-arm64-0000000000000000000a", "", "ARM64")
+	// The previous images were made with the same programs: the key
+	// changed for another of its inputs, such as Debian's image.
+	for _, arch := range config.Arches {
+		name := "lsr-base-" + arch + "-0000000000000000000a"
+		e.gce.AddLabelledImage(name, "", gceArch(arch), labelled(name, programs()))
+	}
 
 	e.pass()
 	for _, arch := range config.Arches {
@@ -381,7 +431,7 @@ func TestABaseImageIsMadeWhenTheKeyChanges(t *testing.T) {
 		}
 		im, ok := e.image(bases.ImageName(arch, e.keys[arch]))
 		if !ok || im.Status != "READY" || im.SourceDisk != b.Name || im.Labels[bases.LabelKind] != bases.KindBase ||
-			im.Labels[bases.LabelArch] != arch || im.Labels[bases.LabelKey] != e.keys[arch] {
+			im.Labels[bases.LabelArch] != arch || im.Labels[bases.LabelKey] != e.keys[arch] || im.Labels[bases.LabelPrograms] != programs() {
 			t.Fatalf("%s image = %+v, %v", arch, im, ok)
 		}
 		if got := e.boot(arch); got != bases.ImageName(arch, e.keys[arch]) {
@@ -500,6 +550,161 @@ func TestAFailedBuildIsTriedAgainUpToThreeTimes(t *testing.T) {
 	e.pass()
 	if _, ok := e.builder("amd64"); !ok {
 		t.Fatal("no builder once the record was deleted")
+	}
+}
+
+// bootErr is why machines of an architecture boot nothing now.
+func (e *env) bootErr(arch string) error {
+	e.t.Helper()
+	ims, err := e.gcec.Images(context.Background())
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	name, err := e.svc.Boot(ims, arch)
+	if err == nil {
+		e.t.Fatalf("%s machines boot %s", arch, name)
+	}
+	if !errors.Is(err, bases.ErrNoImage) {
+		e.t.Fatalf("%s machines boot nothing for %v, not for want of an image", arch, err)
+	}
+	return err
+}
+
+// TestMachinesWaitForAnImageOfTheServicesPrograms: while a key's image is
+// made, machines boot no earlier image made with other programs, or with
+// none recorded, as images made before they had the label: nothing boots
+// until the new image is ready, which the one builder goes on making
+// (specs/0003-disks.md, Which image machines boot).
+func TestMachinesWaitForAnImageOfTheServicesPrograms(t *testing.T) {
+	e := setup(t)
+	e.only("amd64")
+	unlabelled := "lsr-base-amd64-0000000000000000000a"
+	e.gce.AddImage(unlabelled, "", "X86_64")
+	e.clock.Advance(time.Second)
+	stale := "lsr-base-amd64-0000000000000000000b"
+	e.gce.AddLabelledImage(stale, "", "X86_64", labelled(stale, "ffffffffffffffffffff"))
+
+	e.pass()
+	b, ok := e.builder("amd64")
+	if !ok {
+		t.Fatal("no builder")
+	}
+	err := e.bootErr("amd64")
+	if !strings.Contains(err.Error(), stale+", was made with programs ffffffffffffffffffff, not the service's, "+programs()) ||
+		!strings.Contains(err.Error(), "its jobs wait for "+bases.ImageName("amd64", e.keys["amd64"])) {
+		t.Errorf("why = %v", err)
+	}
+	// Without the label, the older image is no more use.
+	e.gce.DeleteImageNow(stale)
+	if err := e.bootErr("amd64"); !strings.Contains(err.Error(), unlabelled+", was made with no record of its programs") {
+		t.Errorf("why = %v", err)
+	}
+
+	// Waiting makes no more builders.
+	for range 3 {
+		e.pass()
+	}
+	if bs := e.builders(); len(bs) != 1 || bs[0].ID != b.ID {
+		t.Fatalf("builders while machines wait = %+v", bs)
+	}
+	if r, _ := e.record("amd64"); r.Attempts != 1 || len(r.Failures) != 0 {
+		t.Fatalf("record = %+v", r)
+	}
+
+	// Once the image is ready, machines boot it.
+	e.say(b, e.built("amd64"))
+	e.pass()
+	if got := e.boot("amd64"); got != bases.ImageName("amd64", e.keys["amd64"]) {
+		t.Fatalf("machines boot %q once the image is ready", got)
+	}
+}
+
+// TestTheCurrentImageIsLabelledWithItsPrograms: the current key's image,
+// if made before images had the programs' label, is labelled with the
+// service's programs, which its key covers, so that a later key's build
+// with the same programs boots it meanwhile, and one with other programs
+// doesn't.
+func TestTheCurrentImageIsLabelledWithItsPrograms(t *testing.T) {
+	e := setup(t)
+	e.only("amd64")
+	cur := bases.ImageName("amd64", e.keys["amd64"])
+	e.gce.AddLabelledImage(cur, "", "X86_64", map[string]string{bases.LabelKind: bases.KindBase, "other": "kept"})
+	// A label that can't be set is set at a later pass.
+	e.gce.ServerError(http.MethodPost, "/global/images/"+cur+"/setLabels", http.StatusForbidden, 1)
+	e.pass()
+	if im, _ := e.image(cur); im.Labels[bases.LabelPrograms] != "" {
+		t.Fatalf("labels = %v; the label was to fail", im.Labels)
+	}
+	e.pass()
+	im, _ := e.image(cur)
+	if im.Labels[bases.LabelPrograms] != programs() || im.Labels["other"] != "kept" || im.Labels[bases.LabelKind] != bases.KindBase {
+		t.Fatalf("labels = %v", im.Labels)
+	}
+	if !strings.Contains(e.logs.String(), "base image labelled with its programs") {
+		t.Error("labelling not logged")
+	}
+	ims, err := e.gcec.Images(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	later := map[string]string{"amd64": "eeeeeeeeeeeeeeeeeeee", "arm64": e.keys["arm64"]}
+	same := &bases.Service{Config: e.cfg, Keys: later}
+	if got, err := same.Boot(ims, "amd64"); got != cur || err != nil {
+		t.Fatalf("a later key with the same programs boots %q, %v", got, err)
+	}
+	changed := &bases.Service{Config: e.cfg, Keys: later, Programs: strings.Repeat("f", 64)}
+	if got, err := changed.Boot(ims, "amd64"); got != "" || !errors.Is(err, bases.ErrNoImage) {
+		t.Fatalf("a later key with other programs boots %q, %v", got, err)
+	}
+}
+
+// TestJobsWaitWhileAKeysBuildsHaveFailed: with every builder of a key
+// failed and no earlier image of the service's programs, machines boot
+// nothing: the error logged at every pass says so, and no more builders are
+// made until the maintainer deletes the key's record (specs/0003-disks.md,
+// Making a base image).
+func TestJobsWaitWhileAKeysBuildsHaveFailed(t *testing.T) {
+	e := setup(t)
+	e.only("amd64")
+	ctx := context.Background()
+	stale := "lsr-base-amd64-0000000000000000000b"
+	e.gce.AddLabelledImage(stale, "", "X86_64", labelled(stale, "ffffffffffffffffffff"))
+	for range bases.Attempts {
+		e.pass()
+		b, ok := e.builder("amd64")
+		if !ok {
+			t.Fatal("no builder")
+		}
+		e.say(b, machine.Failed+"no network")
+		e.pass()
+		e.clock.Advance(time.Minute)
+	}
+	e.pass()
+	e.pass()
+	if bs := e.builders(); len(bs) != 0 {
+		t.Fatalf("a fourth builder: %+v", bs)
+	}
+	e.bootErr("amd64")
+	logs := e.logs.String()
+	if n := strings.Count(logs, "no machine of its architecture until a deploy changes the key or the maintainer deletes its record"); n != 2 {
+		t.Errorf("logged giving up, with no machine to boot, %d times in two passes", n)
+	}
+	if !strings.Contains(logs, "machines_boot=none") {
+		t.Error("the log doesn't say machines boot nothing")
+	}
+	_, gen, _ := e.objects.Get(ctx, "bases/amd64-"+e.keys["amd64"]+".json")
+	if err := e.objects.Delete(ctx, "bases/amd64-"+e.keys["amd64"]+".json", gen); err != nil {
+		t.Fatal(err)
+	}
+	e.pass()
+	b, ok := e.builder("amd64")
+	if !ok {
+		t.Fatal("no builder once the record was deleted")
+	}
+	e.say(b, e.built("amd64"))
+	e.pass()
+	if got := e.boot("amd64"); got != bases.ImageName("amd64", e.keys["amd64"]) {
+		t.Fatalf("machines boot %q", got)
 	}
 }
 

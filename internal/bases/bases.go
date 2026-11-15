@@ -4,7 +4,9 @@
 // a builder, lsr-build-<arch>-<key>, a machine with no account booted from
 // Debian's own image, which runs only the service's own script; reads its
 // result from its serial console; stops it; and makes the image from its
-// boot disk. Until that image is ready, machines boot the previous one.
+// boot disk. Until that image is ready, machines boot the previous one,
+// but only if it was made with the same programs as the service's own, by
+// its lsr-programs label; with none such, jobs wait for the new image.
 //
 // What builders and images exist is in their names and labels; what can't
 // be read back from them is in the bucket:
@@ -25,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -49,6 +52,10 @@ const (
 	LabelKey    = "lsr-key"
 	KindBase    = "base"
 	KindBuilder = "builder"
+	// LabelPrograms is a base image's programs' label (ProgramsLabel): the
+	// service's programs, and the files installed with them, that it was
+	// made with.
+	LabelPrograms = "lsr-programs"
 
 	// BootDiskGB is a builder's boot disk, Debian's image's size, and so
 	// the base image's.
@@ -135,6 +142,11 @@ func Keys(cfg *config.Config) map[string]string {
 	return out
 }
 
+// ProgramsLabel is the lsr-programs label of a base image made with the
+// service's programs of digest (machine.Digest): its first 20 hex digits,
+// as the key keeps of its own hash, since a label's value can't hold all 64.
+func ProgramsLabel(digest string) string { return digest[:min(len(digest), 20)] }
+
 // ImageName is a key's base image.
 func ImageName(arch, key string) string { return ImagePrefix + arch + "-" + key }
 
@@ -153,24 +165,54 @@ func requestID(parts ...string) string {
 
 func recordName(arch, key string) string { return "bases/" + arch + "-" + key + ".json" }
 
+// ErrNoImage is why no machine of an architecture can be made: it has no
+// ready base image that its machines may boot.
+var ErrNoImage = errors.New("no base image machines may boot")
+
 // Boot is the base image machines of an architecture boot: its image for
 // key once it's ready, or else the newest ready base image of that
-// architecture, made for an earlier key (specs/0003-disks.md, Which image
-// machines boot). With key "", it's the newest.
-func Boot(images []compute.Image, arch, key string) (string, bool) {
-	var best compute.Image
+// architecture, made for an earlier key, whose lsr-programs label is
+// programs, made with the same programs as the service's own
+// (specs/0003-disks.md, Which image machines boot). One whose label is
+// another, or that has none, as images made before they had it don't, is
+// never booted in key's image's place: what a machine's programs do before
+// its job starts, such as the job-started hook, is the service's of the
+// moment, so jobs wait for key's image instead. With key "", it's the
+// newest of any. With none, the error, an ErrNoImage, says why.
+func Boot(images []compute.Image, arch, key, programs string) (string, error) {
+	var best, other compute.Image
 	for _, im := range images {
 		if im.Status != "READY" || !strings.HasPrefix(im.Name, ImagePrefix+arch+"-") {
 			continue
 		}
 		if key != "" && im.Name == ImageName(arch, key) {
-			return im.Name, true
+			return im.Name, nil
+		}
+		if p := im.Labels[LabelPrograms]; key != "" && (p == "" || p != programs) {
+			if other.Name == "" || im.Created.After(other.Created) {
+				other = im
+			}
+			continue
 		}
 		if best.Name == "" || im.Created.After(best.Created) {
 			best = im
 		}
 	}
-	return best.Name, best.Name != ""
+	switch {
+	case best.Name != "":
+		return best.Name, nil
+	case other.Name != "":
+		made := "no record of its programs"
+		if p := other.Labels[LabelPrograms]; p != "" {
+			made = "programs " + p
+		}
+		return "", fmt.Errorf("%w: %s isn't ready, and the newest other ready base image of %s, %s, was made with %s, not the service's, %s; "+
+			"its jobs wait for %s", ErrNoImage, ImageName(arch, key), arch, other.Name, made, programs, ImageName(arch, key))
+	case key != "":
+		return "", fmt.Errorf("%w: %s isn't ready, and there's no other ready base image of %s; its jobs wait for it", ErrNoImage, ImageName(arch, key), arch)
+	default:
+		return "", fmt.Errorf("%w: there's no ready base image for %s", ErrNoImage, arch)
+	}
 }
 
 // Record is a key's build, in bases/<arch>-<key>.json.
@@ -223,7 +265,10 @@ type Service struct {
 
 	// Keys are each architecture's current key; unset, Keys(Config).
 	Keys map[string]string
-	once sync.Once
+	// Programs is the digest of the service's programs and the files
+	// installed with them; unset, machine.Digest. The key covers it too.
+	Programs string
+	once     sync.Once
 	// Script and Files are the builder's script and lsr-files; unset,
 	// machine.BuildScript and machine.Archive, in base64.
 	Script string
@@ -244,13 +289,22 @@ func (s *Service) keys() map[string]string {
 		if s.Keys == nil {
 			s.Keys = Keys(s.Config)
 		}
+		if s.Programs == "" {
+			s.Programs = machine.Digest()
+		}
 	})
 	return s.Keys
 }
 
+// programs is the lsr-programs label of the images the service makes.
+func (s *Service) programs() string {
+	s.keys()
+	return ProgramsLabel(s.Programs)
+}
+
 // Boot is the base image machines of an architecture boot now.
-func (s *Service) Boot(images []compute.Image, arch string) (string, bool) {
-	return Boot(images, arch, s.keys()[arch])
+func (s *Service) Boot(images []compute.Image, arch string) (string, error) {
+	return Boot(images, arch, s.keys()[arch], s.programs())
 }
 
 // inventory is what a pass read of builders, images and records.
@@ -365,6 +419,7 @@ func (s *Service) advance(ctx context.Context, inv *inventory, arch, key string)
 		}
 		switch im.Status {
 		case "READY":
+			s.labelPrograms(ctx, im)
 			for _, b := range builders {
 				s.deleteBuilder(ctx, b, "its image is ready")
 			}
@@ -557,7 +612,16 @@ func (s *Service) exhausted(inv *inventory, arch, key string, rec Record) {
 	if n := len(rec.Failures); n > 0 {
 		last = rec.Failures[n-1].Reason
 	}
-	boot, _ := Boot(inv.images, arch, key)
+	boot, err := Boot(inv.images, arch, key, s.programs())
+	if err != nil {
+		// No image made with the service's programs is ready: no machine
+		// of the architecture is made, and its jobs wait queued until a
+		// deploy changes the key or the maintainer deletes its record.
+		s.log().Error("base image builds failed; making no more for this key, and no machine of its architecture until a deploy changes the key or the maintainer deletes its record",
+			"arch", arch, "key", key, "image", ImageName(arch, key), "attempts", rec.Attempts, "last_failure", last, "machines_boot", "none",
+			"why", err.Error())
+		return
+	}
 	s.log().Error("base image builds failed; making no more for this key", "arch", arch, "key", key, "image", ImageName(arch, key),
 		"attempts", rec.Attempts, "last_failure", last, "machines_boot", boot)
 }
@@ -698,7 +762,7 @@ func (s *Service) makeImage(ctx context.Context, arch, key string, b compute.Ins
 	ictx, cancel := context.WithTimeout(ctx, imageWait)
 	defer cancel()
 	err := s.Compute.CreateImage(ictx, compute.ImageSpec{Name: name, SourceZone: b.Zone, SourceDisk: disk,
-		Labels: map[string]string{LabelKind: KindBase, LabelArch: arch, LabelKey: key}},
+		Labels: map[string]string{LabelKind: KindBase, LabelArch: arch, LabelKey: key, LabelPrograms: s.programs()}},
 		requestID("base image", name))
 	switch {
 	case err == nil:
@@ -752,6 +816,29 @@ func (s *Service) deleteBuilder(ctx context.Context, b compute.Instance, why str
 		return
 	}
 	s.log().Info("base image builder deleted", "builder", b.Name, "instance_id", b.ID, "why", why)
+}
+
+// labelPrograms labels the current key's ready image with the service's
+// programs, if it hasn't that label, as an image made before images had it
+// hasn't: its key covers the programs, so they're the service's. A later
+// key's build may then boot it until its own image is ready, if its
+// programs are the same. A label that couldn't be set is set at a later
+// pass.
+func (s *Service) labelPrograms(ctx context.Context, im compute.Image) {
+	want := s.programs()
+	if im.Labels[LabelPrograms] == want {
+		return
+	}
+	labels := maps.Clone(im.Labels)
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	labels[LabelPrograms] = want
+	if err := s.Compute.SetImageLabels(ctx, im.Name, labels, im.LabelFingerprint); err != nil {
+		s.log().Warn("labelling a base image with its programs", "image", im.Name, "err", err.Error())
+		return
+	}
+	s.log().Info("base image labelled with its programs", "image", im.Name, "programs", want)
 }
 
 // prune deletes an architecture's other base images once both they and the
