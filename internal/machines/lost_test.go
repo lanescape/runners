@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/lanescape/runners/emulators/fault"
+	gcsemu "github.com/lanescape/runners/emulators/storage"
 	"github.com/lanescape/runners/internal/deploy"
 	"github.com/lanescape/runners/internal/machines"
 )
@@ -523,5 +524,34 @@ func TestAContributionsLostJob(t *testing.T) {
 				t.Fatal("the machine wasn't deleted")
 			}
 		})
+	}
+}
+
+// TestABusyRunnerThatCantBeRecordedWaits: a runner GitHub refused to remove
+// as busy, which can't be recorded as such, keeps its machine, which isn't
+// looked into further that pass.
+func TestABusyRunnerThatCantBeRecordedWaits(t *testing.T) {
+	e := setup(t)
+	p := e.withLost()
+	run := e.mainRun()
+	j := e.queue(run, sel2)
+	e.pass()
+	m := e.boot(e.one())
+	m.taken(j)
+	e.gcs.Faults().Add(fault.Rule{Method: http.MethodPost,
+		Match:   func(r *http.Request) bool { return strings.Contains(r.URL.RawQuery, "runner.json") },
+		Respond: gcsemu.JSONError(http.StatusForbidden, "forbidden", "Forbidden")})
+	e.clock.Advance(machines.IdleLimit)
+	e.pass()
+	if !e.exists(m.in.Name) {
+		t.Fatal("deleted though its runner's state couldn't be recorded")
+	}
+	if _, ok := p.lostOn(m.in.Name); ok {
+		t.Fatal("looked into further though its runner's state couldn't be recorded")
+	}
+	e.gcs.Faults().Reset()
+	e.pass()
+	if lost, ok := p.lostOn(m.in.Name); !ok || lost.JobID != j.ID || e.exists(m.in.Name) {
+		t.Fatalf("lost = %+v, %v; want it recorded and the machine gone", lost, ok)
 	}
 }
