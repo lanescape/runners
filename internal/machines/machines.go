@@ -39,6 +39,7 @@ import (
 	"github.com/lanescape/runners/internal/auth"
 	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/compute"
+	"github.com/lanescape/runners/internal/deploy"
 	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/pass"
 	"github.com/lanescape/runners/internal/scope"
@@ -203,6 +204,11 @@ type Service struct {
 	// architecture's machines boot. Unset, machines boot the newest ready
 	// base image of their architecture.
 	Bases Bases
+	// Fence says whether a later deploy replaced this revision, which then
+	// makes no machines and retires none for their programs
+	// (specs/0004-deployment.md, Which revision makes machines). Unset,
+	// none ever does.
+	Fence *deploy.Fence
 }
 
 // Bases are the base images (specs/0003-disks.md, Base images).
@@ -214,6 +220,9 @@ type Bases interface {
 	// Boot is the base image an architecture's machines boot now, or, as
 	// a bases.ErrNoImage, why there's none they may.
 	Boot(images []compute.Image, arch string) (string, error)
+	// Ours reports whether a machine of an architecture booted from image
+	// runs the service's own programs.
+	Ours(images []compute.Image, arch, image string) bool
 }
 
 // BootLogs reads a machine's serial console, by its numeric ID, from Cloud

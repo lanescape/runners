@@ -630,6 +630,18 @@ func (f *fakeBases) Boot(ims []compute.Image, arch string) (string, error) {
 	return bases.Boot(ims, arch, f.key, programs())
 }
 
+func (f *fakeBases) Ours(ims []compute.Image, arch, image string) bool {
+	if image == bases.ImageName(arch, f.key) {
+		return true
+	}
+	for _, im := range ims {
+		if im.Name == image {
+			return im.Labels[bases.LabelPrograms] == programs()
+		}
+	}
+	return false
+}
+
 // programs is the lsr-programs label of the images this service makes.
 func programs() string { return bases.ProgramsLabel(baseimage.Digest()) }
 

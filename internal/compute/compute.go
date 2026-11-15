@@ -128,6 +128,8 @@ type Disk struct {
 	Labels  map[string]string
 	Users   []string // the instances it's attached to, by name
 	Created time.Time
+	// SourceImage is the image it was made from, by name, if any.
+	SourceImage string
 }
 
 // Image is an image in the project.
@@ -527,7 +529,7 @@ func (c *Client) AttachDisk(ctx context.Context, zone, instance, disk, deviceNam
 
 func diskOf(d *gce.Disk) Disk {
 	out := Disk{Name: d.Name, ID: d.Id, Zone: last(d.Zone), SizeGB: d.SizeGb, Status: d.Status, Labels: d.Labels,
-		Created: parseTime(d.CreationTimestamp)}
+		Created: parseTime(d.CreationTimestamp), SourceImage: last(d.SourceImage)}
 	for _, u := range d.Users {
 		out.Users = append(out.Users, last(u))
 	}

@@ -66,6 +66,11 @@ type inventory struct {
 	checked   map[string]github.RunnerGroup
 	images    map[string]string
 	noImage   map[string]error
+	imageList []compute.Image
+	listed    bool
+	// retiring is whether this revision retires machines for their
+	// programs this pass, once known.
+	retiring  *bool
 	attempted map[string]bool
 	deleted   map[string]bool
 }
@@ -546,6 +551,10 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 				"job_id", w.job.ID, "selector", w.sel.String())
 			continue
 		}
+		// A later deploy's revision makes the machines from now on.
+		if s.replaced(ctx) {
+			return
+		}
 		err := s.make(ctx, inv, w)
 		if err == nil {
 			running++
@@ -674,6 +683,11 @@ func (s *Service) wants(ctx context.Context, inv *inventory, q *queue) []wanted 
 	idle := map[string][]Machine{}
 	for _, m := range inv.machines {
 		if m.RepositoryID != repo.ID || !inv.live(m) {
+			continue
+		}
+		// A machine that cleanup retires this pass for its programs
+		// takes no job.
+		if _, stale := s.staleImage(ctx, inv, m); stale {
 			continue
 		}
 		if _, admitted := inv.admissions[m.Name]; !admitted {
@@ -953,7 +967,7 @@ func (s *Service) baseImage(ctx context.Context, inv *inventory, arch string) (s
 	if err, ok := inv.noImage[arch]; ok {
 		return "", err
 	}
-	ims, err := s.Compute.Images(ctx)
+	ims, err := s.images(ctx, inv)
 	if err != nil {
 		return "", err
 	}
@@ -969,6 +983,92 @@ func (s *Service) baseImage(ctx context.Context, inv *inventory, arch string) (s
 	}
 	inv.images[arch] = name
 	return name, nil
+}
+
+// images are the project's images, listed once a pass.
+func (s *Service) images(ctx context.Context, inv *inventory) ([]compute.Image, error) {
+	if inv.listed {
+		return inv.imageList, nil
+	}
+	ims, err := s.Compute.Images(ctx)
+	if err != nil {
+		return nil, err
+	}
+	inv.imageList, inv.listed = ims, true
+	return ims, nil
+}
+
+// replaced reports whether a later deploy replaced this revision, which
+// then makes no machines (specs/0004-deployment.md, Which revision makes
+// machines), and logs why. A record that can't be read counts as one, for
+// this call.
+func (s *Service) replaced(ctx context.Context) bool {
+	if s.Fence == nil {
+		return false
+	}
+	newer, replaced, err := s.Fence.Newer(ctx)
+	switch {
+	case err != nil:
+		s.log().Warn("making no machine: the latest deploy can't be read", "err", err.Error())
+		return true
+	case replaced:
+		s.log().Info("making no machine: a later deploy replaced this revision", "deploy", s.Fence.Own.String(), "latest", newer.String())
+		return true
+	}
+	return false
+}
+
+// staleImage is the base image an unadmitted machine booted from, if that
+// image doesn't run the service's own programs, by the machine's boot
+// disk's source image (specs/0003-disks.md, Which image machines boot), and
+// this revision, not replaced by a later deploy's, retires such machines.
+// A machine whose image isn't known, such as when the disks or the images
+// couldn't be listed, isn't retired for it.
+func (s *Service) staleImage(ctx context.Context, inv *inventory, m Machine) (string, bool) {
+	if s.Bases == nil || !inv.disksComplete {
+		return "", false
+	}
+	if _, admitted := inv.admissions[m.Name]; admitted {
+		return "", false
+	}
+	boot := ""
+	for _, d := range m.Disks {
+		if d.Boot {
+			boot = d.Disk
+		}
+	}
+	image := ""
+	for _, d := range inv.disks {
+		if d.Name == boot && d.Zone == m.Zone {
+			image = d.SourceImage
+		}
+	}
+	if image == "" {
+		return "", false
+	}
+	ims, err := s.images(ctx, inv)
+	if err != nil || s.Bases.Ours(ims, m.Selector.Arch, image) {
+		return "", false
+	}
+	if inv.retiring == nil {
+		// A replaced revision's own programs aren't the service's: it
+		// leaves machines to the revision that replaced it.
+		retiring := s.Fence == nil
+		if s.Fence != nil {
+			newer, replaced, err := s.Fence.Newer(ctx)
+			switch {
+			case err != nil:
+				s.log().Warn("retiring no machine for its programs this pass: the latest deploy can't be read", "err", err.Error())
+			case replaced:
+				s.log().Info("retiring no machine for its programs: a later deploy replaced this revision", "deploy", s.Fence.Own.String(),
+					"latest", newer.String())
+			default:
+				retiring = true
+			}
+		}
+		inv.retiring = &retiring
+	}
+	return image, *inv.retiring
 }
 
 // make makes one machine for a job: a just-in-time runner for the selector

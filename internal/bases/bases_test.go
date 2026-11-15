@@ -24,6 +24,7 @@ import (
 	gcsemu "github.com/lanescape/runners/emulators/storage"
 	"github.com/lanescape/runners/internal/bases"
 	"github.com/lanescape/runners/internal/compute"
+	"github.com/lanescape/runners/internal/deploy"
 	"github.com/lanescape/runners/internal/lease"
 	"github.com/lanescape/runners/internal/pass"
 	"github.com/lanescape/runners/internal/store"
@@ -718,6 +719,38 @@ func TestJobsWaitWhileAKeysBuildsHaveFailed(t *testing.T) {
 	e.pass()
 	if got := e.boot("amd64"); got != bases.ImageName("amd64", e.keys["amd64"]) {
 		t.Fatalf("machines boot %q", got)
+	}
+}
+
+// TestAReplacedRevisionMakesNoBuilder: once a later deploy's revision has
+// recorded itself, an earlier revision starts no builder, and says why
+// (specs/0004-deployment.md, Which revision makes machines).
+func TestAReplacedRevisionMakesNoBuilder(t *testing.T) {
+	e := setup(t)
+	e.only("amd64")
+	ctx := context.Background()
+	e.svc.Fence = &deploy.Fence{Own: deploy.ID{Run: 1, Attempt: 1}, Objects: e.objects, Clock: e.clock}
+	if err := (&deploy.Fence{Own: deploy.ID{Run: 2, Attempt: 1}, Objects: e.objects, Clock: e.clock}).Serving(ctx); err != nil {
+		t.Fatal(err)
+	}
+	e.pass()
+	if bs := e.builders(); len(bs) != 0 {
+		t.Fatalf("builders = %+v", bs)
+	}
+	if r, ok := e.record("amd64"); ok && r.Attempts != 0 {
+		t.Fatalf("record = %+v; no attempt was made", r)
+	}
+	if !strings.Contains(e.logs.String(), "making no base image builder: a later deploy replaced this revision") {
+		t.Fatal("why isn't logged")
+	}
+	// A later deploy's revision makes it.
+	e.svc.Fence = &deploy.Fence{Own: deploy.ID{Run: 3, Attempt: 1}, Objects: e.objects, Clock: e.clock}
+	if err := e.svc.Fence.Serving(ctx); err != nil {
+		t.Fatal(err)
+	}
+	e.pass()
+	if _, ok := e.builder("amd64"); !ok {
+		t.Fatal("the latest revision made no builder")
 	}
 }
 

@@ -37,6 +37,7 @@ import (
 
 	"github.com/lanescape/runners/config"
 	"github.com/lanescape/runners/internal/compute"
+	"github.com/lanescape/runners/internal/deploy"
 	"github.com/lanescape/runners/internal/pass"
 	"github.com/lanescape/runners/internal/store"
 	"github.com/lanescape/runners/machine"
@@ -269,6 +270,10 @@ type Service struct {
 	// installed with them; unset, machine.Digest. The key covers it too.
 	Programs string
 	once     sync.Once
+	// Fence says whether a later deploy replaced this revision, which then
+	// makes no builders (specs/0004-deployment.md, Which revision makes
+	// machines). Unset, none ever does.
+	Fence *deploy.Fence
 	// Script and Files are the builder's script and lsr-files; unset,
 	// machine.BuildScript and machine.Archive, in base64.
 	Script string
@@ -305,6 +310,24 @@ func (s *Service) programs() string {
 // Boot is the base image machines of an architecture boot now.
 func (s *Service) Boot(images []compute.Image, arch string) (string, error) {
 	return Boot(images, arch, s.keys()[arch], s.programs())
+}
+
+// Ours reports whether a machine of an architecture booted from image runs
+// the service's own programs: image is the current key's, whose key covers
+// them, or has the service's programs' label, by images, the project's
+// images as listed. An image that isn't listed, such as one since deleted,
+// isn't known to.
+func (s *Service) Ours(images []compute.Image, arch, image string) bool {
+	if image == ImageName(arch, s.keys()[arch]) {
+		return true
+	}
+	for _, im := range images {
+		if im.Name == image {
+			p := im.Labels[LabelPrograms]
+			return p != "" && p == s.programs()
+		}
+	}
+	return false
 }
 
 // inventory is what a pass read of builders, images and records.
@@ -496,6 +519,18 @@ func (s *Service) advance(ctx context.Context, inv *inventory, arch, key string)
 		if rec.Attempts >= Attempts {
 			s.exhausted(inv, arch, key, rec)
 			return
+		}
+		if s.Fence != nil {
+			newer, replaced, err := s.Fence.Newer(ctx)
+			switch {
+			case err != nil:
+				s.log().Warn("making no base image builder this pass: the latest deploy can't be read", "arch", arch, "key", key, "err", err.Error())
+				return
+			case replaced:
+				s.log().Info("making no base image builder: a later deploy replaced this revision", "arch", arch, "key", key,
+					"deploy", s.Fence.Own.String(), "latest", newer.String())
+				return
+			}
 		}
 		return s.makeBuilder(ctx, arch, key, rec, gen)
 	}

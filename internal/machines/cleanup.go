@@ -203,11 +203,24 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 		if s.retire(ctx, m, "it stopped before its job started") {
 			s.finish(ctx, inv, m, "it stopped before its job started", nil)
 		}
+	case s.retiresForImage(ctx, inv, m):
+		image, _ := s.staleImage(ctx, inv, m)
+		why := "its base image, " + image + ", wasn't made with the service's programs"
+		if s.retire(ctx, m, why) {
+			s.finish(ctx, inv, m, why, nil)
+		}
 	case age >= IdleLimit:
 		if s.retire(ctx, m, "it hasn't picked up a job after "+IdleLimit.String()) {
 			s.finish(ctx, inv, m, "it hasn't picked up a job after "+IdleLimit.String(), nil)
 		}
 	}
+}
+
+// retiresForImage reports whether an unadmitted machine is retired for its
+// base image's programs (staleImage).
+func (s *Service) retiresForImage(ctx context.Context, inv *inventory, m Machine) bool {
+	_, stale := s.staleImage(ctx, inv, m)
+	return stale
 }
 
 // requestID is a request ID for a change a pass makes, new each time it's

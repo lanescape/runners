@@ -12,6 +12,7 @@ import (
 
 	gcsemu "github.com/lanescape/runners/emulators/storage"
 	"github.com/lanescape/runners/endpoints"
+	"github.com/lanescape/runners/internal/deploy"
 	"github.com/lanescape/runners/internal/lease"
 	"github.com/lanescape/runners/internal/pass"
 	"github.com/lanescape/runners/internal/store"
@@ -31,6 +32,7 @@ func good() map[string]string {
 		"RUNNERS_GITHUB_APP_KEY_FILE": "/secrets/app-key",
 		"RUNNERS_WEBHOOK_SECRET_FILE": "/secrets/webhook",
 		"RUNNERS_RECONCILE_ACCOUNTS":  "scheduler@p.iam.gserviceaccount.com, push@p.iam.gserviceaccount.com",
+		"RUNNERS_DEPLOY_ID":           "19283746-2",
 	}
 }
 
@@ -39,9 +41,19 @@ func TestSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Port != "8080" || s.AppID != 12345 ||
+	if s.Port != "8080" || s.AppID != 12345 || s.Deploy != (deploy.ID{Run: 19283746, Attempt: 2}) ||
 		!slices.Equal(s.ReconcileAccounts, []string{"scheduler@p.iam.gserviceaccount.com", "push@p.iam.gserviceaccount.com"}) {
 		t.Fatalf("settings = %+v", s)
+	}
+}
+
+// TestNoDeployID: a service run outside a deploy, with no ID, starts.
+func TestNoDeployID(t *testing.T) {
+	m := good()
+	delete(m, "RUNNERS_DEPLOY_ID")
+	s, err := loadSettings(env(m))
+	if err != nil || !s.Deploy.IsZero() {
+		t.Fatalf("settings = %+v, %v", s, err)
 	}
 }
 
@@ -60,6 +72,7 @@ func TestBadSettings(t *testing.T) {
 		"no app key file": {"RUNNERS_GITHUB_APP_KEY_FILE", "", "RUNNERS_GITHUB_APP_KEY_FILE is required"},
 		"negative app ID": {"RUNNERS_GITHUB_APP_ID", "-1", "numeric ID"},
 		"missing app ID":  {"RUNNERS_GITHUB_APP_ID", "", "numeric ID"},
+		"bad deploy ID":   {"RUNNERS_DEPLOY_ID", "19283746", "RUNNERS_DEPLOY_ID"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			m := good()
