@@ -348,7 +348,7 @@ func TestTheHookPrintsWhyItsJobFails(t *testing.T) {
 
 func TestTheHookAsksAgainWithNoAnswer(t *testing.T) {
 	h := newHookEnv(t)
-	h.codes = []int{http.StatusServiceUnavailable, http.StatusBadGateway, http.StatusOK}
+	h.codes = []int{http.StatusServiceUnavailable, http.StatusServiceUnavailable, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusOK}
 	_, done, out := h.run()
 	select {
 	case err := <-done:
@@ -358,8 +358,14 @@ func TestTheHookAsksAgainWithNoAnswer(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("the hook never got its answer")
 	}
-	if asked, _ := h.requests(); len(asked) != 3 {
-		t.Fatalf("asked %d times, want 3", len(asked))
+	if asked, _ := h.requests(); len(asked) != 5 {
+		t.Fatalf("asked %d times, want 5", len(asked))
+	}
+	// A reason is said each time it changes, and not while it stays.
+	for want, n := range map[string]int{"asking again: the service answered 503": 2, "asking again: the service answered 502": 1} {
+		if got := strings.Count(out.String(), want); got != n {
+			t.Fatalf("the hook said %q %d times, want %d:\n%s", want, got, n, out)
+		}
 	}
 }
 
