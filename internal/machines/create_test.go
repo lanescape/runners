@@ -965,7 +965,7 @@ func TestAJobGetsNoMachineUntilItsRecordSaysItsWaitEnded(t *testing.T) {
 	if ms := e.ours(); len(ms) != 0 {
 		t.Fatalf("machines = %+v; the job's record still says it waits", ms)
 	}
-	if !e.logged("until its record says whether it waits for a base image") {
+	if !e.logged("no machine made, and no decision whether a job's machines are out of time, this pass") {
 		t.Fatal("why the job gets no machine isn't logged")
 	}
 	e.gcs.Faults().Reset()
@@ -1024,6 +1024,35 @@ func TestAJobsWaitIsLeftAsItIsWhileTheImagesCantBeListed(t *testing.T) {
 			t.Fatalf("job record = %v; want its wait ended", rec)
 		}
 	})
+}
+
+// TestAJobOutOfTimeGetsNoMachineWhenItsWaitsEndIsntRecorded: a job whose
+// hour had run out before it began to wait for a base image, and whose
+// record can't at first take the end of its wait, gets no machine in the
+// meantime, and is refused once its record says its wait has ended.
+func TestAJobOutOfTimeGetsNoMachineWhenItsWaitsEndIsntRecorded(t *testing.T) {
+	e, _, run, job := aJobWithAFirstMachine(t)
+	e.clock.Advance(machines.RetryLimit + time.Minute)
+	e.pass()
+	key := "jobs/5001/" + strconv.FormatInt(job.ID, 10) + ".json"
+	if rec, _ := e.record(key); rec["waiting_since"] == nil {
+		t.Fatalf("job record = %v; want its wait recorded", rec)
+	}
+	e.clock.Advance(10 * time.Minute)
+	e.gce.HoldImages(false)
+	e.jobWrites(1, false)
+	e.pass()
+	if ms := e.ours(); len(ms) != 0 {
+		t.Fatalf("machines = %+v; the job's hour had run out", ms)
+	}
+	e.pass()
+	if ms := e.ours(); len(ms) != 0 {
+		t.Fatalf("machines = %+v; the job's hour had run out", ms)
+	}
+	if rf, ok := e.record("refusals/5001/" + strconv.FormatInt(run.ID, 10) + "-1.json"); !ok ||
+		!strings.Contains(fmt.Sprint(rf["reason"]), "it waited for a base image") {
+		t.Fatalf("refusal = %v; want the run refused once its wait's end was recorded", rf)
+	}
 }
 
 // TestJobsBootAnEarlierImageOfTheSamePrograms: after a deploy that changes
