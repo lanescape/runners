@@ -31,6 +31,7 @@ import (
 	"log/slog"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jonboulle/clockwork"
@@ -39,6 +40,7 @@ import (
 	"github.com/lanescape/runners/internal/auth"
 	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/compute"
+	"github.com/lanescape/runners/internal/deploy"
 	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/pass"
 	"github.com/lanescape/runners/internal/scope"
@@ -86,13 +88,16 @@ const (
 	// before anything else, within its 7; that's under 25 minutes. Recording
 	// the machine's job and making its resume image come after the stop, and
 	// take as many passes as they need.
-	MaxRunDuration  = MaxAge + 30*time.Minute
-	IdleLimit       = 20 * time.Minute
-	ReportWait      = 10 * time.Minute
-	RetryLimit      = time.Hour
-	CancelEvery     = time.Minute
-	ForceCancel     = 5 * time.Minute
-	QueueDeadline   = 2 * time.Minute
+	MaxRunDuration = MaxAge + 30*time.Minute
+	IdleLimit      = 20 * time.Minute
+	ReportWait     = 10 * time.Minute
+	RetryLimit     = time.Hour
+	CancelEvery    = time.Minute
+	ForceCancel    = 5 * time.Minute
+	QueueDeadline  = 2 * time.Minute
+	// RunLimit is how long GitHub lets a run last, its reruns included,
+	// before it ends it.
+	RunLimit        = 35 * 24 * time.Hour
 	assignmentWait  = 20 * time.Second
 	assignmentRetry = 2 * time.Second
 	recordsKept     = 24 * time.Hour
@@ -152,6 +157,12 @@ type Saver interface {
 // service stopped it at its age limit.
 type Preemptions interface {
 	Stopped(ctx context.Context, m Machine, a Admission, preempted, ageLimit bool) error
+	// Lost records the job a retired machine's runner took before the
+	// machine was claimed, by a, what the job-started check would have
+	// decided of it, so that its run is rerun, as a preempted job's is
+	// (specs/0002-machines.md, Retiring a machine). The job was never
+	// admitted, so it has no work disk to resume from.
+	Lost(ctx context.Context, m Machine, a Admission) error
 }
 
 // Service is the machines' part of the service.
@@ -203,6 +214,11 @@ type Service struct {
 	// architecture's machines boot. Unset, machines boot the newest ready
 	// base image of their architecture.
 	Bases Bases
+	// Fence says whether a later deploy replaced this revision, which then
+	// makes no machines and retires none for their programs
+	// (specs/0004-deployment.md, Which revision makes machines). Unset,
+	// none ever does.
+	Fence *deploy.Fence
 }
 
 // Bases are the base images (specs/0003-disks.md, Base images).
@@ -211,7 +227,12 @@ type Bases interface {
 	// a builder is waiting for, which no job draws on for the rest of the
 	// pass.
 	Pass(p *pass.Pass) (short []string)
-	Boot(images []compute.Image, arch string) (string, bool)
+	// Boot is the base image an architecture's machines boot now, or, as
+	// a bases.ErrNoImage, why there's none they may.
+	Boot(images []compute.Image, arch string) (string, error)
+	// Ours reports whether a machine of an architecture booted from the
+	// image of ID runs the service's own programs.
+	Ours(images []compute.Image, arch string, id uint64) bool
 }
 
 // BootLogs reads a machine's serial console, by its numeric ID, from Cloud
@@ -342,8 +363,18 @@ type Admission struct {
 	Commit string      `json:"commit,omitempty"`
 	// Unbound says the job was allowed on an unbound pull_request_target
 	// run: the smallest shape, standard, with no work disk.
-	Unbound bool      `json:"unbound,omitempty"`
+	Unbound bool `json:"unbound,omitempty"`
+	// Retired says a pass claimed the machine for cleanup before any
+	// check decided (claim).
+	Retired bool      `json:"retired,omitempty"`
 	At      time.Time `json:"at"`
+}
+
+// retiredClaim reports whether an admission is a pass's claim of the
+// machine for cleanup, not a check's decision; claims made before they
+// were marked so say so in their reason.
+func (a Admission) retiredClaim() bool {
+	return !a.Allowed && (a.Retired || a.JobID == 0 && strings.HasPrefix(a.Reason, "retired: "))
 }
 
 // Resolve is the machine as its admitted job resolved it: with the run's
@@ -428,7 +459,8 @@ type Refusal struct {
 }
 
 // JobRecord is when a queued job's first machine was made: another is made
-// while it's still queued, for up to RetryLimit from then. It's written
+// while it's still queued, for up to RetryLimit from then, not counting
+// while it waited for a base image its machine may boot. It's written
 // before the machine is made, tentative until the machine is known to have
 // been: a tentative record doesn't start the hour.
 type JobRecord struct {
@@ -437,6 +469,21 @@ type JobRecord struct {
 	FirstMachineAt time.Time `json:"first_machine_at"`
 	Machine        string    `json:"machine"`
 	Tentative      bool      `json:"tentative,omitempty"`
+	// WaitingSince is when the job began to wait for a base image its
+	// machine may boot, while it still does, and Waited how long it waited
+	// so before.
+	WaitingSince time.Time     `json:"waiting_since,omitzero"`
+	Waited       time.Duration `json:"waited,omitempty"`
+}
+
+// spent is how much of its RetryLimit a job has spent by now: the time
+// since its first machine, but for its waits for a base image.
+func (r JobRecord) spent(now time.Time) time.Duration {
+	d := now.Sub(r.FirstMachineAt) - r.Waited
+	if !r.WaitingSince.IsZero() {
+		d -= now.Sub(r.WaitingSince)
+	}
+	return d
 }
 
 func admissionKey(machine string) string { return "machines/" + machine + "/admission.json" }

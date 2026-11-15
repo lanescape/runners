@@ -43,6 +43,7 @@ import (
 	"github.com/lanescape/runners/internal/bases"
 	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/compute"
+	"github.com/lanescape/runners/internal/deploy"
 	"github.com/lanescape/runners/internal/disks"
 	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/lease"
@@ -78,6 +79,9 @@ type settings struct {
 	AppKeyFile        string
 	WebhookSecretFile string
 	ReconcileAccounts []string
+	// Deploy is CD's run ID and attempt, which orders deploys; zero when
+	// the service runs outside a deploy.
+	Deploy deploy.ID
 }
 
 func loadSettings(getenv func(string) string) (settings, error) {
@@ -114,6 +118,9 @@ func loadSettings(getenv func(string) string) (settings, error) {
 		errs = append(errs, errors.New("RUNNERS_GITHUB_APP_ID must be the App's numeric ID"))
 	}
 	s.AppID = id
+	if s.Deploy, err = deploy.Parse(getenv("RUNNERS_DEPLOY_ID")); err != nil {
+		errs = append(errs, fmt.Errorf("RUNNERS_DEPLOY_ID: %w", err))
+	}
 	for _, a := range strings.Split(getenv("RUNNERS_RECONCILE_ACCOUNTS"), ",") {
 		if a = strings.TrimSpace(a); a != "" {
 			if !strings.HasSuffix(a, ".gserviceaccount.com") {
@@ -204,14 +211,21 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 		return err
 	}
 	svc.BootLogs = bootLogs
+	// The latest deploy is recorded by the first step of each pass, so
+	// only a revision that serves records it (deploy.Fence.Pass).
+	fence := &deploy.Fence{Own: s.Deploy, Objects: objects, Clock: clock, Logger: log}
+	if s.Deploy.IsZero() {
+		log.Warn("RUNNERS_DEPLOY_ID isn't set: this revision records no deploy, and makes no machines once a deploy is recorded")
+	}
+	svc.Fence = fence
 	images := &bases.Service{Config: cfg, Compute: gce, Objects: objects, Clock: clock, Logger: log,
-		Network: machines.Network, Subnetwork: machines.Subnetwork, DiskType: machines.DiskType, Keys: bases.Keys(cfg)}
+		Network: machines.Network, Subnetwork: machines.Subnetwork, DiskType: machines.DiskType, Keys: bases.Keys(cfg), Fence: fence}
 	svc.Bases = images
 	for _, arch := range config.Arches {
 		log.Info("base image", "arch", arch, "image", bases.ImageName(arch, images.Keys[arch]))
 	}
 	passes := &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log}
-	body := pass.All(svc.Pass, dks.Pass)
+	body := pass.All(fence.Pass, svc.Pass, dks.Pass)
 	svc.Kick = kicker(ctx, passes, body, 15*time.Second, log)
 	h, err := server.New(server.Config{
 		Logger:           log,

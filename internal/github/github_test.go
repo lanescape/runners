@@ -64,10 +64,10 @@ func TestRepositoryAndRun(t *testing.T) {
 	}
 	want := github.WorkflowRun{ID: run.ID, RepositoryID: 5001, Event: "push", Status: "in_progress", Attempt: 1,
 		HeadBranch: "main", HeadSHA: e.repo.Head("main"), HeadRepositoryID: 5001}
-	if got.CreatedAt.IsZero() {
-		t.Fatal("run has no creation time")
+	if got.CreatedAt.IsZero() || got.UpdatedAt.Before(got.CreatedAt) {
+		t.Fatalf("run's times: created %v, updated %v", got.CreatedAt, got.UpdatedAt)
 	}
-	got.CreatedAt = time.Time{}
+	got.CreatedAt, got.UpdatedAt = time.Time{}, time.Time{}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("run = %+v, want %+v", got, want)
 	}

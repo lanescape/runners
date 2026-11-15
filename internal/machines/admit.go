@@ -343,7 +343,7 @@ func (s *Service) searchJob(ctx context.Context, repo github.Repository, m Machi
 			}
 		}
 	}
-	runs, err := s.GitHub.Runs(ctx, repo, "in_progress")
+	runs, err := s.runsInProgress(ctx, repo, m)
 	if err != nil {
 		return github.Job{}, github.WorkflowRun{}, err
 	}
@@ -380,33 +380,9 @@ func (s *Service) facts(ctx context.Context, m Machine, f binding.Facts) (bindin
 // the job, from GitHub's records and its run, never from the machine.
 // An error means GitHub or the bucket gave no confirmed answer.
 func (s *Service) decide(ctx context.Context, repo github.Repository, m Machine, job github.Job, run github.WorkflowRun, reported binding.Facts) (Admission, error) {
-	a := Admission{Machine: m.Name, Zone: m.Zone, RepositoryID: m.RepositoryID, JobID: job.ID, RunID: run.ID,
-		RunAttempt: job.RunAttempt, JobName: job.Name, Selector: m.Selector.String(), At: s.now()}
-	refuse := func(reason string, cancel bool) (Admission, error) {
-		a.Allowed, a.Reason, a.Cancel = false, reason, cancel
-		return a, nil
-	}
-	fail := func(reason string) (Admission, error) {
-		a.Allowed, a.Reason, a.Cancel, a.Fail = false, reason, true, reason
-		return a, nil
-	}
-	// The job's repository is the machine's consumer, and the
-	// organization's.
-	if repo.ID != m.RepositoryID || run.RepositoryID != repo.ID || repo.OwnerID != s.Config.Organization.ID {
-		return refuse("the job's repository isn't the machine's consumer", false)
-	}
-	// Its labels are exactly one selector, the machine's.
-	if err := selector.MatchesMachine(job.Labels, m.Selector); err != nil {
-		return refuse(err.Error(), errors.Is(err, selector.ErrOtherLabels))
-	}
-	// A fork's pull_request run never gets a machine.
-	if run.Event != "pull_request_target" && run.HeadRepositoryID != repo.ID {
-		return refuse("the run is a fork's pull request's", true)
-	}
-
-	bd, bound, err := s.Binder.Lookup(ctx, repo.ID, run.ID)
-	if err != nil {
-		return Admission{}, retryErr(err)
+	a, decided, bd, bound, err := s.judge(ctx, repo, m, job, run)
+	if err != nil || decided {
+		return a, err
 	}
 	if !bound {
 		// Every machine boots the base image, and its first check binds,
@@ -424,28 +400,69 @@ func (s *Service) decide(ctx context.Context, repo github.Repository, m Machine,
 			bound = true
 		}
 	}
+	return s.conclude(a, m, run, bd, bound), nil
+}
+
+// judge applies the check's conditions that need nothing a machine
+// reports: decided says the job is refused already, and otherwise the run's
+// binding is returned, if it has one, for conclude.
+func (s *Service) judge(ctx context.Context, repo github.Repository, m Machine, job github.Job, run github.WorkflowRun) (a Admission, decided bool, bd binding.Binding, bound bool, err error) {
+	a = Admission{Machine: m.Name, Zone: m.Zone, RepositoryID: m.RepositoryID, JobID: job.ID, RunID: run.ID,
+		RunAttempt: job.RunAttempt, JobName: job.Name, Selector: m.Selector.String(), At: s.now()}
+	refuse := func(reason string, cancel bool) (Admission, bool, binding.Binding, bool, error) {
+		a.Allowed, a.Reason, a.Cancel = false, reason, cancel
+		return a, true, binding.Binding{}, false, nil
+	}
+	// The job's repository is the machine's consumer, and the
+	// organization's.
+	if repo.ID != m.RepositoryID || run.RepositoryID != repo.ID || repo.OwnerID != s.Config.Organization.ID {
+		return refuse("the job's repository isn't the machine's consumer", false)
+	}
+	// Its labels are exactly one selector, the machine's.
+	if err := selector.MatchesMachine(job.Labels, m.Selector); err != nil {
+		return refuse(err.Error(), errors.Is(err, selector.ErrOtherLabels))
+	}
+	// A fork's pull_request run never gets a machine.
+	if run.Event != "pull_request_target" && run.HeadRepositoryID != repo.ID {
+		return refuse("the run is a fork's pull request's", true)
+	}
+	bd, bound, err = s.Binder.Lookup(ctx, repo.ID, run.ID)
+	if err != nil {
+		return Admission{}, false, binding.Binding{}, false, retryErr(err)
+	}
+	return a, false, bd, bound, nil
+}
+
+// conclude applies the rest of the check's conditions to a job judge left
+// undecided, its run bound or not by then.
+func (s *Service) conclude(a Admission, m Machine, run github.WorkflowRun, bd binding.Binding, bound bool) Admission {
+	fail := func(reason string) Admission {
+		a.Allowed, a.Reason, a.Cancel, a.Fail = false, reason, true, reason
+		return a
+	}
 	if !bound {
 		// An unbound pull_request_target run's job may have the smallest
 		// shape, standard: nothing restored, nothing saved.
 		if run.Event == "pull_request_target" && m.Selector.Plain(s.Config.Shapes.Smallest()) {
 			a.Allowed, a.Unbound = true, true
-			return a, nil
+			return a
 		}
 		if run.Event == "pull_request_target" {
 			return fail("the contribution's run isn't approved, so its jobs may have only " + s.Config.Shapes.Smallest() +
 				", standard, until its contribution job is approved")
 		}
-		return refuse("the job's run has no binding", false)
+		a.Allowed, a.Reason = false, "the job's run has no binding"
+		return a
 	}
 	if bd.Fail != "" {
 		return fail(bd.Fail)
 	}
 	if run.Event == "pull_request_target" {
-		a.Contribution = bd.HeadRepositoryID != repo.ID
+		a.Contribution = bd.HeadRepositoryID != run.RepositoryID
 	}
 	a.Scope, a.Base, a.Commit = bd.Scope, bd.Base, bd.Commit
 	a.Allowed = true
-	return a, nil
+	return a
 }
 
 // refuse carries out a refusal: the machine stops at once, and the run of a

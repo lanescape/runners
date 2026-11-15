@@ -309,7 +309,11 @@ type Preemption struct {
 	// AgeLimit says the service stopped the machine at its age limit, its
 	// job unfinished: the job was lost, whatever the evidence of a
 	// preemption.
-	AgeLimit  bool      `json:"age_limit,omitempty"`
+	AgeLimit bool `json:"age_limit,omitempty"`
+	// Retired says the job was lost on a machine the service retired
+	// after its runner took the job, before the job's check: the job was
+	// lost, and never had a work disk.
+	Retired   bool      `json:"retired,omitempty"`
 	StoppedAt time.Time `json:"stopped_at"`
 	// ResumeImage is the resume image made of its work disk, if its scope
 	// saves and it had one.

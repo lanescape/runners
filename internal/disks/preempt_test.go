@@ -1028,3 +1028,52 @@ func TestARerunWaitsAndReadsAgain(t *testing.T) {
 		t.Fatalf("rerun record = %v", rr)
 	}
 }
+
+// lostOnRetirement plays a job its machine's runner took, which the
+// machine's retirement after 20 minutes idle loses before its check: GitHub
+// fails the job once its runner is gone.
+func (e *env) lostOnRetirement(run *ghemu.Run, j *ghemu.WorkflowJob) *job {
+	e.t.Helper()
+	jb := e.take(run, j)
+	e.clock.Advance(machines.IdleLimit)
+	e.pass()
+	if _, ok := e.gce.Instance(jb.in.Zone, jb.in.Name); ok {
+		e.t.Fatal("the retired machine is still there")
+	}
+	e.gh.CompleteJobByID(j.ID, "failure")
+	return jb
+}
+
+// TestAJobLostOnARetiredMachineIsRerun: a job a retired machine's runner
+// took before its check is recorded as lost, with no work disk, and its run
+// is rerun once it has finished, up to three attempts in all, as for a
+// preemption (specs/0002-machines.md, Retiring a machine, Reruns).
+func TestAJobLostOnARetiredMachineIsRerun(t *testing.T) {
+	e := setup(t)
+	run := e.mainRun()
+	jb := e.lostOnRetirement(run, e.queueJob(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}}))
+	key := "preemptions/5001/" + strconv.FormatInt(run.ID, 10) + "/" + strconv.FormatUint(jb.in.ID, 10) + ".json"
+	rec, ok := e.record(key)
+	if !ok || rec["retired"] != true || rec["done"] != true || rec["no_disk"] != true || rec["job_name"] != "build" ||
+		rec["run_attempt"] != float64(1) || rec["preempted"] != disks.NotPreempted {
+		t.Fatalf("record = %v", rec)
+	}
+	e.pass()
+	if e.attempt(run) != 2 {
+		t.Fatalf("attempt %d; the run wasn't rerun", e.attempt(run))
+	}
+	e.lostOnRetirement(run, e.rerunJob(run, 2, "build"))
+	e.pass()
+	if e.attempt(run) != 3 {
+		t.Fatalf("attempt %d, want 3", e.attempt(run))
+	}
+	e.lostOnRetirement(run, e.rerunJob(run, 3, "build"))
+	e.pass()
+	e.pass()
+	if e.attempt(run) != 3 {
+		t.Fatalf("a run was rerun past 3 attempts: %d", e.attempt(run))
+	}
+	if !e.logged("job lost on a retired machine recorded") {
+		t.Fatal("not logged")
+	}
+}

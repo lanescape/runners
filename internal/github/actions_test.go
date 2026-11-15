@@ -73,6 +73,69 @@ func TestRunsAndJobs(t *testing.T) {
 	}
 }
 
+// TestRunsCreated: runs of a status created in a span, by GitHub's created
+// filter; a span holding more runs than GitHub lists for one filter is
+// split until each part's are listed in full.
+func TestRunsCreated(t *testing.T) {
+	ctx := context.Background()
+	e := setup(t)
+	repo := e.repository(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	var want []int64
+	for i := range 7 {
+		r := e.emu.PushRun(e.repo, "main")
+		e.emu.SetRunStatus(r, "completed")
+		r.Created = now.Add(-time.Duration(i) * time.Hour)
+		if i < 6 {
+			want = append(want, r.ID)
+		}
+	}
+	old := e.emu.PushRun(e.repo, "main")
+	e.emu.SetRunStatus(old, "completed")
+	old.Created = now.Add(-48 * time.Hour)
+	// GitHub lists 3 of a filter's runs at most, here.
+	e.emu.RunSearchLimit = 3
+	runs, err := e.c.RunsCreated(ctx, repo, "completed", now.Add(-5*time.Hour), now)
+	var got []int64
+	for _, r := range runs {
+		got = append(got, r.ID)
+	}
+	slices.Sort(got)
+	slices.Sort(want)
+	if err != nil || !slices.Equal(got, want) {
+		t.Fatalf("runs created in the last 5 hours = %v, %v; want %v", got, err, want)
+	}
+	// Four runs created in the same second can't be split.
+	for range 4 {
+		r := e.emu.PushRun(e.repo, "main")
+		e.emu.SetRunStatus(r, "completed")
+		r.Created = now.Add(-30 * time.Hour)
+	}
+	if _, err := e.c.RunsCreated(ctx, repo, "completed", now.Add(-31*time.Hour), now.Add(-29*time.Hour)); !errors.Is(err, github.ErrIncomplete) {
+		t.Fatalf("an unsplittable span: %v, want ErrIncomplete", err)
+	}
+}
+
+// TestRunsCreatedPastAFullPage: GitHub's page past the runs it lists for
+// a filter is empty, with a count of 0, and the span is split all the same.
+func TestRunsCreatedPastAFullPage(t *testing.T) {
+	ctx := context.Background()
+	e := setup(t)
+	repo := e.repository(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	for i := range 150 {
+		r := e.emu.PushRun(e.repo, "main")
+		e.emu.SetRunStatus(r, "completed")
+		r.Created = now.Add(-time.Duration(i) * time.Minute)
+	}
+	// It lists 100, a full page, which links to the next.
+	e.emu.RunSearchLimit = 100
+	runs, err := e.c.RunsCreated(ctx, repo, "completed", now.Add(-3*time.Hour), now)
+	if err != nil || len(runs) != 150 {
+		t.Fatalf("%d runs, %v; want 150", len(runs), err)
+	}
+}
+
 func TestApprovals(t *testing.T) {
 	ctx := context.Background()
 	e := setup(t)

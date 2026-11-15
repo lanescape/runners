@@ -439,3 +439,36 @@ func TestAMachineWithNoAccountFromAPublicImage(t *testing.T) {
 		t.Fatalf("past its maximum run duration: %v", err)
 	}
 }
+
+// TestABootDisksSourceImage: a machine's boot disk names the image it was
+// made from, and its ID, which stays once the image is deleted, as the name
+// doesn't, so an image made again under the name isn't taken for it.
+func TestABootDisksSourceImage(t *testing.T) {
+	ctx := context.Background()
+	emu, c := setup(t)
+	if err := c.CreateInstance(ctx, zoneA, spec("lsr-5001-aaaaaaaa", "n4-highcpu-2", false), compute.RequestID("i")); err != nil {
+		t.Fatal(err)
+	}
+	ims, err := c.Images(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var id uint64
+	for _, im := range ims {
+		if im.Name == "lsr-base-amd64-1" {
+			id = im.ID
+		}
+	}
+	d, err := c.Disk(ctx, zoneA, "lsr-5001-aaaaaaaa")
+	if err != nil || d.SourceImage != "lsr-base-amd64-1" || d.SourceImageID != id || id == 0 {
+		t.Fatalf("boot disk = %+v, %v; image ID %d", d, err, id)
+	}
+	if err := c.DeleteImage(ctx, "lsr-base-amd64-1", compute.RequestID("di")); err != nil {
+		t.Fatal(err)
+	}
+	emu.AddImage("lsr-base-amd64-1", "", "X86_64")
+	d, err = c.Disk(ctx, zoneA, "lsr-5001-aaaaaaaa")
+	if err != nil || d.SourceImage != "" || d.SourceImageID != id {
+		t.Fatalf("boot disk once its image was deleted = %+v, %v", d, err)
+	}
+}

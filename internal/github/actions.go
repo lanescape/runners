@@ -21,6 +21,10 @@ var ErrConflict = errors.New("conflict on GitHub")
 // runner that's running a job.
 var ErrRefused = errors.New("refused by GitHub")
 
+// ErrIncomplete is an answer GitHub couldn't give in full: a list of more
+// runs than it lists for one filter, in a span that can't be split.
+var ErrIncomplete = errors.New("more than GitHub lists")
+
 // Job is a workflow job, as GitHub records it. RunnerID and RunnerName are
 // the runner GitHub handed it to, once it shows the assignment.
 type Job struct {
@@ -71,6 +75,11 @@ type Actions interface {
 	Repositories(ctx context.Context) ([]Repository, error)
 	// Runs lists a repository's runs with a status, such as queued.
 	Runs(ctx context.Context, repo Repository, status string) ([]WorkflowRun, error)
+	// RunsCreated lists a repository's runs with a status that were created
+	// from from to to, both included, to the second. GitHub answers a
+	// filtered list with at most 1,000 runs, so a span that holds more is
+	// split; one that can't be is ErrIncomplete.
+	RunsCreated(ctx context.Context, repo Repository, status string, from, to time.Time) ([]WorkflowRun, error)
 	// RunJobs lists the jobs of a run's latest attempt.
 	RunJobs(ctx context.Context, repo Repository, runID int64) ([]Job, error)
 	// AttemptJobs lists the jobs of one of a run's attempts.
@@ -167,18 +176,60 @@ func (c *Client) Repositories(ctx context.Context) ([]Repository, error) {
 
 // Runs implements Actions.
 func (c *Client) Runs(ctx context.Context, repo Repository, status string) ([]WorkflowRun, error) {
-	opts := &gh.ListWorkflowRunsOptions{Status: status, ListOptions: gh.ListOptions{PerPage: 100}}
+	return c.runs(ctx, repo, &gh.ListWorkflowRunsOptions{Status: status, ListOptions: gh.ListOptions{PerPage: 100}})
+}
+
+// RunsCreated implements Actions.
+func (c *Client) RunsCreated(ctx context.Context, repo Repository, status string, from, to time.Time) ([]WorkflowRun, error) {
+	from, to = from.UTC().Truncate(time.Second), to.UTC().Truncate(time.Second)
+	if to.Before(from) {
+		return nil, nil
+	}
+	opts := &gh.ListWorkflowRunsOptions{Status: status, Created: from.Format(time.RFC3339) + ".." + to.Format(time.RFC3339),
+		ListOptions: gh.ListOptions{PerPage: 100}}
+	out, total, err := c.listRuns(ctx, repo, opts)
+	if err != nil || len(out) >= total {
+		return out, err
+	}
+	// More than GitHub lists for one filter: each half on its own.
+	if !to.After(from) {
+		return nil, fmt.Errorf("%w: more than %d runs created at %s", ErrIncomplete, len(out), from.Format(time.RFC3339))
+	}
+	mid := from.Add(to.Sub(from) / 2).Truncate(time.Second)
+	first, err := c.RunsCreated(ctx, repo, status, from, mid)
+	if err != nil {
+		return nil, err
+	}
+	second, err := c.RunsCreated(ctx, repo, status, mid.Add(time.Second), to)
+	if err != nil {
+		return nil, err
+	}
+	return append(first, second...), nil
+}
+
+func (c *Client) runs(ctx context.Context, repo Repository, opts *gh.ListWorkflowRunsOptions) ([]WorkflowRun, error) {
+	out, _, err := c.listRuns(ctx, repo, opts)
+	return out, err
+}
+
+// listRuns lists every page of runs, and GitHub's count of the runs that
+// match, which it may not list in full.
+func (c *Client) listRuns(ctx context.Context, repo Repository, opts *gh.ListWorkflowRunsOptions) ([]WorkflowRun, int, error) {
 	var out []WorkflowRun
+	// GitHub's page past the 1,000 it lists is empty, with a count of 0:
+	// the largest count of any page is the one.
+	total := 0
 	for {
 		rs, resp, err := c.gh.Actions.ListRepositoryWorkflowRuns(ctx, repo.Owner, repo.Name, opts)
 		if err != nil {
-			return nil, classify(err)
+			return nil, 0, classify(err)
 		}
+		total = max(total, rs.GetTotalCount())
 		for _, r := range rs.WorkflowRuns {
 			out = append(out, runOf(r))
 		}
-		if resp.NextPage == 0 {
-			return out, nil
+		if resp.NextPage == 0 || len(rs.WorkflowRuns) == 0 {
+			return out, total, nil
 		}
 		opts.Page = resp.NextPage
 	}

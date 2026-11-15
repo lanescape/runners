@@ -36,6 +36,9 @@ type Emulator struct {
 	URL string
 	// Actions is the Actions OIDC issuer.
 	Actions *oidc.Issuer
+	// RunSearchLimit is how many runs a filtered runs list lists at most,
+	// whatever its count says: GitHub's 1,000, unless a test sets fewer.
+	RunSearchLimit int
 
 	srv    *httptest.Server
 	api    http.Handler
@@ -128,6 +131,14 @@ type Pull struct {
 	mergeSHA string
 }
 
+// updated is when the run last changed, as GitHub's updated_at says.
+func (r *Run) updated() time.Time {
+	if r.Updated.IsZero() {
+		return r.Created
+	}
+	return r.Updated
+}
+
 // Run is a workflow run, with what its jobs' environment and tokens carry.
 type Run struct {
 	ID         int64
@@ -151,7 +162,9 @@ type Run struct {
 	BaseRef string
 	HeadRef string
 
-	Created   time.Time
+	Created time.Time
+	// Updated is when its status last changed.
+	Updated   time.Time
 	Jobs      []*WorkflowJob
 	Approvals []Approval
 
@@ -437,6 +450,7 @@ func (e *Emulator) addRun(r *Run) *Run {
 	r.Created = e.clock.Now()
 	if r.Status == "" {
 		r.Status = "in_progress"
+		r.Updated = e.clock.Now()
 	}
 	if r.Attempt == 0 {
 		r.Attempt = 1
@@ -530,6 +544,7 @@ func (e *Emulator) SetRunStatus(r *Run, status string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	r.Status = status
+	r.Updated = e.clock.Now()
 	e.notify()
 }
 

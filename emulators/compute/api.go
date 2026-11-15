@@ -689,7 +689,7 @@ func (e *Emulator) insertInstance(r *http.Request, zone string) (*operation, *ap
 		size = im.sizeGB
 	}
 	d := &disk{id: newID(), name: bootName, zone: zone, typ: typ, sizeGB: size, iops: ip.ProvisionedIops,
-		throughput: ip.ProvisionedThroughput, labels: ip.Labels, sourceImage: e.imageURL(im), arch: im.arch, created: now,
+		throughput: ip.ProvisionedThroughput, labels: ip.Labels, sourceImage: e.imageURL(im), source: im, arch: im.arch, created: now,
 		users: []*instance{in}}
 	e.disks[zone+"/"+bootName] = d
 	dev := boots[0].DeviceName
@@ -889,9 +889,17 @@ func (e *Emulator) serialPort(w http.ResponseWriter, r *http.Request, zone strin
 
 func (e *Emulator) diskJSON(d *disk) *gce.Disk {
 	out := &gce.Disk{Kind: "compute#disk", Id: d.id, Name: d.name, Zone: e.zoneURL(d.zone), SizeGb: d.sizeGB,
-		Type: e.zoneURL(d.zone) + "/diskTypes/" + d.typ, Status: "READY", Labels: d.labels, SourceImage: d.sourceImage,
+		Type: e.zoneURL(d.zone) + "/diskTypes/" + d.typ, Status: "READY", Labels: d.labels,
 		ProvisionedIops: d.iops, ProvisionedThroughput: d.throughput, CreationTimestamp: d.created.Format(timeFormat),
 		SelfLink: e.diskURL(d), Architecture: d.arch}
+	// A disk names its source image only while that image is there, as
+	// Compute Engine's do; its ID stays.
+	if im := d.source; im != nil {
+		out.SourceImageId = strconv.FormatUint(im.id, 10)
+		if im.project == "" && e.images[im.name] == im || im.project != "" && e.public[im.project+"/"+im.name] == im {
+			out.SourceImage = d.sourceImage
+		}
+	}
 	for _, u := range d.users {
 		out.Users = append(out.Users, e.instanceURL(u))
 	}
@@ -951,7 +959,7 @@ func (e *Emulator) insertDisk(r *http.Request, zone string) (*operation, *apiErr
 		if err != nil {
 			return nil, err
 		}
-		d.sourceImage, d.arch = e.imageURL(im), im.arch
+		d.sourceImage, d.source, d.arch = e.imageURL(im), im, im.arch
 		if d.sizeGB == 0 {
 			d.sizeGB = im.sizeGB
 		}

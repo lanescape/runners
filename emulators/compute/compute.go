@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http/httptest"
 	"regexp"
 	"slices"
@@ -150,9 +151,12 @@ type disk struct {
 	throughput  int64
 	labels      map[string]string
 	sourceImage string
-	arch        string
-	created     time.Time
-	users       []*instance
+	// source is the image it was made from, by which its sourceImageId
+	// is answered, and its sourceImage only while that image is there.
+	source  *image
+	arch    string
+	created time.Time
+	users   []*instance
 }
 
 type image struct {
@@ -266,9 +270,15 @@ func archOf(family string) string {
 // AddImage adds a ready image to the project, as one built elsewhere would
 // be. arch is X86_64 or ARM64.
 func (e *Emulator) AddImage(name, family, arch string) {
+	e.AddLabelledImage(name, family, arch, nil)
+}
+
+// AddLabelledImage adds a ready image with labels, as AddImage does.
+func (e *Emulator) AddLabelledImage(name, family, arch string, labels map[string]string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.images[name] = &image{id: newID(), name: name, family: family, status: "READY", arch: arch, created: e.clock.Now(), sizeGB: 10}
+	e.images[name] = &image{id: newID(), name: name, family: family, status: "READY", arch: arch, labels: maps.Clone(labels),
+		created: e.clock.Now(), sizeGB: 10}
 }
 
 // HoldImages makes images made from now on stay PENDING, as one Compute

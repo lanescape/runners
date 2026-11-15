@@ -187,6 +187,30 @@ type preemptions struct {
 	family map[string]string
 	// at, if it's set, is called as each machine is recorded.
 	at func(m machines.Machine)
+	// lost are the jobs recorded lost on retired machines, by machine;
+	// failLost, if set, fails each record.
+	lost     map[string]machines.Admission
+	failLost error
+}
+
+func (p *preemptions) Lost(_ context.Context, m machines.Machine, a machines.Admission) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.failLost != nil {
+		return p.failLost
+	}
+	if p.lost == nil {
+		p.lost = map[string]machines.Admission{}
+	}
+	p.lost[m.Name] = a
+	return nil
+}
+
+func (p *preemptions) lostOn(name string) (machines.Admission, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	a, ok := p.lost[name]
+	return a, ok
 }
 
 func (p *preemptions) Stopped(_ context.Context, m machines.Machine, _ machines.Admission, preempted, ageLimit bool) error {
@@ -658,7 +682,9 @@ func TestAFirstMachineIsConfirmedBeforeItGoes(t *testing.T) {
 	}
 	// GitHub's queue can't be read when the idle machine goes.
 	e.clock.Advance(machines.IdleLimit)
-	e.gh.ServerError("/repos/lanescape/app/actions/runs", http.StatusBadGateway, 0)
+	e.gh.Faults().Add(fault.Rule{Method: http.MethodGet,
+		Match:   func(r *http.Request) bool { return strings.Contains(r.URL.RawQuery, "status=queued") },
+		Respond: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusBadGateway) }})
 	e.pass()
 	e.wantMachines(0)
 	if rec, _ := e.record(key); rec["tentative"] != nil {

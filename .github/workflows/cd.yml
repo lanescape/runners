@@ -145,7 +145,10 @@ jobs:
           fi
           echo "image=$image" >>"$GITHUB_OUTPUT"
           echo "Image: \`$image\`" >>"$GITHUB_STEP_SUMMARY"
+      # apply.sh asks again whether the commit is main's head, at every
+      # attempt, since a rerun of this job alone keeps the gate's answer.
       - name: Preview and apply infra/
         env:
           IMAGE: ${{ steps.image.outputs.image }}
+          GH_TOKEN: ${{ github.token }}
         run: bash cd/apply.sh

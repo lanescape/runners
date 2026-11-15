@@ -65,6 +65,12 @@ type inventory struct {
 	groups    map[string]github.RunnerGroup
 	checked   map[string]github.RunnerGroup
 	images    map[string]string
+	noImage   map[string]error
+	imageList []compute.Image
+	listed    bool
+	// retiring is whether this revision retires machines for their
+	// programs this pass, once known.
+	retiring  *bool
 	attempted map[string]bool
 	deleted   map[string]bool
 }
@@ -107,7 +113,7 @@ func (s *Service) Pass(p *pass.Pass) error {
 func (s *Service) inventory(p *pass.Pass) *inventory {
 	ctx := p.Context()
 	inv := &inventory{machines: map[string]Machine{}, repos: map[int64]github.Repository{}, groups: nil,
-		checked: map[string]github.RunnerGroup{}, images: map[string]string{}, attempted: map[string]bool{}, deleted: map[string]bool{}}
+		checked: map[string]github.RunnerGroup{}, images: map[string]string{}, noImage: map[string]error{}, attempted: map[string]bool{}, deleted: map[string]bool{}}
 
 	// Machines and disks first, then records.
 	inv.machinesComplete, inv.disksComplete = true, true
@@ -477,6 +483,13 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 		s.log().Error("making no machines", "err", err.Error())
 		return
 	}
+	// A later deploy's revision gives jobs their machines, and keeps their
+	// records: a replaced one neither makes machines nor decides anything
+	// of queued jobs, such as whether they wait for a base image, which
+	// its own images can't tell.
+	if s.replaced(ctx) {
+		return
+	}
 	var all []wanted
 	for _, q := range inv.queues {
 		if ctx.Err() != nil {
@@ -522,6 +535,14 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 		if ctx.Err() != nil {
 			return
 		}
+		// A job whose wait for a base image has ended, by its record,
+		// gets no machine until its record says so, so that its hour
+		// runs again before it has one.
+		if _, err := s.noteWait(ctx, inv, w.repo.ID, w.job.ID, w.sel.Arch); err != nil {
+			s.log().Warn("no machine made; the job stays queued until its record says whether it waits for a base image",
+				"repository_id", w.repo.ID, "job_id", w.job.ID, "selector", w.sel.String(), "err", err.Error())
+			continue
+		}
 		// The quota pools the job's machine may draw on: its machine
 		// families', and for a Spot job, the Spot quota every family
 		// shares.
@@ -537,9 +558,23 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 				"job_id", w.job.ID, "selector", w.sel.String())
 			continue
 		}
+		// A later deploy's revision makes the machines from now on, even
+		// one recorded during this pass.
+		if s.replaced(ctx) {
+			return
+		}
 		err := s.make(ctx, inv, w)
 		if err == nil {
 			running++
+			continue
+		}
+		if errors.Is(err, bases.ErrNoImage) {
+			// It waits queued for a base image its machine may boot:
+			// no runner is registered and no machine recorded for it,
+			// and its wait doesn't count towards the hour its machines
+			// have to start (noteWait).
+			s.log().Info("a job waits for a base image its machine may boot", "repository_id", w.repo.ID, "job_id", w.job.ID,
+				"selector", w.sel.String(), "why", err.Error())
 			continue
 		}
 		s.log().Warn("no machine made; the job stays queued", "repository_id", w.repo.ID, "job_id", w.job.ID, "selector", w.sel.String(),
@@ -556,6 +591,50 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 			}
 		}
 	}
+}
+
+// noteWait says whether a queued job with a first machine's record waits
+// for a base image its machine may boot, and brings its record up to date:
+// when it began to wait, and once it no longer does, how long it waited, so
+// that its waits don't count towards its RetryLimit (specs/0003-disks.md,
+// Which image machines boot). A record not yet confirmed is left as it is.
+// The error says whether the job waits isn't known, since the images
+// couldn't be listed, or the record couldn't be brought up to date; it's
+// tried again at the next call, and meanwhile the record's hour runs as it
+// last said. A write whose answer was lost is read back.
+func (s *Service) noteWait(ctx context.Context, inv *inventory, repoID, jobID int64, arch string) (bool, error) {
+	key := jobKey(repoID, jobID)
+	r, ok := inv.jobRecords[key]
+	if !ok {
+		return false, nil
+	}
+	_, err := s.baseImage(ctx, inv, arch)
+	waiting := errors.Is(err, bases.ErrNoImage)
+	if err != nil && !waiting {
+		return false, fmt.Errorf("reading whether its base image is ready: %w", err)
+	}
+	if r.v.Tentative || waiting == !r.v.WaitingSince.IsZero() {
+		return waiting, nil
+	}
+	rec := r.v
+	if waiting {
+		rec.WaitingSince = s.now()
+	} else {
+		rec.Waited += s.now().Sub(rec.WaitingSince)
+		rec.WaitingSince = time.Time{}
+	}
+	gen, err := replaceJSON(ctx, s.Objects, key, rec, r.gen)
+	if err != nil {
+		if v, g, ok, rerr := getJSON[JobRecord](ctx, s.Objects, key); rerr == nil && ok {
+			inv.jobRecords[key] = record[JobRecord]{v, g}
+			if waiting == !v.WaitingSince.IsZero() {
+				return waiting, nil
+			}
+		}
+		return waiting, fmt.Errorf("recording a job's wait for a base image: %w", err)
+	}
+	inv.jobRecords[key] = record[JobRecord]{rec, gen}
+	return waiting, nil
 }
 
 // shortOf says what a job's placements that found no quota or capacity
@@ -612,6 +691,11 @@ func (s *Service) wants(ctx context.Context, inv *inventory, q *queue) []wanted 
 	idle := map[string][]Machine{}
 	for _, m := range inv.machines {
 		if m.RepositoryID != repo.ID || !inv.live(m) {
+			continue
+		}
+		// A machine that cleanup retires this pass for its programs
+		// takes no job.
+		if _, stale := s.staleImage(ctx, inv, m); stale {
 			continue
 		}
 		if _, admitted := inv.admissions[m.Name]; !admitted {
@@ -673,10 +757,29 @@ func (s *Service) wants(ctx context.Context, inv *inventory, q *queue) []wanted 
 			refuse("a fork's pull request's run gets none of the service's machines")
 			continue
 		}
-		if jr, ok := s.jobRecord(ctx, inv, repo.ID, job.ID); ok && s.now().Sub(jr.FirstMachineAt) >= RetryLimit {
-			refuse(fmt.Sprintf("no machine made for job %d started its runner within %s of its first, made at %s",
-				job.ID, RetryLimit, jr.FirstMachineAt.Format(time.RFC3339)))
-			continue
+		if jr, ok := s.jobRecord(ctx, inv, repo.ID, job.ID); ok {
+			// A job that waits for a base image isn't refused, even if
+			// its record couldn't say so. One whose record couldn't be
+			// brought up to date, or that might wait, is neither refused
+			// nor given a machine this pass, so that it gets none its
+			// record would refuse.
+			waiting, err := s.noteWait(ctx, inv, repo.ID, job.ID, sel.Arch)
+			if err != nil {
+				log.Warn("no machine made, and no decision whether a job's machines are out of time, this pass", "err", err.Error())
+				continue
+			}
+			if r, ok := inv.jobRecords[jobKey(repo.ID, job.ID)]; ok && !r.v.Tentative {
+				jr = r.v
+			}
+			if !waiting && jr.spent(s.now()) >= RetryLimit {
+				waited := ""
+				if jr.Waited > 0 {
+					waited = fmt.Sprintf(", not counting %s it waited for a base image", jr.Waited.Round(time.Second))
+				}
+				refuse(fmt.Sprintf("no machine made for job %d started its runner within %s of its first, made at %s%s",
+					job.ID, RetryLimit, jr.FirstMachineAt.Format(time.RFC3339), waited))
+				continue
+			}
 		}
 		w := wanted{repo: repo, sel: sel, job: job, contribution: contribution(run)}
 		bySel[sel.String()] = append(bySel[sel.String()], w)
@@ -861,27 +964,124 @@ func (s *Service) group(ctx context.Context, inv *inventory, repo github.Reposit
 
 // baseImage is the base image machines of an architecture boot,
 // lsr-base-<arch>-<key>: the current key's once it's ready, and until then
-// the previous one (specs/0003-disks.md, Which image machines boot).
+// the previous one, if it was made with the service's own programs
+// (specs/0003-disks.md, Which image machines boot). With none, the error, a
+// bases.ErrNoImage, says why, and the architecture's jobs wait queued; the
+// pass doesn't look again.
 func (s *Service) baseImage(ctx context.Context, inv *inventory, arch string) (string, error) {
 	if im, ok := inv.images[arch]; ok {
 		return im, nil
 	}
-	ims, err := s.Compute.Images(ctx)
+	if err, ok := inv.noImage[arch]; ok {
+		return "", err
+	}
+	ims, err := s.images(ctx, inv)
 	if err != nil {
 		return "", err
 	}
 	var name string
-	var ok bool
 	if s.Bases != nil {
-		name, ok = s.Bases.Boot(ims, arch)
+		name, err = s.Bases.Boot(ims, arch)
 	} else {
-		name, ok = bases.Boot(ims, arch, "")
+		name, err = bases.Boot(ims, arch, "", "")
 	}
-	if !ok {
-		return "", fmt.Errorf("there's no ready base image for %s", arch)
+	if err != nil {
+		inv.noImage[arch] = err
+		return "", err
 	}
 	inv.images[arch] = name
 	return name, nil
+}
+
+// images are the project's images, listed once a pass.
+func (s *Service) images(ctx context.Context, inv *inventory) ([]compute.Image, error) {
+	if inv.listed {
+		return inv.imageList, nil
+	}
+	ims, err := s.Compute.Images(ctx)
+	if err != nil {
+		return nil, err
+	}
+	inv.imageList, inv.listed = ims, true
+	return ims, nil
+}
+
+// replaced reports whether a later deploy replaced this revision, which
+// then makes no machines (specs/0004-deployment.md, Which revision makes
+// machines), and logs why. A record that can't be read counts as one, for
+// this call.
+func (s *Service) replaced(ctx context.Context) bool {
+	if s.Fence == nil {
+		return false
+	}
+	newer, replaced, err := s.Fence.Newer(ctx)
+	switch {
+	case err != nil:
+		s.log().Warn("making no machine: the latest deploy can't be read", "err", err.Error())
+		return true
+	case replaced:
+		s.log().Info("making no machine: a later deploy replaced this revision", "deploy", s.Fence.Own.String(), "latest", newer.String())
+		return true
+	}
+	return false
+}
+
+// staleImage is the base image an unadmitted machine booted from, if that
+// image doesn't run the service's own programs, by the ID of its boot
+// disk's source image (specs/0003-disks.md, Which image machines boot), and
+// this revision, not replaced by a later deploy's, retires such machines.
+// An image no longer listed, deleted since, isn't known to run them. A
+// machine whose boot disk isn't known, such as when the disks or the images
+// couldn't be listed, isn't retired for it.
+func (s *Service) staleImage(ctx context.Context, inv *inventory, m Machine) (string, bool) {
+	if s.Bases == nil || !inv.disksComplete {
+		return "", false
+	}
+	if _, admitted := inv.admissions[m.Name]; admitted {
+		return "", false
+	}
+	boot := ""
+	for _, d := range m.Disks {
+		if d.Boot {
+			boot = d.Disk
+		}
+	}
+	var image string
+	var id uint64
+	for _, d := range inv.disks {
+		if d.Name == boot && d.Zone == m.Zone {
+			image, id = d.SourceImage, d.SourceImageID
+		}
+	}
+	if id == 0 {
+		return "", false
+	}
+	ims, err := s.images(ctx, inv)
+	if err != nil || s.Bases.Ours(ims, m.Selector.Arch, id) {
+		return "", false
+	}
+	if image == "" {
+		image = "image " + strconv.FormatUint(id, 10) + ", since deleted"
+	}
+	if inv.retiring == nil {
+		// A replaced revision's own programs aren't the service's: it
+		// leaves machines to the revision that replaced it.
+		retiring := s.Fence == nil
+		if s.Fence != nil {
+			newer, replaced, err := s.Fence.Newer(ctx)
+			switch {
+			case err != nil:
+				s.log().Warn("retiring no machine for its programs this pass: the latest deploy can't be read", "err", err.Error())
+			case replaced:
+				s.log().Info("retiring no machine for its programs: a later deploy replaced this revision", "deploy", s.Fence.Own.String(),
+					"latest", newer.String())
+			default:
+				retiring = true
+			}
+		}
+		inv.retiring = &retiring
+	}
+	return image, *inv.retiring
 }
 
 // make makes one machine for a job: a just-in-time runner for the selector

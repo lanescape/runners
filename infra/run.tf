@@ -68,6 +68,12 @@ resource "google_cloud_run_v2_service" "service" {
         name  = "RUNNERS_PROJECT"
         value = var.project_id
       }
+      # Orders deploys, so that a revision a later deploy replaced makes no
+      # machines (specs/0004-deployment.md, Which revision makes machines).
+      env {
+        name  = "RUNNERS_DEPLOY_ID"
+        value = var.deploy_id
+      }
       env {
         name  = "RUNNERS_BUCKET"
         value = google_storage_bucket.state.name
