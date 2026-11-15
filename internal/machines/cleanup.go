@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -175,7 +174,7 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 		}
 		// A retired machine settles its runner first, if it can: at the
 		// age limit it goes all the same, and says what may be lost.
-		if ra, ok := inv.admissions[m.Name]; ok && ra.retiredClaim() && !s.settleRunner(ctx, inv, m, ra, true) {
+		if ra, ok := inv.admissions[m.Name]; ok && ra.retiredClaim() && !s.settleRunner(ctx, inv, m, ra) {
 			s.log().Error("deleting a retired machine at its age limit, though its runner's job couldn't be settled; a job it took may be lost",
 				"machine", m.Name, "repository_id", m.RepositoryID, "runner_id", m.RunnerID)
 		}
@@ -193,7 +192,7 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 		// A machine an earlier pass retired, but didn't delete, settles
 		// its runner first.
 		if a.retiredClaim() {
-			if !s.settleRunner(ctx, inv, m, a, true) {
+			if !s.settleRunner(ctx, inv, m, a) {
 				return
 			}
 			s.finish(ctx, inv, m, strings.TrimPrefix(a.Reason, "retired: "), nil)
@@ -230,36 +229,38 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 // leaves it to be deleted, and one that allowed keeps it for its job.
 func (s *Service) retireAndFinish(ctx context.Context, inv *inventory, m Machine, why string) {
 	a, ok := s.retire(ctx, m, why)
-	// A machine that stopped may have lost its runner's job long enough
-	// ago for GitHub to have ended it.
-	if !ok || !s.settleRunner(ctx, inv, m, a, m.Stopped()) {
+	if !ok || !s.settleRunner(ctx, inv, m, a) {
 		return
 	}
 	s.finish(ctx, inv, m, why, nil)
 }
 
 // settleRunner deals with the runner of a machine a pass retired, before
-// the machine goes (specs/0002-machines.md, Retiring a machine). It removes
-// the runner's registration, so that GitHub gives it no further job, then
-// asks GitHub for a job on it: GitHub hands a runner its job before the
-// hook asks, so it may have taken one just before the claim, whose check
-// the claim refuses. Such a job is lost, and is recorded, if the check
-// would have allowed it, so that its run is rerun as a preempted job's is.
-// It reports whether the machine may go: not while GitHub can't be read,
-// nor while it refuses to remove the runner as running a job it doesn't
-// show yet, nor while its record can't be written. deep says the job may
-// have ended since the runner took it: the machine had stopped, or an
-// earlier pass retired it, so finished runs are looked through too
-// (runnerJob). A claim that isn't a retirement, such as a check's refusal,
-// settles nothing.
-func (s *Service) settleRunner(ctx context.Context, inv *inventory, m Machine, a Admission, deep bool) bool {
+// the machine goes (specs/0002-machines.md, Retiring a machine). GitHub
+// hands a runner its job before the hook asks, so the runner may have taken
+// one just before the claim, whose check the claim refuses: that job is
+// lost. settleRunner removes the runner's registration, so that GitHub
+// gives it no further job, and GitHub's answer says whether it had one:
+// removed, it had none, though the job the machine was made for is checked
+// all the same; refused as running a job, it has one, assigned or running;
+// gone already, it may have run one, which GitHub has ended since and
+// removed the runner after, as it does a just-in-time runner's, so it's
+// looked for among the runs in progress and finished too. A job it had is
+// recorded, if the check would have allowed it, so that its run is rerun as
+// a preempted job's is. It reports whether the machine may go: not while
+// GitHub can't be read, nor while it refuses to remove the runner as running
+// a job it doesn't show, nor while the record can't be written. A claim that
+// isn't a retirement, such as a check's refusal, settles nothing.
+func (s *Service) settleRunner(ctx context.Context, inv *inventory, m Machine, a Admission) bool {
 	if !a.retiredClaim() || m.RunnerID == 0 {
 		return true
 	}
 	log := s.log().With("machine", m.Name, "repository_id", m.RepositoryID, "runner_id", m.RunnerID)
 	err := s.GitHub.DeleteRunner(ctx, m.RunnerID)
-	busy := errors.Is(err, github.ErrRefused)
-	if err != nil && !busy && !errors.Is(err, github.ErrNotFound) {
+	busy, gone := errors.Is(err, github.ErrRefused), errors.Is(err, github.ErrNotFound)
+	// removed says this service removed the runner, which had no job then.
+	removed := err == nil
+	if err != nil && !busy && !gone {
 		log.Warn("removing a retired machine's runner; the machine waits for it", "err", err.Error())
 		return false
 	}
@@ -273,30 +274,63 @@ func (s *Service) settleRunner(ctx context.Context, inv *inventory, m Machine, a
 		log.Warn("reading a retired machine's repository; the machine waits for it", "err", err.Error())
 		return false
 	}
-	job, run, found, err := s.runnerJob(ctx, inv, repo, m, busy, deep)
+	var job github.Job
+	var run github.WorkflowRun
+	var found bool
+	if removed {
+		// It had no job when it was removed; but the job its machine was
+		// made for, read by its ID, is checked all the same.
+		job, run, found, err = s.madeFor(ctx, repo, m)
+	} else {
+		job, run, found, err = s.runnerJob(ctx, repo, m, busy)
+	}
 	switch {
 	case err != nil:
 		log.Warn("looking for a job on a retired machine's runner; the machine waits for it", "err", err.Error())
 		return false
-	case !found && busy:
-		log.Warn("GitHub refused to remove a retired machine's runner as running a job, which it doesn't show yet; the machine waits for it")
-		return false
-	case !found:
+	case !found && !busy:
+		// Removed now with no job, or gone with none GitHub shows, in
+		// progress or ended.
 		return true
+	case !found:
+		log.Warn("a retired machine's runner had a job, which GitHub doesn't show yet; the machine waits for it", "busy", busy)
+		return false
 	}
 	log = log.With("run_id", run.ID, "job_id", job.ID)
+	if job.RunAttempt != run.Attempt {
+		// Its run has been rerun since: the job is past rerunning.
+		log.Info("a job lost on a retired machine isn't rerun: its run has been rerun since")
+		return true
+	}
 	lost, decided, bd, bound, err := s.judge(ctx, repo, m, job, run)
 	if err != nil {
 		log.Warn("judging a job lost on a retired machine; the machine waits for it", "err", err.Error())
 		return false
 	}
-	if !decided && (bound || run.Event == "pull_request_target") {
-		lost = s.conclude(lost, m, run, bd, bound)
-		decided = !lost.Allowed
+	switch {
+	case decided:
+	case bound:
+		lost = s.conclude(lost, m, run, bd, true)
+	case run.Event == "pull_request_target":
+		// An approved contribution's run would have been bound at its
+		// check, as its rerun's job's check binds it.
+		approved, err := s.approved(ctx, repo, run.ID)
+		if err != nil {
+			log.Warn("reading a contribution's approval for a job lost on a retired machine; the machine waits for it", "err", err.Error())
+			return false
+		}
+		if approved {
+			lost.Allowed = true
+		} else {
+			lost = s.conclude(lost, m, run, bd, false)
+		}
+	default:
+		// An unbound run's job would have bound it at its check, from
+		// what GitHub told the runner, which a rerun's job reports
+		// instead.
+		lost.Allowed = true
 	}
-	// An unbound run's job would have bound it at its check, from what
-	// GitHub told the runner, which a rerun's job reports instead.
-	if decided {
+	if !lost.Allowed {
 		log.Info("a job lost on a retired machine isn't rerun: its check would have refused it", "reason", lost.Reason)
 		return true
 	}
@@ -313,32 +347,22 @@ func (s *Service) settleRunner(ctx context.Context, inv *inventory, m Machine, a
 }
 
 // runnerJob is the job GitHub shows on a machine's runner, by the runner's
-// ID and name, whatever the job's status: the job the machine was made for,
-// which its runner takes most often, read by its ID; or one of the
-// repository's runs in progress, read once a pass, or, for a runner GitHub
-// refused to remove as busy, looked for again for a while, as the check
-// does, until GitHub shows it; and, if deep, one of its finished runs,
-// for a job that may have ended since the runner took it: runs created
-// since the longest a run lasts before the machine was made, and updated
-// since it was made, as a run whose job it took was when it finished.
-// Only a run's latest attempt is looked at: a job lost in an earlier one
-// is past rerunning, since its run has been rerun already.
-func (s *Service) runnerJob(ctx context.Context, inv *inventory, repo github.Repository, m Machine, busy, deep bool) (github.Job, github.WorkflowRun, bool, error) {
+// ID and name, whatever the job's status, read afresh, never from what an
+// earlier lookup read before the runner's removal: the job the machine was
+// made for, which its runner takes most often, by its ID; for a runner
+// GitHub refused to remove as running a job, one of the repository's runs
+// in progress, looked for again for a while, as the check does, until
+// GitHub shows it; and for one already gone, one of the runs in progress, or
+// of the finished runs created since the longest a run lasts before the
+// machine was made and updated since it was made, as a run whose job it
+// took was when it finished. Only a run's latest attempt is looked at: a job lost in an
+// earlier one is past rerunning, since its run has been rerun already.
+func (s *Service) runnerJob(ctx context.Context, repo github.Repository, m Machine, busy bool) (github.Job, github.WorkflowRun, bool, error) {
 	none := func(err error) (github.Job, github.WorkflowRun, bool, error) {
 		return github.Job{}, github.WorkflowRun{}, false, err
 	}
-	if m.MadeFor > 0 {
-		j, err := s.GitHub.Job(ctx, repo, m.MadeFor)
-		switch {
-		case err == nil && onRunner(j, m):
-			run, err := s.GitHub.WorkflowRun(ctx, repo, j.RunID)
-			if err != nil {
-				return none(err)
-			}
-			return j, run, true, nil
-		case err != nil && !errors.Is(err, github.ErrNotFound):
-			return none(err)
-		}
+	if job, run, ok, err := s.madeFor(ctx, repo, m); err != nil || ok {
+		return job, run, ok, err
 	}
 	if busy {
 		job, run, err := s.findJob(ctx, repo, m, 0)
@@ -348,26 +372,43 @@ func (s *Service) runnerJob(ctx context.Context, inv *inventory, repo github.Rep
 		case !errors.Is(err, errNoAssignment):
 			return none(err)
 		}
-	} else {
-		runs, err := s.runsOf(ctx, inv, repo, "in_progress")
-		if err != nil {
-			return none(err)
-		}
-		if job, run, ok, err := s.jobAmong(ctx, inv, repo, m, runs); err != nil || ok {
-			return job, run, ok, err
-		}
-	}
-	if !deep {
 		return none(nil)
 	}
-	runs, err := s.runsOf(ctx, inv, repo, "completed")
+	runs, err := s.GitHub.Runs(ctx, repo, "in_progress")
+	if err != nil {
+		return none(err)
+	}
+	if job, run, ok, err := s.jobAmong(ctx, repo, m, runs); err != nil || ok {
+		return job, run, ok, err
+	}
+	done, err := s.GitHub.RunsCreated(ctx, repo, "completed", m.CreatedAt.Add(-RunLimit-clockSkew), s.now().Add(clockSkew))
 	if err != nil {
 		return none(err)
 	}
 	// GitHub's clock and the service's may differ a little.
 	since := m.CreatedAt.Add(-clockSkew)
-	runs = slices.DeleteFunc(slices.Clone(runs), func(r github.WorkflowRun) bool { return r.UpdatedAt.Before(since) })
-	return s.jobAmong(ctx, inv, repo, m, runs)
+	done = slices.DeleteFunc(done, func(r github.WorkflowRun) bool { return r.UpdatedAt.Before(since) })
+	return s.jobAmong(ctx, repo, m, done)
+}
+
+// madeFor is the job a machine was made for, read by its ID, if GitHub
+// shows it on the machine's runner.
+func (s *Service) madeFor(ctx context.Context, repo github.Repository, m Machine) (github.Job, github.WorkflowRun, bool, error) {
+	if m.MadeFor <= 0 {
+		return github.Job{}, github.WorkflowRun{}, false, nil
+	}
+	j, err := s.GitHub.Job(ctx, repo, m.MadeFor)
+	if errors.Is(err, github.ErrNotFound) || err == nil && !onRunner(j, m) {
+		return github.Job{}, github.WorkflowRun{}, false, nil
+	}
+	if err != nil {
+		return github.Job{}, github.WorkflowRun{}, false, err
+	}
+	run, err := s.GitHub.WorkflowRun(ctx, repo, j.RunID)
+	if err != nil {
+		return github.Job{}, github.WorkflowRun{}, false, err
+	}
+	return j, run, true, nil
 }
 
 // clockSkew is as far as GitHub's clock is taken to be from the service's.
@@ -378,53 +419,19 @@ func onRunner(j github.Job, m Machine) bool {
 	return j.RunnerID == m.RunnerID && strings.EqualFold(j.RunnerName, m.Name)
 }
 
-// runsOf are a repository's runs of a status, read once a pass: those in
-// progress, or those finished that were created since the longest a run
-// lasts before the oldest machine a pass may find, which covers the runs
-// whose jobs any machine's runner took.
-func (s *Service) runsOf(ctx context.Context, inv *inventory, repo github.Repository, status string) ([]github.WorkflowRun, error) {
-	key := fmt.Sprint(repo.ID, "/", status)
-	if runs, ok := inv.runs[key]; ok {
-		return runs, nil
-	}
-	var runs []github.WorkflowRun
-	var err error
-	if status == "in_progress" {
-		runs, err = s.GitHub.Runs(ctx, repo, status)
-	} else {
-		runs, err = s.GitHub.RunsCreated(ctx, repo, status, s.now().Add(-RunLimit-MaxRunDuration), s.now())
-	}
-	if err != nil {
-		return nil, err
-	}
-	if inv.runs == nil {
-		inv.runs = map[string][]github.WorkflowRun{}
-	}
-	inv.runs[key] = runs
-	return runs, nil
-}
-
 // jobAmong is the job on a machine's runner among runs' latest attempts'
-// jobs, each run's read once a pass.
-func (s *Service) jobAmong(ctx context.Context, inv *inventory, repo github.Repository, m Machine, runs []github.WorkflowRun) (github.Job, github.WorkflowRun, bool, error) {
+// jobs.
+func (s *Service) jobAmong(ctx context.Context, repo github.Repository, m Machine, runs []github.WorkflowRun) (github.Job, github.WorkflowRun, bool, error) {
 	for _, run := range runs {
 		if run.RepositoryID != repo.ID {
 			continue
 		}
-		jobs, ok := inv.runJobs[run.ID]
-		if !ok {
-			var err error
-			jobs, err = s.GitHub.RunJobs(ctx, repo, run.ID)
-			if errors.Is(err, github.ErrNotFound) {
-				continue
-			}
-			if err != nil {
-				return github.Job{}, github.WorkflowRun{}, false, err
-			}
-			if inv.runJobs == nil {
-				inv.runJobs = map[int64][]github.Job{}
-			}
-			inv.runJobs[run.ID] = jobs
+		jobs, err := s.GitHub.RunJobs(ctx, repo, run.ID)
+		if errors.Is(err, github.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return github.Job{}, github.WorkflowRun{}, false, err
 		}
 		for _, j := range jobs {
 			if onRunner(j, m) && j.RunID == run.ID {

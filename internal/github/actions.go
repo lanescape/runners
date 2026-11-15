@@ -216,16 +216,20 @@ func (c *Client) runs(ctx context.Context, repo Repository, opts *gh.ListWorkflo
 // match, which it may not list in full.
 func (c *Client) listRuns(ctx context.Context, repo Repository, opts *gh.ListWorkflowRunsOptions) ([]WorkflowRun, int, error) {
 	var out []WorkflowRun
+	// GitHub's page past the 1,000 it lists is empty, with a count of 0:
+	// the largest count of any page is the one.
+	total := 0
 	for {
 		rs, resp, err := c.gh.Actions.ListRepositoryWorkflowRuns(ctx, repo.Owner, repo.Name, opts)
 		if err != nil {
 			return nil, 0, classify(err)
 		}
+		total = max(total, rs.GetTotalCount())
 		for _, r := range rs.WorkflowRuns {
 			out = append(out, runOf(r))
 		}
 		if resp.NextPage == 0 || len(rs.WorkflowRuns) == 0 {
-			return out, rs.GetTotalCount(), nil
+			return out, total, nil
 		}
 		opts.Page = resp.NextPage
 	}

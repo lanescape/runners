@@ -339,3 +339,79 @@ func TestAStoppedMachinesEndedJobIsFound(t *testing.T) {
 		t.Fatal("the machine wasn't deleted")
 	}
 }
+
+// TestAnEndedJobInARunStillInProgressIsFound: a job, not the one the
+// machine was made for, that GitHub ended after the runner took it, while
+// another job keeps its run in progress, is found among the runs in
+// progress, read afresh.
+func TestAnEndedJobInARunStillInProgressIsFound(t *testing.T) {
+	e := setup(t)
+	p := e.withLost()
+	made := e.queue(e.mainRun(), sel2)
+	e.pass()
+	e.gh.CompleteJobByID(made.ID, "cancelled")
+	run := e.mainRun()
+	j := e.queue(run, sel2)
+	// Another of the run's jobs, on GitHub's own runners, keeps it going.
+	other := e.queue(run, "ubuntu-latest")
+	e.gh.RunJob(other)
+	m := e.boot(e.one())
+	m.taken(j)
+	e.gce.Shutdown(m.in.Zone, m.in.Name)
+	e.gh.CompleteJobByID(j.ID, "failure")
+	if st, _ := e.gh.RunState(run); st == "completed" {
+		t.Fatal("the run finished")
+	}
+	e.pass()
+	if lost, ok := p.lostOn(m.in.Name); !ok || lost.JobID != j.ID {
+		t.Fatalf("lost = %+v, %v", lost, ok)
+	}
+}
+
+// TestAJobLostInAnEarlierAttemptIsntRecorded: a job whose run has been rerun
+// since is past rerunning.
+func TestAJobLostInAnEarlierAttemptIsntRecorded(t *testing.T) {
+	e := setup(t)
+	p := e.withLost()
+	run := e.mainRun()
+	j := e.queue(run, sel2)
+	e.pass()
+	m := e.boot(e.one())
+	m.taken(j)
+	e.gce.Shutdown(m.in.Zone, m.in.Name)
+	e.gh.CompleteJobByID(j.ID, "failure")
+	e.gh.Rerun(run)
+	e.pass()
+	if _, ok := p.lostOn(m.in.Name); ok {
+		t.Fatal("a job of an earlier attempt was recorded")
+	}
+	if e.exists(m.in.Name) {
+		t.Fatal("the machine wasn't deleted")
+	}
+}
+
+// TestAContributionsLostJob: an approved contribution's job, its run not
+// yet bound, on a shape larger than the smallest, is recorded, as its check
+// would have bound the run and allowed it; an unapproved one's isn't.
+func TestAContributionsLostJob(t *testing.T) {
+	for name, approve := range map[string]bool{"approved": true, "unapproved": false} {
+		t.Run(name, func(t *testing.T) {
+			e := setup(t)
+			p := e.withLost()
+			run, _ := e.contribution(approve)
+			j := e.queue(run, "lanescape-16vcpu-linux-amd64")
+			e.pass()
+			m := e.boot(e.one())
+			m.taken(j)
+			e.clock.Advance(machines.IdleLimit)
+			e.pass()
+			lost, ok := p.lostOn(m.in.Name)
+			if ok != approve || ok && (lost.JobID != j.ID || !lost.Allowed) {
+				t.Fatalf("lost = %+v, %v", lost, ok)
+			}
+			if e.exists(m.in.Name) {
+				t.Fatal("the machine wasn't deleted")
+			}
+		})
+	}
+}

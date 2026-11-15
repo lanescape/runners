@@ -116,6 +116,26 @@ func TestRunsCreated(t *testing.T) {
 	}
 }
 
+// TestRunsCreatedPastAFullPage: GitHub's page past the runs it lists for
+// a filter is empty, with a count of 0, and the span is split all the same.
+func TestRunsCreatedPastAFullPage(t *testing.T) {
+	ctx := context.Background()
+	e := setup(t)
+	repo := e.repository(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	for i := range 150 {
+		r := e.emu.PushRun(e.repo, "main")
+		e.emu.SetRunStatus(r, "completed")
+		r.Created = now.Add(-time.Duration(i) * time.Minute)
+	}
+	// It lists 100, a full page, which links to the next.
+	e.emu.RunSearchLimit = 100
+	runs, err := e.c.RunsCreated(ctx, repo, "completed", now.Add(-3*time.Hour), now)
+	if err != nil || len(runs) != 150 {
+		t.Fatalf("%d runs, %v; want 150", len(runs), err)
+	}
+}
+
 func TestApprovals(t *testing.T) {
 	ctx := context.Background()
 	e := setup(t)

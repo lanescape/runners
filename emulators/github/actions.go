@@ -889,19 +889,41 @@ func (e *Emulator) listRuns(w http.ResponseWriter, r *http.Request, rp *Repo) {
 	slices.SortFunc(runs, func(a, b *Run) int { return cmp.Compare(b.ID, a.ID) })
 	total := len(runs)
 	// GitHub lists at most 1,000 runs for a filtered list, whatever its
-	// count says.
+	// count says: its pages link on past them, and a page past them is
+	// empty, with a count of 0.
+	limit := len(runs)
 	if q.Get("status") != "" || q.Get("created") != "" {
-		limit := e.RunSearchLimit
+		limit = e.RunSearchLimit
 		if limit == 0 {
 			limit = 1000
 		}
-		runs = runs[:min(len(runs), limit)]
+	}
+	pageRuns := page(w, r, runs, e.URL)
+	if first := pageStart(r, len(pageRuns)); first+len(pageRuns) > limit {
+		pageRuns = pageRuns[:max(limit-first, 0)]
+		if len(pageRuns) == 0 {
+			total = 0
+		}
 	}
 	out := []map[string]any{}
-	for _, run := range page(w, r, runs, e.URL) {
+	for _, run := range pageRuns {
 		out = append(out, e.runJSON(run))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"total_count": total, "workflow_runs": out})
+}
+
+// pageStart is the index of a page's first item, as page reads the request.
+func pageStart(r *http.Request, _ int) int {
+	q := r.URL.Query()
+	per := 30
+	if n, err := strconv.Atoi(q.Get("per_page")); err == nil && n > 0 {
+		per = min(n, 100)
+	}
+	pg := 1
+	if n, err := strconv.Atoi(q.Get("page")); err == nil && n > 0 {
+		pg = n
+	}
+	return (pg - 1) * per
 }
 
 // createdSpan reads a runs list's created filter: >=<time>, whose to is
