@@ -64,10 +64,10 @@ jobs:
           }
           install 1.17.1 4638628058e71a55212b1c563712eac03b902128f40740f3dc8174df12135061
           install 1.5.7 c0ed7bc32ee52ae255af9982c8c88a7a4c610485cf1d55feeb037eab75fa082c
-      - name: Refuse what infra/ and bootstrap/ may not hold
+      - name: Refuse what infra/, bootstrap/ and tools/ may not hold
         run: infra/check.sh
       - name: terraform fmt
-        run: '"$RUNNER_TEMP/terraform-1.17.1/terraform" fmt -check -diff -recursive infra bootstrap'
+        run: '"$RUNNER_TEMP/terraform-1.17.1/terraform" fmt -check -diff -recursive infra bootstrap tools'
       - name: terraform validate
         run: |
           set -euo pipefail
@@ -79,5 +79,6 @@ jobs:
             "$tf" -chdir="$dir" validate
           }
           validate 1.17.1 bootstrap
+          validate 1.17.1 tools
           validate 1.17.1 infra
           validate 1.5.7 infra
