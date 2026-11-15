@@ -261,6 +261,17 @@ func TestALostJobThatCantBeRecordedWaits(t *testing.T) {
 	if !e.exists(m.in.Name) {
 		t.Fatal("deleted before its lost job was recorded")
 	}
+	// The hook fails, the runner exits, and the supervisor reports: the
+	// machine still settles its runner before it goes.
+	m.release(false)
+	m.finished()
+	if code := m.report(); code != http.StatusNoContent {
+		t.Fatalf("report: %d", code)
+	}
+	e.pass()
+	if !e.exists(m.in.Name) {
+		t.Fatal("a report let the machine go before its lost job was recorded")
+	}
 	p.mu.Lock()
 	p.failLost = nil
 	p.mu.Unlock()
@@ -361,6 +372,13 @@ func TestAnEndedJobInARunStillInProgressIsFound(t *testing.T) {
 	e.gh.CompleteJobByID(j.ID, "failure")
 	if st, _ := e.gh.RunState(run); st == "completed" {
 		t.Fatal("the run finished")
+	}
+	// Newer runs in progress, more than GitHub lists for one filter here,
+	// each created a second apart.
+	e.gh.RunSearchLimit = 2
+	for i := range 3 {
+		r := e.gh.PushRun(e.repo, "main")
+		r.Created = time.Now().Add(time.Duration(i+1) * time.Second)
 	}
 	e.pass()
 	if lost, ok := p.lostOn(m.in.Name); !ok || lost.JobID != j.ID {

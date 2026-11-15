@@ -343,7 +343,7 @@ func (s *Service) searchJob(ctx context.Context, repo github.Repository, m Machi
 			}
 		}
 	}
-	runs, err := s.GitHub.Runs(ctx, repo, "in_progress")
+	runs, err := s.runsInProgress(ctx, repo, m)
 	if err != nil {
 		return github.Job{}, github.WorkflowRun{}, err
 	}

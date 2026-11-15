@@ -181,21 +181,20 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 		s.finish(ctx, inv, m, "past "+MaxAge.String()+", saving nothing", nil)
 	case !inv.recordsComplete:
 		return
+	case admitted && a.retiredClaim():
+		// A machine an earlier pass retired, but didn't delete, settles
+		// its runner first, even if its runner has since exited and its
+		// supervisor reported: its job, never admitted, was lost.
+		if inv.unrecorded(m.Name) || !s.settleRunner(ctx, inv, m, a) {
+			return
+		}
+		s.finish(ctx, inv, m, strings.TrimPrefix(a.Reason, "retired: "), nil)
 	case reported:
 		s.finish(ctx, inv, m, "its supervisor reported", &rep)
 	case admitted && !a.Allowed:
 		if inv.unrecorded(m.Name) {
 			// Its admission is the only record that its run must be
 			// cancelled: the machine waits for the refusal.
-			return
-		}
-		// A machine an earlier pass retired, but didn't delete, settles
-		// its runner first.
-		if a.retiredClaim() {
-			if !s.settleRunner(ctx, inv, m, a) {
-				return
-			}
-			s.finish(ctx, inv, m, strings.TrimPrefix(a.Reason, "retired: "), nil)
 			return
 		}
 		s.finish(ctx, inv, m, "its job was refused", nil)
@@ -374,7 +373,7 @@ func (s *Service) runnerJob(ctx context.Context, repo github.Repository, m Machi
 		}
 		return none(nil)
 	}
-	runs, err := s.GitHub.Runs(ctx, repo, "in_progress")
+	runs, err := s.runsInProgress(ctx, repo, m)
 	if err != nil {
 		return none(err)
 	}
@@ -409,6 +408,14 @@ func (s *Service) madeFor(ctx context.Context, repo github.Repository, m Machine
 		return github.Job{}, github.WorkflowRun{}, false, err
 	}
 	return j, run, true, nil
+}
+
+// runsInProgress are a repository's runs in progress that a machine's
+// runner may have taken a job of: created since the longest GitHub lets a
+// run last before the machine was made. GitHub lists at most 1,000 runs for
+// one filter, so the span is split as RunsCreated does.
+func (s *Service) runsInProgress(ctx context.Context, repo github.Repository, m Machine) ([]github.WorkflowRun, error) {
+	return s.GitHub.RunsCreated(ctx, repo, "in_progress", m.CreatedAt.Add(-RunLimit-clockSkew), s.now().Add(clockSkew))
 }
 
 // clockSkew is as far as GitHub's clock is taken to be from the service's.
