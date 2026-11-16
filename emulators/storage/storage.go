@@ -1,6 +1,7 @@
 // Package storage emulates Cloud Storage's JSON and XML APIs, as
 // cloud.google.com/go/storage calls them over HTTP: buckets of objects with
-// generations, preconditions, reads, lists by prefix and deletes.
+// generations, preconditions, reads, lists by prefix and deletes, and
+// uploads in one request or resumable, in chunks.
 //
 // Versioning isn't emulated: a bucket keeps only each object's live
 // generation, as the service's buckets do.
@@ -42,9 +43,41 @@ type Emulator struct {
 	faults fault.Injector
 	clock  clockwork.Clock
 
-	mu      sync.Mutex
-	buckets map[string]*bucket
-	lastGen int64
+	mu       sync.Mutex
+	buckets  map[string]*bucket
+	lastGen  int64
+	sessions map[string]*session
+	nextSess int
+}
+
+// checkSums checks an upload's data against the checksums its caller sent,
+// if it sent any, as Cloud Storage does before it makes the object.
+func checkSums(data []byte, crc32c, md5Hash string) *apiError {
+	if crc32c != "" {
+		var crc [4]byte
+		binary.BigEndian.PutUint32(crc[:], crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli)))
+		if got := base64.StdEncoding.EncodeToString(crc[:]); got != crc32c {
+			return errInvalid(fmt.Sprintf("Provided CRC32C %q doesn't match calculated CRC32C %q.", crc32c, got))
+		}
+	}
+	if md5Hash != "" {
+		sum := md5.Sum(data)
+		if got := base64.StdEncoding.EncodeToString(sum[:]); got != md5Hash {
+			return errInvalid(fmt.Sprintf("Provided MD5 hash %q doesn't match calculated MD5 hash %q.", md5Hash, got))
+		}
+	}
+	return nil
+}
+
+// session is a resumable upload: what's been received of it, the
+// checksums its caller sent, and once it's whole, the object it made.
+type session struct {
+	bucket, name    string
+	c               conds
+	meta            objectMeta
+	crc32c, md5Hash string
+	data            []byte
+	done            *object
 }
 
 type bucket struct {
@@ -74,7 +107,7 @@ func WithClock(c clockwork.Clock) Option { return func(e *Emulator) { e.clock = 
 
 // New starts an emulator. Close it when done.
 func New(opts ...Option) *Emulator {
-	e := &Emulator{clock: clockwork.NewRealClock(), buckets: map[string]*bucket{}}
+	e := &Emulator{clock: clockwork.NewRealClock(), buckets: map[string]*bucket{}, sessions: map[string]*session{}}
 	for _, o := range opts {
 		o(e)
 	}
@@ -745,6 +778,16 @@ func (e *Emulator) list(w http.ResponseWriter, r *http.Request, bucketName strin
 }
 
 func (e *Emulator) serveUpload(w http.ResponseWriter, r *http.Request, rest string) {
+	// A resumable upload's chunks come by PUT, or by POST as Google's Go
+	// client sends them; Cloud Storage takes both.
+	if id := r.URL.Query().Get("upload_id"); id != "" && (r.Method == http.MethodPut || r.Method == http.MethodPost) {
+		e.resumablePut(w, r, rest, id)
+		return
+	}
+	if r.URL.Query().Get("uploadType") == "resumable" && r.Method == http.MethodPost {
+		e.resumableStart(w, r, rest)
+		return
+	}
 	bucketName, _, hasObjects, hasObject, err := splitObjectPath(rest)
 	if err != nil || !hasObjects || hasObject || r.Method != http.MethodPost {
 		writeJSONError(w, errNotEmulated(r.Method+" "+r.URL.Path))
@@ -790,20 +833,9 @@ func (e *Emulator) serveUpload(w http.ResponseWriter, r *http.Request, rest stri
 		writeJSONError(w, &apiError{http.StatusBadRequest, "required", "InvalidArgument", "Required"})
 		return
 	}
-	if meta.CRC32C != "" {
-		var crc [4]byte
-		binary.BigEndian.PutUint32(crc[:], crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli)))
-		if got := base64.StdEncoding.EncodeToString(crc[:]); got != meta.CRC32C {
-			writeJSONError(w, errInvalid(fmt.Sprintf("Provided CRC32C %q doesn't match calculated CRC32C %q.", meta.CRC32C, got)))
-			return
-		}
-	}
-	if meta.MD5Hash != "" {
-		sum := md5.Sum(data)
-		if got := base64.StdEncoding.EncodeToString(sum[:]); got != meta.MD5Hash {
-			writeJSONError(w, errInvalid(fmt.Sprintf("Provided MD5 hash %q doesn't match calculated MD5 hash %q.", meta.MD5Hash, got)))
-			return
-		}
+	if err := checkSums(data, meta.CRC32C, meta.MD5Hash); err != nil {
+		writeJSONError(w, err)
+		return
 	}
 	if meta.ContentType == "" {
 		meta.ContentType = "application/octet-stream"
@@ -854,4 +886,153 @@ func readMultipart(r *http.Request) (m objectMeta, name, crc, md5Hash string, da
 		meta.ContentType = mediaPart.Header.Get("Content-Type")
 	}
 	return meta.objectMeta, meta.Name, meta.CRC32C, meta.MD5Hash, data, nil
+}
+
+// resumableStart starts a resumable upload, as the JSON API's
+// uploadType=resumable does: the object's name from the query or the
+// request's body, which may hold its metadata; its preconditions are
+// checked now, and again when it's whole. The answer's Location is where
+// the upload's chunks go.
+func (e *Emulator) resumableStart(w http.ResponseWriter, r *http.Request, rest string) {
+	bucketName, _, hasObjects, hasObject, err := splitObjectPath(rest)
+	if err != nil || !hasObjects || hasObject {
+		writeJSONError(w, errNotEmulated(r.Method+" "+r.URL.Path))
+		return
+	}
+	q := r.URL.Query()
+	var meta struct {
+		objectMeta
+		Name    string `json:"name"`
+		CRC32C  string `json:"crc32c"`
+		MD5Hash string `json:"md5Hash"`
+	}
+	if body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)); err == nil && len(bytes.TrimSpace(body)) > 0 {
+		if json.Unmarshal(body, &meta) != nil {
+			writeJSONError(w, errInvalid("the upload's metadata isn't JSON"))
+			return
+		}
+	}
+	name := q.Get("name")
+	if name == "" {
+		name = meta.Name
+	}
+	if name == "" {
+		writeJSONError(w, errInvalid("Required: name"))
+		return
+	}
+	if meta.ContentType == "" {
+		meta.ContentType = r.Header.Get("X-Upload-Content-Type")
+	}
+	c := queryConds(q)
+	if c.err != nil {
+		writeJSONError(w, errInvalid(c.err.Error()))
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	b := e.buckets[bucketName]
+	if b == nil {
+		writeJSONError(w, errNoBucket(bucketName))
+		return
+	}
+	if err := c.checkWrite(b.objects[name]); err != nil {
+		writeJSONError(w, err)
+		return
+	}
+	e.nextSess++
+	id := strconv.Itoa(e.nextSess)
+	e.sessions[id] = &session{bucket: bucketName, name: name, c: c, meta: meta.objectMeta, crc32c: meta.CRC32C, md5Hash: meta.MD5Hash}
+	w.Header().Set("Location", e.URL+"/upload/storage/v1/b/"+url.PathEscape(bucketName)+"/o?uploadType=resumable&upload_id="+id)
+	w.WriteHeader(http.StatusOK)
+}
+
+// resumablePut takes a chunk of a resumable upload, or asks how much of it
+// was received, by its Content-Range: "bytes a-b/*" for a chunk, a multiple
+// of 256 KiB, "bytes a-b/N" for the last, "bytes */N" to finish with what
+// was received, "bytes */*" to ask. While it isn't whole the answer is 308,
+// with the Range received if any, or 200 with X-Http-Status-Code-Override:
+// 308 for a caller that sends X-GUploader-No-308: yes, as Cloud Storage
+// answers; once it is, the object, every time.
+func (e *Emulator) resumablePut(w http.ResponseWriter, r *http.Request, rest, id string) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return
+	}
+	bucketName, _, _, _, _ := splitObjectPath(rest)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	s := e.sessions[id]
+	if s == nil || s.bucket != bucketName {
+		writeJSONError(w, &apiError{code: http.StatusNotFound, reason: "notFound", xmlCode: "NoSuchUpload", message: "no such upload session"})
+		return
+	}
+	if s.done != nil {
+		writeJSON(w, http.StatusOK, e.resource(e.buckets[s.bucket], s.done))
+		return
+	}
+	cr, ok := strings.CutPrefix(r.Header.Get("Content-Range"), "bytes ")
+	rng, tot, ok2 := strings.Cut(cr, "/")
+	if !ok || !ok2 {
+		writeJSONError(w, errInvalid("Content-Range must be bytes <range>/<total>"))
+		return
+	}
+	total := int64(-1)
+	if tot != "*" {
+		if total, err = strconv.ParseInt(tot, 10, 64); err != nil || total < 0 {
+			writeJSONError(w, errInvalid("Content-Range's total isn't a number"))
+			return
+		}
+	}
+	if rng != "*" {
+		a, b, ok := strings.Cut(rng, "-")
+		start, err1 := strconv.ParseInt(a, 10, 64)
+		end, err2 := strconv.ParseInt(b, 10, 64)
+		switch {
+		case !ok || err1 != nil || err2 != nil || start < 0 || end < start || end-start+1 != int64(len(body)):
+			writeJSONError(w, errInvalid("Content-Range's range isn't the chunk sent"))
+			return
+		case start > int64(len(s.data)):
+			writeJSONError(w, errInvalid("a chunk starts past what was received"))
+			return
+		case total < 0 && len(body)%(256<<10) != 0:
+			writeJSONError(w, errInvalid("a chunk that isn't the last must be a multiple of 256 KiB"))
+			return
+		case total >= 0 && end+1 > total:
+			writeJSONError(w, errInvalid("a chunk ends past the upload's total"))
+			return
+		}
+		// What was received stays received, as Cloud Storage keeps it: a
+		// chunk sent again adds only what's past it.
+		if end+1 > int64(len(s.data)) {
+			s.data = append(s.data, body[int64(len(s.data))-start:]...)
+		}
+	}
+	if total >= 0 && int64(len(s.data)) == total {
+		if err := checkSums(s.data, s.crc32c, s.md5Hash); err != nil {
+			delete(e.sessions, id)
+			writeJSONError(w, err)
+			return
+		}
+		b := e.buckets[s.bucket]
+		if err := s.c.checkWrite(b.objects[s.name]); err != nil {
+			writeJSONError(w, err)
+			return
+		}
+		s.done = e.write(b, s.name, s.data, s.meta.ContentType, s.meta)
+		writeJSON(w, http.StatusOK, e.resource(b, s.done))
+		return
+	}
+	// Anything else, "bytes */N" before N bytes arrived included, is
+	// answered with what was received.
+	if len(s.data) > 0 {
+		w.Header().Set("Range", fmt.Sprintf("bytes=0-%d", len(s.data)-1))
+	}
+	// A caller that asks not to get a 308, which HTTP means as a redirect,
+	// as Google's Go client does, gets 200 saying it would have been.
+	if r.Header.Get("X-GUploader-No-308") == "yes" {
+		w.Header().Set("X-Http-Status-Code-Override", "308")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	w.WriteHeader(http.StatusPermanentRedirect)
 }

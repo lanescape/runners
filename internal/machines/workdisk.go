@@ -14,14 +14,10 @@ import (
 	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/compute"
 	"github.com/lanescape/runners/internal/github"
-	"github.com/lanescape/runners/internal/selector"
 )
 
-// The work disk's endpoints (specs/0005-interface.md, Work disks).
-const (
-	DisksPath = "/v1/disks"
-	SavePath  = "/v1/disks/save"
-)
+// The work disk's endpoint (specs/0005-interface.md, Work disks).
+const DisksPath = "/v1/disks"
 
 // diskTimeout bounds a work disk request: what isn't done by then is
 // carried on by the caller's next request, every 5 seconds.
@@ -37,12 +33,6 @@ const (
 type DiskAnswer struct {
 	State    string `json:"state"`
 	Restored string `json:"restored"`
-}
-
-// SaveAnswer is the answer to POST /v1/disks/save.
-type SaveAnswer struct {
-	Saves  bool   `json:"saves"`
-	Reason string `json:"reason,omitempty"`
 }
 
 // refuse answers a request the service refuses, saying why.
@@ -135,32 +125,22 @@ func (s *Service) activeJob(ctx context.Context, w http.ResponseWriter, r *http.
 // DiskRequest is the work disk's endpoint, POST /v1/disks.
 func (s *Service) DiskRequest() http.Handler { return http.HandlerFunc(s.disk) }
 
-// SaveRequest is the save request's endpoint, POST /v1/disks/save.
-func (s *Service) SaveRequest() http.Handler { return http.HandlerFunc(s.save) }
-
-// disk gives a running job its work disk of the family it names
-// (specs/0002-machines.md, The work disk): the job chooses the family, the
-// service everything else. A job's first request decides its family; a
-// later one for the same family carries on with the same disk, and one for
-// another is refused.
+// disk gives a running job its work disk (specs/0002-machines.md, The work
+// disk): empty, or, for the rerun of a job lost to a preemption or the age
+// limit, made from its resume image. A job has one work disk: a later
+// request carries on with the same disk.
 func (s *Service) disk(w http.ResponseWriter, r *http.Request) {
 	// The disk is carried on if its caller goes, so that what a request
 	// started is recorded.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), diskTimeout)
 	defer cancel()
-	var body struct {
-		Family string `json:"family"`
-	}
+	var body struct{}
 	j, ok := s.activeJob(ctx, w, r, &body)
 	if !ok {
 		return
 	}
 	m, a := j.Machine, j.Admission
 	log := s.log().With("machine", m.Name, "repository_id", a.RepositoryID, "run_id", a.RunID, "job_id", a.JobID)
-	if !selector.ValidName(body.Family) {
-		refuse(w, "the body names no family: 1 to 32 lowercase letters, digits and hyphens, starting with a letter and not ending with a hyphen")
-		return
-	}
 	key := diskKey(WorkDisk(m.Name))
 	rec, gen, found, err := getJSON[DiskRecord](ctx, s.Objects, key)
 	if err != nil {
@@ -168,31 +148,14 @@ func (s *Service) disk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !found {
-		rf, err := s.runFiles(ctx, j.Repository, j.Binding)
-		if err != nil {
-			log.Warn("reading the run's files", "err", err.Error())
-			retryLater(w, "the run's files couldn't be read; try again")
-			return
-		}
-		fkey, err := familyKey(rf, body.Family)
-		var ef errFiles
-		if errors.As(err, &ef) {
-			log.Info("work disk refused", "family", body.Family, "reason", ef.reason)
-			refuse(w, ef.reason)
-			return
-		}
-		if rec, gen, err = s.chooseDisk(ctx, m, a, body.Family, fkey); err != nil {
-			log.Warn("choosing a work disk", "family", body.Family, "err", err.Error())
+		if rec, gen, err = s.chooseDisk(ctx, m, a); err != nil {
+			log.Warn("choosing a work disk", "err", err.Error())
 			retryLater(w, "the work disk couldn't be chosen; try again")
 			return
 		}
 	}
 	if rec.Machine != m.Name || rec.JobID != a.JobID {
 		refuse(w, "the machine's work disk is recorded for another job")
-		return
-	}
-	if rec.Family != body.Family {
-		refuse(w, fmt.Sprintf("this job's work disk is of the family %s: a job has one work disk", rec.Family))
 		return
 	}
 	if err := s.attach(ctx, m, a, &rec, gen); err != nil {
@@ -206,27 +169,25 @@ func (s *Service) disk(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, DiskAnswer{State: state, Restored: rec.Restored})
 }
 
-// chooseDisk picks what a job's work disk of a family starts from, and
-// records the disk before it's made. A request that raced another gets the
-// record written first.
-func (s *Service) chooseDisk(ctx context.Context, m Machine, a Admission, family, key string) (DiskRecord, int64, error) {
+// chooseDisk picks what a job's work disk starts from, and records the disk
+// before it's made. A request that raced another gets the record written
+// first.
+func (s *Service) chooseDisk(ctx context.Context, m Machine, a Admission) (DiskRecord, int64, error) {
 	shape := s.Config.Shapes.Shapes[m.Selector.Shape]
 	if shape == nil {
 		return DiskRecord{}, 0, fmt.Errorf("the machine's shape %s isn't configured", m.Selector.Shape)
 	}
-	size, image, restored := int64(shape.WorkDiskGB), "", "none"
+	size, image, restored := int64(shape.WorkDiskGB), "", NotRestored
 	if s.Disks != nil {
-		resolved := a.Resolve(m, nil)
-		resolved.Selector.Family, resolved.Selector.Key = family, key
 		var err error
-		if image, size, restored, err = s.Disks.Choose(ctx, resolved, a, size); err != nil {
+		if image, size, restored, err = s.Disks.Choose(ctx, a.Resolve(m), a, size); err != nil {
 			return DiskRecord{}, 0, err
 		}
 	}
 	var nonce [8]byte
 	_, _ = rand.Read(nonce[:])
 	rec := DiskRecord{Disk: WorkDisk(m.Name), Machine: m.Name, Zone: m.Zone, RepositoryID: m.RepositoryID, JobID: a.JobID, State: DiskMaking,
-		Family: family, Key: key, Restored: restored, SizeGB: size, SourceImage: image, Nonce: hex.EncodeToString(nonce[:]), At: s.now()}
+		Restored: restored, LegacyFamily: LegacyFamily, SizeGB: size, SourceImage: image, Nonce: hex.EncodeToString(nonce[:]), At: s.now()}
 	return createOnce(ctx, s.Objects, diskKey(rec.Disk), rec)
 }
 
@@ -303,47 +264,7 @@ func (s *Service) attach(ctx context.Context, m Machine, a Admission, rec *DiskR
 		if err := step(DiskAttached); err != nil {
 			return err
 		}
-		s.log().Info("work disk attached", "machine", m.Name, "disk", rec.Disk, "family", rec.Family, "restored", rec.Restored)
+		s.log().Info("work disk attached", "machine", m.Name, "disk", rec.Disk, "restored", rec.Restored)
 	}
 	return nil
-}
-
-// save records a running job's request that its work disk be saved once it
-// has finished (specs/0003-disks.md). Whether it's saved is still the
-// service's to decide then, from GitHub's conclusion for the job.
-func (s *Service) save(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), finishedTimeout)
-	defer cancel()
-	var body struct {
-		Save *bool `json:"save"`
-	}
-	j, ok := s.activeJob(ctx, w, r, &body)
-	if !ok {
-		return
-	}
-	m, a := j.Machine, j.Admission
-	if body.Save == nil || !*body.Save {
-		refuse(w, `the body must be {"save": true}`)
-		return
-	}
-	rec, _, found, err := getJSON[DiskRecord](ctx, s.Objects, diskKey(WorkDisk(m.Name)))
-	if err != nil {
-		retryLater(w, "the work disk's record couldn't be read; try again")
-		return
-	}
-	if !found || rec.Machine != m.Name || rec.JobID != a.JobID {
-		refuse(w, "this job has no work disk: a job asks for one with the disk action before it asks to save it")
-		return
-	}
-	if _, _, err := createOnce(ctx, s.Objects, saveRequestKey(m.Name), SaveRequest{Machine: m.Name, JobID: a.JobID, At: s.now()}); err != nil {
-		retryLater(w, "the save request wasn't recorded; try again")
-		return
-	}
-	s.log().Info("work disk save asked for", "machine", m.Name, "repository_id", a.RepositoryID, "run_id", a.RunID, "job_id", a.JobID,
-		"family", rec.Family, "scope", a.Scope.String())
-	if !a.Scope.Saves() {
-		writeJSON(w, http.StatusOK, SaveAnswer{Saves: false, Reason: "the run's scope, " + a.Scope.String() + ", saves nothing"})
-		return
-	}
-	writeJSON(w, http.StatusOK, SaveAnswer{Saves: true})
 }

@@ -1,6 +1,10 @@
 package service
 
-import "errors"
+import (
+	"errors"
+
+	gcsemu "github.com/lanescape/runners/emulators/storage"
+)
 
 // World is what a test of the interface drives (specs/0005-interface.md):
 // this package's emulator, or the real service wired to this repository's
@@ -9,7 +13,8 @@ import "errors"
 // service would once GitHub tells it something, and fails the test itself
 // if it can't. The conformance suite in package conformance runs against
 // both, and they must agree. What a job asks of the service, its work disk
-// and its save, it asks over HTTP, at URL, signed with Token.
+// and its caches, it asks over HTTP, at URL, signed with Token, and it
+// uploads and reads its caches' objects in CacheStorage.
 type World interface {
 	// URL is the service's address, and the audience of every token sent
 	// to it.
@@ -77,8 +82,8 @@ type World interface {
 	// FinishJob finishes a job with a conclusion, as its runner reports it
 	// to GitHub and its machine's supervisor then reports to the service,
 	// and returns once the service has done what the job's end makes it do:
-	// its work disk is saved if it asked to save it, its conclusion is
-	// success and its run's scope saves (specs/0003-disks.md). The
+	// the cache versions it committed are ready if its conclusion is
+	// success, and any other goes (specs/0003-disks.md, Caches). The
 	// service refuses its machine's requests from then on.
 	FinishJob(job Job, conclusion string)
 	// CompleteJob records a job's conclusion in GitHub alone, as its runner
@@ -94,6 +99,11 @@ type World interface {
 
 	// Binding is a run's bound scope, if it has one.
 	Binding(run Run) (string, bool)
+
+	// CacheStorage is the Cloud Storage emulator whose bucket the service
+	// hands out for caches, which a job uploads what it saves to, with
+	// the token it was given, and reads what it restores from.
+	CacheStorage() *gcsemu.Emulator
 
 	// HoldDisks, while on, keeps every work disk that isn't attached yet
 	// being made, so its job's requests are answered making; off, as it

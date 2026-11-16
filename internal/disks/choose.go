@@ -16,41 +16,28 @@ import (
 	"github.com/lanescape/runners/internal/selector"
 )
 
-// Choose picks what a job's work disk of a family starts from
-// (specs/0002-machines.md, The work disk): its run's resume image for the
-// job's name, family and architecture, if one is eligible and it can claim
-// it; otherwise its run's restore choice for the family and architecture,
-// made the first time one of the run's jobs asks. m is resolved with the
-// run's scope and the family and its key. It returns "" for an empty disk,
-// the disk's size, the shape's or the image's if that's larger, and where
-// it came from: machines.Resumed, or the step of the restore order. It
-// implements machines.DiskSource.
+// Choose picks what a job's work disk starts from (specs/0002-machines.md,
+// The work disk): its run's resume image for the job's name and
+// architecture, if one is eligible and it can claim it, or nothing. m is
+// resolved with the run's scope. It returns "" for an empty disk, the
+// disk's size, the shape's or the image's if that's larger, and where it
+// came from: machines.Resumed or machines.NotRestored. It implements
+// machines.DiskSource.
 func (s *Service) Choose(ctx context.Context, m machines.Machine, a machines.Admission, sizeGB int64) (string, int64, string, error) {
-	if !m.Selector.HasDisk() {
-		return "", 0, "", fmt.Errorf("a work disk is chosen only for a family")
-	}
-	if im, ok, err := s.resume(ctx, m, a); err != nil {
-		return "", 0, "", err
-	} else if ok {
-		s.log().Info("work disk from a resume image", "machine", m.Name, "run_id", a.RunID, "job_id", a.JobID, "image", im.Image)
-		return im.Image, max(sizeGB, im.SizeGB), machines.Resumed, nil
-	}
-	im, step, err := s.restore(ctx, m, a)
+	im, ok, err := s.resume(ctx, m, a)
 	if err != nil {
 		return "", 0, "", err
 	}
-	if im == nil {
-		s.log().Info("work disk starts empty: no saved disk to restore", "machine", m.Name, "run_id", a.RunID, "family", m.Selector.Family)
-		return "", sizeGB, step, nil
+	if !ok {
+		return "", sizeGB, machines.NotRestored, nil
 	}
-	s.log().Info("work disk restored", "machine", m.Name, "run_id", a.RunID, "family", m.Selector.Family, "image", im.Image, "scope", im.Scope,
-		"key", im.Key, "step", step)
-	return im.Image, max(sizeGB, im.SizeGB), step, nil
+	s.log().Info("work disk from a resume image", "machine", m.Name, "run_id", a.RunID, "job_id", a.JobID, "image", im.Image)
+	return im.Image, max(sizeGB, im.SizeGB), machines.Resumed, nil
 }
 
 // resume finds the job's resume image, and claims it for the job's ID
 // (specs/0002-machines.md, Resuming): one made in an earlier attempt of the
-// job's run, for the job's name, family and architecture, within a day of its machine
+// job's run, for the job's name and architecture, within a day of its machine
 // stopping, where exactly one job had that name in the attempt that was
 // preempted and exactly one has it in the one starting. A claim is created
 // only if absent, so no other job ever gets the image.
@@ -65,7 +52,7 @@ func (s *Service) resume(ctx context.Context, m machines.Machine, a machines.Adm
 	var cands []Preemption
 	for _, r := range recs {
 		p := r.v
-		if p.ResumeImage != "" && p.RepositoryID == m.RepositoryID && p.RunID == a.RunID && p.Family == m.Selector.Family &&
+		if p.ResumeImage != "" && p.RepositoryID == m.RepositoryID && p.RunID == a.RunID &&
 			p.Arch == m.Selector.Arch && p.JobName == a.JobName && p.RunAttempt < a.RunAttempt && s.now().Sub(p.StoppedAt) < ResumeKept {
 			cands = append(cands, p)
 		}
@@ -116,7 +103,7 @@ func (s *Service) resume(ctx context.Context, m machines.Machine, a machines.Adm
 		err := s.step(ctx, m.RepositoryID, func(ctx context.Context) error {
 			rec, _, ok, err := getJSON[Image](ctx, s.Objects, imageKey(m.RepositoryID, p.ResumeImage))
 			if err != nil || !ok || rec.State != ImageReady || rec.Kind != KindResume || rec.RunID != a.RunID ||
-				rec.Family != m.Selector.Family || rec.Arch != m.Selector.Arch || rec.JobName != a.JobName {
+				rec.Arch != m.Selector.Arch || rec.JobName != a.JobName {
 				return err
 			}
 			im, err := s.Compute.Image(ctx, rec.Image)
@@ -137,7 +124,7 @@ func (s *Service) resume(ctx context.Context, m machines.Machine, a machines.Adm
 			if c.JobID != a.JobID {
 				return nil
 			}
-			if err := s.touch(ctx, m.RepositoryID, rec.Image); err != nil {
+			if err := s.touch(ctx, imageKey(m.RepositoryID, rec.Image), rec.Image); err != nil {
 				return err
 			}
 			got, claimed = rec, true
@@ -153,36 +140,29 @@ func (s *Service) resume(ctx context.Context, m machines.Machine, a machines.Adm
 	return Image{}, false, nil
 }
 
-// restore is the run's restore choice for the job's family and
+// restore is the run's restore choice for a cache on the job's
 // architecture, picked and recorded under the disks' lease the first time,
-// then the same for every job of the run that asks for that family on that
-// architecture. A recorded choice is read, and its image touched, under the
-// lease too, so a pass that drops the choice or marks the image does so
-// wholly before or after. It returns nil for an empty disk, and the step of
-// the restore order the choice came from.
-func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Admission) (*Image, string, error) {
+// then the same for every job of the run that restores that cache on that
+// architecture. A recorded choice is read, and its version touched, under
+// the lease too, so a pass that drops the choice or marks the version does
+// so wholly before or after. It returns nil for none, and the step of the
+// restore order the choice came from.
+func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Admission, cache, cacheKey string) (*Image, string, error) {
 	repo, sel := m.RepositoryID, m.Selector
-	key := choiceKey(repo, a.RunID, sel)
-	// valid is a recorded choice's image, if it still has one to give.
+	key := choiceKey(repo, a.RunID, cache, sel.Arch)
+	// valid is a recorded choice's version, if it still has one to give.
 	valid := func(ctx context.Context, c Choice) (*Image, bool, error) {
 		if c.Image == "" {
 			return nil, true, nil
 		}
-		rec, _, ok, err := getJSON[Image](ctx, s.Objects, imageKey(repo, c.Image))
+		rec, _, ok, err := getJSON[Image](ctx, s.Objects, versionKey(repo, c.Image))
 		if err != nil {
 			return nil, false, err
 		}
-		if !ok || rec.State != ImageReady {
+		if !ok || rec.Kind != KindCache || rec.State != ImageReady {
 			return nil, false, nil
 		}
-		im, err := s.Compute.Image(ctx, rec.Image)
-		if errors.Is(err, compute.ErrNotFound) {
-			return nil, false, nil
-		}
-		if err != nil {
-			return nil, false, err
-		}
-		return &rec, matches(im, rec), nil
+		return &rec, true, nil
 	}
 	var out *Image
 	outStep := StepNone
@@ -200,8 +180,8 @@ func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Ad
 				return err
 			}
 			if stale {
-				s.log().Info("a maintainer's rerun picks its restore choice again", "run_id", a.RunID, "selector", a.Selector,
-					"attempt", a.RunAttempt)
+				s.log().Info("a maintainer's rerun picks its restore choice again", "run_id", a.RunID, "cache", cache,
+					"arch", sel.Arch, "attempt", a.RunAttempt)
 			}
 		}
 		if ok && !stale {
@@ -211,18 +191,18 @@ func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Ad
 			}
 			if good {
 				if im != nil {
-					if err := s.touch(ctx, repo, im.Image); err != nil {
+					if err := s.touch(ctx, versionKey(repo, im.Image), im.Image); err != nil {
 						return err
 					}
 				}
 				out, outStep = im, c.Step
 				return nil
 			}
-			// The recorded image is gone, which only happens if someone
+			// The recorded version is gone, which only happens if someone
 			// else deleted it: the run picks again.
-			s.log().Warn("a run's restore choice is gone; picking again", "run_id", a.RunID, "selector", a.Selector, "image", c.Image)
+			s.log().Warn("a run's restore choice is gone; picking again", "run_id", a.RunID, "cache", cache, "version", c.Image)
 		}
-		recs, err := listJSON[Image](ctx, s.Objects, fmt.Sprintf("images/%d/", repo))
+		recs, err := listJSON[Image](ctx, s.Objects, fmt.Sprintf("caches/%d/", repo))
 		if err != nil {
 			return err
 		}
@@ -242,21 +222,11 @@ func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Ad
 		}
 		var pick *Image
 		step := StepNone
-		for _, cand := range candidates(recs, sel, chain, closure) {
-			im, err := s.Compute.Image(ctx, cand.Image.Image)
-			if errors.Is(err, compute.ErrNotFound) {
-				continue
-			}
-			if err != nil {
-				return err
-			}
-			if matches(im, cand.Image) {
-				pick, step = &cand.Image, cand.step
-				break
-			}
+		if cands := candidates(recs, sel, cache, cacheKey, chain, closure); len(cands) > 0 {
+			pick, step = &cands[0].Image, cands[0].step
 		}
 		choice := Choice{RepositoryID: repo, RunID: a.RunID, Selector: sel.String(), Scope: sel.Scope.String(), Arch: sel.Arch,
-			Family: sel.Family, Step: step, Attempt: a.RunAttempt, At: s.now()}
+			Cache: cache, Step: step, Attempt: a.RunAttempt, At: s.now()}
 		if pick != nil {
 			choice.Image = pick.Image
 		}
@@ -271,8 +241,8 @@ func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Ad
 			return err
 		}
 		if pick != nil {
-			if err := s.touch(ctx, repo, pick.Image); err != nil {
-				// Not chosen after all: the choice names an image that
+			if err := s.touch(ctx, versionKey(repo, pick.Image), pick.Image); err != nil {
+				// Not chosen after all: the choice names a version that
 				// isn't ready, so the next try picks again.
 				return err
 			}
@@ -280,7 +250,7 @@ func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Ad
 		// What each restore found, so the order and what's kept can be
 		// tuned from evidence. Nothing here is a URL, token or payload.
 		s.log().Info("restore choice", "repository_id", repo, "run_id", a.RunID, "selector", a.Selector, "scope", choice.Scope,
-			"arch", choice.Arch, "family", choice.Family, "step", step, "image", choice.Image)
+			"arch", choice.Arch, "cache", choice.Cache, "key", cacheKey, "step", step, "version", choice.Image)
 		out, outStep = pick, step
 		return nil
 	})
@@ -339,17 +309,17 @@ func Steps(sc scope.Scope) (exact, newest string) {
 	return StepPullRequestExact, StepPullRequestNewest
 }
 
-// candidates are the saved disks a selector may start from, in the order to
-// try them (specs/0003-disks.md, Saved disks): for each scope of the run's
-// restore chain in turn, its disk for the family and key, then its newest
-// for the family. Only disks of the selector's architecture, ready and
+// candidates are the versions of a cache a job may restore, in the order to
+// try them (specs/0003-disks.md, Caches): for each scope of the run's
+// restore chain in turn, its version for the cache's key, then its newest
+// of the cache. Only versions of the job's architecture, ready and
 // unmarked, count, and none of a pull request's saved by a run bound before
 // it was last seen closed; of several versions, the newest comes first.
-func candidates(recs map[string]record[Image], sel selector.Selector, chain []scope.Scope, closure *Closure) []candidate {
+func candidates(recs map[string]record[Image], sel selector.Selector, cache, key string, chain []scope.Scope, closure *Closure) []candidate {
 	var pool []Image
 	for _, r := range recs {
 		v := r.v
-		if v.Kind == KindSaved && v.State == ImageReady && v.Arch == sel.Arch && v.Family == sel.Family && !retired(v, closure) {
+		if v.Kind == KindCache && v.State == ImageReady && v.Arch == sel.Arch && v.Cache == cache && !retired(v, closure) {
 			pool = append(pool, v)
 		}
 	}
@@ -357,7 +327,7 @@ func candidates(recs map[string]record[Image], sel selector.Selector, chain []sc
 	var out []candidate
 	add := func(scope string, exact bool, step string) {
 		for _, v := range pool {
-			if v.Scope == scope && (!exact || v.Key == sel.Key) && !slices.ContainsFunc(out, func(o candidate) bool { return o.Image.Image == v.Image }) {
+			if v.Scope == scope && (!exact || v.Key == key) && !slices.ContainsFunc(out, func(o candidate) bool { return o.Image.Image == v.Image }) {
 				out = append(out, candidate{v, step})
 			}
 		}
@@ -370,8 +340,8 @@ func candidates(recs map[string]record[Image], sel selector.Selector, chain []sc
 	return out
 }
 
-// candidate is a saved disk a selector may start from, and the step of the
-// restore order it comes from.
+// candidate is a version a job may restore, and the step of the restore
+// order it comes from.
 type candidate struct {
 	Image Image
 	step  string

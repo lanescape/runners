@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/lanescape/runners/emulators/fault"
 	ghemu "github.com/lanescape/runners/emulators/github"
 	"github.com/lanescape/runners/internal/disks"
 	"github.com/lanescape/runners/internal/lease"
@@ -24,31 +26,34 @@ func (e *env) hold() func() {
 	return func() { _ = h.Release(context.Background()) }
 }
 
+// forbidden answers 403, which no client tries again.
+var forbidden = fault.Status(http.StatusForbidden, nil, `{"error": {"code": 403, "message": "Forbidden"}}`)
+
 func TestAChoiceWaitsForTheLease(t *testing.T) {
 	e := setup(t)
-	img := e.saveMain(key1)
+	v := e.saveMain(key1)
 	release := e.hold()
 	run := e.mainRun()
 	jb := e.take(run, e.queueJob(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}}))
-	if code := jb.askDisk(); code != http.StatusServiceUnavailable {
-		t.Fatalf("a disk request while the disks' lease is held: %d, want a retryable 503", code)
+	if code := jb.askRestore(); code != http.StatusServiceUnavailable {
+		t.Fatalf("a restore while the disks' lease is held: %d, want a retryable 503", code)
 	}
 	release()
-	if code := jb.askDisk(); code != http.StatusOK {
-		t.Fatalf("the disk request once the lease is free: %d", code)
+	if code := jb.askRestore(); code != http.StatusOK {
+		t.Fatalf("the restore once the lease is free: %d", code)
 	}
-	if jb.source() != img {
-		t.Fatalf("restored %q, want %s", jb.source(), img)
+	if jb.restored() != v {
+		t.Fatalf("restored %q, want %s", jb.restored(), v)
 	}
 	// The run's next job reuses its choice, under the lease too.
 	release = e.hold()
 	next := e.take(run, e.queueJob(run, ghemu.JobSpec{Name: "test", Labels: []string{sel(key1, "main")}}))
-	if code := next.askDisk(); code != http.StatusServiceUnavailable {
+	if code := next.askRestore(); code != http.StatusServiceUnavailable {
 		t.Fatalf("reusing a choice while the disks' lease is held: %d, want a retryable 503", code)
 	}
 	release()
-	if code := next.askDisk(); code != http.StatusOK || next.source() != img {
-		t.Fatalf("reusing the choice: %d, %q", code, next.source())
+	if code := next.askRestore(); code != http.StatusOK || next.restored() != v {
+		t.Fatalf("reusing the choice: %d, %q", code, next.restored())
 	}
 }
 
@@ -56,30 +61,46 @@ func TestADeletionThatFailedIsTriedAgain(t *testing.T) {
 	e := setup(t)
 	old := e.saveMain(key1)
 	e.clock.Advance(time.Minute)
-	e.gce.FailNextOperation("images.delete", "INTERNAL_ERROR")
+	// The deletion of each of its two objects fails, and so does the next
+	// pass's first, as the waiting job's machine is made.
+	e.gcs.Faults().Add(fault.Rule{Method: http.MethodDelete, Times: 3, Respond: forbidden,
+		Match: func(r *http.Request) bool { return strings.Contains(r.URL.Path, "/b/"+cachesBucket+"/o/") }})
 	newer := e.saveMain(key1)
-	if !e.has(old) {
+	if !e.has(old) || !e.recorded(old) {
 		t.Fatal("the deletion didn't fail")
 	}
+	if rec, _ := e.record("caches/5001/" + old + ".json"); rec["state"] != disks.ImageMarked {
+		t.Fatalf("version record = %v; want it marked", rec)
+	}
+	run := e.mainRun()
+	jb := e.take(run, e.queueJob(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}}))
+	if !e.recorded(old) {
+		t.Fatal("the second try didn't fail")
+	}
+	// Marked, it's never restored.
+	if code := jb.askRestore(); code != http.StatusOK || jb.restored() != newer {
+		t.Fatalf("restore: %d, %q, want %s", code, jb.restored(), newer)
+	}
 	e.pass()
-	if e.has(old) || !e.has(newer) {
-		t.Fatal("a marked image whose deletion failed wasn't deleted on the next try")
+	if e.has(old) || e.recorded(old) || !e.ready(newer) {
+		t.Fatal("a marked version whose deletion failed wasn't deleted on the next try")
 	}
 }
 
 func TestMarkingWaitsForTheLease(t *testing.T) {
 	e := setup(t)
+	// The saving job starts before the older version is saved, so no
+	// choice of its keeps it.
+	jb := e.start(e.mainRun(), ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}})
 	old := e.saveMain(key1)
 	e.clock.Advance(time.Minute)
-	jb := e.start(e.mainRun(), ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}})
-	// The save of a newer version can't mark the older one while the
-	// lease is held; the save itself is done.
+	// A newer version can't mark the older one while the lease is held;
+	// it's ready all the same.
 	release := e.hold()
-	before := e.images()
 	jb.finish(true)
-	newer := e.saved(before).Name
-	if !e.has(old) || !e.has(newer) {
-		t.Fatalf("old %v, newer %v; want both while the lease is held", e.has(old), e.has(newer))
+	newer := jb.saved
+	if !e.has(old) || !e.ready(newer) {
+		t.Fatalf("old %v, newer %v; want both while the lease is held", e.has(old), e.ready(newer))
 	}
 	release()
 	e.pass()
@@ -88,10 +109,14 @@ func TestMarkingWaitsForTheLease(t *testing.T) {
 	}
 }
 
-func TestAMarkedImageIsNeverChosen(t *testing.T) {
+func TestAMarkedVersionIsNeverChosen(t *testing.T) {
 	e := setup(t)
-	img := e.saveMain(key1)
-	key := "images/5001/" + img + ".json"
+	v := e.saveMain(key1)
+	// A job waiting to restore, given its machine before the version is
+	// marked, since a pass deletes what's marked.
+	run := e.mainRun()
+	jb := e.take(run, e.queueJob(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}}))
+	key := "caches/5001/" + v + ".json"
 	data, gen, _ := e.gcs.Object("state", key)
 	var rec disks.Image
 	_ = json.Unmarshal(data, &rec)
@@ -100,43 +125,48 @@ func TestAMarkedImageIsNeverChosen(t *testing.T) {
 	if _, err := e.objects.Replace(context.Background(), key, b, gen); err != nil {
 		t.Fatal(err)
 	}
-	jb := e.start(e.mainRun(), ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}})
-	if src := jb.source(); src != "" {
-		t.Fatalf("a marked image was chosen: %s", src)
+	if code := jb.askRestore(); code != http.StatusOK || jb.restored() != "" || !e.has(v) {
+		t.Fatalf("restore: %d, %q; want a marked version, still there, never chosen", code, jb.restored())
 	}
-	// And the next pass deletes it.
+	// And the next pass deletes it, objects and record.
 	e.pass()
-	if e.has(img) {
-		t.Fatal("a marked image wasn't deleted")
+	if e.has(v) || e.recorded(v) {
+		t.Fatal("a marked version wasn't deleted")
 	}
 }
 
 func TestOrphans(t *testing.T) {
 	e := setup(t)
-	img := e.saveMain(key1)
-	// An image of the service's names with no record, as one would be if
-	// its record were lost, goes.
-	if err := e.objects.Delete(context.Background(), "images/5001/"+img+".json", mustGen(t, e, "images/5001/"+img+".json")); err != nil {
-		t.Fatal(err)
-	}
+	v := e.saveMain(key1)
+	// A version's objects with no record, as they would be if its record
+	// were lost, go.
+	e.orphan(v)
 	e.pass()
-	if e.has(img) {
-		t.Fatal("an orphaned image wasn't deleted")
+	if e.has(v) {
+		t.Fatal("a version's orphaned objects weren't deleted")
 	}
-	// A record of an image that's gone goes too, and a run's choice of it
-	// picks again.
-	img = e.saveMain(key1)
+	if !e.logged(`msg="orphaned cache objects deleted"`) {
+		t.Fatal("not logged")
+	}
+	// A record of a ready version whose objects are gone goes too, and a
+	// run's choice of it picks again.
+	v = e.saveMain(key1)
 	run := e.mainRun()
-	if e.start(run, ghemu.JobSpec{Name: "a", Labels: []string{sel(key1, "main")}}).source() != img {
+	if e.start(run, ghemu.JobSpec{Name: "a", Labels: []string{sel(key1, "main")}}).restored() != v {
 		t.Fatal("no restore")
 	}
-	e.gce.DeleteImageNow(img)
-	if src := e.start(run, ghemu.JobSpec{Name: "b", Labels: []string{sel(key1, "main")}}).source(); src != "" {
-		t.Fatalf("a choice of a deleted image restored %s", src)
-	}
+	e.removeObjects(v)
+	e.clock.Advance(time.Second)
 	e.pass()
-	if _, ok := e.record("images/5001/" + img + ".json"); ok {
-		t.Fatal("the record of a deleted image was kept")
+	if e.recorded(v) {
+		t.Fatal("the record of a version whose objects are gone was kept")
+	}
+	if b := e.start(run, ghemu.JobSpec{Name: "b", Labels: []string{sel(key1, "main")}}); b.restored() != "" ||
+		b.restore.Restored != disks.StepNone {
+		t.Fatalf("a choice of a version whose objects are gone restored %+v", b.restore)
+	}
+	if !e.logged("a run's restore choice is gone; picking again") {
+		t.Fatal("picking again wasn't logged")
 	}
 	// Base images are never the disks' to delete.
 	for _, im := range e.gce.Images() {
@@ -147,10 +177,28 @@ func TestOrphans(t *testing.T) {
 	t.Fatal("a base image was deleted")
 }
 
-func TestASaveNeedsAnAllowedAdmission(t *testing.T) {
+// A cache request is a running job's: once its job has ended, it's refused.
+func TestCacheRequestsNeedARunningJob(t *testing.T) {
 	e := setup(t)
-	if err := e.disks.Save(context.Background(), machines.Machine{}, machines.Admission{}); err != nil || len(e.images()) != 0 {
-		t.Fatalf("a save with no admission: %v, images %v", err, e.images())
+	jb := e.start(e.mainRun(), ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}})
+	code, ans := jb.askSave()
+	if code != http.StatusOK || !ans.Saves {
+		t.Fatalf("save: %d, %+v", code, ans)
+	}
+	jb.upload(ans.Prefix)
+	jb.runSteps()
+	if code, _ := jb.commit(); code != http.StatusForbidden {
+		t.Fatalf("a commit once the job has ended: %d, want 403", code)
+	}
+	if code := jb.askRestore(); code != http.StatusForbidden {
+		t.Fatalf("a restore once the job has ended: %d, want 403", code)
+	}
+	jb.sendReport()
+	e.gce.Shutdown(jb.in.Zone, jb.in.Name)
+	e.pass()
+	// Never committed, its version goes with its objects.
+	if len(e.versions()) != 0 {
+		t.Fatalf("versions %v; want the uncommitted one gone", e.versions())
 	}
 }
 
@@ -163,56 +211,49 @@ func mustGen(t *testing.T, e *env, key string) int64 {
 	return gen
 }
 
-// An image whose making failed, and left a failed image behind, isn't a
-// save: it's deleted and made again, and nothing is superseded meanwhile.
+// A resume image whose making failed, and left a failed image behind, is
+// deleted and made again; the machine waits for it, and its run is rerun
+// only once it's ready.
 func TestAFailedImageIsMadeAgain(t *testing.T) {
 	e := setup(t)
-	old := e.saveMain(key1)
-	e.clock.Advance(time.Minute)
-	jb := e.start(e.mainRun(), ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}})
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
 	e.gce.FailNextOperation("images.insert.leave", "INTERNAL_ERROR")
-	before := e.images()
-	jb.finish(true)
-	if !e.has(old) {
-		t.Fatal("an older version went for a save that failed")
-	}
+	jb.preempt()
+	e.pass()
+	resume := disks.ResumeName(repoID, jb.in.ID)
 	if _, ok := e.gce.Instance(jb.in.Zone, jb.in.Name); !ok {
-		t.Fatal("the machine went before its save was made")
+		t.Fatal("the machine went before its resume image was made")
 	}
-	ready := func() bool {
-		for n, im := range e.images() {
-			if _, ok := before[n]; !ok && im.Status == "READY" {
-				return true
-			}
-		}
-		return false
+	if e.attempt(run) != 1 {
+		t.Fatal("the run was rerun before its resume image was ready")
 	}
-	for i := 0; i < 3 && !ready(); i++ {
+	for i := 0; i < 3 && e.attempt(run) == 1; i++ {
 		e.pass()
 	}
-	var newer string
-	for n, im := range e.images() {
-		if _, ok := before[n]; !ok {
-			if im.Status != "READY" {
-				t.Fatalf("saved image %s is %s", n, im.Status)
-			}
-			newer = n
-		}
+	if im, ok := e.images()[resume]; !ok || im.Status != "READY" {
+		t.Fatalf("resume image = %+v, %v; want it made again", im, ok)
 	}
-	if newer == "" {
-		t.Fatalf("no save: images %v", e.images())
+	if rec, _ := e.record("images/5001/" + resume + ".json"); rec["state"] != disks.ImageReady {
+		t.Fatalf("resume image record = %v", rec)
 	}
-	e.pass()
-	if e.has(old) {
-		t.Fatal("the older version outlived the save that superseded it")
+	if e.attempt(run) != 2 {
+		t.Fatal("not rerun once the resume image was made")
+	}
+	if src := e.admit(run, e.rerunJob(run, 2, "build")).source(); src != resume {
+		t.Fatalf("the rerun's job started from %q, want %s", src, resume)
 	}
 }
 
-// An image whose making was abandoned, its machine gone, goes after an
-// hour, and stops counting against its scope's limit.
+// A resume image whose making was abandoned, its machine gone, goes after
+// an hour.
 func TestAnAbandonedImageGoes(t *testing.T) {
 	e := setup(t)
-	img := e.saveMain(key1)
+	run := e.mainRun()
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{spot}})
+	jb.preempt()
+	e.pass()
+	img := disks.ResumeName(repoID, jb.in.ID)
 	key := "images/5001/" + img + ".json"
 	data, gen, _ := e.gcs.Object("state", key)
 	var rec disks.Image
@@ -223,12 +264,12 @@ func TestAnAbandonedImageGoes(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.pass()
-	if !e.has(img) {
+	if _, ok := e.images()[img]; !ok {
 		t.Fatal("an image being made went before an hour")
 	}
 	e.clock.Advance(time.Hour)
 	e.pass()
-	if e.has(img) {
+	if _, ok := e.images()[img]; ok {
 		t.Fatal("an abandoned image wasn't deleted")
 	}
 	if _, ok := e.record(key); ok {
@@ -237,19 +278,23 @@ func TestAnAbandonedImageGoes(t *testing.T) {
 }
 
 // A repository transferred out of the organization between its job's
-// admission and its work disk gets nothing of the organization's.
-func TestATransferredRepositoryGetsNoDisk(t *testing.T) {
+// admission and its restore gets nothing of the organization's: no
+// version, nor a work disk.
+func TestATransferredRepositoryGetsNoCache(t *testing.T) {
 	e := setup(t)
 	e.saveMain(key1)
 	release := e.hold()
 	run := e.mainRun()
 	jb := e.take(run, e.queueJob(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}}))
-	if code := jb.askDisk(); code != http.StatusServiceUnavailable {
+	if code := jb.askRestore(); code != http.StatusServiceUnavailable {
 		t.Fatalf("while the lease is held: %d", code)
 	}
 	e.gh.Transfer(e.repo, e.gh.Org(1234, "elsewhere"))
 	release()
-	if code := jb.askDisk(); code != http.StatusForbidden {
+	if code := jb.askRestore(); code != http.StatusForbidden || jb.restored() != "" {
+		t.Fatalf("a transferred repository's restore: %d, want 403", code)
+	}
+	if code := jb.call(machines.DisksPath, map[string]string{}, nil); code != http.StatusForbidden {
 		t.Fatalf("a transferred repository's disk request: %d, want 403", code)
 	}
 	in, _ := e.gce.Instance(jb.in.Zone, jb.in.Name)
@@ -258,53 +303,56 @@ func TestATransferredRepositoryGetsNoDisk(t *testing.T) {
 	}
 }
 
-// Nor does it save.
+// Nor does it save: a save asked for once it's transferred is refused, and
+// a version committed before waits, neither ready nor deleted, while GitHub
+// shows the repository as another owner's; transferred back, it's ready.
 func TestATransferredRepositoryDoesntSave(t *testing.T) {
 	e := setup(t)
 	jb := e.start(e.mainRun(), ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}})
-	if code := jb.call("/v1/disks/save", map[string]bool{"save": true}, nil); code != http.StatusOK {
-		t.Fatalf("save request: %d", code)
+	e.gh.Transfer(e.repo, e.gh.Org(1234, "elsewhere"))
+	if code, _ := jb.askSave(); code != http.StatusForbidden {
+		t.Fatalf("a transferred repository's save: %d, want 403", code)
 	}
+	jb.finish(false)
+	if len(e.versions()) != 0 {
+		t.Fatalf("versions %v; a transferred repository saved", e.versions())
+	}
+
+	e.gh.Transfer(e.repo, e.org)
+	jb = e.start(e.mainRun(), ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}})
+	v := jb.saveCache()
 	e.gh.Transfer(e.repo, e.gh.Org(1234, "elsewhere"))
 	jb.finish(false)
-	if len(e.images()) != 0 {
-		t.Fatalf("images %v; a transferred repository saved", e.images())
+	e.pass()
+	if rec, _ := e.record("caches/5001/" + v + ".json"); rec["state"] != disks.ImageCommitted || !e.has(v) {
+		t.Fatalf("version %v; want it kept, committed, while its repository is another owner's", rec)
+	}
+	e.gh.Transfer(e.repo, e.org)
+	e.pass()
+	if !e.ready(v) {
+		t.Fatal("a version wasn't made ready once its repository was transferred back")
 	}
 }
 
-// Which disk is a family's newest is read from the images there are: a
-// record of one that's gone doesn't leave the one that's there unprotected.
+// Which version of a cache is newest is read from the versions there are:
+// a record of one whose objects are gone doesn't leave the one that's there
+// unprotected.
 func TestTheNewestThatsThereIsKept(t *testing.T) {
 	e := setup(t)
 	old := e.saveMain(key1)
-	// A newer disk of the family, recorded ready, whose image is gone.
+	// A newer version of the cache, recorded ready, whose objects are gone.
 	e.clock.Advance(time.Minute)
-	gone := disks.SavedName(repoID, disks.Series("main", "amd64", "build", key2), e.clock.Now(), "lsr-5001-goneaway")
-	b, _ := json.Marshal(disks.Image{Image: gone, RepositoryID: repoID, Kind: disks.KindSaved, State: disks.ImageReady, Scope: "main",
-		Arch: "amd64", Family: "build", Key: key2, Machine: "lsr-5001-goneaway", SavedAt: e.clock.Now().UTC()})
-	e.gcs.Put("state", "images/5001/"+gone+".json", b)
+	gone := disks.VersionName(repoID, disks.Series("main", "amd64", "build", key2), e.clock.Now(), "lsr-5001-goneaway")
+	b, _ := json.Marshal(disks.Image{Image: gone, RepositoryID: repoID, Kind: disks.KindCache, State: disks.ImageReady, Scope: "main",
+		Arch: "amd64", Cache: "build", Key: key2, Machine: "lsr-5001-goneaway", SavedAt: e.clock.Now().UTC(),
+		Objects: []machines.CacheObject{{Name: disks.VersionPrefix(repoID, gone) + "0.tar.zst", Size: 1, CRC32C: "AAAAAA==", Generation: 1}}})
+	e.gcs.Put("state", "caches/5001/"+gone+".json", b)
 	e.pass()
-	if !e.has(old) {
-		t.Fatal("a family's newest disk that's there went, replaced by one that's gone")
+	if !e.has(old) || !e.ready(old) {
+		t.Fatal("a cache's newest version that's there went, replaced by one whose objects are gone")
 	}
-}
-
-// An image with no record that an unfinished run's choice names is kept.
-func TestAnOrphanAChoiceNamesIsKept(t *testing.T) {
-	e := setup(t)
-	img := e.saveMain(key1)
-	run := e.mainRun()
-	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "main")}})
-	if jb.source() != img {
-		t.Fatal("no restore")
-	}
-	key := "images/5001/" + img + ".json"
-	if err := e.objects.Delete(context.Background(), key, mustGen(t, e, key)); err != nil {
-		t.Fatal(err)
-	}
-	e.pass()
-	if !e.has(img) {
-		t.Fatal("an image an unfinished run's choice names was deleted as an orphan")
+	if e.recorded(gone) {
+		t.Fatal("the record of a version whose objects are gone was kept")
 	}
 }
 
@@ -332,7 +380,7 @@ func TestAClaimedOrphanKeepsItsClaim(t *testing.T) {
 	}
 	e.pass()
 	e.pass()
-	if !e.has(resume) {
+	if _, ok := e.images()[resume]; !ok {
 		t.Fatal("a claimed image with no record was deleted")
 	}
 	if _, ok := e.record("claims/5001/" + resume + ".json"); !ok {
@@ -355,7 +403,7 @@ func TestAClaimedOrphanGoesWithItsJob(t *testing.T) {
 	}
 	again.finish(false)
 	e.pass()
-	if e.has(resume) {
+	if _, ok := e.images()[resume]; ok {
 		t.Fatal("a claimed orphan outlived its job")
 	}
 }

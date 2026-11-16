@@ -3,11 +3,11 @@
 // it, through systemd, in the machine's own mount namespace, outside every
 // job, once Compute Engine has attached the disk the job's disk action asked
 // for. It formats the disk if it's empty, as a new disk is, and keeps the
-// filesystem of one made from a saved disk; it mounts the disk out of sight
-// first, at a staging directory, where it grows a kept filesystem to the
-// whole disk, which can be larger than the disk it was saved from, and
-// gives its root to the runner's user, as a saved disk's may not be if its
-// job changed it, and only then binds it onto /work, so a job never sees it
+// filesystem of one made from an image, a lost job's resume image; it mounts
+// the disk out of sight first, at a staging directory, where it grows a kept
+// filesystem to the whole disk, which can be larger than the disk it was
+// made from, and gives its root to the runner's user, as an image's may not
+// be if its job changed it, and only then binds it onto /work, so a job never sees it
 // there smaller than its disk or with another owner. Run again, it finds the
 // disk mounted and only repairs its owner.
 //

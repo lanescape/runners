@@ -75,17 +75,11 @@ const (
 	// MaxAge is the most a machine lives, from its creation: a job on the
 	// service should take under 30 minutes, 60 at worst, and this is the
 	// absolute maximum. A machine past it is stopped, even mid-job, and
-	// deleted, saving nothing, but for the save of a job that finished
-	// before it (SaveGrace); a job it cut short is recorded first, with a
+	// deleted, saving nothing; a job it cut short is recorded first, with a
 	// resume image of its work disk, and resumes in its run's rerun, as from
 	// a preemption (specs/0002-machines.md, The age limit). It's the one
 	// constant that says so.
 	MaxAge = 90 * time.Minute
-	// SaveGrace is how long past MaxAge the stopped machine of a job that
-	// finished before it, and asked to save its work disk, waits for the
-	// save, which spans passes while Compute Engine makes its image; then
-	// it goes, saving nothing.
-	SaveGrace = time.Hour
 	// MaxRunDuration is when Compute Engine itself stops a machine, the
 	// backstop for when the service can't. Its margin over MaxAge covers
 	// the service's own stop, so the backstop never races it: a pass runs
@@ -137,29 +131,112 @@ var (
 	diskName    = regexp.MustCompile(`^lsr-([1-9][0-9]*)-([a-z0-9]{8})(-work)?$`)
 )
 
-// DiskSource chooses what a job's work disk of a family starts from: a
-// resume image or its run's restore choice (specs/0003-disks.md). m is
-// resolved with the run's scope and the family and its key. It returns the
-// image's name, or "" for an empty disk, the disk's size, at least sizeGB,
-// and where it came from: Resumed, or the step of the restore order.
+// DiskSource chooses what a job's work disk starts from: the resume image of
+// a job lost to a preemption or the age limit, for its run's rerun, or
+// nothing (specs/0002-machines.md, Preemption). m is resolved with the run's
+// scope. It returns the image's name, or "" for an empty disk, the disk's
+// size, at least sizeGB, and where it came from: Resumed, or NotRestored.
 type DiskSource interface {
 	Choose(ctx context.Context, m Machine, a Admission, sizeGB int64) (image string, size int64, restored string, err error)
 }
 
-// Resumed is where a work disk made from a resume image came from.
-const Resumed = "resume"
+// Where a work disk came from: a resume image, or nothing.
+const (
+	Resumed     = "resume"
+	NotRestored = "none"
+)
 
-// ErrPending is what a Saver or Preemptions returns while something it
+// ErrPending is what Preemptions returns while something it
 // asked for, such as an image Compute Engine is still making, isn't done:
 // the machine waits for a later pass to go on with it, as after any error,
 // but nothing has gone wrong.
 var ErrPending = errors.New("not done yet; a later pass goes on")
 
-// Saver saves a finished job's work disk, from its stopped machine
-// (specs/0003-disks.md). It returns ErrPending while the disk's image is
-// being made.
-type Saver interface {
-	Save(ctx context.Context, m Machine, a Admission) error
+// Caches keeps the consumers' caches (specs/0003-disks.md, Caches): what a
+// running job restores and saves, by name, in its run's scope, with the
+// cache's key for the run's commit. m is resolved with the run's scope. Each
+// answers as the interface says (specs/0005-interface.md, Caches); an
+// errFiles-like refusal is RefusedError, and any other error is retried.
+type Caches interface {
+	Restore(ctx context.Context, m Machine, a Admission, cache, key string) (CacheRestore, error)
+	Save(ctx context.Context, m Machine, a Admission, cache, key string) (CacheSave, error)
+	Commit(ctx context.Context, m Machine, a Admission, cache string) (CacheCommit, error)
+}
+
+// RefusedError is a cache request the service refuses, with the reason the
+// caller is told.
+type RefusedError struct{ Reason string }
+
+func (e RefusedError) Error() string { return e.Reason }
+
+// CacheObject is one object of a cache's version, as Cloud Storage holds it.
+type CacheObject struct {
+	Name       string `json:"name"`
+	Size       int64  `json:"size"`
+	CRC32C     string `json:"crc32c"`
+	Generation int64  `json:"generation"`
+}
+
+// A version's limits, which keep its record, read by every pass, small:
+// at most MaxCacheObjects objects, whose list takes no more than
+// MaxCacheManifest bytes as JSON.
+const (
+	MaxCacheObjects  = 1000
+	MaxCacheManifest = 512 << 10
+)
+
+// CheckCacheObjects refuses a version's objects that don't fit its limits,
+// saying why: the service and its emulator decide the same.
+func CheckCacheObjects(cache string, objs []CacheObject) error {
+	if len(objs) > MaxCacheObjects {
+		return RefusedError{Reason: fmt.Sprintf("the cache %s's version has %d objects: a version holds at most %d", cache, len(objs), MaxCacheObjects)}
+	}
+	data, err := json.Marshal(objs)
+	if err != nil {
+		return err
+	}
+	if len(data) > MaxCacheManifest {
+		return RefusedError{Reason: fmt.Sprintf("the cache %s's version's objects take %d bytes to record, more than %d: shorter names, "+
+			"or fewer objects, fit", cache, len(data), MaxCacheManifest)}
+	}
+	return nil
+}
+
+// LegacyFamily is the family that work disks' and preemptions' records,
+// and resume images, still carry, though nothing reads it any more: a
+// revision of the service from before caches, which still cleans up while a
+// deploy moves traffic over, makes a lost job's resume image only for a
+// work disk with a family.
+const LegacyFamily = "work"
+
+// CacheRestore is the answer to POST /v1/caches/restore: where the cache
+// came from, a step of the restore order or none, and, for a version, its
+// objects and a token that reads them alone.
+type CacheRestore struct {
+	Restored string        `json:"restored"`
+	Bucket   string        `json:"bucket,omitempty"`
+	Objects  []CacheObject `json:"objects,omitempty"`
+	Token    string        `json:"token,omitempty"`
+	Expires  *time.Time    `json:"expires,omitempty"`
+}
+
+// CacheSave is the answer to POST /v1/caches/save: whether the run's scope
+// saves, and, if it does, where the new version goes and a token that may
+// only create objects there.
+type CacheSave struct {
+	Saves   bool       `json:"saves"`
+	Reason  string     `json:"reason,omitempty"`
+	Bucket  string     `json:"bucket,omitempty"`
+	Prefix  string     `json:"prefix,omitempty"`
+	Token   string     `json:"token,omitempty"`
+	Expires *time.Time `json:"expires,omitempty"`
+}
+
+// CacheCommit is the answer to POST /v1/caches/commit: what the version
+// holds.
+type CacheCommit struct {
+	Objects int   `json:"objects"`
+	Bytes   int64 `json:"bytes"`
 }
 
 // Preemptions deals with a machine that stopped with its job admitted and
@@ -208,12 +285,11 @@ type Service struct {
 	AssignmentWait  time.Duration
 	AssignmentRetry time.Duration
 
-	// The later parts of a machine's life, which the disks package serves
-	// (specs/0003-disks.md): unset, every work disk starts empty, nothing
-	// is saved, and a stopped Spot machine, or one stopped at its age limit,
-	// is deleted.
+	// What the disks package serves (specs/0003-disks.md): unset, every
+	// work disk starts empty, there are no caches, and a stopped Spot
+	// machine, or one stopped at its age limit, is deleted.
 	Disks       DiskSource
-	Saves       Saver
+	Caches      Caches
 	Preemptions Preemptions
 	// FailStopDelay is how long after a failed job's hook is answered its
 	// machine is stopped; zero is DefaultFailStopDelay.
@@ -392,14 +468,10 @@ func (a Admission) retiredClaim() bool {
 }
 
 // Resolve is the machine as its admitted job resolved it: with the run's
-// scope, and the family and key of the work disk the job asked for, if it
-// did, none of which the label carries.
-func (a Admission) Resolve(m Machine, d *DiskRecord) Machine {
+// scope, which the label doesn't carry.
+func (a Admission) Resolve(m Machine) Machine {
 	if a.Allowed && !a.Unbound {
 		m.Selector.Scope = a.Scope
-		if d != nil && d.Machine == m.Name && d.JobID == a.JobID {
-			m.Selector.Family, m.Selector.Key = d.Family, d.Key
-		}
 	}
 	return m
 }
@@ -407,8 +479,7 @@ func (a Admission) Resolve(m Machine, d *DiskRecord) Machine {
 // Report is the supervisor's report that its machine's job is done, with
 // what the machine used, if it said, and what its log needs of the machine
 // and the job its check admitted (specs/0002-machines.md, What a job used). Nothing in it decides
-// anything: a job asks to save its work disk itself, and no report means no
-// save.
+// anything.
 type Report struct {
 	Machine      string    `json:"machine"`
 	At           time.Time `json:"at"`
@@ -422,15 +493,6 @@ type Report struct {
 	RunAttempt   int       `json:"run_attempt,omitempty"`
 	JobID        int64     `json:"job_id,omitempty"`
 	JobName      string    `json:"job_name,omitempty"`
-}
-
-// SaveRequest is a job's request, through the save-disk action, that its
-// work disk be saved once it has finished (specs/0003-disks.md). Nothing
-// withdraws it.
-type SaveRequest struct {
-	Machine string    `json:"machine"`
-	JobID   int64     `json:"job_id"`
-	At      time.Time `json:"at"`
 }
 
 // The states a work disk is recorded in.
@@ -450,14 +512,12 @@ type DiskRecord struct {
 	RepositoryID int64  `json:"repository_id"`
 	JobID        int64  `json:"job_id"`
 	State        string `json:"state"`
-	// Family is what the job asked for, and Key the family's key at the
-	// run's commit; Restored is where the disk came from, as the request's
-	// answer says.
-	Family      string `json:"family"`
-	Key         string `json:"key"`
-	Restored    string `json:"restored"`
-	SizeGB      int64  `json:"size_gb"`
-	SourceImage string `json:"source_image,omitempty"`
+	// Restored is where the disk came from, as the request's answer says.
+	Restored string `json:"restored"`
+	// LegacyFamily is always LegacyFamily.
+	LegacyFamily string `json:"family,omitempty"`
+	SizeGB       int64  `json:"size_gb"`
+	SourceImage  string `json:"source_image,omitempty"`
 	// Attempt counts the confirmed failures to make or attach it, and
 	// names the request ID of the next try. Nonce is new with each record,
 	// so a record made again after its image went, whose attempts count
@@ -526,9 +586,8 @@ type Answered struct {
 // recorded before passes stop it anyway.
 const AnswerWait = 2 * time.Minute
 
-func reportKey(machine string) string      { return "machines/" + machine + "/report.json" }
-func saveRequestKey(machine string) string { return "machines/" + machine + "/save-request.json" }
-func diskKey(disk string) string           { return "disks/" + disk + ".json" }
+func reportKey(machine string) string { return "machines/" + machine + "/report.json" }
+func diskKey(disk string) string      { return "disks/" + disk + ".json" }
 func refusalKey(repo, run int64, attempt int) string {
 	return fmt.Sprintf("refusals/%d/%d-%d.json", repo, run, attempt)
 }

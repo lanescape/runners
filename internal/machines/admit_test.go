@@ -124,7 +124,7 @@ func TestADiskRequestWhoseAnswersAreLost(t *testing.T) {
 		m, _ := e.admitted(sel2)
 		e.gce.LoseResponse(http.MethodPost, "/disks", 1)
 		e.gce.LoseResponse(http.MethodPost, "/attachDisk", 1)
-		m.diskReady("build")
+		m.diskReady()
 		in, _ := e.gce.Instance(m.in.Zone, m.in.Name)
 		if in.Disks[machines.WorkDevice] != machines.WorkDisk(m.in.Name) || len(e.gce.Disks()) != 2 {
 			t.Fatal("the work disk wasn't made and attached once")
@@ -139,7 +139,7 @@ func TestADiskRequestWhoseAnswersAreLost(t *testing.T) {
 				return strings.Contains(r.URL.RawQuery, "disks") || strings.Contains(r.URL.Path, "disks")
 			},
 			Respond: gcsemu.JSONError(http.StatusServiceUnavailable, "backendError", "Backend Error")})
-		m.diskReady("build")
+		m.diskReady()
 		if in, _ := e.gce.Instance(m.in.Zone, m.in.Name); in.Disks[machines.WorkDevice] != machines.WorkDisk(m.in.Name) || len(e.gce.Disks()) != 2 {
 			t.Fatal("the work disk wasn't made and attached once")
 		}
@@ -174,11 +174,13 @@ func TestIdentity(t *testing.T) {
 			if code, _ := e.post("/v1/jobs/finished", tc.token, machines.FinishedRequest{}); code != tc.code {
 				t.Fatalf("job-finished: %d, want %d", code, tc.code)
 			}
-			if code, _ := e.post(machines.DisksPath, tc.token, map[string]string{"family": "build"}); code != tc.code {
+			if code, _ := e.post(machines.DisksPath, tc.token, map[string]string{}); code != tc.code {
 				t.Fatalf("work disk: %d, want %d", code, tc.code)
 			}
-			if code, _ := e.post(machines.SavePath, tc.token, map[string]bool{"save": true}); code != tc.code {
-				t.Fatalf("save: %d, want %d", code, tc.code)
+			for _, path := range []string{machines.CacheRestorePath, machines.CacheSavePath, machines.CacheCommitPath} {
+				if code, _ := e.post(path, tc.token, map[string]string{"cache": "build"}); code != tc.code {
+					t.Fatalf("%s: %d, want %d", path, code, tc.code)
+				}
 			}
 		})
 	}
@@ -444,13 +446,13 @@ func TestAWorkDiskThatCouldntBeMadeIsTriedAgain(t *testing.T) {
 	e.gce.StockoutDisks(m.in.Zone, true)
 	// The request is answered: the disk is being made, and the caller asks
 	// again.
-	if code, body := m.disk("build"); code != http.StatusOK || body["state"] != machines.DiskStateMaking {
+	if code, body := m.disk(); code != http.StatusOK || body["state"] != machines.DiskStateMaking {
 		t.Fatalf("with no disk capacity: %d %v, want 200 making", code, body)
 	}
 	// Compute Engine answers a request ID it has seen with its first
 	// outcome, so the next try needs another.
 	e.gce.StockoutDisks(m.in.Zone, false)
-	if code, body := m.disk("build"); code != http.StatusOK || body["state"] != machines.DiskStateReady {
+	if code, body := m.disk(); code != http.StatusOK || body["state"] != machines.DiskStateReady {
 		t.Fatalf("once there's capacity: %d %v, want 200 ready", code, body)
 	}
 }
@@ -484,13 +486,13 @@ func TestAWorkDiskWhoseImageWentIsChosenAgain(t *testing.T) {
 	e.svc.Disks = v
 	e.repo.Commit("main", map[string]string{".github/runners.json": declares})
 	m, _ := e.admitted(sel2)
-	if code, body := m.disk("build"); code != http.StatusOK || body["state"] != machines.DiskStateMaking {
+	if code, body := m.disk(); code != http.StatusOK || body["state"] != machines.DiskStateMaking {
 		t.Fatalf("with its image gone: %d %v, want 200 making", code, body)
 	}
 	if _, ok := e.record("disks/" + machines.WorkDisk(m.in.Name) + ".json"); ok {
 		t.Fatal("the record of a disk whose image went was kept")
 	}
-	code, body := m.disk("build")
+	code, body := m.disk()
 	if code != http.StatusOK || body["state"] != machines.DiskStateReady || body["restored"] != "none" || v.choices() != 2 {
 		t.Fatalf("the next try: %d %v, %d choices; want it to choose again", code, body, v.choices())
 	}
@@ -505,10 +507,10 @@ func TestAWorkDiskWhoseImageWentInItsOperationIsChosenAgain(t *testing.T) {
 	e.repo.Commit("main", map[string]string{".github/runners.json": declares})
 	m, _ := e.admitted(sel2)
 	e.gce.FailNextOperation("disks.insert", "RESOURCE_NOT_FOUND")
-	if code, body := m.disk("build"); code != http.StatusOK || body["state"] != machines.DiskStateMaking {
+	if code, body := m.disk(); code != http.StatusOK || body["state"] != machines.DiskStateMaking {
 		t.Fatalf("with its image gone: %d %v, want 200 making", code, body)
 	}
-	if code, body := m.disk("build"); code != http.StatusOK || body["state"] != machines.DiskStateReady {
+	if code, body := m.disk(); code != http.StatusOK || body["state"] != machines.DiskStateReady {
 		t.Fatalf("the next try, which chose the same image again: %d %v", code, body)
 	}
 }
@@ -721,10 +723,10 @@ func TestAWorkDiskWhoseOperationFailed(t *testing.T) {
 	e.repo.Commit("main", map[string]string{".github/runners.json": declares})
 	m, _ := e.admitted(sel2)
 	e.gce.FailNextOperation("disks.insert", "INTERNAL_ERROR")
-	if code, body := m.disk("build"); code != http.StatusOK || body["state"] != machines.DiskStateMaking {
+	if code, body := m.disk(); code != http.StatusOK || body["state"] != machines.DiskStateMaking {
 		t.Fatalf("work disk request: %d %v, want 200 making", code, body)
 	}
-	if code, body := m.disk("build"); code != http.StatusOK || body["state"] != machines.DiskStateReady {
+	if code, body := m.disk(); code != http.StatusOK || body["state"] != machines.DiskStateReady {
 		t.Fatalf("asked again: %d %v; a finished operation's failure needs a new request", code, body)
 	}
 }

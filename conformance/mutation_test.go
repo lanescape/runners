@@ -90,34 +90,34 @@ func newDiverging(t *testing.T, m mutation) service.World {
 // its answers makes at least one fail.
 func TestADivergenceFailsTheSuite(t *testing.T) {
 	mutations := map[string]func() mutation{
-		"a work disk in another scope's restore chain": func() mutation {
+		"a cache from another scope's restore chain": func() mutation {
 			return func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
-				if p == "/v1/disks" && b["restored"] == "none" {
+				if p == "/v1/caches/restore" && b["restored"] == "none" {
 					b["restored"] = "main_exact"
 				}
 				return c, b
 			}
 		},
-		"a work disk from a pull request's own disk answered as main's": func() mutation {
+		"a cache from a pull request's own version answered as main's": func() mutation {
 			return func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
-				if p == "/v1/disks" && b["restored"] == "pull_request_exact" {
+				if p == "/v1/caches/restore" && b["restored"] == "pull_request_exact" {
 					b["restored"] = "main_exact"
 				}
 				return c, b
 			}
 		},
-		"a work disk from another step of the restore order": func() mutation {
+		"a cache from another step of the restore order": func() mutation {
 			return func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
-				if p == "/v1/disks" && b["restored"] == "main_exact" {
+				if p == "/v1/caches/restore" && b["restored"] == "main_exact" {
 					b["restored"] = "main_newest"
 				}
 				return c, b
 			}
 		},
-		"a work disk refused answered": func() mutation {
+		"a cache refused answered": func() mutation {
 			return func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
-				if p == "/v1/disks" && c == http.StatusForbidden {
-					return http.StatusOK, map[string]any{"state": "ready", "restored": "none"}
+				if p == "/v1/caches/restore" && c == http.StatusForbidden {
+					return http.StatusOK, map[string]any{"restored": "none"}
 				}
 				return c, b
 			}
@@ -132,16 +132,16 @@ func TestADivergenceFailsTheSuite(t *testing.T) {
 		},
 		"a save in a scope that saves nothing answered as saving": func() mutation {
 			return func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
-				if p == "/v1/disks/save" && b["saves"] == false {
-					return c, map[string]any{"saves": true}
+				if p == "/v1/caches/save" && b["saves"] == false {
+					return c, map[string]any{"saves": true, "bucket": "b", "prefix": "1/x/", "token": "t", "expires": "2030-01-01T00:00:00Z"}
 				}
 				return c, b
 			}
 		},
-		"a save without a work disk answered": func() mutation {
+		"a commit with nothing uploaded answered": func() mutation {
 			return func(p string, c int, b map[string]any, _ http.Header) (int, map[string]any) {
-				if p == "/v1/disks/save" && c == http.StatusForbidden {
-					return http.StatusOK, map[string]any{"saves": true}
+				if p == "/v1/caches/commit" && c == http.StatusForbidden {
+					return http.StatusOK, map[string]any{"objects": 1, "bytes": 1}
 				}
 				return c, b
 			}
@@ -247,7 +247,7 @@ func (f failing) StartJob(r service.Run, selector string) (service.Job, error) {
 	return j, err
 }
 
-// unsaved is the emulator never saving a finished job's work disk.
+// unsaved is the emulator never saving a finished job's caches.
 type unsaved struct{ service.World }
 
 func (u unsaved) FinishJob(j service.Job, conclusion string) { u.World.FinishJob(j, "failure") }
@@ -287,7 +287,7 @@ func TestABindingDivergenceFailsTheSuite(t *testing.T) {
 	for name, wrap := range map[string]func(service.World) service.World{
 		"a fork's pull request's job given a machine": func(w service.World) service.World { return forks{w} },
 		"a job the service fails given a machine":     func(w service.World) service.World { return failing{w} },
-		"a finished job's work disk never saved":      func(w service.World) service.World { return unsaved{w} },
+		"a finished job's caches never saved":         func(w service.World) service.World { return unsaved{w} },
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

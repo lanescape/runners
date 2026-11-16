@@ -30,11 +30,14 @@ var ErrPrecondition = errors.New("object generation precondition failed")
 // maxObject bounds what Get reads, since records are small.
 const maxObject = 1 << 20
 
-// Object is an object's name and generation.
+// Object is an object's name and generation, and what Cloud Storage says
+// of its contents: its size and CRC32C.
 type Object struct {
 	Name       string
 	Generation int64
 	Updated    time.Time
+	Size       int64
+	CRC32C     uint32
 }
 
 // Objects is the service's bucket. Every write states the generation it
@@ -172,7 +175,7 @@ func (g *GCS) Delete(ctx context.Context, name string, generation int64) error {
 // List implements Objects.
 func (g *GCS) List(ctx context.Context, prefix string) ([]Object, error) {
 	q := &storage.Query{Prefix: prefix}
-	if err := q.SetAttrSelection([]string{"Name", "Generation", "Updated"}); err != nil {
+	if err := q.SetAttrSelection([]string{"Name", "Generation", "Updated", "Size", "CRC32C"}); err != nil {
 		return nil, err
 	}
 	it := g.bucket.Objects(ctx, q)
@@ -185,6 +188,6 @@ func (g *GCS) List(ctx context.Context, prefix string) ([]Object, error) {
 		if err != nil {
 			return nil, classify(err)
 		}
-		out = append(out, Object{Name: a.Name, Generation: a.Generation, Updated: a.Updated})
+		out = append(out, Object{Name: a.Name, Generation: a.Generation, Updated: a.Updated, Size: a.Size, CRC32C: a.CRC32C})
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"runtime"
 	"sync"
 	"testing"
@@ -15,7 +16,7 @@ import (
 	"github.com/lanescape/runners/internal/machines"
 )
 
-// retention watches the files the service reads for a family's key: before
+// retention watches the files the service reads for a cache's key: before
 // each file is read, every file read before it must be garbage, and the
 // live heap no larger than a few files' worth above where it started.
 type retention struct {
@@ -52,10 +53,10 @@ func (r *retention) File(ctx context.Context, repo github.Repository, path, comm
 	return b, err
 }
 
-// A family may list many large files: the service hashes each as it reads
+// A cache may list many large files: the service hashes each as it reads
 // it, and holds no more than one file's contents at a time, so a
 // declaration can't make it hold them all (specs/0003-disks.md, Keys).
-func TestAFamilysKeyHoldsOneFileAtATime(t *testing.T) {
+func TestACachesKeyHoldsOneFileAtATime(t *testing.T) {
 	const files, size = 24, 2 << 20 // over the contents API's limit, so read as blobs
 	e := setup(t)
 	commit := map[string]string{}
@@ -68,7 +69,7 @@ func TestAFamilysKeyHoldsOneFileAtATime(t *testing.T) {
 		commit[p] = string(c)
 		want = append(want, consumer.PathContents{Path: p, Contents: c})
 	}
-	decl, _ := json.Marshal(map[string]any{"disks": map[string]any{"big": map[string]any{"from": from}}})
+	decl, _ := json.Marshal(map[string]any{"caches": map[string]any{"big": map[string]any{"from": from}}})
 	commit[".github/runners.json"] = string(decl)
 	e.repo.Commit("main", commit)
 	key := consumer.Key("big", want, true)
@@ -76,12 +77,14 @@ func TestAFamilysKeyHoldsOneFileAtATime(t *testing.T) {
 
 	r := &retention{API: e.svc.GitHub}
 	e.svc.GitHub = r
+	cs := &caches{}
+	e.svc.Caches = cs
 	m := e.admit(e.mainRun(), sel2)
-	m.diskReady("big")
-
-	rec, ok := e.record("disks/" + machines.WorkDisk(m.in.Name) + ".json")
-	if !ok || rec["key"] != key {
-		t.Fatalf("disk record = %v; want the key %s", rec, key)
+	if code, body := m.cache(machines.CacheRestorePath, "big"); code != http.StatusOK {
+		t.Fatalf("restore: %d %v", code, body)
+	}
+	if asked, _ := cs.all(); len(asked) != 1 || asked[0] != "restore big "+key {
+		t.Fatalf("asked %v; want the key %s", asked, key)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()

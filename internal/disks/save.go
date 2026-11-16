@@ -6,95 +6,13 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-	"time"
 
-	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/compute"
 	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/machines"
 	"github.com/lanescape/runners/internal/scope"
 	"github.com/lanescape/runners/internal/store"
 )
-
-// Save saves a finished job's work disk, from its stopped machine, as a new
-// version of its scope's disk for its selector's family and key
-// (specs/0003-disks.md, Saved disks). The machines' part has checked that
-// the job succeeded, asked, and that its scope saves; this checks the scope
-// and selector again, and deletes what the new disk replaces that no
-// unfinished run's choice names: its scope's older disks of the family on
-// its architecture, whatever their key. It
-// implements machines.Saver, and is called again until it returns nil.
-func (s *Service) Save(ctx context.Context, m machines.Machine, a machines.Admission) error {
-	sel := m.Selector
-	if !a.Allowed || a.Machine != m.Name || a.Selector != sel.String() || !sel.Scope.Saves() || !sel.HasDisk() {
-		return nil
-	}
-	log := s.log().With("machine", m.Name, "repository_id", m.RepositoryID, "run_id", a.RunID, "job_id", a.JobID, "selector", a.Selector)
-	// Only the organization's consumers save.
-	if repo, err := s.GitHub.RepositoryByID(ctx, m.RepositoryID); err != nil {
-		return err
-	} else if repo.OwnerID != s.Config.Organization.ID {
-		log.Warn("work disk not saved: the repository is no longer the organization's")
-		return nil
-	}
-	sv, gen, found, err := getJSON[Save](ctx, s.Objects, saveKey(m.Name))
-	if err != nil {
-		return err
-	}
-	if found && (sv.Done || sv.Skipped != "") {
-		return nil
-	}
-	if !found {
-		d, err := s.Compute.Disk(ctx, m.Zone, machines.WorkDisk(m.Name))
-		if errors.Is(err, compute.ErrNotFound) {
-			log.Warn("the job asked to save its work disk, and it has none")
-			_, _, err := createOnce(ctx, s.Objects, saveKey(m.Name), Save{Machine: m.Name, Skipped: "no work disk", At: s.now()})
-			return err
-		}
-		if err != nil {
-			return err
-		}
-		series := Series(sel.Scope.String(), sel.Arch, sel.Family, sel.Key)
-		sv, gen, err = createOnce(ctx, s.Objects, saveKey(m.Name), Save{Machine: m.Name, Image: SavedName(m.RepositoryID, series, s.now(), m.Name),
-			SizeGB: d.SizeGB, At: s.now()})
-		if err != nil {
-			return err
-		}
-	}
-	key := imageKey(m.RepositoryID, sv.Image)
-	rec, rgen, ok, err := getJSON[Image](ctx, s.Objects, key)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		// When the run was bound, so that a pull request's disk saved by a
-		// run from before it closed is never chosen after it's reopened.
-		var bound time.Time
-		if b, _, found, err := getJSON[binding.Binding](ctx, s.Objects, binding.Key(m.RepositoryID, a.RunID)); err != nil {
-			return err
-		} else if found {
-			bound = b.BoundAt
-		}
-		rec = Image{Image: sv.Image, RepositoryID: m.RepositoryID, Kind: KindSaved, State: ImageMaking, Scope: sel.Scope.String(),
-			Arch: sel.Arch, Family: sel.Family, Key: sel.Key, Machine: m.Name, Zone: m.Zone, InstanceID: m.ID, JobID: a.JobID,
-			JobName: a.JobName, RunID: a.RunID, RunAttempt: a.RunAttempt, Selector: a.Selector, SizeGB: sv.SizeGB,
-			SavedAt: sv.At, BoundAt: bound}
-		if rec, rgen, err = createOnce(ctx, s.Objects, key, rec); err != nil {
-			return err
-		}
-	}
-	if rec, _, err = s.make(ctx, key, rec, rgen); err != nil {
-		return fmt.Errorf("saving the work disk as %s: %w", rec.Image, err)
-	}
-	log.Info("work disk saved", "image", rec.Image, "scope", rec.Scope, "family", rec.Family, "key", rec.Key, "size_gb", rec.SizeGB)
-	if err := s.supersede(ctx, rec); err != nil {
-		// The pass deletes them later.
-		log.Warn("deleting older versions of a saved disk", "err", err.Error())
-	}
-	sv.Done = true
-	_, err = replaceJSON(ctx, s.Objects, saveKey(m.Name), sv, gen)
-	return err
-}
 
 // unreported are the runs, by ID, with a machine whose job was admitted and
 // that hasn't reported, other than except: one may be a stopped Spot
@@ -194,7 +112,7 @@ func (s *Service) named(ctx context.Context, repo int64, finished map[int64]bool
 // at, so a choice or claim of it since then makes the mark fail.
 func (s *Service) markOne(ctx context.Context, rec Image, gen int64) (Image, error) {
 	rec.State, rec.MarkedAt = ImageMarked, s.now()
-	if _, err := replaceJSON(ctx, s.Objects, imageKey(rec.RepositoryID, rec.Image), rec, gen); err != nil {
+	if _, err := replaceJSON(ctx, s.Objects, recordKey(rec), rec, gen); err != nil {
 		return rec, err
 	}
 	return rec, nil
@@ -242,40 +160,46 @@ func (s *Service) mark(ctx context.Context, repo int64, cands []record[Image], f
 	return marked, err
 }
 
-// deleteMarked deletes a marked image, then its record, and any claim of
-// it.
+// deleteMarked deletes a marked version's objects, or a marked image, then
+// its record, and any claim of it.
 func (s *Service) deleteMarked(ctx context.Context, rec Image) error {
 	if rec.State != ImageMarked {
-		return fmt.Errorf("image %s isn't marked for deletion", rec.Image)
+		return fmt.Errorf("%s isn't marked for deletion", rec.Image)
 	}
-	err := s.Compute.DeleteImage(ctx, rec.Image, freshID("delete image", rec.Image))
-	if err != nil && !errors.Is(err, compute.ErrNotFound) {
-		return err
+	if rec.Kind == KindCache {
+		if err := s.deleteObjects(ctx, VersionPrefix(rec.RepositoryID, rec.Image)); err != nil {
+			return err
+		}
+	} else {
+		err := s.Compute.DeleteImage(ctx, rec.Image, freshID("delete image", rec.Image))
+		if err != nil && !errors.Is(err, compute.ErrNotFound) {
+			return err
+		}
 	}
 	if c, gen, ok, err := getJSON[Claim](ctx, s.Objects, claimKey(rec.RepositoryID, rec.Image)); err == nil && ok && c.Image == rec.Image {
 		_ = s.Objects.Delete(ctx, claimKey(rec.RepositoryID, rec.Image), gen)
 	}
-	_, gen, ok, err := getJSON[Image](ctx, s.Objects, imageKey(rec.RepositoryID, rec.Image))
+	_, gen, ok, err := getJSON[Image](ctx, s.Objects, recordKey(rec))
 	if err != nil || !ok {
 		return err
 	}
-	if err := s.Objects.Delete(ctx, imageKey(rec.RepositoryID, rec.Image), gen); err != nil && !errors.Is(err, store.ErrNotFound) {
+	if err := s.Objects.Delete(ctx, recordKey(rec), gen); err != nil && !errors.Is(err, store.ErrNotFound) {
 		return err
 	}
 	return nil
 }
 
-// replaces reports whether a ready saved disk, older than a newly saved one,
-// is one the new one replaces: any of its scope's disks of the family on its
-// architecture, an older version of its key or of any other, since a scope
-// keeps one disk of each family and architecture, its newest save
-// (specs/0003-disks.md, Deletion).
+// replaces reports whether a ready version, older than a newly ready one, is
+// one the new one replaces: any of its scope's versions of the cache on its
+// architecture, of its key or of any other, since a scope keeps one version
+// of each cache and architecture, its newest save (specs/0003-disks.md,
+// Deletion).
 func replaces(newer, v Image) bool {
-	return v.Kind == KindSaved && v.State == ImageReady && v.Image != newer.Image && v.Scope == newer.Scope && v.Arch == newer.Arch &&
-		v.Family == newer.Family && olderThan(v, newer)
+	return v.Kind == KindCache && v.State == ImageReady && v.Image != newer.Image && v.Scope == newer.Scope && v.Arch == newer.Arch &&
+		v.Cache == newer.Cache && olderThan(v, newer)
 }
 
-// olderThan orders saved disks by when they were saved, then by name.
+// olderThan orders versions by when they were saved, then by name.
 func olderThan(x, y Image) bool {
 	return x.SavedAt.Before(y.SavedAt) || (x.SavedAt.Equal(y.SavedAt) && x.Image < y.Image)
 }
@@ -295,13 +219,13 @@ func lasting(sc string) bool {
 	return err == nil && parsed.Lasting()
 }
 
-// supersede deletes what a newly ready saved disk replaces, except what an
+// supersede deletes what a newly ready version replaces, except what an
 // unfinished run's choice names, which goes once it has finished. A pull
-// request's disk saved by a run bound before the pull request was last seen
-// closed replaces nothing: it's never chosen, and goes itself. That's read
-// again under the lease, as the closure may be recorded meanwhile.
+// request's version saved by a run bound before the pull request was last
+// seen closed replaces nothing: it's never chosen, and goes itself. That's
+// read again under the lease, as the closure may be recorded meanwhile.
 func (s *Service) supersede(ctx context.Context, rec Image) error {
-	recs, err := listJSON[Image](ctx, s.Objects, fmt.Sprintf("images/%d/", rec.RepositoryID))
+	recs, err := listJSON[Image](ctx, s.Objects, fmt.Sprintf("caches/%d/", rec.RepositoryID))
 	if err != nil {
 		return err
 	}
@@ -352,7 +276,8 @@ func (s *Service) supersede(ctx context.Context, rec Image) error {
 	}
 	var errs []error
 	for _, v := range marked {
-		s.log().Info("saved disk deleted: a newer one replaces it", "image", v.Image, "newer", rec.Image, "scope", v.Scope)
+		s.log().Info("cache version deleted: a newer one replaces it", "version", v.Image, "newer", rec.Image, "scope", v.Scope,
+			"cache", v.Cache)
 		errs = append(errs, s.deleteMarked(ctx, v))
 	}
 	return errors.Join(errs...)

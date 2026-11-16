@@ -10,6 +10,8 @@ package conformance
 
 import (
 	"errors"
+	"fmt"
+	"github.com/lanescape/runners/emulators/fault"
 	"net/http"
 	"slices"
 	"strconv"
@@ -51,14 +53,16 @@ func Cases() []Case {
 		one("forks and approved contributions", contributions),
 		one("a contribution pushed to after its approval", pushedContribution),
 		one("a contribution bound to its own pull request only", ownPullRequest),
-		one("a run not approved left unbound and refused disks and saves", unapproved),
+		one("a run not approved left unbound and refused disks and caches", unapproved),
 		one("a job on a machine made for another run's job", anotherRunsMachine),
-		one("disk requests from a run's own machine only", diskRequests),
-		one("work disks kept to their repository", ownRepository),
-		one("a work disk in the run's own scope from each step of the restore order", restoreOrder),
-		one("a new key's save replaces the old key's disk once no unfinished run chose it", newKey),
-		one("one work disk per job", oneWorkDisk),
-		one("saves asked for", saves),
+		one("disk and cache requests from a run's own machine only", diskRequests),
+		one("caches kept to their repository", ownRepository),
+		one("a cache in the run's own scope from each step of the restore order", restoreOrder),
+		one("a new key's save replaces the old key's version once no unfinished run chose it", newKey),
+		one("one work disk per job, and one save of each cache", oneWorkDisk),
+		one("caches saved", saves),
+		one("the newest save kept, whichever job finished first", overlappingSaves),
+		one("a version within its limits, and whole, or not kept", wholeVersions),
 		one("refusals and retries", refusals),
 	)
 }
@@ -74,11 +78,11 @@ const (
 )
 
 // Files are a consumer's files, which the suite's cases commit: a
-// long-lived branch, support/v1, and two families of work disks, build,
-// keyed by deps.txt, and cache, with one key.
+// long-lived branch, support/v1, and two caches, build, keyed by deps.txt,
+// and tools, with one key.
 var Files = map[string]string{
 	consumer.RunnersFile: `{"branches": {"support/v1": "v1"},
- "disks": {"build": {"from": ["deps.txt"]}, "cache": {}}}`,
+ "caches": {"build": {"from": ["deps.txt"]}, "tools": {}}}`,
 	"deps.txt": "1\n",
 }
 
@@ -144,15 +148,14 @@ func (w *world) status(what string, a Answer, want int) {
 	}
 }
 
-// disk asks for a job's work disk of a family, again while it's being
-// made, as the disk action does, until it's ready, and returns where it
-// came from.
-func (w *world) disk(j service.Job, family string) string {
+// disk asks for a job's work disk, again while it's being made, as the disk
+// action does, until it's ready, and returns where it came from.
+func (w *world) disk(j service.Job) string {
 	w.t.Helper()
 	restored := ""
 	for end := time.Now().Add(30 * time.Second); ; time.Sleep(20 * time.Millisecond) {
-		a, d := w.c.Disk(w.Token(j), family)
-		w.status("job "+strconv.FormatInt(j.ID, 10)+"'s work disk of "+family, a, http.StatusOK)
+		a, d := w.c.Disk(w.Token(j))
+		w.status("job "+strconv.FormatInt(j.ID, 10)+"'s work disk", a, http.StatusOK)
 		if restored != "" && d.Restored != restored {
 			w.t.Fatalf("job %d's work disk came from %s, then %s", j.ID, restored, d.Restored)
 		}
@@ -161,26 +164,46 @@ func (w *world) disk(j service.Job, family string) string {
 			return restored
 		}
 		if time.Now().After(end) {
-			w.t.Fatalf("job %d's work disk of %s was never ready", j.ID, family)
+			w.t.Fatalf("job %d's work disk was never ready", j.ID)
 		}
 	}
 }
 
-// restored checks where a job's work disk of a family came from.
-func (w *world) restored(j service.Job, family, want string) {
+// restored restores a job's cache, as the cache action does, and checks
+// where it came from; a version's objects are there, as its answer names
+// them.
+func (w *world) restored(j service.Job, cache, want string) {
 	w.t.Helper()
-	if got := w.disk(j, family); got != want {
-		w.t.Fatalf("job %d (run %d, %s) has a work disk of %s from %s; want %s", j.ID, j.Run.ID, j.Run.Event, family, got, want)
+	a, r := w.c.Restore(w.Token(j), cache)
+	w.status("job "+strconv.FormatInt(j.ID, 10)+"'s restore of "+cache, a, http.StatusOK)
+	if r.Restored != want {
+		w.t.Fatalf("job %d (run %d, %s) restored %s from %s; want %s", j.ID, j.Run.ID, j.Run.Event, cache, r.Restored, want)
+	}
+	for _, o := range r.Objects {
+		data, gen, ok := w.CacheStorage().Object(r.Bucket, o.Name)
+		if !ok || gen != o.Generation || int64(len(data)) != o.Size {
+			w.t.Fatalf("job %d's restore of %s names %+v, which isn't there as named", j.ID, cache, o)
+		}
 	}
 }
 
-// save asks for a job's work disk to be saved, which must be answered.
-func (w *world) save(j service.Job, saves bool) {
+// save saves a job's cache, as the save-cache action does: in a scope that
+// saves, it uploads an object under the version's prefix, and commits it.
+func (w *world) save(j service.Job, cache string, saves bool) {
 	w.t.Helper()
-	a, s := w.c.Save(w.Token(j))
-	w.status("job "+strconv.FormatInt(j.ID, 10)+"'s save", a, http.StatusOK)
+	a, s := w.c.Save(w.Token(j), cache)
+	w.status("job "+strconv.FormatInt(j.ID, 10)+"'s save of "+cache, a, http.StatusOK)
 	if s.Saves != saves {
-		w.t.Fatalf("job %d (run %d, %s) asked to save: %+v; want saves %v", j.ID, j.Run.ID, j.Run.Event, s, saves)
+		w.t.Fatalf("job %d (run %d, %s) asked to save %s: %+v; want saves %v", j.ID, j.Run.ID, j.Run.Event, cache, s, saves)
+	}
+	if !saves {
+		return
+	}
+	w.CacheStorage().Put(s.Bucket, s.Prefix+"shard-000.tar.zst", []byte("job "+strconv.FormatInt(j.ID, 10)+"'s "+cache))
+	a, c := w.c.Commit(w.Token(j), cache)
+	w.status("job "+strconv.FormatInt(j.ID, 10)+"'s commit of "+cache, a, http.StatusOK)
+	if c.Objects != 1 {
+		w.t.Fatalf("job %d's commit of %s recorded %d objects; want 1", j.ID, cache, c.Objects)
 	}
 }
 
@@ -288,7 +311,7 @@ func contributions(t T, w *world) {
 	// An approved contribution's run saves in its pull request's scope,
 	// which its next run restores, and starts from main's.
 	w.restored(j, "build", service.StepNone)
-	w.save(j, true)
+	w.save(j, "build", true)
 	w.FinishJob(j, "success")
 	next := w.PullRequestTargetRun(pr)
 	w.Approve(next)
@@ -326,10 +349,12 @@ func unapproved(t T, w *world) {
 	run := w.PullRequestTargetRun(pr)
 	j := w.start(run, Small)
 	w.bound(run, "")
-	// Nothing that needs a scope: no work disk, no save.
-	a, _ := w.c.Disk(w.Token(j), "build")
+	// Nothing that needs a scope: no work disk, no cache.
+	a, _ := w.c.Disk(w.Token(j))
 	w.status("an unbound run's work disk request", a, http.StatusForbidden)
-	a, _ = w.c.Save(w.Token(j))
+	a, _ = w.c.Restore(w.Token(j), "build")
+	w.status("an unbound run's restore", a, http.StatusForbidden)
+	a, _ = w.c.Save(w.Token(j), "build")
 	w.status("an unbound run's save", a, http.StatusForbidden)
 	w.bound(run, "")
 }
@@ -348,7 +373,7 @@ func anotherRunsMachine(t T, w *world) {
 	w.bound(run, "read")
 	w.bound(madeFor, "")
 	w.restored(j, "build", service.StepNone)
-	w.save(j, false)
+	w.save(j, "build", false)
 }
 
 func diskRequests(t T, w *world) {
@@ -356,41 +381,48 @@ func diskRequests(t T, w *world) {
 	run := w.Push(repo, "main")
 	j := w.start(run, Small)
 	j2 := w.start(run, Small)
+	w.disk(j)
 	w.restored(j, "build", service.StepNone)
 	// A request with no token, or one that isn't a machine's, is refused.
-	a, _ := w.c.Disk("", "build")
+	a, _ := w.c.Disk("")
 	if a.Status != http.StatusUnauthorized {
 		t.Fatalf("a work disk request with no token answered %d", a.Status)
 	}
-	a, _ = w.c.Disk("not.a.token", "build")
+	a, _ = w.c.Restore("not.a.token", "build")
 	if a.Status != http.StatusUnauthorized {
-		t.Fatalf("a work disk request with a token that isn't one answered %d", a.Status)
+		t.Fatalf("a restore with a token that isn't one answered %d", a.Status)
 	}
 	// A job GitHub shows completed can ask for nothing, even before its
 	// machine reports, as when its supervisor has died.
 	jc := w.start(run, Small)
-	w.restored(jc, "build", service.StepNone)
+	w.save(jc, "tools", true)
 	w.CompleteJob(jc, "success")
-	a, _ = w.c.Disk(w.Token(jc), "build")
+	a, _ = w.c.Disk(w.Token(jc))
 	w.status("a completed job's work disk request, before its machine reports", a, http.StatusForbidden)
-	a, _ = w.c.Save(w.Token(jc))
+	a, _ = w.c.Restore(w.Token(jc), "build")
+	w.status("a completed job's restore, before its machine reports", a, http.StatusForbidden)
+	a, _ = w.c.Save(w.Token(jc), "build")
 	w.status("a completed job's save, before its machine reports", a, http.StatusForbidden)
+	a, _ = w.c.Commit(w.Token(jc), "tools")
+	w.status("a completed job's commit, before its machine reports", a, http.StatusForbidden)
 	// A machine whose job has finished can ask for nothing.
 	w.FinishJob(j, "success")
-	a, _ = w.c.Disk(w.Token(j), "build")
+	a, _ = w.c.Disk(w.Token(j))
 	w.status("a finished job's work disk request", a, http.StatusForbidden)
-	a, _ = w.c.Save(w.Token(j))
+	a, _ = w.c.Save(w.Token(j), "build")
 	w.status("a finished job's save", a, http.StatusForbidden)
-	// The run's other jobs still can, each with a disk of its own.
-	w.restored(j2, "build", service.StepNone)
-	w.save(j2, true)
+	// The run's other jobs still can, each with a disk of its own; what the
+	// completed job saved is restored by later runs, since it succeeded.
+	w.disk(j2)
+	w.save(j2, "build", true)
+	w.restored(w.start(w.Push(repo, "main"), Small), "tools", service.StepMainExact)
 }
 
 func ownRepository(t T, w *world) {
 	a, b := w.consumer("one"), w.consumer("two")
 	ja := w.start(w.Push(a, "main"), Small)
 	w.restored(ja, "build", service.StepNone)
-	w.save(ja, true)
+	w.save(ja, "build", true)
 	w.FinishJob(ja, "success")
 	w.restored(w.start(w.Push(a, "main"), Small), "build", service.StepMainExact)
 	// Another repository's main, of the same family and key, starts empty.
@@ -402,7 +434,7 @@ func restoreOrder(t T, w *world) {
 	// Nothing saved yet: the disk starts empty; main saves it.
 	j := w.start(w.Push(repo, "main"), Small)
 	w.restored(j, "build", service.StepNone)
-	w.save(j, true)
+	w.save(j, "build", true)
 	w.FinishJob(j, "success")
 	// Main's next run starts from it; a machine of the other architecture
 	// starts empty.
@@ -419,7 +451,7 @@ func restoreOrder(t T, w *world) {
 	j = w.start(ra, Small)
 	other := w.start(ra, Small)
 	w.restored(j, "build", service.StepMainExact)
-	w.save(j, true)
+	w.save(j, "build", true)
 	w.FinishJob(j, "success")
 	w.restored(other, "build", service.StepMainExact)
 	w.FinishJob(other, "success")
@@ -439,7 +471,7 @@ func restoreOrder(t T, w *world) {
 	w.Branch(repo, "support/v1")
 	j = w.start(w.Push(repo, "support/v1"), Small)
 	w.restored(j, "build", service.StepMainExact)
-	w.save(j, true)
+	w.save(j, "build", true)
 	w.FinishJob(j, "success")
 	w.restored(w.start(w.Push(repo, "support/v1"), Small), "build", service.StepBranchExact)
 	w.restored(w.start(w.PullRequestRun(w.PullRequest(repo, "support/v1", "c")), Small), "build", service.StepBranchExact)
@@ -454,7 +486,7 @@ func newKey(t T, w *world) {
 	repo := w.consumer("app")
 	j := w.start(w.Push(repo, "main"), Small)
 	w.restored(j, "build", service.StepNone)
-	w.save(j, true)
+	w.save(j, "build", true)
 	w.FinishJob(j, "success")
 	// A pull request of main's key starts from main's, and holds it while
 	// its run is unfinished.
@@ -467,7 +499,7 @@ func newKey(t T, w *world) {
 	w.Commit(repo, "main", map[string]string{"deps.txt": "2\n"})
 	j = w.start(w.Push(repo, "main"), Small)
 	w.restored(j, "build", service.StepMainNewest)
-	w.save(j, true)
+	w.save(j, "build", true)
 	w.FinishJob(j, "success")
 	w.Commit(repo, "older", map[string]string{"deps.txt": "1\n"})
 	older := w.PullRequest(repo, "main", "older")
@@ -487,42 +519,65 @@ func oneWorkDisk(t T, w *world) {
 	run := w.Push(repo, "main")
 	j := w.start(run, Small)
 	// While it's being made, a repeated request is answered about the same
-	// disk, and another family is refused.
+	// disk.
 	w.HoldDisks(true)
 	for range 2 {
-		a, d := w.c.Disk(w.Token(j), "build")
+		a, d := w.c.Disk(w.Token(j))
 		if a.Status != http.StatusOK || d.State != "making" || d.Restored != service.StepNone {
 			t.Fatalf("a held work disk: %d %+v", a.Status, d)
 		}
 	}
-	a, _ := w.c.Disk(w.Token(j), "cache")
-	w.status("a second family while the first is made", a, http.StatusForbidden)
 	w.HoldDisks(false)
-	w.restored(j, "build", service.StepNone)
-	w.restored(j, "build", service.StepNone)
-	a, _ = w.c.Disk(w.Token(j), "cache")
-	w.status("a second family", a, http.StatusForbidden)
-	// Another job of the run may have the other family.
-	w.restored(w.start(run, Small), "cache", service.StepNone)
+	if got := w.disk(j); got != service.StepNone {
+		t.Fatalf("a work disk came from %s", got)
+	}
+	// A job saves each cache once: a repeat before its commit names the
+	// same version, and one after is refused; it may save another cache.
+	_, first := w.c.Save(w.Token(j), "build")
+	_, again := w.c.Save(w.Token(j), "build")
+	if first.Prefix == "" || again.Prefix != first.Prefix {
+		t.Fatalf("a repeated save named %q, then %q", first.Prefix, again.Prefix)
+	}
+	w.CacheStorage().Put(first.Bucket, first.Prefix+"shard-000.tar.zst", []byte("build"))
+	a, c := w.c.Commit(w.Token(j), "build")
+	w.status("a commit", a, http.StatusOK)
+	a, again2 := w.c.Commit(w.Token(j), "build")
+	w.status("a repeated commit", a, http.StatusOK)
+	if again2 != c {
+		t.Fatalf("a repeated commit answered %+v, then %+v", c, again2)
+	}
+	a, _ = w.c.Save(w.Token(j), "build")
+	w.status("a save of a cache the job has saved", a, http.StatusForbidden)
+	w.save(j, "tools", true)
+	w.FinishJob(j, "success")
+	next := w.start(w.Push(repo, "main"), Small)
+	w.restored(next, "build", service.StepMainExact)
+	w.restored(next, "tools", service.StepMainExact)
 }
 
 func saves(t T, w *world) {
 	repo := w.consumer("app")
 	j := w.start(w.Push(repo, "main"), Small)
-	a, _ := w.c.Save(w.Token(j))
-	w.status("a save without a work disk", a, http.StatusForbidden)
-	w.disk(j, "build")
-	w.save(j, true)
-	w.save(j, true)
+	// A commit names a cache the job is saving, with something uploaded.
+	a, _ := w.c.Commit(w.Token(j), "build")
+	w.status("a commit of a cache the job isn't saving", a, http.StatusForbidden)
+	a, s := w.c.Save(w.Token(j), "build")
+	w.status("a save", a, http.StatusOK)
+	a, _ = w.c.Commit(w.Token(j), "build")
+	w.status("a commit with nothing uploaded", a, http.StatusForbidden)
+	w.CacheStorage().Put(s.Bucket, s.Prefix+"shard-000.tar.zst", []byte("x"))
+	a, _ = w.c.Commit(w.Token(j), "build")
+	w.status("a commit", a, http.StatusOK)
 	// A job that fails saves nothing.
 	w.FinishJob(j, "failure")
 	j = w.start(w.Push(repo, "main"), Small)
 	w.restored(j, "build", service.StepNone)
-	// Nor does one that didn't ask.
+	// Nor does one that didn't commit.
+	w.c.Save(w.Token(j), "build")
 	w.FinishJob(j, "success")
 	j = w.start(w.Push(repo, "main"), Small)
 	w.restored(j, "build", service.StepNone)
-	w.save(j, true)
+	w.save(j, "build", true)
 	w.FinishJob(j, "success")
 	w.restored(w.start(w.Push(repo, "main"), Small), "build", service.StepMainExact)
 
@@ -530,50 +585,124 @@ func saves(t T, w *world) {
 	for _, run := range []service.Run{w.Event(repo, "workflow_dispatch", "main"), w.Tag(repo, "v1")} {
 		j = w.start(run, Small)
 		w.restored(j, "build", service.StepMainExact)
-		a, s := w.c.Save(w.Token(j))
-		if a.Status != http.StatusOK || s.Saves || s.Reason == "" {
-			t.Fatalf("a save in a scope that saves nothing: %d %+v", a.Status, s)
-		}
+		w.save(j, "build", false)
 		w.FinishJob(j, "success")
 	}
+}
+
+func overlappingSaves(t T, w *world) {
+	repo := w.consumer("app")
+	first, later := w.start(w.Push(repo, "main"), Small), w.start(w.Push(repo, "main"), Small)
+	prefix := map[service.Job]string{}
+	for _, j := range []service.Job{first, later} {
+		a, s := w.c.Save(w.Token(j), "build")
+		w.status("a save", a, http.StatusOK)
+		w.CacheStorage().Put(s.Bucket, s.Prefix+"shard-000.tar.zst", []byte(s.Prefix))
+		a, _ = w.c.Commit(w.Token(j), "build")
+		w.status("a commit", a, http.StatusOK)
+		prefix[j] = s.Prefix
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The later save's job finishes first: it's still the newer, and the
+	// one kept.
+	w.FinishJob(later, "success")
+	w.FinishJob(first, "success")
+	j := w.start(w.Push(repo, "main"), Small)
+	a, r := w.c.Restore(w.Token(j), "build")
+	w.status("a restore", a, http.StatusOK)
+	if r.Restored != service.StepMainExact || len(r.Objects) != 1 || !strings.HasPrefix(r.Objects[0].Name, prefix[later]) {
+		t.Fatalf("restored %s %+v; want main's version saved later, under %s", r.Restored, r.Objects, prefix[later])
+	}
+}
+
+func wholeVersions(t T, w *world) {
+	repo := w.consumer("app")
+	j := w.start(w.Push(repo, "main"), Small)
+	// More objects than a version holds: refused.
+	a, s := w.c.Save(w.Token(j), "build")
+	w.status("a save", a, http.StatusOK)
+	for i := range 1001 {
+		w.CacheStorage().Put(s.Bucket, fmt.Sprintf("%sshard-%04d", s.Prefix, i), []byte("x"))
+	}
+	a, _ = w.c.Commit(w.Token(j), "build")
+	w.status("a commit of 1,001 objects", a, http.StatusForbidden)
+	// Objects whose names fit, but whose record doesn't: 1,000 of 500
+	// bytes, 500,000 bytes of names, more than 512 KiB to record.
+	m := w.start(w.Push(repo, "main"), Small)
+	a, s = w.c.Save(w.Token(m), "build")
+	w.status("a save", a, http.StatusOK)
+	for i := range 1000 {
+		head := fmt.Sprintf("%sshard-%04d-", s.Prefix, i)
+		w.CacheStorage().Put(s.Bucket, head+strings.Repeat("x", 500-len(head)), []byte("x"))
+	}
+	a, _ = w.c.Commit(w.Token(m), "build")
+	w.status("a commit whose record is too large", a, http.StatusForbidden)
+	// A version one of whose objects changed after its commit is never
+	// restored, and replaces nothing.
+	k := w.start(w.Push(repo, "main"), Small)
+	a, s = w.c.Save(w.Token(k), "tools")
+	w.status("a save", a, http.StatusOK)
+	w.CacheStorage().Put(s.Bucket, s.Prefix+"shard-000.tar.zst", []byte("first"))
+	a, _ = w.c.Commit(w.Token(k), "tools")
+	w.status("a commit", a, http.StatusOK)
+	// A commit asked again is answered from what was committed, without
+	// listing again: the bucket's listings failing doesn't matter.
+	list := "/storage/v1/b/" + s.Bucket + "/o"
+	w.CacheStorage().Faults().Add(fault.Rule{Method: http.MethodGet, Match: func(r *http.Request) bool { return r.URL.Path == list },
+		Respond: fault.Status(http.StatusForbidden, nil, `{"error": {"code": 403}}`)})
+	a, c := w.c.Commit(w.Token(k), "tools")
+	w.CacheStorage().Faults().Reset()
+	w.status("a commit asked again", a, http.StatusOK)
+	if c.Objects != 1 {
+		t.Fatalf("a commit asked again: %+v; want the one object committed", c)
+	}
+	w.CacheStorage().Put(s.Bucket, s.Prefix+"shard-000.tar.zst", []byte("changed after its commit"))
+	w.FinishJob(k, "success")
+	w.FinishJob(m, "success")
+	w.FinishJob(j, "success")
+	next := w.start(w.Push(repo, "main"), Small)
+	w.restored(next, "tools", service.StepNone)
+	w.restored(next, "build", service.StepNone)
 }
 
 func refusals(t T, w *world) {
 	repo := w.consumer("app")
 	j := w.start(w.Push(repo, "main"), Small)
 	for _, name := range []string{"other", "Build", "", "build-", strings.Repeat("a", 33)} {
-		a, _ := w.c.Disk(w.Token(j), name)
-		w.status("a request for the family "+strconv.Quote(name), a, http.StatusForbidden)
+		a, _ := w.c.Restore(w.Token(j), name)
+		w.status("a restore of the cache "+strconv.Quote(name), a, http.StatusForbidden)
+		a, _ = w.c.Save(w.Token(j), name)
+		w.status("a save of the cache "+strconv.Quote(name), a, http.StatusForbidden)
 	}
 
-	// A family's listed file that doesn't exist, and a .github/runners.json
-	// that isn't valid, an "images" field included.
+	// A cache's listed file that doesn't exist, and a .github/runners.json
+	// that isn't valid, a "disks" or "images" field included.
 	w.Commit(repo, "main", map[string]string{"deps.txt": ""})
 	gone := w.start(w.Push(repo, "main"), Small)
-	a, _ := w.c.Disk(w.Token(gone), "build")
+	a, _ := w.c.Restore(w.Token(gone), "build")
 	if a.Status != http.StatusForbidden || !strings.Contains(a.Reason, "deps.txt") {
-		t.Fatalf("a family whose listed file doesn't exist: %d %q", a.Status, a.Reason)
+		t.Fatalf("a cache whose listed file doesn't exist: %d %q", a.Status, a.Reason)
 	}
-	for _, file := range []string{`{"disks": {"cache": {}}, "images": {"build": ".github/images/build"}}`, `{"disks": {"cache": {"from": "x"}}}`, `[]`,
-		`{"disks": {"cache": null}}`, `{"disks": {"cache": {"FROM": []}}}`} {
+	for _, file := range []string{`{"caches": {"tools": {}}, "images": {"build": ".github/images/build"}}`, `{"caches": {"tools": {"from": "x"}}}`, `[]`,
+		`{"caches": {"tools": null}}`, `{"caches": {"tools": {"FROM": []}}}`, `{"disks": {"tools": {}}}`} {
 		w.Commit(repo, "main", map[string]string{consumer.RunnersFile: file})
 		invalid := w.start(w.Push(repo, "main"), Small)
-		a, _ = w.c.Disk(w.Token(invalid), "cache")
-		w.status("a family of a .github/runners.json that isn't valid, "+file, a, http.StatusForbidden)
+		a, _ = w.c.Restore(w.Token(invalid), "tools")
+		w.status("a cache of a .github/runners.json that isn't valid, "+file, a, http.StatusForbidden)
 	}
 
 	// GitHub unavailable: the service confirms nothing, and the caller
 	// asks again.
 	w.Unavailable(true)
-	a, _ = w.c.Disk(w.Token(j), "cache")
-	w.status("a work disk request with GitHub unavailable", a, http.StatusServiceUnavailable)
-	a, _ = w.c.Save(w.Token(j))
+	a, _ = w.c.Restore(w.Token(j), "tools")
+	w.status("a restore with GitHub unavailable", a, http.StatusServiceUnavailable)
+	a, _ = w.c.Save(w.Token(j), "tools")
 	w.status("a save with GitHub unavailable", a, http.StatusServiceUnavailable)
 	_, err := w.StartJob(w.Push(repo, "main"), Small)
 	w.Unavailable(false)
 	if !errors.Is(err, service.ErrUnavailable) {
 		t.Fatalf("a job's check with GitHub unavailable: %v", err)
 	}
-	w.restored(j, "cache", service.StepNone)
-	w.save(j, true)
+	w.restored(j, "tools", service.StepNone)
+	w.save(j, "tools", true)
 }

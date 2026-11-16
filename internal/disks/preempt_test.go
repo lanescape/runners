@@ -3,6 +3,7 @@ package disks_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strconv"
@@ -20,7 +21,9 @@ import (
 	"github.com/lanescape/runners/internal/selector"
 )
 
-const spot = "lanescape-2vcpu-linux-amd64-spot-disk-build-" + zero + "-main"
+// spot is a Spot machine's job, which asks for a work disk and restores the
+// cache build, in main's scope.
+const spot = "lanescape-2vcpu-linux-amd64-spot-cache-build-" + zero + "-main"
 
 // preempt preempts an admitted job's Spot machine, and GitHub fails the job
 // whose runner it lost.
@@ -69,15 +72,20 @@ func TestAPreemptedJobResumes(t *testing.T) {
 	if _, ok := e.gce.Instance(jb.in.Zone, jb.in.Name); ok {
 		t.Fatal("a preempted machine wasn't deleted")
 	}
+	// The record names a family, which nothing reads now, because a
+	// revision from before caches, cleaning up during a deploy, makes a
+	// resume image only for a record that names one.
 	rec, ok := e.record("preemptions/5001/" + strconv.FormatInt(run.ID, 10) + "/" + strconv.FormatUint(jb.in.ID, 10) + ".json")
 	if !ok || rec["preempted"] != disks.Preempted || rec["job_id"] != float64(jb.j.ID) || rec["job_name"] != "build" ||
-		rec["run_attempt"] != float64(1) || rec["selector"] != newLabel(spot) || rec["family"] != familyOf([]string{spot}) || rec["zone"] != jb.in.Zone || rec["runner_id"] == float64(0) {
+		rec["run_attempt"] != float64(1) || rec["selector"] != newLabel(spot) || rec["arch"] != "amd64" || rec["family"] != machines.LegacyFamily ||
+		rec["zone"] != jb.in.Zone || rec["runner_id"] == float64(0) {
 		t.Fatalf("preemption record = %v", rec)
 	}
 	resume := disks.ResumeName(repoID, jb.in.ID)
 	im, ok := e.images()[resume]
-	if !ok || im.Labels[disks.LabelKind] != disks.KindResume || im.Labels[disks.LabelRun] != strconv.FormatInt(run.ID, 10) ||
-		im.Labels[disks.LabelFamily] != selector.Hash(familyOf([]string{spot})) || im.Labels[disks.LabelJobName] != selector.Hash("build") {
+	if !ok || im.Labels[disks.LabelKind] != disks.KindResume || im.Labels[disks.LabelFamily] != selector.Hash(machines.LegacyFamily) ||
+		im.Labels[disks.LabelRun] != strconv.FormatInt(run.ID, 10) || im.Labels[disks.LabelArch] != "amd64" ||
+		im.Labels[disks.LabelJobName] != selector.Hash("build") {
 		t.Fatalf("resume image = %+v, %v", im, ok)
 	}
 	// The run has finished with its Spot job lost, so it's rerun.
@@ -87,11 +95,25 @@ func TestAPreemptedJobResumes(t *testing.T) {
 	if rr, ok := e.record("reruns/5001/" + strconv.FormatInt(run.ID, 10) + ".json"); !ok || len(rr["attempts"].([]any)) != 1 {
 		t.Fatalf("rerun record = %v", rr)
 	}
-	// The rerun's job of the same name resumes from it, claimed by its ID.
+	// The rerun's job of the same name resumes from it, claimed by its ID,
+	// on a work disk at least as large as the image's, which is larger
+	// here than the shape's.
+	ikey := "images/5001/" + resume + ".json"
+	data, gen, _ := e.gcs.Object("state", ikey)
+	var irec disks.Image
+	_ = json.Unmarshal(data, &irec)
+	irec.SizeGB = 80
+	b, _ := json.Marshal(irec)
+	if _, err := e.objects.Replace(context.Background(), ikey, b, gen); err != nil {
+		t.Fatal(err)
+	}
 	j2 := e.rerunJob(run, 2, "build")
 	again := e.admit(run, j2)
 	if src := again.source(); src != resume {
 		t.Fatalf("the rerun's job started from %q, want the resume image %s", src, resume)
+	}
+	if again.size() != 80 {
+		t.Fatalf("a resumed work disk of %d GB, smaller than its image", again.size())
 	}
 	claim, ok := e.record("claims/5001/" + resume + ".json")
 	if !ok || claim["job_id"] != float64(j2.ID) {
@@ -100,7 +122,7 @@ func TestAPreemptedJobResumes(t *testing.T) {
 	// Once its job has started from it, the resume image goes, while the
 	// job runs on.
 	e.pass()
-	if e.has(resume) {
+	if e.hasImage(resume) {
 		t.Fatal("a resume image outlived its job's start")
 	}
 	again.finish(false)
@@ -180,7 +202,7 @@ func TestEvidenceFromTheRecordedEvent(t *testing.T) {
 	if e.attempt(run) != 1 {
 		t.Fatal("a run whose job was never shown preempted was rerun")
 	}
-	if !e.has(disks.ResumeName(repoID, jb.in.ID)) {
+	if !e.hasImage(disks.ResumeName(repoID, jb.in.ID)) {
 		t.Fatal("no resume image while the evidence is unknown")
 	}
 	// The event arrives late, through the push subscription.
@@ -359,7 +381,7 @@ func TestAClaimedResumeImageGoesOnceItsJobStarts(t *testing.T) {
 		t.Fatal("no resume")
 	}
 	e.pass()
-	if e.has(resume) {
+	if e.hasImage(resume) {
 		t.Fatal("a claimed resume image outlived its job's start")
 	}
 }
@@ -376,12 +398,12 @@ func TestAResumeImageWaitsForItsRun(t *testing.T) {
 	// Its job's run hasn't finished, so it isn't rerun yet.
 	e.pass()
 	resume := disks.ResumeName(repoID, jb.in.ID)
-	if !e.has(resume) {
+	if !e.hasImage(resume) {
 		t.Fatal("no resume image")
 	}
 	e.clock.Advance(2 * disks.ResumeKept)
 	e.pass()
-	if !e.has(resume) {
+	if !e.hasImage(resume) {
 		t.Fatal("a resume image went while its run was unfinished")
 	}
 }
@@ -397,12 +419,12 @@ func TestAResumeImageOfARepositoryGitHubDoesntFindIsKept(t *testing.T) {
 	}
 	e.pass()
 	resume := disks.ResumeName(repoID, jb.in.ID)
-	if !e.has(resume) {
+	if !e.hasImage(resume) {
 		t.Fatal("no resume image")
 	}
 	e.gh.Delete(e.repo)
 	e.pass()
-	if !e.has(resume) {
+	if !e.hasImage(resume) {
 		t.Fatal("a resume image went while GitHub answered 404 for its repository")
 	}
 }
@@ -418,20 +440,20 @@ func TestAnUnusedResumeImageGoesWithItsRun(t *testing.T) {
 	b.finish(false)
 	e.pass()
 	resume := disks.ResumeName(repoID, a.in.ID)
-	if !e.has(resume) || e.attempt(run) != 2 {
+	if !e.hasImage(resume) || e.attempt(run) != 2 {
 		t.Fatal("no resume image, or no rerun")
 	}
 	again := e.admit(run, e.rerunJob(run, 2, "test"))
 	if again.source() != "" {
 		t.Fatal("a job whose name its matrix shares resumed")
 	}
-	if !e.has(resume) {
+	if !e.hasImage(resume) {
 		t.Fatal("a resume image went while its run was due a rerun")
 	}
 	again.finish(false)
 	e.eventually("the run is finished", func() bool { s, _ := e.gh.RunState(run); return s == "completed" })
 	e.pass()
-	if e.has(resume) {
+	if e.hasImage(resume) {
 		t.Fatal("a resume image outlived its run")
 	}
 }
@@ -455,7 +477,7 @@ func TestAPreemptionPastTheAgeLimit(t *testing.T) {
 		t.Fatalf("preemption record = %v", rec)
 	}
 	resume := disks.ResumeName(repoID, jb.in.ID)
-	if !e.has(resume) || len(e.images()) != 1 {
+	if !e.hasImage(resume) || len(e.images()) != 1 {
 		t.Fatalf("images %v; want only the resume image", e.images())
 	}
 	if e.attempt(run) != 2 {
@@ -471,9 +493,9 @@ func TestAnAutomaticRerunKeepsItsRunsChoice(t *testing.T) {
 	e := setup(t)
 	old := e.saveMain(key1)
 	run := e.mainRun()
-	label := "lanescape-2vcpu-linux-amd64-spot-disk-build-" + key1 + "-main"
+	label := "lanescape-2vcpu-linux-amd64-spot-cache-build-" + key1 + "-main"
 	lost := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{label}})
-	if lost.source() != old {
+	if lost.restored() != old {
 		t.Fatal("no restore")
 	}
 	e.clock.Advance(time.Minute)
@@ -484,13 +506,13 @@ func TestAnAutomaticRerunKeepsItsRunsChoice(t *testing.T) {
 		t.Fatal("not rerun")
 	}
 	if !e.has(old) {
-		t.Fatal("the choice of a run due a rerun lost its image")
+		t.Fatal("the choice of a run due a rerun lost its version")
 	}
 	if src := e.admit(run, e.rerunJob(run, 2, "build")).source(); src != disks.ResumeName(repoID, lost.in.ID) {
 		t.Fatalf("the rerun's lost job started from %q, not its resume image", src)
 	}
 	other := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{label}})
-	if src := other.source(); src != old || src == newer {
+	if src := other.restored(); src != old || src == newer {
 		t.Fatalf("an automatic rerun's job started from %q, want its run's choice %s", src, old)
 	}
 }
@@ -525,9 +547,9 @@ func TestARefusedRerunThenAMaintainersPicksAgain(t *testing.T) {
 	e := setup(t)
 	old := e.saveMain(key1)
 	run := e.mainRun()
-	label := "lanescape-2vcpu-linux-amd64-spot-disk-build-" + key1 + "-main"
+	label := "lanescape-2vcpu-linux-amd64-spot-cache-build-" + key1 + "-main"
 	lost := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{label}})
-	if lost.source() != old {
+	if lost.restored() != old {
 		t.Fatal("no restore")
 	}
 	e.clock.Advance(time.Minute)
@@ -539,7 +561,7 @@ func TestARefusedRerunThenAMaintainersPicksAgain(t *testing.T) {
 		t.Fatal("rerun despite GitHub's refusal")
 	}
 	e.gh.Rerun(run)
-	if src := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{label}}).source(); src != newer {
+	if src := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{label}}).restored(); src != newer {
 		t.Fatalf("a maintainer's rerun started from %q, want the newest %s", src, newer)
 	}
 }
@@ -601,7 +623,7 @@ func TestARunningMachinePastTheAgeLimitIsRecorded(t *testing.T) {
 			if !ok || rec["preempted"] != want || rec["age_limit"] != true {
 				t.Fatalf("record = %v; want one at the age limit, preempted %s", rec, want)
 			}
-			if !e.has(disks.ResumeName(repoID, jb.in.ID)) || len(e.images()) != 1 {
+			if !e.hasImage(disks.ResumeName(repoID, jb.in.ID)) || len(e.images()) != 1 {
 				t.Fatalf("images %v; want only the resume image", e.images())
 			}
 		})
@@ -636,9 +658,9 @@ func TestARunningMachinePastTheAgeLimitStopsWithoutTheRecords(t *testing.T) {
 	}
 }
 
-// standard is a standard machine's job, with a work disk of family build,
-// in main's scope.
-const standard = "lanescape-2vcpu-linux-amd64-disk-build-" + zero + "-main"
+// standard is a standard machine's job, which asks for a work disk and
+// restores the cache build, in main's scope.
+const standard = "lanescape-2vcpu-linux-amd64-cache-build-" + zero + "-main"
 
 // lost is the record of a job's machine, once its job was lost.
 func lost(run *ghemu.Run, jb *job) string {
@@ -681,11 +703,11 @@ func TestAJobAtTheAgeLimitResumes(t *testing.T) {
 	}
 	rec, ok := e.record(lost(run, jb))
 	if !ok || rec["age_limit"] != true || rec["preempted"] != disks.NotPreempted || rec["job_id"] != float64(jb.j.ID) ||
-		rec["job_name"] != "build" || rec["family"] != "build" {
+		rec["job_name"] != "build" || rec["arch"] != "amd64" {
 		t.Fatalf("record = %v", rec)
 	}
 	resume := disks.ResumeName(repoID, jb.in.ID)
-	if !e.has(resume) {
+	if !e.hasImage(resume) {
 		t.Fatal("no resume image")
 	}
 	// The run isn't rerun until GitHub fails the job whose runner it lost,
@@ -703,13 +725,12 @@ func TestAJobAtTheAgeLimitResumes(t *testing.T) {
 		t.Fatalf("the rerun's job started from %q, want its resume image %s", src, resume)
 	}
 	e.pass()
-	if e.has(resume) {
+	if e.hasImage(resume) {
 		t.Fatal("a resume image outlived its job's start")
 	}
-	before := e.images()
 	again.finish(true)
-	if im := e.saved(before); im.Labels[disks.LabelKind] != disks.KindSaved || im.Labels[disks.LabelScope] != selector.Hash("main") {
-		t.Fatalf("the resumed job's save = %+v; want main's saved disk", im)
+	if rec, _ := e.record("caches/5001/" + again.saved + ".json"); !e.ready(again.saved) || rec["scope"] != "main" || len(e.images()) != 0 {
+		t.Fatalf("the resumed job's save = %v, images %v; want main's version, and no image", rec, e.images())
 	}
 	if e.attempt(run) != 2 {
 		t.Fatal("a run whose rerun succeeded was rerun again")
@@ -788,7 +809,7 @@ func TestARerunWaitsForEveryLostJob(t *testing.T) {
 			b.preempt()
 			e.pass()
 			e.pass()
-			if !e.has(disks.ResumeName(repoID, a.in.ID)) {
+			if !e.hasImage(disks.ResumeName(repoID, a.in.ID)) {
 				t.Fatal("the first job's resume image wasn't made")
 			}
 			if e.attempt(run) != 1 {
@@ -884,7 +905,7 @@ func TestAReadRunsJobAtTheAgeLimitIsRerunWithoutAResumeImage(t *testing.T) {
 	if e.bind(run) != "read" {
 		t.Fatal("not read")
 	}
-	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{"lanescape-2vcpu-linux-amd64-disk-build-" + zero + "-read"}})
+	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{"lanescape-2vcpu-linux-amd64-cache-build-" + zero + "-read"}})
 	jb.atTheLimit()
 	e.pass()
 	if len(e.images()) != 0 {
@@ -941,9 +962,9 @@ func TestARefusedRerunWithNoReadBack(t *testing.T) {
 	e := setup(t)
 	old := e.saveMain(key1)
 	run := e.mainRun()
-	label := "lanescape-2vcpu-linux-amd64-spot-disk-build-" + key1 + "-main"
+	label := "lanescape-2vcpu-linux-amd64-spot-cache-build-" + key1 + "-main"
 	lost := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{label}})
-	if lost.source() != old {
+	if lost.restored() != old {
 		t.Fatal("no restore")
 	}
 	e.clock.Advance(time.Minute)
@@ -968,7 +989,7 @@ func TestARefusedRerunWithNoReadBack(t *testing.T) {
 		t.Fatal("rerun despite GitHub's refusal")
 	}
 	e.gh.Rerun(run)
-	if src := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{label}}).source(); src != newer {
+	if src := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{label}}).restored(); src != newer {
 		t.Fatalf("a maintainer's rerun started from %q, want the newest %s", src, newer)
 	}
 }
@@ -979,9 +1000,9 @@ func TestARefusalWhileAMaintainersRerunBegins(t *testing.T) {
 	e := setup(t)
 	old := e.saveMain(key1)
 	run := e.mainRun()
-	label := "lanescape-2vcpu-linux-amd64-spot-disk-build-" + key1 + "-main"
+	label := "lanescape-2vcpu-linux-amd64-spot-cache-build-" + key1 + "-main"
 	lost := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{label}})
-	if lost.source() != old {
+	if lost.restored() != old {
 		t.Fatal("no restore")
 	}
 	e.clock.Advance(time.Minute)
@@ -997,7 +1018,7 @@ func TestARefusalWhileAMaintainersRerunBegins(t *testing.T) {
 			_, _ = w.Write([]byte(`{"message": "This workflow is already running"}`))
 		}})
 	e.pass()
-	if src := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{label}}).source(); src != newer {
+	if src := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{label}}).restored(); src != newer {
 		t.Fatalf("the maintainer's rerun started from %q, want the newest %s", src, newer)
 	}
 }

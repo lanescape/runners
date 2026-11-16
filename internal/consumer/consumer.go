@@ -1,6 +1,6 @@
 // Package consumer reads what a consumer's repository says to the service
 // (specs/0005-interface.md, A consumer's files): its .github/runners.json,
-// and the keys of its saved disks (specs/0003-disks.md, Keys).
+// and the keys of its caches (specs/0003-disks.md, Keys).
 package consumer
 
 import (
@@ -23,7 +23,7 @@ import (
 // RunnersFile is the consumer's file.
 const RunnersFile = ".github/runners.json"
 
-// NoKey is the one key of a family declared without "from".
+// NoKey is the one key of a cache declared without "from".
 const NoKey = "00000000000000000000"
 
 // ErrInvalid means a file isn't what the spec says it must be.
@@ -33,9 +33,9 @@ func invalid(format string, args ...any) error {
 	return fmt.Errorf("%w: "+format, append([]any{ErrInvalid}, args...)...)
 }
 
-// Disk is a family's declaration.
-type Disk struct {
-	// From are the files the family's contents depend on, in order.
+// Cache is a cache's declaration.
+type Cache struct {
+	// From are the files the cache's contents depend on, in order.
 	From []string `json:"from,omitempty"`
 }
 
@@ -44,7 +44,7 @@ type File struct {
 	// Branches maps each long-lived branch to its scope's name, as written:
 	// see Branches for what the service keeps of it.
 	Branches map[string]string
-	Disks    map[string]Disk
+	Caches   map[string]Cache
 }
 
 // strict decodes a JSON value, refusing unknown fields and anything after
@@ -62,15 +62,15 @@ func strict(data []byte, v any) error {
 }
 
 // Parse reads a .github/runners.json. A file that isn't an object of the
-// two fields, exactly so named, or whose disks aren't what the spec says,
-// is invalid: any other field, "images" included, makes it invalid
+// two fields, exactly so named, or whose caches aren't what the spec says,
+// is invalid: any other field, "disks" and "images" included, makes it invalid
 // (specs/0005-interface.md, A consumer's files).
 func Parse(data []byte) (File, error) {
 	var m map[string]json.RawMessage
 	if err := strict(data, &m); err != nil || m == nil {
 		return File{}, invalid("%s isn't a JSON object", RunnersFile)
 	}
-	f := File{Branches: map[string]string{}, Disks: map[string]Disk{}}
+	f := File{Branches: map[string]string{}, Caches: map[string]Cache{}}
 	for k, v := range m {
 		switch k {
 		case "branches":
@@ -87,25 +87,25 @@ func Parse(data []byte) (File, error) {
 				}
 				f.Branches[branch] = name
 			}
-		case "disks":
+		case "caches":
 			var d map[string]json.RawMessage
 			if err := json.Unmarshal(v, &d); err != nil || d == nil {
-				return File{}, invalid("%s: disks isn't an object", RunnersFile)
+				return File{}, invalid("%s: caches isn't an object", RunnersFile)
 			}
-			for family, raw := range d {
-				if !selector.ValidName(family) {
-					return File{}, invalid("%s: %q isn't a family's name", RunnersFile, family)
+			for cache, raw := range d {
+				if !selector.ValidName(cache) {
+					return File{}, invalid("%s: %q isn't a cache's name", RunnersFile, cache)
 				}
 				// Exactly {} or {"from": [<path>, ...]}: no other field, no
 				// other case, and neither null.
 				var decl map[string]json.RawMessage
 				if err := strict(raw, &decl); err != nil || decl == nil {
-					return File{}, invalid("%s: family %s: its declaration isn't {\"from\": [...]} or {}", RunnersFile, family)
+					return File{}, invalid("%s: cache %s: its declaration isn't {\"from\": [...]} or {}", RunnersFile, cache)
 				}
-				var dd Disk
+				var dd Cache
 				for k, v := range decl {
 					if k != "from" || !bytes.HasPrefix(bytes.TrimSpace(v), []byte("[")) || json.Unmarshal(v, &dd.From) != nil {
-						return File{}, invalid("%s: family %s: its declaration isn't {\"from\": [...]} or {}", RunnersFile, family)
+						return File{}, invalid("%s: cache %s: its declaration isn't {\"from\": [...]} or {}", RunnersFile, cache)
 					}
 					if dd.From == nil {
 						dd.From = []string{}
@@ -114,14 +114,14 @@ func Parse(data []byte) (File, error) {
 				seen := map[string]bool{}
 				for _, p := range dd.From {
 					if !ValidPath(p) {
-						return File{}, invalid("%s: family %s: %q isn't a path relative to the repository's root", RunnersFile, family, p)
+						return File{}, invalid("%s: cache %s: %q isn't a path relative to the repository's root", RunnersFile, cache, p)
 					}
 					if seen[p] {
-						return File{}, invalid("%s: family %s lists %s twice", RunnersFile, family, p)
+						return File{}, invalid("%s: cache %s lists %s twice", RunnersFile, cache, p)
 					}
 					seen[p] = true
 				}
-				f.Disks[family] = dd
+				f.Caches[cache] = dd
 			}
 		default:
 			return File{}, invalid("%s has a field %q it may not", RunnersFile, k)
@@ -191,29 +191,29 @@ type PathContents struct {
 	Contents []byte
 }
 
-// Key is a family's key: the first 20 hex digits of the SHA-256 of the
-// family, then each listed path and its contents, in the order listed
-// (specs/0003-disks.md, Keys). A family declared with no files has NoKey.
-func Key(family string, files []PathContents, declared bool) string {
+// Key is a cache's key: the first 20 hex digits of the SHA-256 of the
+// cache, then each listed path and its contents, in the order listed
+// (specs/0003-disks.md, Keys). A cache declared with no files has NoKey.
+func Key(cache string, files []PathContents, declared bool) string {
 	if !declared {
 		return NoKey
 	}
-	k := NewKeyHash(family)
+	k := NewKeyHash(cache)
 	for _, f := range files {
 		k.Add(f.Path, f.Contents)
 	}
 	return k.Sum()
 }
 
-// KeyHash makes a declared family's key one file at a time, so that no
-// file's contents need be kept once it's added: a family may list many
+// KeyHash makes a declared cache's key one file at a time, so that no
+// file's contents need be kept once it's added: a cache may list many
 // large files, and Key's list would hold them all at once.
 type KeyHash struct{ h hash.Hash }
 
-// NewKeyHash starts the key of a family declared with "from".
-func NewKeyHash(family string) *KeyHash {
+// NewKeyHash starts the key of a cache declared with "from".
+func NewKeyHash(cache string) *KeyHash {
 	k := &KeyHash{h: sha256.New()}
-	part(k.h, []byte(family))
+	part(k.h, []byte(cache))
 	return k
 }
 
@@ -223,5 +223,5 @@ func (k *KeyHash) Add(path string, contents []byte) {
 	part(k.h, contents)
 }
 
-// Sum is the key of the family and the files added so far.
+// Sum is the key of the cache and the files added so far.
 func (k *KeyHash) Sum() string { return hex.EncodeToString(k.h.Sum(nil))[:20] }

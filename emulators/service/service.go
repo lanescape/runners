@@ -1,8 +1,8 @@
 // Package service emulates this repository's service as its interface for
 // actions describes it (specs/0005-interface.md), and nothing more: runs
-// bound at their first job's check, as the service binds them, and work
-// disks and their saves, chosen from the saved disks of the run's restore
-// chain. It runs
+// bound at their first job's check, as the service binds them, work disks,
+// always empty, and caches, restored from the versions of the run's restore
+// chain and saved into the caches' bucket of a Cloud Storage emulator. It runs
 // in-process, as an httptest server, over a GitHub emulator of this
 // module's: its own, or one the test hands it with WithGitHub, so that one
 // GitHub state serves the test's jobs and the service emulator, as GitHub
@@ -13,8 +13,8 @@
 // server that mints them.
 //
 // What it doesn't model: a machine's age limit, Spot preemption and resume
-// images, the deletion of saved disks beyond a scope's one disk of each
-// family and architecture and a closed pull request's, such as a family's
+// images, the deletion of versions beyond a scope's one version of each
+// cache and architecture and a closed pull request's, such as a cache's
 // once its declaration is removed, which the service does at its next
 // pass, and the mounting of a work disk, which is the test's to arrange.
 //
@@ -44,11 +44,13 @@ import (
 	"github.com/lanescape/runners/emulators/fault"
 	ghemu "github.com/lanescape/runners/emulators/github"
 	emuoidc "github.com/lanescape/runners/emulators/oidc"
+	gcsemu "github.com/lanescape/runners/emulators/storage"
 	"github.com/lanescape/runners/endpoints"
 	"github.com/lanescape/runners/internal/binding"
 	"github.com/lanescape/runners/internal/github"
 	"github.com/lanescape/runners/internal/machines"
 	"github.com/lanescape/runners/internal/selector"
+	"github.com/lanescape/runners/internal/store"
 )
 
 // Project and Account are the project and account the emulator's machines'
@@ -79,8 +81,13 @@ type Emulator struct {
 	ghc        *github.Client
 	maintainer *ghemu.Account
 	objects    *memStore
-	binder     *binding.Binder
-	files      *machines.Service
+	// gcs is the storage emulator whose CachesBucket holds what jobs save,
+	// which caches reads.
+	gcs     *gcsemu.Emulator
+	ownsGCS bool
+	caches  store.Objects
+	binder  *binding.Binder
+	files   *machines.Service
 
 	mu          sync.Mutex
 	nextID      int64
@@ -140,6 +147,13 @@ func WithOrganization(id int64, login string) Option {
 	return func(e *Emulator) { e.org, e.login = id, login }
 }
 
+// WithStorage makes gcs, a Cloud Storage emulator the test already runs,
+// where jobs upload what they save: the emulator makes its CachesBucket
+// there, and reads each version's objects from it when a job commits it.
+// Without it, the emulator starts a storage emulator of its own, which
+// CacheStorage gives.
+func WithStorage(gcs *gcsemu.Emulator) Option { return func(e *Emulator) { e.gcs = gcs } }
+
 // New starts an emulator. Close it when done.
 func New(opts ...Option) *Emulator {
 	e := &Emulator{clock: clockwork.NewRealClock(), org: endpoints.Organization, login: "lanescape", nextID: 1_000_000,
@@ -174,9 +188,21 @@ func New(opts ...Option) *Emulator {
 	e.binder = &binding.Binder{GitHub: ghc, Objects: e.objects, OrganizationID: e.org, Clock: e.clock}
 	e.files = &machines.Service{GitHub: ghc, Objects: e.objects}
 	e.issuer = emuoidc.New(emuoidc.WithClock(e.clock))
+	if e.gcs == nil {
+		e.gcs = gcsemu.New(gcsemu.WithClock(e.clock))
+		e.ownsGCS = true
+	}
+	e.gcs.CreateBucket(CachesBucket)
+	caches, err := store.NewGCS(context.Background(), CachesBucket, e.gcs.ClientOptions()...)
+	if err != nil {
+		panic("service emulator: " + err.Error())
+	}
+	e.caches = caches
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/disks", e.disk)
-	mux.HandleFunc("POST /v1/disks/save", e.save)
+	mux.HandleFunc("POST /v1/caches/restore", e.restoreCache)
+	mux.HandleFunc("POST /v1/caches/save", e.saveCache)
+	mux.HandleFunc("POST /v1/caches/commit", e.commitCache)
 	mux.HandleFunc("GET /_metadata/{machine}/computeMetadata/v1/instance/service-accounts/default/identity", e.identity)
 	mux.HandleFunc("GET /_metadata/{machine}/computeMetadata/v1/instance/attributes/lsr-service", e.serviceAttribute)
 	e.srv = httptest.NewServer(e.faults.Wrap(mux))
@@ -215,7 +241,14 @@ func (e *Emulator) Close() {
 	if e.ownsGH {
 		e.gh.Close()
 	}
+	if e.ownsGCS {
+		e.gcs.Close()
+	}
 }
+
+// CacheStorage implements World: the Cloud Storage emulator whose
+// CachesBucket jobs upload what they save to.
+func (e *Emulator) CacheStorage() *gcsemu.Emulator { return e.gcs }
 
 // URL implements World.
 func (e *Emulator) URL() string { return e.url }

@@ -78,6 +78,10 @@ resource "google_cloud_run_v2_service" "service" {
         name  = "RUNNERS_BUCKET"
         value = google_storage_bucket.state.name
       }
+      env {
+        name  = "RUNNERS_CACHES_BUCKET"
+        value = google_storage_bucket.caches.name
+      }
       # bootstrap/ makes the topic, and grants the service publishing on it.
       env {
         name  = "RUNNERS_WEBHOOK_TOPIC"
@@ -134,6 +138,7 @@ resource "google_cloud_run_v2_service" "service" {
 
   depends_on = [
     google_storage_bucket_iam_member.state_service,
+    google_storage_bucket_iam_member.caches_service,
     google_secret_manager_secret_iam_member.app_key,
     google_secret_manager_secret_iam_member.webhook_secret,
   ]
