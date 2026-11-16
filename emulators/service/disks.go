@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	gceemu "github.com/lanescape/runners/emulators/compute"
 	"github.com/lanescape/runners/emulators/fault"
 	ghemu "github.com/lanescape/runners/emulators/github"
 	"github.com/lanescape/runners/internal/consumer"
@@ -51,6 +52,11 @@ type WorkDisk struct {
 	Restored string
 	// Ready reports whether it's attached.
 	Ready bool
+	// SizeGB, IOPS and ThroughputMiBps are what its job asked for, with the
+	// service's defaults for what it left out.
+	SizeGB, IOPS, ThroughputMiBps int64
+	// Refused is why Compute Engine refused to make it, if it did.
+	Refused string
 }
 
 // CacheVersion is a version of a cache that a job saved in its run's scope
@@ -133,6 +139,15 @@ func (e *Emulator) WorkDisk(j Job) (WorkDisk, bool) {
 	return *d, true
 }
 
+// WorkDiskSettings implements World.
+func (e *Emulator) WorkDiskSettings(j Job) (DiskSettings, bool) {
+	d, ok := e.WorkDisk(j)
+	if !ok || d.Refused != "" {
+		return DiskSettings{}, false
+	}
+	return DiskSettings{SizeGB: d.SizeGB, IOPS: d.IOPS, ThroughputMiBps: d.ThroughputMiBps}, true
+}
+
 // Caches implements World: a repository's cache versions that a restore may
 // still choose, oldest first.
 func (e *Emulator) Caches(repo Repository) []CacheVersion {
@@ -180,20 +195,44 @@ func cacheKey(rf machines.RunFiles, cache string) (string, error) {
 }
 
 // disk is POST /v1/disks: the job's work disk, empty, in its run's bound
-// scope (specs/0002-machines.md, The work disk). A later request is
-// answered about the same disk.
+// scope, of the size and performance it asks for (specs/0002-machines.md,
+// The work disk). What Compute Engine wouldn't make, by the limits the
+// compute emulator gives it, is refused as the service refuses it. A later
+// request is answered about the same disk, if it asks for the same.
 func (e *Emulator) disk(w http.ResponseWriter, r *http.Request) {
-	var body struct{}
+	var body machines.DiskAsk
 	rq, ok := e.active(w, r, &body)
 	if !ok {
+		return
+	}
+	want, why := body.Settings(e.shapes)
+	if why != "" {
+		fault.Refuse(why)(w, r)
 		return
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	d := e.dsk.work[rq.m.name]
 	if d == nil {
-		d = &WorkDisk{Architecture: rq.m.selector.Arch, Scope: rq.bd.Scope.String(), Restored: StepNone}
+		if why := e.diskFits(rq.m, want.SizeGB); why != "" {
+			fault.Refuse(why)(w, r)
+			return
+		}
+		d = &WorkDisk{Architecture: rq.m.selector.Arch, Scope: rq.bd.Scope.String(), Restored: StepNone,
+			SizeGB: want.SizeGB, IOPS: want.IOPS, ThroughputMiBps: want.ThroughputMiBps}
+		if why := gceemu.HyperdiskBalancedRefusal(want.SizeGB, want.IOPS, want.ThroughputMiBps); why != "" {
+			d.Refused = "Compute Engine refused the work disk: " + why
+		}
 		e.dsk.work[rq.m.name] = d
+	}
+	was := machines.DiskSettings{SizeGB: d.SizeGB, IOPS: d.IOPS, ThroughputMiBps: d.ThroughputMiBps}
+	if !body.Matches(was) {
+		fault.Refuse(fmt.Sprintf("the job's work disk was asked for as %s; a job has one work disk", was))(w, r)
+		return
+	}
+	if d.Refused != "" {
+		fault.Refuse(d.Refused)(w, r)
+		return
 	}
 	if !d.Ready && !e.holdDisks {
 		d.Ready = true
@@ -203,6 +242,25 @@ func (e *Emulator) disk(w http.ResponseWriter, r *http.Request) {
 		state = "ready"
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"state": state, "restored": d.Restored})
+}
+
+// diskFits is why the service would refuse a work disk of sizeGB for m, by
+// what the compute emulator reports of Hyperdisk Balanced and of the first
+// machine type of m's shape, or "".
+func (e *Emulator) diskFits(m *machine, sizeGB int64) string {
+	if sizeGB < gceemu.HyperdiskBalancedMinGB || sizeGB > gceemu.HyperdiskBalancedMaxGB {
+		return fmt.Sprintf("the work disk would be %d GB, but Compute Engine makes %s disks of %d to %d GB",
+			sizeGB, machines.DiskType, gceemu.HyperdiskBalancedMinGB, gceemu.HyperdiskBalancedMaxGB)
+	}
+	mt := ""
+	if sh := e.shapes.Shapes[m.selector.Shape]; sh != nil && len(sh.MachineTypes) > 0 {
+		mt = sh.MachineTypes[0]
+	}
+	if boot := int64(e.shapes.BootDiskGB); boot+sizeGB > gceemu.MaxDisksSizeGB {
+		return fmt.Sprintf("the work disk would be %d GB, but Compute Engine lets a %s machine's disks hold %d GB in all, and its boot disk is %d GB",
+			sizeGB, mt, int64(gceemu.MaxDisksSizeGB), boot)
+	}
+	return ""
 }
 
 // cacheRequest reads a cache request's job and cache, and, with withKey, the

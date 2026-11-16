@@ -21,7 +21,7 @@ func TestDefaultConfig(t *testing.T) {
 	if want := []string{"northamerica-northeast1-a", "northamerica-northeast1-b"}; !slices.Equal(c.Shapes.Zones, want) {
 		t.Errorf("zones = %v, want %v", c.Shapes.Zones, want)
 	}
-	if c.Shapes.BootDiskGB != 100 || c.Shapes.DiskIOPS != 3000 || c.Shapes.DiskThroughputMiBps != 400 {
+	if c.Shapes.BootDiskGB != 100 || c.Shapes.WorkDiskGB != 50 || c.Shapes.DiskIOPS != 3000 || c.Shapes.DiskThroughputMiBps != 400 {
 		t.Errorf("disks = %+v", c.Shapes)
 	}
 	big := c.Shapes.Shapes["lanescape-80vcpu-linux-amd64"]
@@ -35,7 +35,7 @@ func TestDefaultConfig(t *testing.T) {
 	// The 16-vCPU amd64 shape promises what the 16-vCPU arm64 shape does.
 	mid := c.Shapes.Shapes["lanescape-16vcpu-linux-amd64"]
 	if mid == nil || !slices.Equal(mid.MachineTypes, []string{"n4-highcpu-16", "c4-highcpu-16"}) || mid.VCPUs != 16 || mid.Arch != "amd64" ||
-		arm == nil || mid.MemoryGB != arm.MemoryGB || mid.WorkDiskGB != arm.WorkDiskGB {
+		arm == nil || mid.MemoryGB != arm.MemoryGB {
 		t.Errorf("16-vCPU amd64 shape = %+v", mid)
 	}
 	if c.Shapes.Shapes["lanescape-2vcpu-linux-amd64"] == nil {
@@ -107,6 +107,7 @@ func TestInvalidConfigs(t *testing.T) {
 		return `
 zones: [northamerica-northeast1-a]
 boot_disk_gb: 100
+work_disk_gb: 50
 disk_iops: 3000
 disk_throughput_mibps: 400
 shapes:
@@ -119,13 +120,14 @@ shapes:
 		{"org by name", "organization.yaml", "id: lanescape", "organization.yaml"},
 		{"unknown field", "organization.yaml", "id: 1\nlogin: lanescape", "not found"},
 		{"empty file", "runner.yaml", "", "empty"},
-		{"bad shape name", "shapes.yaml", shapes("  lanescape-80cpu-linux-amd64: {machine_types: [n4-highcpu-80], memory_gb: 1, work_disk_gb: 1}"), "isn't lanescape-"},
-		{"too few vCPUs", "shapes.yaml", shapes("  lanescape-80vcpu-linux-amd64: {machine_types: [n4-highcpu-64], memory_gb: 1, work_disk_gb: 1}"), "fewer than 80"},
-		{"wrong architecture", "shapes.yaml", shapes("  lanescape-16vcpu-linux-amd64: {machine_types: [c4a-highcpu-16], memory_gb: 1, work_disk_gb: 1}"), "is arm64, not amd64"},
-		{"no machine types", "shapes.yaml", shapes("  lanescape-16vcpu-linux-arm64: {memory_gb: 1, work_disk_gb: 1}"), "no machine types"},
-		{"no work disk", "shapes.yaml", shapes("  lanescape-16vcpu-linux-arm64: {machine_types: [c4a-highcpu-16], memory_gb: 32}"), "must be positive"},
-		{"duplicate type", "shapes.yaml", shapes("  lanescape-2vcpu-linux-amd64: {machine_types: [n4-highcpu-2, n4-highcpu-2], memory_gb: 4, work_disk_gb: 1}"), "twice"},
-		{"no zones", "shapes.yaml", "boot_disk_gb: 100\ndisk_iops: 3000\ndisk_throughput_mibps: 400\nshapes: {lanescape-2vcpu-linux-amd64: {machine_types: [n4-highcpu-2], memory_gb: 4, work_disk_gb: 1}}", "no zones"},
+		{"bad shape name", "shapes.yaml", shapes("  lanescape-80cpu-linux-amd64: {machine_types: [n4-highcpu-80], memory_gb: 1}"), "isn't lanescape-"},
+		{"too few vCPUs", "shapes.yaml", shapes("  lanescape-80vcpu-linux-amd64: {machine_types: [n4-highcpu-64], memory_gb: 1}"), "fewer than 80"},
+		{"wrong architecture", "shapes.yaml", shapes("  lanescape-16vcpu-linux-amd64: {machine_types: [c4a-highcpu-16], memory_gb: 1}"), "is arm64, not amd64"},
+		{"no machine types", "shapes.yaml", shapes("  lanescape-16vcpu-linux-arm64: {memory_gb: 1}"), "no machine types"},
+		{"no memory", "shapes.yaml", shapes("  lanescape-16vcpu-linux-arm64: {machine_types: [c4a-highcpu-16]}"), "memory_gb must be positive"},
+		{"no work disk", "shapes.yaml", "zones: [northamerica-northeast1-a]\nboot_disk_gb: 100\ndisk_iops: 3000\ndisk_throughput_mibps: 400\nshapes: {lanescape-2vcpu-linux-amd64: {machine_types: [n4-highcpu-2], memory_gb: 4}}", "work_disk_gb"},
+		{"duplicate type", "shapes.yaml", shapes("  lanescape-2vcpu-linux-amd64: {machine_types: [n4-highcpu-2, n4-highcpu-2], memory_gb: 4}"), "twice"},
+		{"no zones", "shapes.yaml", "boot_disk_gb: 100\nwork_disk_gb: 50\ndisk_iops: 3000\ndisk_throughput_mibps: 400\nshapes: {lanescape-2vcpu-linux-amd64: {machine_types: [n4-highcpu-2], memory_gb: 4}}", "no zones"},
 		{"bad runner version", "runner.yaml", "version: v2.338\nsha256: {amd64: " + strings.Repeat("a", 64) + ", arm64: " + strings.Repeat("a", 64) + "}", "isn't a release version"},
 		{"missing checksum", "runner.yaml", "version: 2.338.2\nsha256: {amd64: " + strings.Repeat("a", 64) + "}", "sha256 for arm64"},
 		{"debian by family", "base.yaml", base("debian-13", "debian-13-trixie-arm64-v20261109", "1.27.3", "n4-standard-2", "c4a-standard-2"), "debian for amd64"},

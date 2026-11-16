@@ -32,6 +32,11 @@ var ErrExists = errors.New("already exists in Compute Engine")
 // ErrInUse means a disk is attached to an instance.
 var ErrInUse = errors.New("in use in Compute Engine")
 
+// ErrInvalid means Compute Engine refused a request as invalid, such as a
+// disk whose size or provisioned performance its type doesn't allow; the
+// error's text after it is Compute Engine's own message.
+var ErrInvalid = errors.New("invalid in Compute Engine")
+
 // ErrFingerprint means a change named a fingerprint, such as a resource's
 // labels', that's no longer the resource's.
 var ErrFingerprint = errors.New("fingerprint no longer current in Compute Engine")
@@ -134,6 +139,23 @@ type Disk struct {
 	SourceImageID uint64
 }
 
+// MachineType is what Compute Engine reports of a machine type in a zone.
+type MachineType struct {
+	Name string
+	// MaxDisksSizeGB is the most the disks attached to one of its machines
+	// may hold in all, boot disk included.
+	MaxDisksSizeGB int64
+}
+
+// DiskType is what Compute Engine reports of a disk type in a zone.
+type DiskType struct {
+	Name string
+	// MinSizeGB and MaxSizeGB are the sizes a disk of the type may be, from
+	// its valid disk size, or 0 where Compute Engine reports none it states
+	// in GB.
+	MinSizeGB, MaxSizeGB int64
+}
+
 // Image is an image in the project.
 type Image struct {
 	Name         string
@@ -216,6 +238,8 @@ type API interface {
 	Disks(ctx context.Context, zone string) ([]Disk, error)
 	Disk(ctx context.Context, zone, name string) (Disk, error)
 	CreateDisk(ctx context.Context, zone string, spec DiskSpec, requestID string) error
+	MachineType(ctx context.Context, zone, name string) (MachineType, error)
+	DiskType(ctx context.Context, zone, name string) (DiskType, error)
 	DeleteDisk(ctx context.Context, zone, name, requestID string) error
 	Images(ctx context.Context) ([]Image, error)
 	Image(ctx context.Context, name string) (Image, error)
@@ -295,6 +319,8 @@ func classify(err error) error {
 		return fmt.Errorf("%w: %s", ErrFingerprint, ge.Message)
 	case ge.Code == http.StatusTooManyRequests || ge.Code >= 500 || reason == "rateLimitExceeded" || reason == "resourceNotReady":
 		return &Unavailable{Err: err}
+	case ge.Code == http.StatusBadRequest:
+		return &Failed{Err: fmt.Errorf("%w: %s", ErrInvalid, ge.Message)}
 	case ge.Code >= 400 && ge.Code < 500:
 		return &Failed{Err: err}
 	}
@@ -321,6 +347,10 @@ func stockout(code string) bool {
 		code == "insufficientCapacity" || code == "zoneResourcePoolExhausted"
 }
 
+// invalidCode is an operation's error code for a request Compute Engine
+// found invalid.
+var invalidCode = map[string]bool{"INVALID_FIELD_VALUE": true, "INVALID_ARGUMENT": true, "BAD_REQUEST": true, "INVALID_USAGE": true}
+
 // opError classes an operation's error, as Compute Engine reports what it
 // couldn't do after accepting a request.
 func opError(op *gce.Operation) error {
@@ -346,6 +376,10 @@ func opError(op *gce.Operation) error {
 		return fmt.Errorf("%w: %s", ErrNotFound, e.Message)
 	case e.Code == "RESOURCE_IN_USE_BY_ANOTHER_RESOURCE":
 		return fmt.Errorf("%w: %s", ErrInUse, e.Message)
+	case invalidCode[e.Code]:
+		// What it refused as invalid once it had accepted the request, as
+		// it can refuse it at once.
+		return &Failed{Err: fmt.Errorf("%w: %s", ErrInvalid, e.Message)}
 	}
 	// A finished operation's error is its outcome, even a passing one such
 	// as an internal error: the request ID has had its answer, and another
@@ -581,6 +615,45 @@ func (c *Client) CreateDisk(ctx context.Context, zone string, s DiskSpec, reques
 	return c.change(ctx, zone, func() (*gce.Operation, error) {
 		return c.svc.Disks.Insert(c.project, zone, d).RequestId(requestID).Context(ctx).Do()
 	})
+}
+
+// MachineType implements API.
+func (c *Client) MachineType(ctx context.Context, zone, name string) (MachineType, error) {
+	mt, err := c.svc.MachineTypes.Get(c.project, zone, name).Context(ctx).Do()
+	if err != nil {
+		return MachineType{}, classify(err)
+	}
+	return MachineType{Name: mt.Name, MaxDisksSizeGB: mt.MaximumPersistentDisksSizeGb}, nil
+}
+
+// DiskType implements API.
+func (c *Client) DiskType(ctx context.Context, zone, name string) (DiskType, error) {
+	dt, err := c.svc.DiskTypes.Get(c.project, zone, name).Context(ctx).Do()
+	if err != nil {
+		return DiskType{}, classify(err)
+	}
+	out := DiskType{Name: dt.Name}
+	out.MinSizeGB, out.MaxSizeGB = validSizes(dt.ValidDiskSize)
+	return out, nil
+}
+
+// validSize is a disk type's valid disk size as Compute Engine states it,
+// such as "4GB-65536GB".
+var validSize = regexp.MustCompile(`^([0-9]+)GB-([0-9]+)GB$`)
+
+// validSizes reads a disk type's valid disk size, or 0, 0 if it isn't one
+// stated in GB.
+func validSizes(s string) (lo, hi int64) {
+	m := validSize.FindStringSubmatch(s)
+	if m == nil {
+		return 0, 0
+	}
+	lo, _ = strconv.ParseInt(m[1], 10, 64)
+	hi, _ = strconv.ParseInt(m[2], 10, 64)
+	if lo > hi {
+		return 0, 0
+	}
+	return lo, hi
 }
 
 // DeleteDisk implements API.

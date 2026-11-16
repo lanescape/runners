@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lanescape/runners/config"
 	"github.com/lanescape/runners/emulators/service"
 	"github.com/lanescape/runners/internal/consumer"
 )
@@ -60,6 +61,7 @@ func Cases() []Case {
 		one("a cache in the run's own scope from each step of the restore order", restoreOrder),
 		one("a new key's save replaces the old key's version once no unfinished run chose it", newKey),
 		one("one work disk per job, and one save of each cache", oneWorkDisk),
+		one("a work disk of the size and performance its job asks for", diskSettings),
 		one("caches saved", saves),
 		one("the newest save kept, whichever job finished first", overlappingSaves),
 		one("a version within its limits, and whole, or not kept", wholeVersions),
@@ -553,6 +555,74 @@ func oneWorkDisk(t T, w *world) {
 	next := w.start(w.Push(repo, "main"), Small)
 	w.restored(next, "build", service.StepMainExact)
 	w.restored(next, "tools", service.StepMainExact)
+}
+
+func diskSettings(t T, w *world) {
+	repo := w.consumer("app")
+	job := func() service.Job { return w.start(w.Push(repo, "main"), Small) }
+	ready := func(j service.Job, ask map[string]any) {
+		t.Helper()
+		for end := time.Now().Add(30 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+			a, d := w.c.DiskAs(w.Token(j), ask)
+			w.status(fmt.Sprintf("a work disk asked for as %v", ask), a, http.StatusOK)
+			if d.State == "ready" {
+				return
+			}
+			if time.Now().After(end) {
+				t.Fatalf("a work disk asked for as %v was never ready", ask)
+			}
+		}
+	}
+	settings := func(j service.Job, want service.DiskSettings) {
+		t.Helper()
+		if got, ok := w.WorkDiskSettings(j); !ok || got != want {
+			t.Fatalf("the work disk is %+v (made: %v); want %+v", got, ok, want)
+		}
+	}
+	refused := func(j service.Job, ask map[string]any, reason string) {
+		t.Helper()
+		a, _ := w.c.DiskAs(w.Token(j), ask)
+		w.status(fmt.Sprintf("a work disk asked for as %v", ask), a, http.StatusForbidden)
+		if !strings.Contains(a.Reason, reason) {
+			t.Fatalf("a work disk asked for as %v was refused saying %q; want %q", ask, a.Reason, reason)
+		}
+	}
+
+	// What a job asks for, it gets; what it leaves out is the service's
+	// default.
+	big := job()
+	ready(big, map[string]any{"size_gb": 500, "iops": 10000, "throughput_mibps": 2400})
+	settings(big, service.DiskSettings{SizeGB: 500, IOPS: 10000, ThroughputMiBps: 2400})
+	plain := job()
+	ready(plain, map[string]any{})
+	cfg, err := config.Default()
+	if err != nil {
+		t.Fatalf("the service's configuration: %v", err)
+	}
+	settings(plain, service.DiskSettings{SizeGB: int64(cfg.Shapes.WorkDiskGB), IOPS: int64(cfg.Shapes.DiskIOPS),
+		ThroughputMiBps: int64(cfg.Shapes.DiskThroughputMiBps)})
+	// A disk too small for 3,000 IOPS may have all its size allows.
+	small := job()
+	ready(small, map[string]any{"size_gb": 4, "iops": 2000, "throughput_mibps": 140})
+	settings(small, service.DiskSettings{SizeGB: 4, IOPS: 2000, ThroughputMiBps: 140})
+	// A job has one work disk: asking again for other settings is refused.
+	refused(big, map[string]any{"size_gb": 501}, "a job has one work disk")
+	ready(big, map[string]any{"size_gb": 500})
+
+	// What can't be made is refused, saying why: settings that aren't
+	// positive, a size the disk type doesn't allow, and what Compute
+	// Engine refuses to make, each time it's asked.
+	refused(job(), map[string]any{"size_gb": 0}, "size_gb must be a positive whole number")
+	refused(job(), map[string]any{"size_gb": 1.5}, "size_gb must be a positive whole number")
+	refused(job(), map[string]any{"iops": nil}, "iops must be a positive whole number")
+	refused(job(), map[string]any{"size_gb": 65537}, "Compute Engine makes hyperdisk-balanced disks of 4 to 65536 GB")
+	tooMany := job()
+	for range 2 {
+		refused(tooMany, map[string]any{"size_gb": 50, "iops": 30000}, "Compute Engine refused the work disk: ")
+	}
+	if _, ok := w.WorkDiskSettings(tooMany); ok {
+		t.Fatalf("a work disk Compute Engine refused was made")
+	}
 }
 
 func saves(t T, w *world) {

@@ -2,13 +2,16 @@ package machines_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	gceemu "github.com/lanescape/runners/emulators/compute"
 	"github.com/lanescape/runners/emulators/fault"
 	ghemu "github.com/lanescape/runners/emulators/github"
 	"github.com/lanescape/runners/internal/machines"
@@ -379,5 +382,208 @@ func TestAJobsRequestsWaitForGitHubToConfirmItRuns(t *testing.T) {
 	for what, ask := range m.requests() {
 		code, body := ask()
 		refusedFor(t, what+" for a job GitHub doesn't show", code, body, "has ended")
+	}
+}
+
+// workDisk is the machine's work disk in Compute Engine, if it's there.
+func (e *env) workDisk(m *machine) (gceemu.DiskState, bool) {
+	for _, d := range e.gce.Disks() {
+		if d.Name == machines.WorkDisk(m.in.Name) {
+			return d, true
+		}
+	}
+	return gceemu.DiskState{}, false
+}
+
+// A job's work disk is the size and performance it asks for, and the
+// service's defaults for what it leaves out.
+func TestAWorkDiskIsWhatItsJobAsksFor(t *testing.T) {
+	for name, tc := range map[string]struct {
+		ask                    map[string]any
+		size, iops, throughput int64
+	}{
+		"everything": {map[string]any{"size_gb": 500, "iops": 10000, "throughput_mibps": 2400}, 500, 10000, 2400},
+		"only size":  {map[string]any{"size_gb": 200}, 200, 3000, 400},
+		"nothing":    {map[string]any{}, 50, 3000, 400},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := setup(t)
+			m := e.admit(e.mainRun(), sel2)
+			e.eventually("the work disk is ready", func() bool {
+				code, body := m.diskAs(tc.ask)
+				if code != http.StatusOK && code != http.StatusServiceUnavailable {
+					t.Fatalf("work disk request: %d %v", code, body)
+				}
+				return body["state"] == machines.DiskStateReady
+			})
+			d, ok := e.workDisk(m)
+			if !ok || d.SizeGB != tc.size || d.IOPS != tc.iops || d.Throughput != tc.throughput {
+				t.Fatalf("work disk = %+v; want %d GB, %d IOPS and %d MiB/s", d, tc.size, tc.iops, tc.throughput)
+			}
+			// Asking again for the same is answered about the same disk;
+			// asking for other settings is refused, since a job has one
+			// work disk.
+			if code, body := m.diskAs(tc.ask); code != http.StatusOK || body["state"] != machines.DiskStateReady {
+				t.Fatalf("again: %d %v", code, body)
+			}
+			code, body := m.diskAs(map[string]any{"size_gb": tc.size + 1})
+			refusedFor(t, "other settings", code, body, "a job has one work disk")
+		})
+	}
+}
+
+// What the service can tell is wrong with a request, it refuses before
+// any disk is made: settings that aren't positive whole numbers, and a size
+// Compute Engine reports its disk type, or the job's machine type, doesn't
+// allow.
+func TestAWorkDiskThatCantBeMadeIsRefused(t *testing.T) {
+	for name, tc := range map[string]struct {
+		ask    map[string]any
+		setup  func(e *env)
+		reason string
+	}{
+		"no size":            {ask: map[string]any{"size_gb": 0}, reason: "size_gb must be a positive whole number"},
+		"negative IOPS":      {ask: map[string]any{"iops": -1}, reason: "iops must be a positive whole number"},
+		"no throughput":      {ask: map[string]any{"throughput_mibps": 0}, reason: "throughput_mibps must be a positive whole number"},
+		"a fraction":         {ask: map[string]any{"size_gb": 1.5}, reason: "size_gb must be a positive whole number"},
+		"null":               {ask: map[string]any{"iops": nil}, reason: "iops must be a positive whole number"},
+		"a string":           {ask: map[string]any{"size_gb": "50"}, reason: "size_gb must be a positive whole number"},
+		"an exponent":        {ask: map[string]any{"iops": json.RawMessage("1e4")}, reason: "iops must be a positive whole number"},
+		"too large a number": {ask: map[string]any{"size_gb": json.RawMessage("9223372036854775808")}, reason: "size_gb must be a positive whole number"},
+		"too small":          {ask: map[string]any{"size_gb": 3}, reason: "Compute Engine makes hyperdisk-balanced disks of 4 to 65536 GB"},
+		"too large":          {ask: map[string]any{"size_gb": 65537}, reason: "Compute Engine makes hyperdisk-balanced disks of 4 to 65536 GB"},
+		"more than it can hold": {
+			ask:    map[string]any{"size_gb": 1000},
+			setup:  func(e *env) { e.gce.SetMaxDisksSize("n4-highcpu-2", 1000) },
+			reason: "lets a n4-highcpu-2 machine's disks hold 1000 GB in all, and its boot disk is 100 GB",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := setup(t)
+			if tc.setup != nil {
+				tc.setup(e)
+			}
+			m := e.admit(e.mainRun(), sel2)
+			code, body := m.diskAs(tc.ask)
+			refusedFor(t, name, code, body, tc.reason)
+			if _, ok := e.workDisk(m); ok {
+				t.Fatal("a work disk was made")
+			}
+			if _, ok := e.record("disks/" + machines.WorkDisk(m.in.Name) + ".json"); ok {
+				t.Fatal("a work disk was recorded")
+			}
+		})
+	}
+}
+
+// What Compute Engine refuses to make, such as more IOPS than a disk of its
+// size may have, fails the job's request with Compute Engine's reason, and
+// every later request with the same, without asking Compute Engine again.
+func TestAWorkDiskComputeEngineRefusesFailsTheRequest(t *testing.T) {
+	e := setup(t)
+	m := e.admit(e.mainRun(), sel2)
+	var mu sync.Mutex
+	inserts := 0
+	e.gce.Faults().Add(fault.Rule{Method: http.MethodPost, Match: func(r *http.Request) bool {
+		if strings.HasSuffix(r.URL.Path, "/disks") {
+			mu.Lock()
+			inserts++
+			mu.Unlock()
+		}
+		return false
+	}})
+	ask := map[string]any{"size_gb": 50, "iops": 30000}
+	code, body := m.diskAs(ask)
+	refusedFor(t, "too many IOPS", code, body, "Compute Engine refused the work disk: Invalid value for field 'resource.provisionedIops': '30000'")
+	if _, ok := e.workDisk(m); ok {
+		t.Fatal("a work disk was made")
+	}
+	rec, ok := e.record("disks/" + machines.WorkDisk(m.in.Name) + ".json")
+	if !ok || rec["state"] != machines.DiskRefused || rec["iops"] != float64(30000) {
+		t.Fatalf("disk record = %v; want it refused", rec)
+	}
+	code, again := m.diskAs(ask)
+	refusedFor(t, "again", code, again, fmt.Sprint(body["reason"]))
+	mu.Lock()
+	defer mu.Unlock()
+	if inserts != 1 {
+		t.Fatalf("Compute Engine was asked to make the disk %d times; want once", inserts)
+	}
+}
+
+// Compute Engine can refuse a disk as invalid in its operation, once it
+// has accepted the request, as well as at once: that too is a refusal.
+func TestAWorkDiskRefusedInItsOperation(t *testing.T) {
+	e := setup(t)
+	m := e.admit(e.mainRun(), sel2)
+	e.gce.FailNextOperation("disks.insert", "INVALID_FIELD_VALUE")
+	code, body := m.disk()
+	refusedFor(t, "refused in its operation", code, body, "Compute Engine refused the work disk: ")
+	rec, ok := e.record("disks/" + machines.WorkDisk(m.in.Name) + ".json")
+	if !ok || rec["state"] != machines.DiskRefused {
+		t.Fatalf("disk record = %v; want it refused", rec)
+	}
+}
+
+// Two requests at once that Compute Engine both refuses are both refused,
+// whichever records the refusal.
+func TestAWorkDiskRefusedToTwoRequestsAtOnce(t *testing.T) {
+	e := setup(t)
+	m := e.admit(e.mainRun(), sel2)
+	// Each insert is held a second, so both requests read the record, and
+	// ask Compute Engine, before either records the refusal. The rule's
+	// match only counts: the injector holds its lock while it matches.
+	var mu sync.Mutex
+	arrived := 0
+	e.gce.Faults().Add(fault.Rule{Method: http.MethodPost, Delay: time.Second, Match: func(r *http.Request) bool {
+		if !strings.HasSuffix(r.URL.Path, "/disks") {
+			return false
+		}
+		mu.Lock()
+		arrived++
+		mu.Unlock()
+		return true
+	}})
+	ask := map[string]any{"size_gb": 50, "iops": 30000}
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	bodies := make([]map[string]any, 2)
+	for i := range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			codes[i], bodies[i] = m.diskAs(ask)
+		}()
+	}
+	wg.Wait()
+	mu.Lock()
+	n := arrived
+	mu.Unlock()
+	if n != 2 {
+		t.Fatalf("Compute Engine was asked %d times; the test needs both requests to ask", n)
+	}
+	for i := range 2 {
+		refusedFor(t, fmt.Sprintf("request %d", i), codes[i], bodies[i], "Compute Engine refused the work disk: ")
+	}
+}
+
+// A disk recorded before jobs asked for their disks' settings asked for
+// none: a request that names settings is refused, since the service can't
+// tell they're the disk's, and one that names none carries on with it.
+func TestAWorkDiskRecordedBeforeSettings(t *testing.T) {
+	e := setup(t)
+	m := e.admit(e.mainRun(), sel2)
+	j, _, _ := e.gh.JobOnRunner(m.in.Name)
+	rec, _ := json.Marshal(machines.DiskRecord{Disk: machines.WorkDisk(m.in.Name), Machine: m.in.Name, Zone: m.in.Zone,
+		RepositoryID: e.repo.ID, JobID: j.ID, State: machines.DiskMaking, Restored: machines.NotRestored, SizeGB: 50,
+		Nonce: "0123456789abcdef", At: time.Now()})
+	e.gcs.Put("state", "disks/"+machines.WorkDisk(m.in.Name)+".json", rec)
+	code, body := m.diskAs(map[string]any{"size_gb": 500, "iops": 10000})
+	refusedFor(t, "settings against an older record", code, body, "before the service took a disk's settings")
+	if restored := m.diskReady(); restored != machines.NotRestored {
+		t.Fatalf("restored = %q", restored)
+	}
+	if d, ok := e.workDisk(m); !ok || d.SizeGB != 50 || d.IOPS != 3000 || d.Throughput != 400 {
+		t.Fatalf("work disk = %+v; want the older record's, at the service's defaults", d)
 	}
 }

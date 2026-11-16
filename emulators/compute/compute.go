@@ -70,6 +70,7 @@ type Emulator struct {
 	stockouts    map[capacityKey]bool
 	refusing     map[capacityKey]bool
 	diskShort    map[string]bool
+	maxDisksSize map[string]int64
 	failNext     map[string]string
 	quotas       map[string]int64 // by region/metric
 	// globalQuotas are quotas of the whole project, by metric, such as
@@ -205,7 +206,7 @@ func New(opts ...Option) *Emulator {
 		zones:     []string{"northamerica-northeast1-a", "northamerica-northeast1-b"},
 		instances: map[string]*instance{}, disks: map[string]*disk{}, images: map[string]*image{}, public: map[string]*image{},
 		ops: map[string]*operation{}, requests: map[string]*operation{}, firstAnswers: map[string]*gce.Operation{},
-		stockouts: map[capacityKey]bool{}, refusing: map[capacityKey]bool{}, diskShort: map[string]bool{}, failNext: map[string]string{}, quotas: map[string]int64{}, globalQuotas: map[string]int64{}, booted: map[uint64]bool{},
+		stockouts: map[capacityKey]bool{}, refusing: map[capacityKey]bool{}, diskShort: map[string]bool{}, maxDisksSize: map[string]int64{}, failNext: map[string]string{}, quotas: map[string]int64{}, globalQuotas: map[string]int64{}, booted: map[uint64]bool{},
 	}
 	for _, o := range opts {
 		o(e)

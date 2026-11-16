@@ -118,7 +118,15 @@ type DiskAnswer struct{ State, Restored string }
 // checks the answer.
 func (c *Client) Disk(token string) (Answer, DiskAnswer) {
 	c.T.Helper()
-	a := c.do(http.MethodPost, "/v1/disks", token, []byte(`{}`))
+	return c.DiskAs(token, map[string]any{})
+}
+
+// DiskAs asks for the job's work disk with these settings, as the disk
+// action does with its inputs, once, and checks the answer.
+func (c *Client) DiskAs(token string, settings map[string]any) (Answer, DiskAnswer) {
+	c.T.Helper()
+	body, _ := json.Marshal(settings)
+	a := c.do(http.MethodPost, "/v1/disks", token, body)
 	if a.Status != http.StatusOK {
 		return a, DiskAnswer{}
 	}

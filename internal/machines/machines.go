@@ -500,6 +500,8 @@ const (
 	DiskMaking   = "making"
 	DiskMade     = "made"
 	DiskAttached = "attached"
+	// DiskRefused is a disk Compute Engine refused to make.
+	DiskRefused = "refused"
 )
 
 // DiskRecord is a work disk, recorded before it's made: cleanup never
@@ -517,7 +519,16 @@ type DiskRecord struct {
 	// LegacyFamily is always LegacyFamily.
 	LegacyFamily string `json:"family,omitempty"`
 	SizeGB       int64  `json:"size_gb"`
-	SourceImage  string `json:"source_image,omitempty"`
+	// RequestedGB, IOPS and ThroughputMiBps are what its job asked for,
+	// with the service's defaults for what it left out: the disk is
+	// RequestedGB, or its resume image's size if that's larger. A record
+	// from before jobs asked has none.
+	RequestedGB     int64  `json:"requested_gb,omitempty"`
+	IOPS            int64  `json:"iops,omitempty"`
+	ThroughputMiBps int64  `json:"throughput_mibps,omitempty"`
+	SourceImage     string `json:"source_image,omitempty"`
+	// Refused is why Compute Engine refused to make it, in DiskRefused.
+	Refused string `json:"refused,omitempty"`
 	// Attempt counts the confirmed failures to make or attach it, and
 	// names the request ID of the next try. Nonce is new with each record,
 	// so a record made again after its image went, whose attempts count

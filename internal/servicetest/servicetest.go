@@ -625,6 +625,16 @@ func (w *World) HoldDisks(on bool) {
 	}
 }
 
+// WorkDiskSettings implements service.World, from Compute Engine's disk.
+func (w *World) WorkDiskSettings(j service.Job) (service.DiskSettings, bool) {
+	for _, d := range w.Compute.Disks() {
+		if d.Name == machines.WorkDisk(j.Machine) {
+			return service.DiskSettings{SizeGB: d.SizeGB, IOPS: d.IOPS, ThroughputMiBps: d.Throughput}, true
+		}
+	}
+	return service.DiskSettings{}, false
+}
+
 // deliver sends GitHub's signed delivery to the service's webhook, and
 // pushes what it published to the reconcile endpoint, signed as the push
 // account, as Pub/Sub does.

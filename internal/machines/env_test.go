@@ -387,6 +387,13 @@ func (m *machine) disk() (int, map[string]any) {
 	return m.e.post(machines.DisksPath, m.e.token(m.in), map[string]string{})
 }
 
+// diskAs asks for the job's work disk with these settings, as the disk
+// action does with its inputs.
+func (m *machine) diskAs(settings map[string]any) (int, map[string]any) {
+	m.e.t.Helper()
+	return m.e.post(machines.DisksPath, m.e.token(m.in), settings)
+}
+
 // diskReady asks for the job's work disk until it's ready, as the disk
 // action does, and returns where it came from.
 func (m *machine) diskReady() string {

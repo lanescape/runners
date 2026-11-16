@@ -6,6 +6,13 @@ import (
 	gcsemu "github.com/lanescape/runners/emulators/storage"
 )
 
+// DiskSettings is a work disk's size and provisioned performance.
+type DiskSettings struct {
+	SizeGB          int64
+	IOPS            int64
+	ThroughputMiBps int64
+}
+
 // World is what a test of the interface drives (specs/0005-interface.md):
 // this package's emulator, or the real service wired to this repository's
 // emulators of GitHub, Compute Engine, Google's issuers, Pub/Sub and Cloud
@@ -110,6 +117,10 @@ type World interface {
 	// starts, a work disk is attached by the time its request is answered
 	// or soon after, and answered ready.
 	HoldDisks(on bool)
+
+	// WorkDiskSettings is the size and performance of a job's work disk,
+	// once it's made.
+	WorkDiskSettings(j Job) (DiskSettings, bool)
 }
 
 // Repository is a repository of the organization.
