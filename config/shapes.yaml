@@ -5,10 +5,15 @@ zones:
   - northamerica-northeast1-a
   - northamerica-northeast1-b
 
-# Every machine's boot disk, and the performance of both its disks.
+# Every machine's boot disk, and the performance of each kind of disk. The work
+# disk holds what a job builds, saves and restores, which is bound by its IOPS
+# (specs/0002-machines.md, Shapes); the boot disk holds the runner and the
+# job's setup. A disk gets no more than its machine type allows.
 boot_disk_gb: 100
-disk_iops: 3000
-disk_throughput_mibps: 400
+boot_disk_iops: 3000
+boot_disk_throughput_mibps: 400
+work_disk_iops: 10000
+work_disk_throughput_mibps: 2400
 
 # The work disk sizes are starting points, to be tuned once real jobs run.
 shapes:

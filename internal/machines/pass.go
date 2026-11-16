@@ -1150,7 +1150,7 @@ func (s *Service) make(ctx context.Context, inv *inventory, w wanted) error {
 	}
 	spec := compute.InstanceSpec{
 		Name: name, Image: image, BootDiskGB: bootGB, DiskType: DiskType,
-		ProvisionedIOPS: int64(s.Config.Shapes.DiskIOPS), ProvisionedThroughput: int64(s.Config.Shapes.DiskThroughputMiBps),
+		ProvisionedIOPS: int64(s.Config.Shapes.BootDiskIOPS), ProvisionedThroughput: int64(s.Config.Shapes.BootDiskThroughputMiBps),
 		Labels: labels, Metadata: metadata,
 		ServiceAccount: s.MachineAccount, Scopes: scopes, Network: Network, Subnetwork: Subnetwork, MaxRunDuration: MaxRunDuration,
 	}

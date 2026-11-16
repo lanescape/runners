@@ -267,7 +267,7 @@ func (s *Service) attach(ctx context.Context, m Machine, a Admission, rec *DiskR
 	if rec.State == DiskMaking {
 		err := s.Compute.CreateDisk(ctx, m.Zone, compute.DiskSpec{
 			Name: rec.Disk, SizeGB: rec.SizeGB, DiskType: DiskType, SourceImage: rec.SourceImage,
-			ProvisionedIOPS: int64(s.Config.Shapes.DiskIOPS), ProvisionedThroughput: int64(s.Config.Shapes.DiskThroughputMiBps),
+			ProvisionedIOPS: int64(s.Config.Shapes.WorkDiskIOPS), ProvisionedThroughput: int64(s.Config.Shapes.WorkDiskThroughputMiBps),
 			Labels: map[string]string{LabelRepository: strconv.FormatInt(m.RepositoryID, 10), LabelMachine: m.Name,
 				LabelJob: strconv.FormatInt(a.JobID, 10), LabelCreated: strconv.FormatInt(s.now().Unix(), 10)},
 		}, compute.RequestID("work disk", rec.Disk, strconv.FormatInt(a.JobID, 10), attempt))

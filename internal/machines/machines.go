@@ -66,7 +66,7 @@ const (
 	// contributors' fork workflows the service runs with.
 	ForkApproval = "all_external_contributors"
 
-	// DiskType is every disk's type, with the shapes' IOPS and throughput.
+	// DiskType is every disk's type, with its kind's IOPS and throughput.
 	DiskType = "hyperdisk-balanced"
 	// WorkDevice is the work disk's device name; the machine sees it as
 	// /dev/disk/by-id/google-work.

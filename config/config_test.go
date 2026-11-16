@@ -21,7 +21,8 @@ func TestDefaultConfig(t *testing.T) {
 	if want := []string{"northamerica-northeast1-a", "northamerica-northeast1-b"}; !slices.Equal(c.Shapes.Zones, want) {
 		t.Errorf("zones = %v, want %v", c.Shapes.Zones, want)
 	}
-	if c.Shapes.BootDiskGB != 100 || c.Shapes.DiskIOPS != 3000 || c.Shapes.DiskThroughputMiBps != 400 {
+	if c.Shapes.BootDiskGB != 100 || c.Shapes.BootDiskIOPS != 3000 || c.Shapes.BootDiskThroughputMiBps != 400 ||
+		c.Shapes.WorkDiskIOPS != 10000 || c.Shapes.WorkDiskThroughputMiBps != 2400 {
 		t.Errorf("disks = %+v", c.Shapes)
 	}
 	big := c.Shapes.Shapes["lanescape-80vcpu-linux-amd64"]
@@ -107,8 +108,10 @@ func TestInvalidConfigs(t *testing.T) {
 		return `
 zones: [northamerica-northeast1-a]
 boot_disk_gb: 100
-disk_iops: 3000
-disk_throughput_mibps: 400
+boot_disk_iops: 3000
+boot_disk_throughput_mibps: 400
+work_disk_iops: 10000
+work_disk_throughput_mibps: 2400
 shapes:
 ` + shape
 	}
@@ -125,7 +128,15 @@ shapes:
 		{"no machine types", "shapes.yaml", shapes("  lanescape-16vcpu-linux-arm64: {memory_gb: 1, work_disk_gb: 1}"), "no machine types"},
 		{"no work disk", "shapes.yaml", shapes("  lanescape-16vcpu-linux-arm64: {machine_types: [c4a-highcpu-16], memory_gb: 32}"), "must be positive"},
 		{"duplicate type", "shapes.yaml", shapes("  lanescape-2vcpu-linux-amd64: {machine_types: [n4-highcpu-2, n4-highcpu-2], memory_gb: 4, work_disk_gb: 1}"), "twice"},
-		{"no zones", "shapes.yaml", "boot_disk_gb: 100\ndisk_iops: 3000\ndisk_throughput_mibps: 400\nshapes: {lanescape-2vcpu-linux-amd64: {machine_types: [n4-highcpu-2], memory_gb: 4, work_disk_gb: 1}}", "no zones"},
+		{"work disk past Hyperdisk's IOPS", "shapes.yaml", strings.Replace(shapes("  lanescape-2vcpu-linux-amd64: {machine_types: [n4-highcpu-2], memory_gb: 4, work_disk_gb: 50}"), "work_disk_iops: 10000", "work_disk_iops: 200000", 1), "work disk's IOPS must be from 3000 to 25000 for 50 GB"},
+		{"work disk IOPS for its size", "shapes.yaml", strings.Replace(shapes("  lanescape-2vcpu-linux-amd64: {machine_types: [n4-highcpu-2], memory_gb: 4, work_disk_gb: 50}"), "work_disk_iops: 10000", "work_disk_iops: 30000", 1), "work disk's IOPS must be from 3000 to 25000 for 50 GB"},
+		{"work disk throughput for its IOPS", "shapes.yaml", strings.Replace(shapes("  lanescape-2vcpu-linux-amd64: {machine_types: [n4-highcpu-2], memory_gb: 4, work_disk_gb: 50}"), "work_disk_iops: 10000", "work_disk_iops: 8000", 1), "work disk's throughput must be from 140 to 2000 MiB/s for 8000 IOPS"},
+		{"boot disk below Hyperdisk's IOPS", "shapes.yaml", strings.Replace(shapes("  lanescape-2vcpu-linux-amd64: {machine_types: [n4-highcpu-2], memory_gb: 4, work_disk_gb: 50}"), "boot_disk_iops: 3000", "boot_disk_iops: 1000", 1), "boot disk's IOPS must be from 3000 to 50000 for 100 GB"},
+		{"no boot disk throughput", "shapes.yaml", strings.Replace(shapes("  lanescape-2vcpu-linux-amd64: {machine_types: [n4-highcpu-2], memory_gb: 4, work_disk_gb: 50}"), "boot_disk_throughput_mibps: 400\n", "", 1), "boot disk's throughput must be from 140 to 750 MiB/s for 3000 IOPS"},
+		{"work disk past 160000 IOPS", "shapes.yaml", strings.Replace(shapes("  lanescape-80vcpu-linux-amd64: {machine_types: [n4-highcpu-80], memory_gb: 160, work_disk_gb: 500}"), "work_disk_iops: 10000", "work_disk_iops: 160001", 1), "work disk's IOPS must be from 3000 to 160000 for 500 GB"},
+		{"work disk throughput past a quarter of its IOPS", "shapes.yaml", strings.NewReplacer("work_disk_iops: 10000", "work_disk_iops: 3001", "work_disk_throughput_mibps: 2400", "work_disk_throughput_mibps: 751").Replace(shapes("  lanescape-80vcpu-linux-amd64: {machine_types: [n4-highcpu-80], memory_gb: 160, work_disk_gb: 500}")), "work disk's throughput must be from 140 to 750 MiB/s for 3001 IOPS"},
+		{"work disk throughput below its IOPS over 256", "shapes.yaml", strings.NewReplacer("work_disk_iops: 10000", "work_disk_iops: 40000", "work_disk_throughput_mibps: 2400", "work_disk_throughput_mibps: 155").Replace(shapes("  lanescape-80vcpu-linux-amd64: {machine_types: [n4-highcpu-80], memory_gb: 160, work_disk_gb: 500}")), "work disk's throughput must be from 156 to 2400 MiB/s for 40000 IOPS"},
+		{"no zones", "shapes.yaml", "boot_disk_gb: 100\nboot_disk_iops: 3000\nboot_disk_throughput_mibps: 400\nwork_disk_iops: 10000\nwork_disk_throughput_mibps: 2400\nshapes: {lanescape-2vcpu-linux-amd64: {machine_types: [n4-highcpu-2], memory_gb: 4, work_disk_gb: 1}}", "no zones"},
 		{"bad runner version", "runner.yaml", "version: v2.338\nsha256: {amd64: " + strings.Repeat("a", 64) + ", arm64: " + strings.Repeat("a", 64) + "}", "isn't a release version"},
 		{"missing checksum", "runner.yaml", "version: 2.338.2\nsha256: {amd64: " + strings.Repeat("a", 64) + "}", "sha256 for arm64"},
 		{"debian by family", "base.yaml", base("debian-13", "debian-13-trixie-arm64-v20261109", "1.27.3", "n4-standard-2", "c4a-standard-2"), "debian for amd64"},
@@ -150,4 +161,16 @@ shapes:
 			t.Fatal("loaded without runner.yaml")
 		}
 	})
+}
+
+// TestDiskPerformanceBoundaries: the limits themselves are allowed, rounded as
+// Compute Engine's table rounds them.
+func TestDiskPerformanceBoundaries(t *testing.T) {
+	for _, tc := range []struct{ size, iops, throughput int }{
+		{500, 160000, 625}, {500, 160000, 2400}, {50, 25000, 140}, {100, 3001, 750}, {500, 40000, 156}, {500, 35841, 140},
+	} {
+		if why := config.DiskPerformance(tc.size, tc.iops, tc.throughput); why != "" {
+			t.Errorf("%d GB, %d IOPS, %d MiB/s: %s", tc.size, tc.iops, tc.throughput, why)
+		}
+	}
 }

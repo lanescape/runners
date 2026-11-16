@@ -85,7 +85,7 @@ func TestAJobAsksForItsWorkDisk(t *testing.T) {
 	for _, d := range e.gce.Disks() {
 		if d.Name == machines.WorkDisk(m.in.Name) {
 			work = true
-			if d.SizeGB != 70 || !strings.HasSuffix(d.SourceImage, "lsr-base-amd64-new") || d.IOPS != 3000 || d.Throughput != 400 ||
+			if d.SizeGB != 70 || !strings.HasSuffix(d.SourceImage, "lsr-base-amd64-new") || d.IOPS != 10000 || d.Throughput != 2400 ||
 				d.Labels[machines.LabelMachine] != m.in.Name || d.Labels[machines.LabelJob] != strconv.FormatInt(j.ID, 10) {
 				t.Fatalf("work disk = %+v; want the chosen image's, at its size", d)
 			}

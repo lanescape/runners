@@ -33,13 +33,34 @@ type Organization struct {
 	ID int64 `yaml:"id"`
 }
 
+// diskPerformance reports why Compute Engine would refuse a Hyperdisk
+// Balanced disk of sizeGB with this provisioned performance, or "": IOPS from
+// 3,000 to 500 per GB of size, and at most 160,000; throughput from 140 MiB/s,
+// and an IOPS for every 256, to 2,400 MiB/s, and an IOPS for every 4.
+func diskPerformance(sizeGB, iops, throughput int) string {
+	maxIOPS := min(500*sizeGB, 160000)
+	if iops < 3000 || iops > maxIOPS {
+		return fmt.Sprintf("IOPS must be from 3000 to %d for %d GB", maxIOPS, sizeGB)
+	}
+	// Rounded down, both, as Compute Engine's own table of limits is.
+	lo, hi := max(140, iops/256), min(2400, iops/4)
+	if throughput < lo || throughput > hi {
+		return fmt.Sprintf("throughput must be from %d to %d MiB/s for %d IOPS", lo, hi, iops)
+	}
+	return ""
+}
+
 // Shapes are the machines jobs may ask for.
 type Shapes struct {
-	Zones               []string          `yaml:"zones"`
-	BootDiskGB          int               `yaml:"boot_disk_gb"`
-	DiskIOPS            int               `yaml:"disk_iops"`
-	DiskThroughputMiBps int               `yaml:"disk_throughput_mibps"`
-	Shapes              map[string]*Shape `yaml:"shapes"`
+	Zones      []string `yaml:"zones"`
+	BootDiskGB int      `yaml:"boot_disk_gb"`
+	// Each kind of disk's provisioned performance, which Hyperdisk Balanced
+	// allows for each disk's size (diskPerformance).
+	BootDiskIOPS            int               `yaml:"boot_disk_iops"`
+	BootDiskThroughputMiBps int               `yaml:"boot_disk_throughput_mibps"`
+	WorkDiskIOPS            int               `yaml:"work_disk_iops"`
+	WorkDiskThroughputMiBps int               `yaml:"work_disk_throughput_mibps"`
+	Shapes                  map[string]*Shape `yaml:"shapes"`
 	// Order is the shapes' names in the order shapes.yaml lists them: the
 	// first is the smallest shape (specs/0002-machines.md, Shapes).
 	Order []string `yaml:"-"`
@@ -212,8 +233,11 @@ func (c *Config) Validate() error {
 		}
 		seenZone[z] = true
 	}
-	if s.BootDiskGB <= 0 || s.DiskIOPS <= 0 || s.DiskThroughputMiBps <= 0 {
-		bad("shapes.yaml: boot_disk_gb, disk_iops and disk_throughput_mibps must be positive")
+	if s.BootDiskGB <= 0 {
+		bad("shapes.yaml: boot_disk_gb must be positive")
+	}
+	if why := diskPerformance(s.BootDiskGB, s.BootDiskIOPS, s.BootDiskThroughputMiBps); why != "" {
+		bad("shapes.yaml: the boot disk's %s", why)
 	}
 	if len(s.Shapes) == 0 {
 		bad("shapes.yaml: no shapes")
@@ -253,6 +277,9 @@ func (c *Config) Validate() error {
 		}
 		if sh.MemoryGB <= 0 || sh.WorkDiskGB <= 0 {
 			bad("shapes.yaml: %s: memory_gb and work_disk_gb must be positive", name)
+		}
+		if why := diskPerformance(sh.WorkDiskGB, s.WorkDiskIOPS, s.WorkDiskThroughputMiBps); sh.WorkDiskGB > 0 && why != "" {
+			bad("shapes.yaml: %s: the work disk's %s", name, why)
 		}
 	}
 
