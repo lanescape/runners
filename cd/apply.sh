@@ -5,16 +5,19 @@
 # there is one yet, then applies, through Infrastructure Manager's API, and
 # prints both one's logs from the artifacts bucket. It fails if anything
 # does: the preview, the apply, a deployment that isn't ACTIVE or a latest
-# revision that isn't APPLIED, or logs that can't be read. apply_test.go
-# runs it against stand-ins for gcloud and curl.
+# revision that isn't APPLIED, or logs that can't be read. Only once the
+# apply has succeeded does it give the step's output deployed=true, which
+# cd.yml's release job needs before it moves the actions' v1
+# (specs/0004-deployment.md, Releasing the actions); a deploy it skips gives
+# none. apply_test.go runs it against stand-ins for gcloud and curl.
 #
 # It takes, from the environment: PROJECT, REGION, DEPLOYMENT,
 # INFRA_ACCOUNT, SOURCE, TF_VERSION, INFRA_MANAGER_BUCKET, GITHUB_APP_ID,
 # IMAGE, GH_TOKEN, and GitHub's GITHUB_REPOSITORY, GITHUB_SHA,
-# GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT and GITHUB_STEP_SUMMARY.
+# GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, GITHUB_STEP_SUMMARY and GITHUB_OUTPUT.
 set -euo pipefail
 : "${PROJECT:?}" "${REGION:?}" "${DEPLOYMENT:?}" "${INFRA_ACCOUNT:?}" "${SOURCE:?}" "${TF_VERSION:?}" "${INFRA_MANAGER_BUCKET:?}" "${GITHUB_APP_ID:?}" "${IMAGE:?}"
-: "${GITHUB_REPOSITORY:?}" "${GH_TOKEN:?}"
+: "${GITHUB_REPOSITORY:?}" "${GH_TOKEN:?}" "${GITHUB_OUTPUT:?}"
 
 # main's head, asked again at every attempt, just before anything is
 # applied: a rerun of this job alone keeps the gate's answer from the run's
@@ -181,3 +184,4 @@ if [ "$logs_failed" = true ]; then
   echo "::error title=Logs unread::infra/ was applied, but its logs couldn't all be read."
   exit 1
 fi
+echo "deployed=true" >>"$GITHUB_OUTPUT"

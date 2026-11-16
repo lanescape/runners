@@ -1,0 +1,134 @@
+name: Lanescape checkout
+description: >
+  Checks out the repository for a job: the run's own commit, as
+  actions/checkout does, or, with contribution: true in a
+  pull_request_target run, exactly the approved contribution's head commit,
+  with no credentials persisted.
+inputs:
+  contribution:
+    description: >
+      true to check out the pull request's head commit,
+      github.event.pull_request.head.sha, from its head repository, in a
+      pull_request_target run; refused in any other event.
+    required: false
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    # The steps up to Build are the same in every action in this
+    # repository; a test keeps them so.
+    - name: Find Go
+      id: go
+      shell: bash
+      run: |
+        want="$(sed -n 's/^toolchain //p' "$GITHUB_ACTION_PATH/../../go.mod")"
+        if [ -z "$want" ]; then echo "::error::go.mod has no toolchain line"; exit 1; fi
+        have="$(env -u GOOS -u GOARCH -u GOFLAGS -u GOEXPERIMENT -u GOROOT -u GODEBUG -u GOFIPS140 \
+          GOENV=off GOWORK=off GOTOOLCHAIN=local GO111MODULE=on go env GOVERSION 2>/dev/null || true)"
+        echo "version=${want#go}" >> "$GITHUB_OUTPUT"
+        if [ "$have" = "$want" ]; then
+          echo "found=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "found=false" >> "$GITHUB_OUTPUT"
+        fi
+    - name: Set up Go
+      if: steps.go.outputs.found != 'true'
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      # actions/setup-go runs go itself, which mustn't see the job's Go
+      # settings either, and prints go env, which mustn't show where the
+      # job gets its modules, since that may hold a credential. It
+      # downloads Go itself, not modules. Empty is Go's default.
+      env:
+        GOENV: 'off'
+        GOWORK: 'off'
+        GOTOOLCHAIN: local
+        GOFLAGS: ''
+        GOOS: ''
+        GOARCH: ''
+        GOAMD64: ''
+        GOARM64: ''
+        GOEXPERIMENT: ''
+        GOROOT: ''
+        GODEBUG: ''
+        GOFIPS140: ''
+        GO111MODULE: ''
+        GOPROXY: ''
+        GONOPROXY: ''
+        GOPRIVATE: ''
+        GOSUMDB: ''
+        GONOSUMDB: ''
+        GOINSECURE: ''
+        GOAUTH: ''
+        GOVCS: ''
+        GOCACHEPROG: ''
+        # And it downloads Go from Go's own site, never from a mirror the
+        # job names, whose URL it would print.
+        GO_DOWNLOAD_BASE_URL: ''
+      with:
+        # Exactly go.mod's toolchain, whatever GOTOOLCHAIN the job has.
+        go-version: ${{ steps.go.outputs.version }}
+        cache: false
+    - name: Build
+      id: build
+      shell: bash
+      env:
+        PROGRAM: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        name="$(basename "$PROGRAM")"
+        dir="$(mktemp -d "$RUNNER_TEMP/lanescape-actions.XXXXXX")"
+        bin="$dir/$name"
+        if [ "$RUNNER_OS" = Windows ]; then bin="$bin.exe"; fi
+        cd "$PROGRAM/../.."
+        # Nothing of the job's Go settings, in its environment or saved
+        # with go env -w, changes the build, but where modules come from.
+        build() {
+          env -u GOOS -u GOARCH -u GOFLAGS -u GOEXPERIMENT -u GOARM64 -u GOAMD64 -u GOROOT -u GODEBUG -u GOFIPS140 \
+            GOENV=off GOWORK=off GOTOOLCHAIN=local GO111MODULE=on CGO_ENABLED=0 "$@"
+        }
+        want="$(sed -n 's/^toolchain //p' go.mod)"
+        have="$(build go env GOVERSION)"
+        if [ "$have" != "$want" ]; then
+          echo "::error::Go is $have, not $want, which go.mod names"
+          exit 1
+        fi
+        build go build -trimpath -o "$bin" "./actions/$name"
+        echo "bin=$bin" >> "$GITHUB_OUTPUT"
+    # Without Git 2.18 or newer, actions/checkout downloads an archive
+    # rather than a repository, and the program couldn't confirm HEAD or
+    # the git config (specs/0007-actions.md, How actions run).
+    - name: Check for Git
+      shell: bash
+      run: |
+        version="$(git --version 2>/dev/null || true)"
+        parts="$(printf '%s\n' "$version" | sed -n 's/^git version \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p')"
+        if [ -z "$parts" ]; then
+          echo "::error::checkout needs Git 2.18 or newer, and there's no Git here"
+          exit 1
+        fi
+        major="${parts% *}"
+        minor="${parts#* }"
+        if [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt 18 ]; }; then
+          echo "::error::checkout needs Git 2.18 or newer, and Git here is $major.$minor"
+          exit 1
+        fi
+    - name: Decide what to check out
+      id: decide
+      shell: bash
+      env:
+        PROGRAM: ${{ steps.build.outputs.bin }}
+        INPUT_CONTRIBUTION: ${{ inputs.contribution }}
+      run: '"$PROGRAM" decide'
+    - name: Check out
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: ${{ steps.decide.outputs.repository }}
+        ref: ${{ steps.decide.outputs.ref }}
+        persist-credentials: ${{ steps.decide.outputs.persist-credentials }}
+        allow-unsafe-pr-checkout: ${{ steps.decide.outputs.allow-unsafe-pr-checkout }}
+    - name: Confirm the checkout
+      shell: bash
+      env:
+        PROGRAM: ${{ steps.build.outputs.bin }}
+        INPUT_EXPECT: ${{ steps.decide.outputs.expect }}
+      run: '"$PROGRAM" verify'

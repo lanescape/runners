@@ -30,7 +30,9 @@ jobs:
         with:
           go-version-file: go.mod
       - name: go vet
-        run: go vet ./...
+        run: |
+          go vet ./...
+          go vet -tags e2e ./...
       - name: gofmt
         run: |
           unformatted="$(gofmt -l .)"
@@ -41,6 +43,94 @@ jobs:
           fi
       - name: go test
         run: go test -race ./...
+
+  # The actions run inside consumers' jobs on other platforms too, where
+  # paths, shells, signals and file locking differ, so their tests also run
+  # natively on Linux arm64 and macOS arm64 (specs/0007-actions.md, Code
+  # and tests); the Go job runs them on Linux amd64.
+  actions:
+    name: Test the actions (${{ matrix.platform }})
+    runs-on: ${{ github.repository_owner_id == '303994381' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && matrix.blacksmith || matrix.github }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-arm64
+            blacksmith: blacksmith-4vcpu-ubuntu-2604-arm
+            github: ubuntu-26.04-arm
+          - platform: macos-arm64
+            blacksmith: blacksmith-12vcpu-macos-26
+            github: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: go vet
+        run: |
+          go vet ./actions/...
+          go vet -tags e2e ./actions/...
+      - name: go test
+        run: go test -race ./actions/...
+
+  checkout:
+    name: Check out with checkout (${{ matrix.platform }})
+    # The checkout action itself, as a consumer's job runs it, for the run's
+    # own commit. A contribution's checkout needs a pull_request_target
+    # run, so the tests cover it up to actions/checkout. disk, cache
+    # and save-cache aren't run here, since they call the runner service,
+    # which CI never relies on; their tests run them against its emulators.
+    runs-on: ${{ github.repository_owner_id == '303994381' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && matrix.blacksmith || matrix.github }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            blacksmith: blacksmith-2vcpu-ubuntu-2604
+            github: ubuntu-26.04
+          - platform: macos-arm64
+            blacksmith: blacksmith-12vcpu-macos-26
+            github: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./actions/checkout
+      - name: The checkout is the run's commit
+        env:
+          WANT: ${{ github.sha }}
+        run: |
+          have="$(git rev-parse HEAD)"
+          if [ "$have" != "$WANT" ]; then
+            echo "::error::checked out $have, not $WANT"
+            exit 1
+          fi
+
+  build:
+    name: Build every action for every platform
+    runs-on: ${{ github.repository_owner_id == '303994381' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'blacksmith-2vcpu-ubuntu-2604' || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: go build
+        # Every action's program, for every platform runners use, as the
+        # actions build them: pure Go, with CGO off.
+        run: |
+          set -euo pipefail
+          for platform in linux/amd64 linux/arm64 darwin/arm64 windows/amd64; do
+            for dir in actions/*/action.yml; do
+              program="${dir%/action.yml}"
+              echo "$program for $platform"
+              CGO_ENABLED=0 GOOS="${platform%/*}" GOARCH="${platform#*/}" \
+                go build -trimpath -o "$RUNNER_TEMP/$platform/$program" "./$program"
+            done
+          done
 
   terraform:
     name: Terraform

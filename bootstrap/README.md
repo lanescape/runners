@@ -61,6 +61,14 @@ CD deploys nothing until the repository's Actions variables below are all set (s
 
 3. Let CD deploy `infra/` for the first time: rerun the latest CD run on main, whose deploy was skipped, or push to main. That apply makes the App's secrets with no value, so it fails where the service would start. Add the secrets' values as `infra/README.md` says, then rerun the failed run's deploy, which starts the service.
 
+## The actions' release
+
+CD moves the actions' `v1` tag after each deploy that succeeds (specs/0004-deployment.md, Releasing the actions). That needs three things on GitHub, which no Terraform here makes, set up by a maintainer before the first push to main that moves `v1`, or its run's release job fails:
+
+1. The "Lanescape Actions" GitHub App, private to the organization, with Repository permissions Contents: read and write and nothing else, and no webhook, installed on this repository.
+2. An environment, `release`, that only the `main` branch may deploy to, with the variable `RELEASE_APP_ID`, the App's ID, and the secret `RELEASE_APP_PRIVATE_KEY`, a private key of the App's made for this repository alone.
+3. A tag ruleset on `v*` that restricts creating, updating and deleting, and lets only that App bypass it.
+
 ## What IAM can't limit
 
 IAM Conditions limit grants by name only for some resource types. The grants here that can't be limited, and so reach other teams' resources in the shared project, are:

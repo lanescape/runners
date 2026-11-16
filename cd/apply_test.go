@@ -89,6 +89,8 @@ type result struct {
 	out     string
 	calls   string
 	summary string
+	// output is what the step gives as its outputs.
+	output string
 }
 
 func apply(t *testing.T, env ...string) result {
@@ -111,10 +113,10 @@ func apply(t *testing.T, env ...string) result {
 	if err := os.Symlink(jq, filepath.Join(bin, "jq")); err != nil {
 		t.Fatal(err)
 	}
-	calls, summary := filepath.Join(dir, "calls"), filepath.Join(dir, "summary")
+	calls, summary, output := filepath.Join(dir, "calls"), filepath.Join(dir, "summary"), filepath.Join(dir, "output")
 	cmd := exec.Command(sh, "apply.sh")
 	cmd.Env = append([]string{
-		"PATH=" + bin + ":/usr/bin:/bin", "CALLS=" + calls, "GITHUB_STEP_SUMMARY=" + summary,
+		"PATH=" + bin + ":/usr/bin:/bin", "CALLS=" + calls, "GITHUB_STEP_SUMMARY=" + summary, "GITHUB_OUTPUT=" + output,
 		"GITHUB_SHA=0123456789abcdef0123456789abcdef01234567", "GITHUB_RUN_ID=111", "GITHUB_RUN_ATTEMPT=2",
 		"GITHUB_REPOSITORY=lanescape/runners", "GH_TOKEN=GH-SECRET",
 		"HEAD_SHA=0123456789abcdef0123456789abcdef01234567",
@@ -127,7 +129,8 @@ func apply(t *testing.T, env ...string) result {
 	out, err := cmd.CombinedOutput()
 	c, _ := os.ReadFile(calls)
 	s, _ := os.ReadFile(summary)
-	return result{err: err, out: string(out), calls: string(c), summary: string(s)}
+	o, _ := os.ReadFile(output)
+	return result{err: err, out: string(out), calls: string(c), summary: string(s), output: string(o)}
 }
 
 func TestAFirstApplyCreatesTheDeployment(t *testing.T) {
@@ -161,6 +164,9 @@ func TestAFirstApplyCreatesTheDeployment(t *testing.T) {
 	}
 	if !strings.Contains(r.summary, "revisions/r-1") {
 		t.Errorf("summary = %q", r.summary)
+	}
+	if r.output != "deployed=true\n" {
+		t.Errorf("output = %q, want deployed=true", r.output)
 	}
 }
 
@@ -223,6 +229,10 @@ func TestEveryFailureFailsTheDeploy(t *testing.T) {
 			if !strings.Contains(r.out, tc.want) {
 				t.Fatalf("output doesn't say %q:\n%s", tc.want, r.out)
 			}
+			// A failed deploy never lets v1 move.
+			if strings.Contains(r.output, "deployed") {
+				t.Fatalf("a failed deploy gave %q", r.output)
+			}
 		})
 	}
 	// A failed preview applies nothing.
@@ -246,6 +256,10 @@ func TestAnAttemptOfACommitNoLongerMainsHeadAppliesNothing(t *testing.T) {
 	}
 	if !strings.Contains(r.out, "main has moved on to fedcba9876543210fedcba9876543210fedcba98") {
 		t.Fatalf("output:\n%s", r.out)
+	}
+	// It succeeds, but deployed nothing, so v1 doesn't move to it.
+	if r.output != "" {
+		t.Fatalf("a skipped deploy gave %q", r.output)
 	}
 	r = apply(t, "EXISTS=1", "GH_FAIL=1")
 	if r.err == nil || strings.Contains(r.calls, "gcloud") {
