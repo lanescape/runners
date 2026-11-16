@@ -20,12 +20,14 @@ import (
 
 // Routes are the service's endpoints.
 const (
-	WebhookPath     = "/v1/webhook"
-	ReconcilePath   = "/v1/reconcile"
-	JobStartedPath  = "/v1/jobs/started"
-	JobFinishedPath = "/v1/jobs/finished"
-	DisksPath       = "/v1/disks"
-	SavePath        = "/v1/disks/save"
+	WebhookPath      = "/v1/webhook"
+	ReconcilePath    = "/v1/reconcile"
+	JobStartedPath   = "/v1/jobs/started"
+	JobFinishedPath  = "/v1/jobs/finished"
+	DisksPath        = "/v1/disks"
+	CacheRestorePath = "/v1/caches/restore"
+	CacheSavePath    = "/v1/caches/save"
+	CacheCommitPath  = "/v1/caches/commit"
 )
 
 // Limits on what the service reads from callers.
@@ -115,11 +117,13 @@ type Config struct {
 	// served.
 	JobStarted  http.Handler
 	JobFinished http.Handler
-	// Disks and Save are a job's requests for its work disk and its save,
-	// which check a Compute Engine identity token themselves; unset, they
-	// aren't served.
-	Disks http.Handler
-	Save  http.Handler
+	// Disks and the caches' are a job's requests for its work disk and its
+	// caches, which check a Compute Engine identity token themselves;
+	// unset, they aren't served.
+	Disks        http.Handler
+	CacheRestore http.Handler
+	CacheSave    http.Handler
+	CacheCommit  http.Handler
 }
 
 type server struct {
@@ -153,8 +157,10 @@ func New(c Config) (http.Handler, error) {
 	if c.Disks != nil {
 		mux.Handle("POST "+DisksPath, c.Disks)
 	}
-	if c.Save != nil {
-		mux.Handle("POST "+SavePath, c.Save)
+	if c.CacheRestore != nil {
+		mux.Handle("POST "+CacheRestorePath, c.CacheRestore)
+		mux.Handle("POST "+CacheSavePath, c.CacheSave)
+		mux.Handle("POST "+CacheCommitPath, c.CacheCommit)
 	}
 	return mux, nil
 }

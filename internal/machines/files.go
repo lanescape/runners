@@ -13,10 +13,10 @@ import (
 )
 
 // RunFiles is what the service read of a run's .github/runners.json, at its
-// commit, once per run: the keys of every family it declares
-// (specs/0003-disks.md, Keys). It's recorded in the
-// bucket as runs/<repository>/<run>/files.json, so every job of the run,
-// in every attempt, resolves the same.
+// commit, once per run: the keys of every cache it declares
+// (specs/0003-disks.md, Keys). It's recorded in the bucket as
+// runs/<repository>/<run>/caches.json, so every job of the run, in every
+// attempt, resolves the same.
 type RunFiles struct {
 	RepositoryID int64  `json:"repository_id"`
 	RunID        int64  `json:"run_id"`
@@ -24,18 +24,18 @@ type RunFiles struct {
 	// Invalid is why the file isn't valid, if it isn't: every job that
 	// relies on it is failed, saying so.
 	Invalid string `json:"invalid,omitempty"`
-	// Families are each declared family's key, or why it has none.
-	Families map[string]FamilyKey `json:"families,omitempty"`
+	// Caches are each declared cache's key, or why it has none.
+	Caches map[string]CacheKey `json:"caches,omitempty"`
 }
 
-// FamilyKey is a family's key for a run, or why it has none: a file it
-// lists doesn't exist.
-type FamilyKey struct {
+// CacheKey is a cache's key for a run, or why it has none: a file it lists
+// doesn't exist.
+type CacheKey struct {
 	Key     string `json:"key,omitempty"`
 	Missing string `json:"missing,omitempty"`
 }
 
-func runFilesKey(repo, run int64) string { return fmt.Sprintf("runs/%d/%d/files.json", repo, run) }
+func runFilesKey(repo, run int64) string { return fmt.Sprintf("runs/%d/%d/caches.json", repo, run) }
 
 // errFiles means the run's files say the job can't run as it asked: the
 // error's text is the reason it's told.
@@ -51,7 +51,7 @@ func (s *Service) runFiles(ctx context.Context, repo github.Repository, bd bindi
 	if rf, _, ok, err := getJSON[RunFiles](ctx, s.Objects, key); err != nil || ok {
 		return rf, err
 	}
-	rf := RunFiles{RepositoryID: repo.ID, RunID: bd.RunID, Commit: bd.Commit, Families: map[string]FamilyKey{}}
+	rf := RunFiles{RepositoryID: repo.ID, RunID: bd.RunID, Commit: bd.Commit, Caches: map[string]CacheKey{}}
 	data, err := s.GitHub.File(ctx, repo, consumer.RunnersFile, bd.Commit)
 	switch {
 	case errors.Is(err, github.ErrNotFound):
@@ -63,18 +63,18 @@ func (s *Service) runFiles(ctx context.Context, repo github.Repository, bd bindi
 	if err != nil {
 		rf.Invalid = err.Error()
 	} else {
-		names := make([]string, 0, len(f.Disks))
-		for n := range f.Disks {
+		names := make([]string, 0, len(f.Caches))
+		for n := range f.Caches {
 			names = append(names, n)
 		}
 		slices.Sort(names)
-		for _, family := range names {
-			d := f.Disks[family]
+		for _, cache := range names {
+			d := f.Caches[cache]
 			// Each file is hashed as it's read, so no more than one file's
-			// contents is held at a time, however many the family lists.
+			// contents is held at a time, however many the cache lists.
 			var kh *consumer.KeyHash
 			if d.From != nil {
-				kh = consumer.NewKeyHash(family)
+				kh = consumer.NewKeyHash(cache)
 			}
 			missing := ""
 			for _, p := range d.From {
@@ -93,32 +93,32 @@ func (s *Service) runFiles(ctx context.Context, repo github.Repository, bd bindi
 				kh.Add(p, b)
 			}
 			if missing != "" {
-				rf.Families[family] = FamilyKey{Missing: missing}
+				rf.Caches[cache] = CacheKey{Missing: missing}
 				continue
 			}
 			key := consumer.NoKey
 			if kh != nil {
 				key = kh.Sum()
 			}
-			rf.Families[family] = FamilyKey{Key: key}
+			rf.Caches[cache] = CacheKey{Key: key}
 		}
 	}
 	got, _, err := createOnce(ctx, s.Objects, key, rf)
 	return got, err
 }
 
-// familyKey is a family's key for a run, or errFiles saying why the job
-// that names it can't run.
-func familyKey(rf RunFiles, family string) (string, error) {
+// cacheKey is a cache's key for a run, or errFiles saying why the job that
+// names it can't have it.
+func cacheKey(rf RunFiles, cache string) (string, error) {
 	if rf.Invalid != "" {
 		return "", errFiles{consumer.RunnersFile + " at the run's commit isn't valid: " + strings.TrimPrefix(rf.Invalid, "invalid: ")}
 	}
-	fk, ok := rf.Families[family]
+	fk, ok := rf.Caches[cache]
 	if !ok {
-		return "", errFiles{fmt.Sprintf("%s at the run's commit doesn't declare the family %s", consumer.RunnersFile, family)}
+		return "", errFiles{fmt.Sprintf("%s at the run's commit doesn't declare the cache %s", consumer.RunnersFile, cache)}
 	}
 	if fk.Missing != "" {
-		return "", errFiles{fmt.Sprintf("the family %s lists %s, which doesn't exist at the run's commit", family, fk.Missing)}
+		return "", errFiles{fmt.Sprintf("the cache %s lists %s, which doesn't exist at the run's commit", cache, fk.Missing)}
 	}
 	return fk.Key, nil
 }

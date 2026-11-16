@@ -7,6 +7,7 @@
 //	RUNNERS_AUDIENCE             the service's URL, as Cloud Run gives it, which must be endpoints.Service
 //	RUNNERS_PROJECT              the project the service's machines are in
 //	RUNNERS_BUCKET               the service's state bucket
+//	RUNNERS_CACHES_BUCKET        the caches' bucket, which holds what jobs save
 //	RUNNERS_WEBHOOK_TOPIC        the Pub/Sub topic the webhook publishes deliveries to, by its full name
 //	RUNNERS_GITHUB_APP_ID        the GitHub App's ID
 //	RUNNERS_GITHUB_APP_KEY_FILE  the App's private key, mounted from Secret Manager
@@ -53,6 +54,7 @@ import (
 	"github.com/lanescape/runners/internal/pubsub"
 	"github.com/lanescape/runners/internal/server"
 	"github.com/lanescape/runners/internal/store"
+	"github.com/lanescape/runners/internal/tokens"
 )
 
 const githubAPI = "https://api.github.com"
@@ -74,6 +76,7 @@ type settings struct {
 	Audience          string
 	Project           string
 	Bucket            string
+	CachesBucket      string
 	WebhookTopic      string
 	AppID             int64
 	AppKeyFile        string
@@ -90,6 +93,7 @@ func loadSettings(getenv func(string) string) (settings, error) {
 		Audience:          getenv("RUNNERS_AUDIENCE"),
 		Project:           getenv("RUNNERS_PROJECT"),
 		Bucket:            getenv("RUNNERS_BUCKET"),
+		CachesBucket:      getenv("RUNNERS_CACHES_BUCKET"),
 		WebhookTopic:      getenv("RUNNERS_WEBHOOK_TOPIC"),
 		AppKeyFile:        getenv("RUNNERS_GITHUB_APP_KEY_FILE"),
 		WebhookSecretFile: getenv("RUNNERS_WEBHOOK_SECRET_FILE"),
@@ -102,6 +106,7 @@ func loadSettings(getenv func(string) string) (settings, error) {
 		"RUNNERS_AUDIENCE":            s.Audience,
 		"RUNNERS_PROJECT":             s.Project,
 		"RUNNERS_BUCKET":              s.Bucket,
+		"RUNNERS_CACHES_BUCKET":       s.CachesBucket,
 		"RUNNERS_WEBHOOK_TOPIC":       s.WebhookTopic,
 		"RUNNERS_GITHUB_APP_KEY_FILE": s.AppKeyFile,
 		"RUNNERS_WEBHOOK_SECRET_FILE": s.WebhookSecretFile,
@@ -177,6 +182,15 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 		return err
 	}
 	defer objects.Close()
+	caches, err := store.NewGCS(ctx, s.CachesBucket)
+	if err != nil {
+		return err
+	}
+	defer caches.Close()
+	downscoper, err := tokens.New(ctx, s.CachesBucket)
+	if err != nil {
+		return err
+	}
 	callers, err := auth.NewGoogle(auth.Options{Issuer: auth.GoogleIssuer, Audience: endpoints.Service}, s.ReconcileAccounts)
 	if err != nil {
 		return err
@@ -202,10 +216,11 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 	}
 	clock := clockwork.NewRealClock()
 	binder := &binding.Binder{GitHub: gh, Objects: objects, OrganizationID: cfg.Organization.ID, Clock: clock, Logger: log}
-	dks := &disks.Service{Config: cfg, Project: s.Project, GitHub: gh, Compute: gce, Objects: objects, Clock: clock, Logger: log}
+	dks := &disks.Service{Config: cfg, Project: s.Project, GitHub: gh, Compute: gce, Objects: objects, Caches: caches,
+		CacheBucket: s.CachesBucket, Tokens: downscoper, Clock: clock, Logger: log}
 	svc := &machines.Service{Config: cfg, Project: s.Project, ServiceURL: endpoints.Service, MachineAccount: account,
 		GitHub: gh, Compute: gce, Objects: objects, Binder: binder, Machines: machineTokens, Clock: clock, Logger: log,
-		Disks: dks, Saves: dks, Preemptions: dks}
+		Disks: dks, Caches: dks, Preemptions: dks}
 	bootLogs, err := logging.New(ctx, s.Project, logging.View)
 	if err != nil {
 		return err
@@ -240,7 +255,9 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 		JobStarted:       svc.JobStarted(),
 		JobFinished:      svc.JobFinished(),
 		Disks:            svc.DiskRequest(),
-		Save:             svc.SaveRequest(),
+		CacheRestore:     svc.CacheRestoreRequest(),
+		CacheSave:        svc.CacheSaveRequest(),
+		CacheCommit:      svc.CacheCommitRequest(),
 	})
 	if err != nil {
 		return err

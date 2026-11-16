@@ -55,7 +55,6 @@ type inventory struct {
 	admissions      map[string]Admission
 	answered        map[string]time.Time
 	reports         map[string]Report
-	saves           map[string]SaveRequest
 	diskRecords     map[string]record[DiskRecord]
 	refusals        map[string]record[Refusal]
 	jobRecords      map[string]record[JobRecord]
@@ -162,7 +161,6 @@ func (s *Service) inventory(p *pass.Pass) *inventory {
 func (s *Service) readRecords(ctx context.Context, inv *inventory) {
 	inv.recordsComplete = true
 	inv.admissions, inv.reports, inv.answered = map[string]Admission{}, map[string]Report{}, map[string]time.Time{}
-	inv.saves = map[string]SaveRequest{}
 	inv.diskRecords, inv.refusals, inv.jobRecords = map[string]record[DiskRecord]{}, map[string]record[Refusal]{}, map[string]record[JobRecord]{}
 	inv.machineKeys = map[string][]store.Object{}
 	list := func(prefix string, each func(o store.Object) error) {
@@ -217,13 +215,6 @@ func (s *Service) readRecords(ctx context.Context, inv *inventory) {
 				var r Report
 				if dec(&r) == nil {
 					inv.reports[parts[1]] = r
-				}
-			})
-		case "save-request.json":
-			return read(o.Name, func(_ int64, dec func(any) error) {
-				var r SaveRequest
-				if dec(&r) == nil {
-					inv.saves[parts[1]] = r
 				}
 			})
 		}

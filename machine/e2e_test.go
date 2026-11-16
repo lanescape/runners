@@ -28,6 +28,7 @@ import (
 	"github.com/lanescape/runners/emulators/fault"
 	ghemu "github.com/lanescape/runners/emulators/github"
 	"github.com/lanescape/runners/emulators/google"
+	"github.com/lanescape/runners/emulators/service"
 	gcsemu "github.com/lanescape/runners/emulators/storage"
 	"github.com/lanescape/runners/internal/auth"
 	"github.com/lanescape/runners/internal/binding"
@@ -46,10 +47,12 @@ import (
 // These tests run the real service against the emulators, with each machine
 // it makes booting the real supervisor, built from its embedded source,
 // which runs the runner stand-in, which runs the real job-started hook's
-// script and program. A job's steps ask for its work disk and its save as
-// the actions do. The base image's rule that mounts the disk is played by
-// the test once Compute Engine shows the disk attached: the mount program
-// mounts as root, so its own tests, in mountwork, hold it to what it does.
+// script and program. A job's steps ask for its work disk, and restore and
+// save its caches, as the actions do, uploading to and downloading from the
+// caches' bucket in the storage emulator. The base image's rule that mounts
+// the disk is played by the test once Compute Engine shows the disk
+// attached: the mount program mounts as root, so its own tests, in
+// mountwork, hold it to what it does.
 
 const (
 	orgID     = 303994381
@@ -59,10 +62,10 @@ const (
 	small     = "lanescape-2vcpu-linux-amd64"
 )
 
-// files are the consumer's: one family of work disks, build, with no key
-// files, and a setup script, which a job runs in its own steps.
+// files are the consumer's: one cache, build, with no key files, and a setup
+// script, which a job runs in its own steps.
 var files = map[string]string{
-	".github/runners.json": `{"disks": {"build": {}}}`,
+	".github/runners.json": `{"caches": {"build": {}}}`,
 	"ci/init.sh":           "echo setting up the machine\n",
 }
 
@@ -139,6 +142,7 @@ func newWorld(t *testing.T) *world {
 	gcs := gcsemu.New()
 	t.Cleanup(gcs.Close)
 	gcs.CreateBucket("state")
+	gcs.CreateBucket(service.CachesBucket)
 	gg := google.New()
 	t.Cleanup(gg.Close)
 
@@ -169,6 +173,11 @@ func newWorld(t *testing.T) *world {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { objects.Close() })
+	caches, err := store.NewGCS(ctx, service.CachesBucket, gcs.ClientOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { caches.Close() })
 
 	// The service's address is its audience, known once it listens.
 	var handler http.Handler
@@ -195,13 +204,14 @@ func newWorld(t *testing.T) *world {
 	})
 	clock := clockwork.NewRealClock()
 	binder := &binding.Binder{GitHub: ghc, Objects: objects, OrganizationID: orgID, Clock: clock, Logger: log}
-	dks := &disks.Service{Config: cfg, Project: gcp.Project, GitHub: ghc, Compute: gcec, Objects: objects, Clock: clock, Logger: log}
+	dks := &disks.Service{Config: cfg, Project: gcp.Project, GitHub: ghc, Compute: gcec, Objects: objects, Caches: caches,
+		CacheBucket: service.CachesBucket, Tokens: &tokens{}, Clock: clock, Logger: log}
 	// A check that GitHub can't answer is answered sooner than in
 	// production, so a test sees the hook ask again without a long wait.
 	later := &laterClock{Clock: clock}
 	svc := &machines.Service{Config: cfg, Project: gcp.Project, ServiceURL: audience, MachineAccount: account,
 		GitHub: ghc, Compute: gcec, Objects: objects, Binder: binder, Machines: verifier, Clock: later, Logger: log,
-		Disks: dks, Saves: dks, Preemptions: dks, FailStopDelay: time.Second, AssignmentWait: 3 * time.Second,
+		Disks: dks, Caches: dks, Preemptions: dks, FailStopDelay: time.Second, AssignmentWait: 3 * time.Second,
 		AssignmentRetry: 100 * time.Millisecond}
 	bootLogs, err := logging.New(ctx, gcp.Project, logging.View, gcp.LoggingOptions()...)
 	if err != nil {
@@ -234,7 +244,8 @@ func newWorld(t *testing.T) *world {
 		Passes:           passes,
 		Reconciler:       reconciler(body), Events: dks,
 		JobStarted: svc.JobStarted(), JobFinished: svc.JobFinished(),
-		Disks: svc.DiskRequest(), Save: svc.SaveRequest(),
+		Disks: svc.DiskRequest(), CacheRestore: svc.CacheRestoreRequest(), CacheSave: svc.CacheSaveRequest(),
+		CacheCommit: svc.CacheCommitRequest(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -248,6 +259,21 @@ func newWorld(t *testing.T) *world {
 	t.Cleanup(w.haltAll)
 	return w
 }
+
+// tokens are what the service hands out for its caches' bucket, which the
+// storage emulator doesn't check. They look like Google's access tokens, so
+// that noCredentials finds one wherever it's logged.
+type tokens struct{ n atomic.Int64 }
+
+func (t *tokens) mint() (string, time.Time, error) {
+	return "ya29.e2e-cache-token-" + strconv.FormatInt(t.n.Add(1), 10), time.Now().Add(time.Hour).UTC(), nil
+}
+
+// Read implements disks.Tokens.
+func (t *tokens) Read(context.Context, string) (string, time.Time, error) { return t.mint() }
+
+// Create implements disks.Tokens.
+func (t *tokens) Create(context.Context, string) (string, time.Time, error) { return t.mint() }
 
 // laterClock is real time, moved on by as much as a test says.
 type laterClock struct {
@@ -331,11 +357,11 @@ func (w *world) boot(m gceemu.Machine) {
 	_ = os.MkdirAll(filepath.Join(dir, "work"), 0o755)
 	cfg := map[string]any{
 		"metadata": m.MetadataURL, "runner": []string{w.standIn}, "runner_dir": runner, "runner_user": "",
-		// A job's steps find the metadata server and /work where these
-		// say, and the machine's own directory, where a test leaves
-		// what a step waits for.
+		// A job's steps find the metadata server, /work and Cloud
+		// Storage where these say, and the machine's own directory,
+		// where a test leaves what a step waits for.
 		"env": []string{"PATH=" + os.Getenv("PATH"), "LSR_TEST_METADATA=" + m.MetadataURL, "LSR_TEST_WORK=" + filepath.Join(dir, "work"),
-			"LSR_TEST_DIR=" + dir},
+			"LSR_TEST_STORAGE=" + w.gcs.URL, "LSR_TEST_DIR=" + dir},
 		"hook":         hook,
 		"poweroff":     []string{"curl", "-fsS", "-X", "POST", m.MetadataURL + "/_emulator/poweroff"},
 		"metadata_for": "10s", "report_for": "30s",
@@ -451,6 +477,52 @@ func (w *world) diskAnswer(name string) string {
 	return ""
 }
 
+// restoreAnswer is what a job's steps on a machine restored of its cache:
+// the step of the restore order, and the version it came from, or "".
+func (w *world) restoreAnswer(name string) (string, string) {
+	w.t.Helper()
+	for _, a := range w.act.stepAnswers(w.console(name)) {
+		if a.Path == "/v1/caches/restore" && a.Code == http.StatusOK {
+			step := a.Body["restored"].(string)
+			if objs, _ := a.Body["objects"].([]any); len(objs) > 0 {
+				obj, _ := objs[0].(map[string]any)
+				n, _ := obj["name"].(string)
+				return step, versionOf(n)
+			}
+			return step, ""
+		}
+	}
+	w.t.Fatalf("the job on %s never restored its cache:\n%s", name, w.console(name))
+	return "", ""
+}
+
+// savedVersion is the version a job's steps on a machine saved of a cache,
+// by the prefix the service gave it, once they committed it.
+func (w *world) savedVersion(name string) string {
+	w.t.Helper()
+	version := ""
+	for _, a := range w.act.stepAnswers(w.console(name)) {
+		switch {
+		case a.Path == "/v1/caches/save" && a.Code == http.StatusOK && a.Body["saves"] == true:
+			version = versionOf(a.Body["prefix"].(string))
+		case a.Path == "/v1/caches/commit" && a.Code == http.StatusOK && version != "":
+			return version
+		}
+	}
+	w.t.Fatalf("the job on %s never saved a cache:\n%s", name, w.console(name))
+	return ""
+}
+
+// versionOf is the version an object name or prefix in the caches' bucket
+// is of: <repository ID>/<version>/<object>.
+func versionOf(name string) string {
+	parts := strings.Split(name, "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[1]
+}
+
 func (w *world) post(path, token string, body any) (int, map[string]any) {
 	w.t.Helper()
 	b, _ := json.Marshal(body)
@@ -541,8 +613,34 @@ func (w *world) gone(name string) bool {
 	return true
 }
 
-// saved are the saved disks and resume images there are, by name.
-func (w *world) saved() map[string]gceemu.ImageState {
+// caches are the ready cache versions the state bucket records, by
+// version.
+func (w *world) caches() map[string]disks.Image {
+	out := map[string]disks.Image{}
+	for _, n := range w.gcs.Names("state") {
+		if !strings.HasPrefix(n, "caches/"+strconv.Itoa(repoID)+"/") {
+			continue
+		}
+		data, _, _ := w.gcs.Object("state", n)
+		var im disks.Image
+		if json.Unmarshal(data, &im) == nil && im.Kind == disks.KindCache && im.State == disks.ImageReady {
+			out[im.Image] = im
+		}
+	}
+	return out
+}
+
+// cacheObjects are the versions the caches' bucket holds objects of.
+func (w *world) cacheObjects() map[string]bool {
+	out := map[string]bool{}
+	for _, n := range w.gcs.Names(service.CachesBucket) {
+		out[versionOf(n)] = true
+	}
+	return out
+}
+
+// images are the resume images there are, by name.
+func (w *world) images() map[string]gceemu.ImageState {
 	out := map[string]gceemu.ImageState{}
 	for _, im := range w.gce.Images() {
 		if !strings.HasPrefix(im.Name, "lsr-base-") {
@@ -603,16 +701,17 @@ func (w *world) noCredentials(secrets ...string) {
 }
 
 // specs/0002-machines.md, A machine's life: a job runs on a machine of its
-// selector, its check binds its run, it asks for its work disk and its save
-// in its steps, and its supervisor's report starts the machine's cleanup,
-// which saves the disk and the boot log.
+// selector, its check binds its run, it asks for its work disk and restores
+// and saves its cache in its steps, and its supervisor's report starts the
+// machine's cleanup, which saves the boot log, and a pass, which makes the
+// cache's version ready once GitHub shows the job succeeded.
 func TestAJobRunsOnItsMachine(t *testing.T) {
 	w := newWorld(t)
 	run := w.gh.PushRun(w.repo, "main")
 	// Nothing binds the run before its first job's check, and nothing is
 	// attached before the job asks.
 	j := w.gh.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{w.act.selector(small, false)},
-		Steps: w.act.steps(w.act.noDiskYetStep(), w.act.diskStep("build"), w.act.saveStep())})
+		Steps: w.act.steps(w.act.noDiskYetStep(), w.act.diskStep(), w.act.restoreStep("build"), w.act.saveStep("build"))})
 	w.pass()
 	ms := w.ours()
 	if len(ms) != 1 {
@@ -624,23 +723,28 @@ func TestAJobRunsOnItsMachine(t *testing.T) {
 	}
 	w.eventually("the job is done", 60*time.Second, func() bool { return w.done(j) })
 	if got := w.gh.Job(j.ID); got.Conclusion != "success" {
-		t.Fatalf("job %s; its steps should have had their work disk and save:\n%s", got.Conclusion, w.console(m.Name))
+		t.Fatalf("job %s; its steps should have had their work disk, restore and save:\n%s", got.Conclusion, w.console(m.Name))
 	}
 	if s := w.scope(run); s != "main" {
 		t.Fatalf("the job's check bound the run %q, want main", s)
 	}
 	if got := w.diskAnswer(m.Name); got != "none" {
-		t.Fatalf("main's first work disk was restored from %q, want none", got)
+		t.Fatalf("main's first work disk came from %q, want none", got)
+	}
+	if got, _ := w.restoreAnswer(m.Name); got != "none" {
+		t.Fatalf("main's first restore of its cache was from %q, want none", got)
 	}
 	var saves []stepAnswer
 	for _, a := range w.act.stepAnswers(w.console(m.Name)) {
-		if a.Path == "/v1/disks/save" {
+		if a.Path == "/v1/caches/save" || a.Path == "/v1/caches/commit" {
 			saves = append(saves, a)
 		}
 	}
-	if len(saves) != 1 || saves[0].Code != http.StatusOK || saves[0].Body["saves"] != true {
-		t.Fatalf("save answers = %+v", saves)
+	if len(saves) != 2 || saves[0].Code != http.StatusOK || saves[0].Body["saves"] != true || saves[1].Code != http.StatusOK ||
+		saves[1].Body["objects"] != float64(1) {
+		t.Fatalf("save and commit answers = %+v", saves)
 	}
+	version := w.savedVersion(m.Name)
 	// The report starts a pass at once, which deletes the machine and its
 	// records, so what the report did is read from the service's log.
 	w.eventually("the supervisor reports", 30*time.Second, func() bool {
@@ -656,8 +760,18 @@ func TestAJobRunsOnItsMachine(t *testing.T) {
 	if n := len(w.gce.Disks()); n != 0 {
 		t.Fatalf("%d disks left", n)
 	}
-	if !strings.Contains(w.logs.String(), `msg="work disk saved" machine=`+m.Name) || len(w.saved()) != 1 {
-		t.Fatalf("the save the job asked for wasn't made: images %v", w.saved())
+	// The job's cache is its upload, and no image is made of its disk.
+	w.eventually("the job's cache is saved", 30*time.Second, func() bool {
+		w.pass()
+		_, ok := w.caches()[version]
+		return ok
+	})
+	if got := w.caches(); len(got) != 1 || got[version].Cache != "build" || got[version].Scope != "main" || len(got[version].Objects) != 1 ||
+		!w.cacheObjects()[version] {
+		t.Fatalf("the cache the job saved: %+v, objects of %v", got, w.cacheObjects())
+	}
+	if len(w.images()) != 0 {
+		t.Fatalf("images %v; a job's work disk is never saved", w.images())
 	}
 	// Its boot log is read from Cloud Logging once the machine has gone.
 	var log []byte
@@ -720,7 +834,7 @@ func TestAJobFailedWithItsReason(t *testing.T) {
 
 // specs/0002-machines.md, A machine's life: machines are general, so a job
 // may take a machine made for another run's job, and is admitted, bound and
-// given its work disk for its own run.
+// given its work disk and its cache for its own run.
 func TestAJobTakesAMachineMadeForAnotherRunsJob(t *testing.T) {
 	w := newWorld(t)
 	w.holdBoots()
@@ -728,7 +842,7 @@ func TestAJobTakesAMachineMadeForAnotherRunsJob(t *testing.T) {
 	w.repo.Commit("feature", map[string]string{"f": "1"})
 	p := w.gh.PullRequest(w.repo, "main", w.repo, "feature", w.maintainer)
 	pr := w.gh.PullRequestRun(p)
-	steps := w.act.steps(w.act.diskStep("build"))
+	steps := w.act.steps(w.act.diskStep(), w.act.restoreStep("build"))
 	first := w.gh.Queue(main, ghemu.JobSpec{Name: "build", Labels: []string{small}, Steps: steps})
 	second := w.gh.Queue(pr, ghemu.JobSpec{Name: "build", Labels: []string{small}, Steps: steps})
 	w.pass()
@@ -755,17 +869,28 @@ func TestAJobTakesAMachineMadeForAnotherRunsJob(t *testing.T) {
 	if s := w.scope(pr); s != "pr"+strconv.Itoa(p.Number) {
 		t.Fatalf("the pull request's run bound %q", s)
 	}
-	// Each job was admitted, and its work disk chosen, for its own run.
+	// Each job was admitted, and its cache's restore chosen, for its own
+	// run, in its run's scope.
 	logs := w.logs.String()
 	for _, c := range []struct {
 		machine string
 		run     *ghemu.Run
-	}{{forSecond, main}, {forFirst, pr}} {
-		for _, msg := range []string{`msg="job admitted"`, `msg="work disk starts empty: no saved disk to restore"`} {
-			if !strings.Contains(logs, msg+" machine="+c.machine+" repository_id=5001 run_id="+strconv.FormatInt(c.run.ID, 10)) &&
-				!strings.Contains(logs, msg+" machine="+c.machine+" run_id="+strconv.FormatInt(c.run.ID, 10)) {
-				t.Fatalf("no %s for run %d on %s", msg, c.run.ID, c.machine)
-			}
+		scope   string
+	}{{forSecond, main, "main"}, {forFirst, pr, "pr" + strconv.Itoa(p.Number)}} {
+		run := " run_id=" + strconv.FormatInt(c.run.ID, 10)
+		if !strings.Contains(logs, `msg="job admitted" machine=`+c.machine+" repository_id=5001"+run) &&
+			!strings.Contains(logs, `msg="job admitted" machine=`+c.machine+run) {
+			t.Fatalf("run %d's job wasn't admitted on %s", c.run.ID, c.machine)
+		}
+		chosen := false
+		for _, l := range strings.Split(logs, "\n") {
+			chosen = chosen || (strings.Contains(l, `msg="restore choice" repository_id=5001`+run+" ") && strings.Contains(l, " scope="+c.scope+" "))
+		}
+		if !chosen {
+			t.Fatalf("no restore choice for run %d in %s", c.run.ID, c.scope)
+		}
+		if got, _ := w.restoreAnswer(c.machine); got != "none" {
+			t.Fatalf("run %d's job on %s restored from %q, want none", c.run.ID, c.machine, got)
 		}
 	}
 	w.noCredentials()
@@ -880,17 +1005,26 @@ func TestAnApprovedContribution(t *testing.T) {
 	if s := w.scope(run); s != "pr"+strconv.Itoa(p.Number) {
 		t.Fatalf("the approved contribution bound %q", s)
 	}
-	// Its next job asks for a work disk, in the pull request's scope.
+	// Its next job asks for a work disk, and restores and saves its cache,
+	// in the pull request's scope.
 	next := w.gh.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{w.act.selector(small, false)},
-		Steps: w.act.steps(w.act.diskStep("build"), w.act.saveStep())})
+		Steps: w.act.steps(w.act.diskStep(), w.act.restoreStep("build"), w.act.saveStep("build"))})
 	w.pass()
 	w.eventually("the contribution's build runs", 60*time.Second, func() bool { return w.done(next) })
 	if c := w.gh.Job(next.ID).Conclusion; c != "success" {
 		t.Fatalf("the contribution's build: %s", c)
 	}
 	if got := w.diskAnswer(w.runnerOf(next)); got != "none" {
-		t.Fatalf("the contribution's disk was restored from %q, want none", got)
+		t.Fatalf("the contribution's disk came from %q, want none", got)
 	}
+	if got, _ := w.restoreAnswer(w.runnerOf(next)); got != "none" {
+		t.Fatalf("the contribution's cache was restored from %q, want none", got)
+	}
+	version := w.savedVersion(w.runnerOf(next))
+	w.eventually("the contribution's cache is saved", 30*time.Second, func() bool {
+		w.pass()
+		return w.caches()[version].Scope == "pr"+strconv.Itoa(p.Number)
+	})
 	w.noCredentials()
 }
 
@@ -926,11 +1060,11 @@ func TestTheHookWaitsForAnAnswer(t *testing.T) {
 	}
 }
 
-// restored is the image the service logged a machine's work disk was
-// restored from, or "".
-func (w *world) restored(machine string) string {
+// resumedFrom is the resume image the service logged a machine's work disk
+// was made from, or "".
+func (w *world) resumedFrom(machine string) string {
 	for _, l := range strings.Split(w.logs.String(), "\n") {
-		if strings.Contains(l, "machine="+machine+" ") && (strings.Contains(l, `msg="work disk restored"`) || strings.Contains(l, `msg="work disk from a resume image"`)) {
+		if strings.Contains(l, "machine="+machine+" ") && strings.Contains(l, `msg="work disk from a resume image"`) {
 			if _, img, ok := strings.Cut(l, " image="); ok {
 				return strings.Fields(img)[0]
 			}
@@ -940,7 +1074,8 @@ func (w *world) restored(machine string) string {
 }
 
 // runJob queues a job, gives it a machine, and waits for it to finish
-// successfully and its machine to go, returning the machine it ran on.
+// successfully and its machine to go, and for a pass, which makes what it
+// saved ready, returning the machine it ran on.
 func (w *world) runJob(run *ghemu.Run, spec ghemu.JobSpec) string {
 	w.t.Helper()
 	j := w.gh.Queue(run, spec)
@@ -951,91 +1086,103 @@ func (w *world) runJob(run *ghemu.Run, spec ghemu.JobSpec) string {
 		w.t.Fatalf("job %s:\n%s", c, w.console(name))
 	}
 	w.eventually("its machine is deleted", 60*time.Second, func() bool { return w.gone(name) })
+	w.pass()
 	return name
 }
 
-// specs/0003-disks.md, Saved disks: a pull request's run is bound from
-// GitHub's records, its job's work disk starts from main's saved disk, its
-// save is its own, and its next run starts from it, while main's goes on
-// from main's.
+// specs/0003-disks.md, Caches: a pull request's run is bound from GitHub's
+// records, its job restores main's version of its cache, its save is its
+// own, and its next run restores it, while main's goes on from main's.
 func TestAPullRequestsRunThroughToItsSaves(t *testing.T) {
 	w := newWorld(t)
-	build := func(run *ghemu.Run) ghemu.JobSpec {
+	build := func() ghemu.JobSpec {
 		return ghemu.JobSpec{Name: "build", Labels: []string{w.act.selector(small, false)},
-			Steps: w.act.steps(w.act.diskStep("build"), w.act.saveStep())}
+			Steps: w.act.steps(w.act.diskStep(), w.act.restoreStep("build"), w.act.saveStep("build"))}
 	}
 	// Main saves first.
-	main := w.gh.PushRun(w.repo, "main")
-	if got := w.diskAnswer(w.runJob(main, build(main))); got != "none" {
-		t.Fatalf("main's first disk was restored from %q", got)
+	m := w.runJob(w.gh.PushRun(w.repo, "main"), build())
+	if got, _ := w.restoreAnswer(m); got != "none" {
+		t.Fatalf("main's first restore was from %q", got)
 	}
-	mains := w.saved()
-	if len(mains) != 1 {
-		t.Fatalf("images %v, want main's", mains)
-	}
-	var mainImage string
-	for n := range mains {
-		mainImage = n
+	mainVersion := w.savedVersion(m)
+	if got := w.caches(); len(got) != 1 || got[mainVersion].Scope != "main" {
+		t.Fatalf("caches %v, want main's %s", got, mainVersion)
 	}
 
-	// A pull request starts from main's, and saves its own.
+	// A pull request restores main's, and saves its own.
 	w.repo.Commit("feature", map[string]string{"x": "1"})
 	p := w.gh.PullRequest(w.repo, "main", w.repo, "feature", w.maintainer)
 	run := w.gh.PullRequestRun(p)
-	m := w.runJob(run, build(run))
+	m = w.runJob(run, build())
 	if s := w.scope(run); s != "pr"+strconv.Itoa(p.Number) {
 		t.Fatalf("the pull request's run bound %s", s)
 	}
-	if got, img := w.diskAnswer(m), w.restored(m); got != "main_exact" || img != mainImage {
-		t.Fatalf("the pull request's job restored %q from %q, want main's %s", got, img, mainImage)
+	if !w.restoredFrom(m, "main_exact", mainVersion) {
+		t.Fatal("the pull request's job didn't restore main's version")
 	}
-	var prImage string
-	for n := range w.saved() {
-		if n != mainImage {
-			prImage = n
-		}
-	}
-	if prImage == "" || len(w.saved()) != 2 {
-		t.Fatalf("images %v; the pull request's save is missing", w.saved())
+	prVersion := w.savedVersion(m)
+	if got := w.caches(); len(got) != 2 || got[prVersion].Scope != "pr"+strconv.Itoa(p.Number) || !w.cacheObjects()[prVersion] {
+		t.Fatalf("caches %v; the pull request's save is missing", got)
 	}
 
-	// Its next run starts from its own; main's next run from main's.
+	// Its next run restores its own; main's next run main's.
 	next := w.gh.PullRequestRun(p)
-	if m := w.runJob(next, build(next)); w.diskAnswer(m) != "pull_request_exact" || w.restored(m) != prImage {
-		t.Fatalf("the pull request's next run restored %q from %q, want %s", w.diskAnswer(m), w.restored(m), prImage)
+	if !w.restoredFrom(w.runJob(next, build()), "pull_request_exact", prVersion) {
+		t.Fatal("the pull request's next run didn't restore its own version")
 	}
 	again := w.gh.PushRun(w.repo, "main")
-	if m := w.runJob(again, build(again)); w.diskAnswer(m) != "main_exact" || w.restored(m) != mainImage {
-		t.Fatalf("main restored %q from %q, want its own %s", w.diskAnswer(m), w.restored(m), mainImage)
+	if !w.restoredFrom(w.runJob(again, build()), "main_exact", mainVersion) {
+		t.Fatal("main's next run didn't restore its own version")
 	}
 	w.noCredentials()
 }
 
-// specs/0003-disks.md, Deletion: main's saved disk is kept while the default
-// branch's .github/runners.json declares its family, a file that isn't
-// valid deletes nothing, and removing the declaration deletes it at the
-// next pass; declared again, the family starts afresh.
-func TestRemovingADeclarationDeletesItsDisks(t *testing.T) {
+// restoredFrom reports whether the job on a machine restored its cache at a
+// step from a version, and downloaded what it saved, logging what it did if
+// not.
+func (w *world) restoredFrom(machine, step, version string) bool {
+	w.t.Helper()
+	got, v := w.restoreAnswer(machine)
+	if got != step || v != version {
+		w.t.Logf("the job on %s restored %q from %q, want %q from %q", machine, got, v, step, version)
+		return false
+	}
+	data, err := os.ReadFile(filepath.Join(w.guest(machine).dir, "work", "caches", "build", "shard-000.tar.zst"))
+	if err != nil || !strings.HasPrefix(string(data), "build of run ") {
+		w.t.Logf("the job on %s downloaded %q, %v", machine, data, err)
+		return false
+	}
+	return true
+}
+
+// specs/0003-disks.md, Deletion: main's cache is kept while the default
+// branch's .github/runners.json declares it, a file that isn't valid
+// deletes nothing, and removing the declaration deletes it, its objects and
+// its record, at the next pass; declared again, the cache starts afresh.
+func TestRemovingADeclarationDeletesItsCaches(t *testing.T) {
 	w := newWorld(t)
 	build := ghemu.JobSpec{Name: "build", Labels: []string{w.act.selector(small, false)},
-		Steps: w.act.steps(w.act.diskStep("build"), w.act.saveStep())}
-	w.runJob(w.gh.PushRun(w.repo, "main"), build)
-	if len(w.saved()) != 1 {
-		t.Fatalf("images %v, want main's", w.saved())
+		Steps: w.act.steps(w.act.diskStep(), w.act.restoreStep("build"), w.act.saveStep("build"))}
+	version := w.savedVersion(w.runJob(w.gh.PushRun(w.repo, "main"), build))
+	if _, ok := w.caches()[version]; !ok || !w.cacheObjects()[version] {
+		t.Fatalf("caches %v, objects of %v, want main's %s", w.caches(), w.cacheObjects(), version)
 	}
-	w.repo.Commit("main", map[string]string{".github/runners.json": `{"disks": {"build": {}}, "images": {}}`})
+	w.repo.Commit("main", map[string]string{".github/runners.json": `{"caches": {"build": {}}, "disks": {}}`})
 	w.pass()
-	if len(w.saved()) != 1 {
-		t.Fatalf("images %v; a file that isn't valid deleted main's disk", w.saved())
+	if _, ok := w.caches()[version]; !ok || !w.cacheObjects()[version] {
+		t.Fatalf("caches %v; a file that isn't valid deleted main's cache", w.caches())
 	}
-	w.repo.Commit("main", map[string]string{".github/runners.json": `{"disks": {}}`})
+	w.repo.Commit("main", map[string]string{".github/runners.json": `{"caches": {}}`})
 	w.pass()
-	if len(w.saved()) != 0 {
-		t.Fatalf("images %v; main's disk outlived its family's declaration", w.saved())
+	if len(w.caches()) != 0 || len(w.cacheObjects()) != 0 {
+		t.Fatalf("caches %v, objects of %v; main's cache outlived its declaration", w.caches(), w.cacheObjects())
+	}
+	if _, _, ok := w.gcs.Object("state", "caches/"+strconv.Itoa(repoID)+"/"+version+".json"); ok {
+		t.Fatal("the deleted version's record is left")
 	}
 	w.repo.Commit("main", files)
-	if got := w.diskAnswer(w.runJob(w.gh.PushRun(w.repo, "main"), build)); got != "none" {
-		t.Fatalf("a family declared again restored from %q", got)
+	if got, _ := w.restoreAnswer(w.runJob(w.gh.PushRun(w.repo, "main"), build)); got != "none" {
+		t.Fatalf("a cache declared again restored from %q", got)
 	}
 }
 
@@ -1048,7 +1195,7 @@ func TestASpotMachinePreemptedMidJobAndItsRunResumed(t *testing.T) {
 	label := w.act.selector(small, true)
 	// The first attempt runs until it's preempted; its rerun finishes.
 	j := w.gh.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{label},
-		Steps: w.act.steps(w.act.diskStep("build"), `if [ "$GITHUB_RUN_ATTEMPT" = 1 ]; then sleep 600; fi`)})
+		Steps: w.act.steps(w.act.diskStep(), `if [ "$GITHUB_RUN_ATTEMPT" = 1 ]; then sleep 600; fi`)})
 	w.pass()
 	m := w.ours()[0]
 	if m.Provisioning != "SPOT" {
@@ -1080,7 +1227,7 @@ func TestASpotMachinePreemptedMidJobAndItsRunResumed(t *testing.T) {
 	resume := disks.ResumeName(repoID, m.ID)
 	w.eventually("the run is rerun, with a resume image", 60*time.Second, func() bool {
 		w.pass()
-		_, ok := w.saved()[resume]
+		_, ok := w.images()[resume]
 		status, _ := w.gh.RunState(run)
 		return ok && status == "in_progress"
 	})
@@ -1103,12 +1250,12 @@ func TestASpotMachinePreemptedMidJobAndItsRunResumed(t *testing.T) {
 	if c := w.gh.Job(rerun.ID).Conclusion; c != "success" {
 		t.Fatalf("the rerun's job: %s", c)
 	}
-	if got, img := w.diskAnswer(second), w.restored(second); got != "resume" || img != resume {
+	if got, img := w.diskAnswer(second), w.resumedFrom(second); got != "resume" || img != resume {
 		t.Fatalf("the rerun's job started from %q, %q, want its resume image %s", got, img, resume)
 	}
 	w.eventually("the resume image goes once its job has started from it", 60*time.Second, func() bool {
 		w.pass()
-		_, ok := w.saved()[resume]
+		_, ok := w.images()[resume]
 		return !ok
 	})
 	w.noCredentials()
@@ -1124,7 +1271,7 @@ func TestAJobStoppedAtTheAgeLimitAndItsRunResumed(t *testing.T) {
 	// The first attempt runs until its machine reaches the age limit; its
 	// rerun finishes.
 	j := w.gh.Queue(run, ghemu.JobSpec{Name: "build", Labels: []string{w.act.selector(small, false)},
-		Steps: w.act.steps(w.act.diskStep("build"), `if [ "$GITHUB_RUN_ATTEMPT" = 1 ]; then sleep 600; fi`)})
+		Steps: w.act.steps(w.act.diskStep(), `if [ "$GITHUB_RUN_ATTEMPT" = 1 ]; then sleep 600; fi`)})
 	w.pass()
 	m := w.ours()[0]
 	if m.Provisioning != "STANDARD" {
@@ -1144,8 +1291,8 @@ func TestAJobStoppedAtTheAgeLimitAndItsRunResumed(t *testing.T) {
 		t.Fatal("a machine past its age limit wasn't deleted")
 	}
 	resume := disks.ResumeName(repoID, m.ID)
-	if _, ok := w.saved()[resume]; !ok {
-		t.Fatalf("images %v; want the resume image %s", w.saved(), resume)
+	if _, ok := w.images()[resume]; !ok {
+		t.Fatalf("images %v; want the resume image %s", w.images(), resume)
 	}
 	rec, _, ok := w.gcs.Object("state", "preemptions/5001/"+strconv.FormatInt(run.ID, 10)+"/"+strconv.FormatUint(m.ID, 10)+".json")
 	if !ok || !strings.Contains(string(rec), `"age_limit":true`) || !strings.Contains(string(rec), `"preempted":"no"`) {
@@ -1173,12 +1320,12 @@ func TestAJobStoppedAtTheAgeLimitAndItsRunResumed(t *testing.T) {
 	if c := w.gh.Job(rerun.ID).Conclusion; c != "success" {
 		t.Fatalf("the rerun's job: %s", c)
 	}
-	if got, img := w.diskAnswer(second), w.restored(second); got != "resume" || img != resume {
+	if got, img := w.diskAnswer(second), w.resumedFrom(second); got != "resume" || img != resume {
 		t.Fatalf("the rerun's job started from %q, %q, want its resume image %s", got, img, resume)
 	}
 	w.eventually("the resume image goes once its job has started from it", 60*time.Second, func() bool {
 		w.pass()
-		_, ok := w.saved()[resume]
+		_, ok := w.images()[resume]
 		return !ok
 	})
 	w.noCredentials()

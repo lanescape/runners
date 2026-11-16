@@ -165,8 +165,8 @@ func (s *Service) tidy(ctx context.Context, inv *inventory, m Machine) {
 				return
 			}
 			preempted := m.Spot && s.preempted(ctx, m)
-			if err := s.Preemptions.Stopped(ctx, a.Resolve(m, inv.disk(m.Name)), a, preempted, true); err != nil {
-				s.log().Warn("recording a machine stopped at its age limit; it waits for its record", "machine", m.Name, "err", err.Error())
+			if err := s.Preemptions.Stopped(ctx, a.Resolve(m), a, preempted, true); err != nil {
+				s.pending(err, "recording a machine stopped at its age limit; it waits for its record", "machine", m.Name)
 				return
 			}
 			s.finish(ctx, inv, m, "past "+MaxAge.String()+", its job recorded to resume, saving nothing", nil)
@@ -560,8 +560,8 @@ func (s *Service) claim(ctx context.Context, m Machine, why string) (Admission, 
 func (s *Service) stoppedSpot(ctx context.Context, inv *inventory, m Machine, a Admission) {
 	preempted := s.preempted(ctx, m)
 	if s.Preemptions != nil {
-		if err := s.Preemptions.Stopped(ctx, a.Resolve(m, inv.disk(m.Name)), a, preempted, false); err != nil {
-			s.log().Warn("recording a stopped Spot machine", "machine", m.Name, "err", err.Error())
+		if err := s.Preemptions.Stopped(ctx, a.Resolve(m), a, preempted, false); err != nil {
+			s.pending(err, "recording a stopped Spot machine; it waits for its record", "machine", m.Name)
 			return
 		}
 	}
@@ -572,6 +572,18 @@ func (s *Service) stoppedSpot(ctx context.Context, inv *inventory, m Machine, a 
 	s.finish(ctx, inv, m, why, nil)
 }
 
+// pending logs why a machine waits for a later pass: as information while
+// what it waits for is only not done yet, such as an image Compute Engine is
+// still making, and as a warning when something went wrong.
+func (s *Service) pending(err error, msg string, args ...any) {
+	args = append(args, "err", err.Error())
+	if errors.Is(err, ErrPending) {
+		s.log().Info(msg, args...)
+		return
+	}
+	s.log().Warn(msg, args...)
+}
+
 // preempted reports whether Compute Engine's zone operations show it
 // preempted a machine.
 func (s *Service) preempted(ctx context.Context, m Machine) bool {
@@ -579,38 +591,12 @@ func (s *Service) preempted(ctx context.Context, m Machine) bool {
 	return err == nil && slices.Contains(ids, m.ID)
 }
 
-// finish ends a machine's life: once its supervisor has reported, it saves
-// the work disk if the job asked and the job and scope allow; then it saves
-// the boot log, and deletes the machine and its disks, then their records.
-// No report means no save.
+// finish ends a machine's life: it saves the boot log, and deletes the
+// machine and its disks, then their records. A job saves what it keeps in
+// its own steps, as caches (specs/0003-disks.md, Caches); nothing of the
+// machine is saved.
 func (s *Service) finish(ctx context.Context, inv *inventory, m Machine, why string, rep *Report) {
 	log := s.log().With("machine", m.Name, "repository_id", m.RepositoryID)
-	if _, asked := inv.saves[m.Name]; rep != nil && asked {
-		if save, err := s.saves(ctx, inv, m); err != nil {
-			log.Warn("deciding whether to save a work disk", "err", err.Error())
-			return
-		} else if save {
-			if s.Saves == nil {
-				log.Warn("the job asked to save its work disk, but this service saves no disks; deleting it")
-			} else {
-				if !m.Stopped() {
-					// The disk is saved from the stopped machine. The
-					// report says the job is done, and the supervisor
-					// powers the machine off next; the service stops it
-					// itself rather than wait for the next pass.
-					if err := s.Compute.StopInstance(ctx, m.Zone, m.Name, s.requestID("stop", m.Name)); err != nil && !errors.Is(err, compute.ErrNotFound) {
-						log.Warn("stopping a reported machine to save its disk", "err", err.Error())
-						return
-					}
-				}
-				a := inv.admissions[m.Name]
-				if err := s.Saves.Save(ctx, a.Resolve(m, inv.disk(m.Name)), a); err != nil {
-					log.Warn("saving a work disk", "err", err.Error())
-					return
-				}
-			}
-		}
-	}
 	// The boot log is saved before the machine, its only copy, goes; a
 	// machine whose log can't be saved waits for a later pass, unless it's
 	// past its age limit.
@@ -677,33 +663,6 @@ func (s *Service) saveBootLog(ctx context.Context, m Machine) error {
 		return err
 	}
 	return nil
-}
-
-// saves reports whether a finished job's work disk is to be saved, once it
-// asked: the job succeeded, by GitHub's conclusion, its scope saves, and it
-// has a work disk, of a family, which its disk action asked for
-// (specs/0003-disks.md).
-func (s *Service) saves(ctx context.Context, inv *inventory, m Machine) (bool, error) {
-	a, ok := inv.admissions[m.Name]
-	if !ok || !a.Allowed || a.Unbound || !a.Scope.Saves() {
-		return false, nil
-	}
-	if sr := inv.saves[m.Name]; sr.JobID != a.JobID || !a.Resolve(m, inv.disk(m.Name)).Selector.HasDisk() {
-		return false, nil
-	}
-	repo, err := s.repository(ctx, inv, m.RepositoryID)
-	if err != nil {
-		return false, err
-	}
-	if repo.OwnerID != s.Config.Organization.ID {
-		// Transferred out of the organization: no longer a consumer.
-		return false, nil
-	}
-	job, err := s.GitHub.Job(ctx, repo, a.JobID)
-	if err != nil {
-		return false, err
-	}
-	return job.Status == "completed" && job.Conclusion == "success", nil
 }
 
 // dropRecords removes a deleted machine's records, and its work disk's,

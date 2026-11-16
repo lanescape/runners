@@ -17,22 +17,19 @@ import (
 )
 
 func tools(key, scope string) string {
-	return "lanescape-2vcpu-linux-amd64-disk-tools-" + key + "-" + scope
+	return "lanescape-2vcpu-linux-amd64-cache-tools-" + key + "-" + scope
 }
 
 // savePull runs one of a pull request's jobs that saves, and returns the
-// image.
+// version.
 func (e *env) savePull(p *ghemu.Pull, label string) string {
 	e.t.Helper()
-	before := e.images()
-	e.start(e.pullRun(p), ghemu.JobSpec{Name: "build", Labels: []string{label}}).finish(true)
-	return e.saved(before).Name
+	return e.save(e.pullRun(p), label)
 }
 
-func (e *env) has(image string) bool { _, ok := e.images()[image]; return ok }
-
-// Nothing goes for want of use or for its age: an open pull request's disk,
-// main's and a long-lived branch's stay, however long no one uses them.
+// Nothing goes for want of use or for its age: an open pull request's
+// version, main's and a long-lived branch's stay, however long no one uses
+// them.
 func TestNothingGoesForWantOfUseOrAge(t *testing.T) {
 	e := setup(t)
 	e.listV1()
@@ -45,20 +42,20 @@ func TestNothingGoesForWantOfUseOrAge(t *testing.T) {
 	if !e.has(m) || !e.has(b) || !e.has(pr) {
 		t.Fatalf("main's %v, the branch's %v, the open pull request's %v; want every one kept", e.has(m), e.has(b), e.has(pr))
 	}
-	if _, ok := e.images()[m].Labels["lsr-last-used"]; ok {
-		t.Fatal("a saved disk labelled with its last use")
+	if !e.ready(m) || !e.ready(b) || !e.ready(pr) {
+		t.Fatal("a version's record went for want of use")
 	}
 }
 
 // A pull request that closes, merged or not, has its whole scope deleted
 // at once; reopened, it starts again from main.
-func TestAClosedPullRequestsDisksGoAtOnce(t *testing.T) {
+func TestAClosedPullRequestsCachesGoAtOnce(t *testing.T) {
 	e := setup(t)
 	m := e.saveMain(key1)
 	p, run := e.pull()
 	pr := "pr" + strconv.Itoa(p.Number)
 	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, pr)}})
-	if src := jb.source(); src != m {
+	if src := jb.restored(); src != m {
 		t.Fatalf("restored %q, want main's %s", src, m)
 	}
 	jb.finish(false)
@@ -67,20 +64,20 @@ func TestAClosedPullRequestsDisksGoAtOnce(t *testing.T) {
 	e.gh.ClosePull(p)
 	e.pass()
 	if e.has(closed) || e.has(other) {
-		t.Fatal("a closed pull request's disks outlived it")
+		t.Fatal("a closed pull request's versions outlived it")
 	}
 	if !e.has(m) {
-		t.Fatal("main's disk went with the pull request")
+		t.Fatal("main's version went with the pull request")
 	}
 	e.gh.ReopenPull(p)
-	if src := e.start(e.pullRun(p), ghemu.JobSpec{Name: "build", Labels: []string{sel(key2, pr)}}).source(); src != m {
+	if src := e.start(e.pullRun(p), ghemu.JobSpec{Name: "build", Labels: []string{sel(key2, pr)}}).restored(); src != m {
 		t.Fatalf("a reopened pull request restored %q, want main's %s", src, m)
 	}
 }
 
-// A pull request keeps one disk of each family: saving one replaces its
-// others of that family, whatever their key, and no other family's.
-func TestAPullRequestKeepsOneDiskOfEachFamily(t *testing.T) {
+// A pull request keeps one version of each cache: saving one replaces its
+// others of that cache, whatever their key, and no other cache's.
+func TestAPullRequestKeepsOneVersionOfEachCache(t *testing.T) {
 	e := setup(t)
 	p, _ := e.pull()
 	pr := "pr" + strconv.Itoa(p.Number)
@@ -89,16 +86,16 @@ func TestAPullRequestKeepsOneDiskOfEachFamily(t *testing.T) {
 	e.clock.Advance(time.Minute)
 	second := e.savePull(p, sel(key2, pr))
 	if e.has(first) || !e.has(second) || !e.has(tool) {
-		t.Fatalf("first %v, second %v, tools %v; want the family's earlier disk replaced", e.has(first), e.has(second), e.has(tool))
+		t.Fatalf("first %v, second %v, tools %v; want the cache's earlier version replaced", e.has(first), e.has(second), e.has(tool))
 	}
-	// The restore order is unchanged: the family's one disk is its newest.
-	if src := e.start(e.pullRun(p), ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, pr)}}).source(); src != second {
+	// The restore order is unchanged: the cache's one version is its newest.
+	if src := e.start(e.pullRun(p), ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, pr)}}).restored(); src != second {
 		t.Fatalf("restored %q, want the pull request's newest %s", src, second)
 	}
 }
 
-// A save under a new key replaces main's disks of the family's older keys,
-// as it replaces older versions of its own, and no other family's
+// A save under a new key replaces main's versions of the cache's older
+// keys, as it replaces older versions of its own, and no other cache's
 // (specs/0003-disks.md, Deletion).
 func TestANewKeysSaveReplacesTheOldKeys(t *testing.T) {
 	e := setup(t)
@@ -113,17 +110,17 @@ func TestANewKeysSaveReplacesTheOldKeys(t *testing.T) {
 	k2 := e.saveMain(key2)
 	e.pass()
 	if e.has(again) || !e.has(k2) || !e.has(tool) {
-		t.Fatalf("key1 %v, key2 %v, tools %v; want the old key's disk replaced, and no other family's", e.has(again), e.has(k2), e.has(tool))
+		t.Fatalf("key1 %v, key2 %v, tools %v; want the old key's version replaced, and no other cache's", e.has(again), e.has(k2), e.has(tool))
 	}
 	// A pull request still of the old key starts from main's newest.
 	p, run := e.pull()
 	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "pr"+strconv.Itoa(p.Number))}})
-	if src := jb.source(); src != k2 {
+	if src := jb.restored(); src != k2 {
 		t.Fatalf("a pull request of the old key restored %q, want main's newest %s", src, k2)
 	}
 }
 
-// An open pull request that chose main's disk of an older key keeps it only
+// An open pull request that chose main's version of an older key keeps it only
 // while its run is unfinished: once a newer key's save replaces it, it goes
 // as soon as that run has finished, the pull request still open.
 func TestAnOpenPullRequestKeepsNoOlderKeyOfMains(t *testing.T) {
@@ -131,13 +128,13 @@ func TestAnOpenPullRequestKeepsNoOlderKeyOfMains(t *testing.T) {
 	k1 := e.saveMain(key1)
 	p, run := e.pull()
 	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, "pr"+strconv.Itoa(p.Number))}})
-	if jb.source() != k1 {
+	if jb.restored() != k1 {
 		t.Fatal("no restore")
 	}
 	e.clock.Advance(time.Minute)
 	e.saveMain(key2)
 	if !e.has(k1) {
-		t.Fatal("a newer key's save deleted the disk an unfinished run's choice names")
+		t.Fatal("a newer key's save deleted the version an unfinished run's choice names")
 	}
 	jb.finish(false)
 	e.eventually("the run is finished", func() bool { s, _ := e.gh.RunState(run); return s == "completed" })
@@ -147,21 +144,13 @@ func TestAnOpenPullRequestKeepsNoOlderKeyOfMains(t *testing.T) {
 	}
 }
 
-// saveMain with a full label.
-func (e *env) saveMainLabel(label string) string {
-	e.t.Helper()
-	before := e.images()
-	e.start(e.mainRun(), ghemu.JobSpec{Name: "build", Labels: []string{label}}).finish(true)
-	return e.saved(before).Name
-}
-
 func TestAPreemptedJobThatSucceededLetsItsRunsChoiceGo(t *testing.T) {
 	e := setup(t)
 	img := e.saveMain(key1)
 	run := e.mainRun()
-	label := "lanescape-2vcpu-linux-amd64-spot-disk-build-" + key1 + "-main"
+	label := "lanescape-2vcpu-linux-amd64-spot-cache-build-" + key1 + "-main"
 	jb := e.start(run, ghemu.JobSpec{Name: "build", Labels: []string{label}})
-	if jb.source() != img {
+	if jb.restored() != img {
 		t.Fatal("no restore")
 	}
 	// Preempted after its last step, with GitHub's success recorded.
@@ -173,7 +162,7 @@ func TestAPreemptedJobThatSucceededLetsItsRunsChoiceGo(t *testing.T) {
 	if e.attempt(run) != 1 {
 		t.Fatal("a run whose preempted job succeeded was rerun")
 	}
-	if _, ok := e.record("choices/5001/" + strconv.FormatInt(run.ID, 10) + "/" + choiceHash(label) + ".json"); ok {
+	if _, ok := e.record(e.choice(run, label)); ok {
 		t.Fatal("a finished run due no rerun kept its choice")
 	}
 }
@@ -187,12 +176,12 @@ func TestASaveDoesntDeleteWhatARunDueARerunChose(t *testing.T) {
 	m1 := e.saveMain(key1)
 	e.clock.Advance(time.Minute)
 	run := e.mainRun()
-	// Another push saves the family's new key; this run's lost job chose
+	// Another push saves the cache's new key; this run's lost job chose
 	// the old.
 	saver := e.start(e.mainRun(), ghemu.JobSpec{Name: "build", Labels: []string{sel(key2, "main")}})
-	lost := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{"lanescape-2vcpu-linux-amd64-spot-disk-build-" + key1 + "-main"}})
-	if lost.source() != m1 {
-		t.Fatal("the run's lost job didn't restore main's disk")
+	lost := e.start(run, ghemu.JobSpec{Name: "test", Labels: []string{"lanescape-2vcpu-linux-amd64-spot-cache-build-" + key1 + "-main"}})
+	if lost.restored() != m1 {
+		t.Fatal("the run's lost job didn't restore main's version")
 	}
 	if err := e.gce.Preempt(lost.in.Zone, lost.in.Name); err != nil {
 		t.Fatal(err)
@@ -200,16 +189,17 @@ func TestASaveDoesntDeleteWhatARunDueARerunChose(t *testing.T) {
 	e.gh.CompleteJobByID(lost.j.ID, "failure")
 	saver.finish(true)
 	if !e.has(m1) {
-		t.Fatal("a save deleted the disk that a run due a rerun chose")
+		t.Fatal("a save deleted the version that a run due a rerun chose")
 	}
 	if e.attempt(run) != 2 {
 		t.Fatal("the run wasn't rerun")
 	}
 }
 
-// A pull request closed while a run's choice holds one of its disks keeps
-// the disk only for that run: reopened, its new runs start again from
-// main's, and the disk goes once the run that chose it has finished.
+// A pull request closed while a run's choice holds one of its versions
+// keeps the version only for that run: reopened, its new runs start again
+// from main's, and the version goes once the run that chose it has
+// finished.
 func TestAReopenedPullRequestNeverRestoresWhatItsEarlierRunsSaved(t *testing.T) {
 	e := setup(t)
 	m := e.saveMain(key1)
@@ -217,22 +207,22 @@ func TestAReopenedPullRequestNeverRestoresWhatItsEarlierRunsSaved(t *testing.T) 
 	pr := "pr" + strconv.Itoa(p.Number)
 	img := e.savePull(p, sel(key1, pr))
 	jb := e.start(e.pullRun(p), ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, pr)}})
-	if jb.source() != img {
-		t.Fatal("no restore of the pull request's own disk")
+	if jb.restored() != img {
+		t.Fatal("no restore of the pull request's own version")
 	}
 	e.gh.ClosePull(p)
 	e.pass()
 	if !e.has(img) {
-		t.Fatal("a disk an unfinished run's choice names was deleted")
+		t.Fatal("a version an unfinished run's choice names was deleted")
 	}
 	e.gh.ReopenPull(p)
-	if src := e.start(e.pullRun(p), ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, pr)}}).source(); src != m {
+	if src := e.start(e.pullRun(p), ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, pr)}}).restored(); src != m {
 		t.Fatalf("a reopened pull request restored %q, want main's %s", src, m)
 	}
 	jb.finish(false)
 	e.pass()
 	if e.has(img) {
-		t.Fatal("a disk saved before its pull request closed outlived the run that chose it")
+		t.Fatal("a version saved before its pull request closed outlived the run that chose it")
 	}
 }
 
@@ -244,7 +234,7 @@ func TestASupersededVersionGoesOnceNoChoiceNamesIt(t *testing.T) {
 	old := e.saveMain(key1)
 	run := e.mainRun()
 	first := e.start(run, ghemu.JobSpec{Name: "a", Labels: []string{sel(key1, "main")}})
-	if first.source() != old {
+	if first.restored() != old {
 		t.Fatal("no restore")
 	}
 	e.clock.Advance(time.Minute)
@@ -252,7 +242,7 @@ func TestASupersededVersionGoesOnceNoChoiceNamesIt(t *testing.T) {
 	// Weeks later, the run's next job uses the old version, by its choice.
 	e.clock.Advance(60 * 24 * time.Hour)
 	second := e.start(run, ghemu.JobSpec{Name: "b", Labels: []string{sel(key1, "main")}})
-	if second.source() != old {
+	if second.restored() != old {
 		t.Fatal("the run's second job didn't start from its run's choice")
 	}
 	// The first job's machine went past its age limit long ago.
@@ -266,7 +256,7 @@ func TestASupersededVersionGoesOnceNoChoiceNamesIt(t *testing.T) {
 	e.clock.Advance(1000 * 24 * time.Hour)
 	e.pass()
 	if !e.has(newer) {
-		t.Fatal("a family's newest disk went for want of use")
+		t.Fatal("a cache's newest version went for want of use")
 	}
 }
 
@@ -289,12 +279,12 @@ func TestARetiredRunsLateSaveReplacesNothing(t *testing.T) {
 		t.Fatal("the retired run's late save wasn't made and deleted")
 	}
 	if !e.has(fresh) {
-		t.Fatal("a retired run's late save replaced the reopened pull request's disk")
+		t.Fatal("a retired run's late save replaced the reopened pull request's version")
 	}
-	// The pull request's first disk, which the late run's choice kept, goes
-	// too, replaced by the reopened pull request's.
-	if len(e.images()) != 1 {
-		t.Fatalf("images %v; want only the reopened pull request's disk", e.images())
+	// The pull request's first version, which the late run's choice kept,
+	// goes too, replaced by the reopened pull request's.
+	if len(e.versions()) != 1 {
+		t.Fatalf("versions %v; want only the reopened pull request's", e.versions())
 	}
 }
 
@@ -326,11 +316,11 @@ func TestAClosingIsRecordedFromItsDelivery(t *testing.T) {
 		t.Fatal("another organization's closing was recorded")
 	}
 	e.clock.Advance(time.Minute)
-	if src := e.start(e.pullRun(p), ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, pr)}}).source(); src != m {
+	if src := e.start(e.pullRun(p), ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, pr)}}).restored(); src != m {
 		t.Fatalf("a pull request reopened before a pass restored %q, want main's %s", src, m)
 	}
 	if e.has(img) {
-		t.Fatal("a disk saved before its pull request's closing outlived it")
+		t.Fatal("a version saved before its pull request's closing outlived it")
 	}
 }
 
@@ -360,7 +350,7 @@ func TestAClosureOnlyMovesForward(t *testing.T) {
 }
 
 // A closing recorded after a pass has read the closures, while it decides
-// what's replaced, keeps a disk a reopened pull request saved that a retired
+// what's replaced, keeps a version a reopened pull request saved that a retired
 // run's late save would otherwise replace.
 func TestAClosingDuringAPassKeepsWhatARetiredSaveWouldReplace(t *testing.T) {
 	e := setup(t)
@@ -370,16 +360,16 @@ func TestAClosingDuringAPassKeepsWhatARetiredSaveWouldReplace(t *testing.T) {
 	late := e.start(e.pullRun(p), ghemu.JobSpec{Name: "build", Labels: []string{sel(key2, pr)}})
 	closed := e.clock.Now().UTC().Add(30 * time.Second)
 	e.clock.Advance(time.Minute)
-	// After it's reopened, a run saves, and another holds that disk.
+	// After it's reopened, a run saves, and another holds that version.
 	fresh := e.savePull(p, sel(key1, pr))
 	holder := e.start(e.pullRun(p), ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, pr)}})
-	if holder.source() != fresh {
+	if holder.restored() != fresh {
 		t.Fatal("no restore")
 	}
 	e.clock.Advance(time.Minute)
 	late.finish(true)
 	if !e.has(fresh) {
-		t.Fatal("a late save replaced a disk an unfinished run's choice names")
+		t.Fatal("a late save replaced a version an unfinished run's choice names")
 	}
 	// The closing's delivery is recorded once the next pass has read its
 	// records: here, as it first takes the disks' lease.
@@ -396,10 +386,10 @@ func TestAClosingDuringAPassKeepsWhatARetiredSaveWouldReplace(t *testing.T) {
 		t.Fatal("the pass took no lease")
 	}
 	if !e.has(fresh) {
-		t.Fatal("a retired run's late save replaced the reopened pull request's disk")
+		t.Fatal("a retired run's late save replaced the reopened pull request's version")
 	}
 	e.pass()
-	if !e.has(fresh) || len(e.images()) != 1 {
-		t.Fatalf("images %v; want only the reopened pull request's disk", e.images())
+	if !e.has(fresh) || len(e.versions()) != 1 {
+		t.Fatalf("versions %v; want only the reopened pull request's", e.versions())
 	}
 }

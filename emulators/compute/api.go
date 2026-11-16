@@ -92,6 +92,8 @@ func (e *Emulator) routes() http.Handler {
 	mux.HandleFunc("POST "+z+"/instances/{name}/setLabels", e.zoned(e.mutating(e.setLabels)))
 	mux.HandleFunc("GET "+z+"/instances/{name}/getGuestAttributes", e.zoned(e.getGuestAttributes))
 	mux.HandleFunc("GET "+z+"/instances/{name}/serialPort", e.zoned(e.serialPort))
+	mux.HandleFunc("GET "+z+"/machineTypes/{name}", e.zoned(e.getMachineType))
+	mux.HandleFunc("GET "+z+"/diskTypes/{name}", e.zoned(e.getDiskType))
 	mux.HandleFunc("GET "+z+"/disks", e.zoned(e.listDisks))
 	mux.HandleFunc("POST "+z+"/disks", e.zoned(e.mutating(e.insertDisk)))
 	mux.HandleFunc("GET "+z+"/disks/{name}", e.zoned(e.getDisk))
@@ -216,6 +218,10 @@ func (e *Emulator) mutating(do func(r *http.Request, zone string) (*operation, *
 				return
 			}
 			if op := e.requests[rid]; op != nil {
+				if first := e.firstAnswers[rid]; e.staleReplays && first != nil {
+					writeJSON(w, http.StatusOK, first)
+					return
+				}
 				writeJSON(w, http.StatusOK, e.opJSON(op))
 				return
 			}
@@ -225,10 +231,11 @@ func (e *Emulator) mutating(do func(r *http.Request, zone string) (*operation, *
 			writeError(w, err)
 			return
 		}
+		answer := e.opJSON(op)
 		if rid != "" {
-			e.requests[rid] = op
+			e.requests[rid], e.firstAnswers[rid] = op, answer
 		}
-		writeJSON(w, http.StatusOK, e.opJSON(op))
+		writeJSON(w, http.StatusOK, answer)
 	}
 }
 
@@ -764,6 +771,13 @@ func (e *Emulator) attachDisk(r *http.Request, zone string) (*operation, *apiErr
 			return nil, invalid("Invalid value for field 'resource.deviceName': '%s'. The device name is already in use.", dev)
 		}
 	}
+	total := d.sizeGB
+	for _, a := range in.disks {
+		total += a.disk.sizeGB
+	}
+	if hi := e.maxDisksSizeOf(in.machineType); total > hi {
+		return nil, invalid("The total size of the disks attached to machine type %s can't exceed %d GB.", in.machineType, hi)
+	}
 	op := e.newOp(zone, "attachDisk", e.instanceURL(in), in.id)
 	d.users = append(d.users, in)
 	in.disks = append(in.disks, &attached{deviceName: dev, disk: d, autoDelete: body.AutoDelete, index: int64(len(in.disks))})
@@ -970,6 +984,11 @@ func (e *Emulator) insertDisk(r *http.Request, zone string) (*operation, *apiErr
 	if d.sizeGB <= 0 {
 		return nil, invalid("Invalid value for field 'resource.sizeGb': '%d'.", d.sizeGB)
 	}
+	if typ == "hyperdisk-balanced" {
+		if why := HyperdiskBalancedRefusal(d.sizeGB, d.iops, d.throughput); why != "" {
+			return nil, invalid("%s", why)
+		}
+	}
 	op := e.newOp(zone, "insert", e.diskURL(d), d.id)
 	if code, ok := e.failing("disks.insert"); ok {
 		return op.fail(http.StatusInternalServerError, code, "The operation failed."), nil
@@ -1081,6 +1100,7 @@ func (e *Emulator) insertImage(r *http.Request, _ string) (*operation, *apiError
 	}
 	if e.pendingImages {
 		im.status = "PENDING"
+		op.doneAt, im.making = time.Now().Add(100*365*24*time.Hour), op
 	}
 	e.images[im.name] = im
 	return op, nil

@@ -24,17 +24,22 @@ import (
 // images, read before the records that describe them, since every record
 // is written before what it describes is made.
 type state struct {
-	images      map[string]compute.Image
-	imagesRead  bool
-	records     map[string]record[Image]
-	closures    map[string]record[Closure]
-	workDisks   map[string]record[machines.DiskRecord]
-	choices     map[string]record[Choice]
-	claims      map[string]record[Claim]
-	preemptions map[string]record[Preemption]
-	events      map[string]record[Event]
-	reruns      map[string]record[Rerun]
-	complete    bool
+	images     map[string]compute.Image
+	imagesRead bool
+	// versions are the caches' bucket's versions, each with its objects,
+	// read before the records, since a version's record is written before
+	// anything of it is uploaded.
+	versions     map[string][]store.Object
+	versionsRead bool
+	records      map[string]record[Image]
+	closures     map[string]record[Closure]
+	workDisks    map[string]record[machines.DiskRecord]
+	choices      map[string]record[Choice]
+	claims       map[string]record[Claim]
+	preemptions  map[string]record[Preemption]
+	events       map[string]record[Event]
+	reruns       map[string]record[Rerun]
+	complete     bool
 
 	repos map[int64]*github.Repository
 	// unconfirmed are the repositories GitHub didn't show as the
@@ -66,6 +71,47 @@ type run struct {
 	rerun bool
 }
 
+// intact reports whether a committed version's objects are all in the
+// caches' bucket as the pass listed it, each at the generation committed,
+// whatever any clock says. One that isn't, as one committed since the
+// listing, is confirmed with a fresh listing before anything goes
+// (objectsGone).
+func (st *state) intact(v Image) bool {
+	if !st.versionsRead {
+		return true
+	}
+	listed := map[string]int64{}
+	for _, o := range st.versions[v.Image] {
+		listed[o.Name] = o.Generation
+	}
+	for _, o := range v.Objects {
+		if g, ok := listed[o.Name]; !ok || g != o.Generation {
+			return false
+		}
+	}
+	return len(v.Objects) > 0
+}
+
+// objectsGone reports whether, listed afresh, any of a committed version's
+// objects is missing or another generation: a listing from before the
+// pass's work can't show what was uploaded since, whatever the clocks say.
+func (s *Service) objectsGone(ctx context.Context, v Image) (bool, error) {
+	objs, err := s.Caches.List(ctx, VersionPrefix(v.RepositoryID, v.Image))
+	if err != nil {
+		return false, err
+	}
+	listed := map[string]int64{}
+	for _, o := range objs {
+		listed[o.Name] = o.Generation
+	}
+	for _, o := range v.Objects {
+		if g, ok := listed[o.Name]; !ok || g != o.Generation {
+			return true, nil
+		}
+	}
+	return len(v.Objects) == 0, nil
+}
+
 func runKey(repo, id int64) string {
 	return strconv.FormatInt(repo, 10) + "/" + strconv.FormatInt(id, 10)
 }
@@ -73,10 +119,11 @@ func runKey(repo, id int64) string {
 // Pass is the disks' part of a pass (specs/0001-architecture.md, Passes),
 // after the machines': it looks for evidence that stopped Spot machines
 // were preempted, reruns runs that lost a job to a preemption or to the age
-// limit once they've finished, drops the restore choices of runs that need them no
-// more, and deletes saved disks that are replaced or no longer declared,
-// resume images nothing can use, and images that are orphaned. A failure on
-// one image or run doesn't stop the rest.
+// limit once they've finished, drops the restore choices of runs that need
+// them no more, settles the cache versions of finished jobs, and deletes
+// versions that are replaced or no longer declared, resume images nothing
+// can use, and images and objects that are orphaned. A failure on one image,
+// version or run doesn't stop the rest.
 func (s *Service) Pass(p *pass.Pass) error {
 	ctx := p.Context()
 	st := s.read(ctx)
@@ -87,6 +134,7 @@ func (s *Service) Pass(p *pass.Pass) error {
 	s.follow(ctx, st)
 	if st.complete {
 		s.dropChoices(ctx, st)
+		s.settle(ctx, st)
 		s.expire(ctx, st)
 		s.tidy(ctx, st)
 	} else {
@@ -114,6 +162,21 @@ func (s *Service) read(ctx context.Context) *state {
 			st.images[im.Name] = im
 		}
 	}
+	st.versions = map[string][]store.Object{}
+	if s.Caches != nil {
+		objs, err := s.Caches.List(ctx, "")
+		if err != nil {
+			s.log().Error("listing the caches' bucket", "err", err.Error())
+			st.complete = false
+		} else {
+			st.versionsRead = true
+		}
+		for _, o := range objs {
+			if _, version, ok := versionOf(o.Name); ok {
+				st.versions[version] = append(st.versions[version], o)
+			}
+		}
+	}
 	list := func(prefix string, into func() error) {
 		if err := into(); err != nil {
 			s.log().Error("listing records", "prefix", prefix, "err", err.Error())
@@ -121,6 +184,14 @@ func (s *Service) read(ctx context.Context) *state {
 		}
 	}
 	list("images/", func() (err error) { st.records, err = listJSON[Image](ctx, s.Objects, "images/"); return })
+	list("caches/", func() error {
+		versions, err := listJSON[Image](ctx, s.Objects, "caches/")
+		if st.records == nil {
+			st.records = map[string]record[Image]{}
+		}
+		maps.Copy(st.records, versions)
+		return err
+	})
 	list("closures/", func() (err error) { st.closures, err = listJSON[Closure](ctx, s.Objects, "closures/"); return })
 	list("disks/", func() (err error) {
 		st.workDisks, err = listJSON[machines.DiskRecord](ctx, s.Objects, "disks/")
@@ -574,12 +645,20 @@ func (s *Service) expire(ctx context.Context, st *state) {
 		if err != nil && !errors.Is(err, errNotShown) {
 			s.log().Warn("reading a consumer with images; deleting none of them this pass", "repository_id", repo, "err", err.Error())
 		}
-		// Which disk of a scope's family is newest is read only from images
-		// Compute Engine has, ready: a record of one that's gone mustn't
-		// stand in for it, and leave the one that's there unprotected.
+		// Which version of a scope's cache is newest is read only from
+		// versions recorded ready whose objects the caches' bucket has, and
+		// images from those Compute Engine has, ready: a record of a version
+		// or image that's gone mustn't stand in for it.
 		there := map[string]record[Image]{}
 		for n, r := range recs {
-			if im, ok := st.images[r.v.Image]; shown && ok && im.Status == "READY" && matches(im, r.v) {
+			if !shown {
+				continue
+			}
+			if r.v.Kind == KindCache {
+				if r.v.State == ImageReady && st.intact(r.v) {
+					there[n] = r
+				}
+			} else if im, ok := st.images[r.v.Image]; ok && im.Status == "READY" && (r.v.Kind == kindSaved || matches(im, r.v)) {
 				there[n] = r
 			}
 		}
@@ -596,13 +675,13 @@ func (s *Service) expire(ctx context.Context, st *state) {
 				why[image] = reason
 			}
 		}
-		// Every pull request whose disks this consumer holds is read once;
+		// Every pull request whose caches this consumer holds is read once;
 		// one seen closed is recorded as closed before anything else, so
 		// that, reopened, it never chooses what its earlier runs saved.
 		closed := map[string]bool{}
 		scopes := map[string]bool{}
 		for _, r := range there {
-			if _, pr := isPullRequest(r.v.Scope); pr && r.v.Kind == KindSaved {
+			if _, pr := isPullRequest(r.v.Scope); pr && r.v.Kind == KindCache {
 				scopes[r.v.Scope] = true
 			}
 		}
@@ -623,17 +702,17 @@ func (s *Service) expire(ctx context.Context, st *state) {
 			return nil
 		}
 		decl := s.declarations(ctx, st, repo, there)
-		// Each scope keeps one disk of each family and architecture: its
+		// Each scope keeps one version of each cache and architecture: its
 		// newest save, whatever its key.
 		lineage := map[string]Image{}
 		for _, r := range there {
 			v := r.v
-			// A retired disk of a pull request's replaces nothing: it goes
-			// itself.
-			if v.Kind != KindSaved || v.State != ImageReady || retired(v, closure(v.Scope)) {
+			// A retired version of a pull request's replaces nothing: it
+			// goes itself.
+			if v.Kind != KindCache || v.State != ImageReady || retired(v, closure(v.Scope)) {
 				continue
 			}
-			f := v.Scope + "\x00" + v.Arch + "\x00" + v.Family
+			f := v.Scope + "\x00" + v.Arch + "\x00" + v.Cache
 			if b, ok := lineage[f]; !ok || olderThan(b, v) {
 				lineage[f] = v
 			}
@@ -644,7 +723,9 @@ func (s *Service) expire(ctx context.Context, st *state) {
 				continue
 			}
 			switch v.Kind {
-			case KindSaved:
+			case kindSaved:
+				add(v.Image, "saved disks are no longer kept: caches replace them")
+			case KindCache:
 				// What a scope's branch declares, where GitHub confirmed it:
 				// a scope it couldn't confirm loses nothing by it.
 				if d, ok := decl[v.Scope]; ok {
@@ -652,8 +733,8 @@ func (s *Service) expire(ctx context.Context, st *state) {
 						add(v.Image, d.gone)
 						continue
 					}
-					if !d.families[v.Family] {
-						add(v.Image, "its family is no longer declared in "+consumer.RunnersFile+" at its scope's branch's head")
+					if !d.caches[v.Cache] {
+						add(v.Image, "its cache is no longer declared in "+consumer.RunnersFile+" at its scope's branch's head")
 						continue
 					}
 				}
@@ -665,8 +746,8 @@ func (s *Service) expire(ctx context.Context, st *state) {
 					add(v.Image, "saved by a run from before its pull request closed")
 					continue
 				}
-				if l, ok := lineage[v.Scope+"\x00"+v.Arch+"\x00"+v.Family]; ok && l.Image != v.Image {
-					add(v.Image, "its scope saved "+l.Image+" of the family since")
+				if l, ok := lineage[v.Scope+"\x00"+v.Arch+"\x00"+v.Cache]; ok && l.Image != v.Image {
+					add(v.Image, "its scope saved "+l.Image+" of the cache since")
 					replacedBy[v.Image] = l
 				}
 			case KindResume:
@@ -750,21 +831,21 @@ func (s *Service) expire(ctx context.Context, st *state) {
 }
 
 // declared is what a pass confirmed of a scope of main's or a long-lived
-// branch's: that all of it goes, and why, or else the families its
-// branch's .github/runners.json declares at its head.
+// branch's: that all of it goes, and why, or else the caches its branch's
+// .github/runners.json declares at its head.
 type declared struct {
-	gone     string
-	families map[string]bool
+	gone   string
+	caches map[string]bool
 }
 
-// declarations reads what keeps the disks of each of main's and long-lived
-// branches' scopes that a consumer's images hold, by GitHub's confirmed
+// declarations reads what keeps the caches of each of main's and long-lived
+// branches' scopes that a consumer's versions hold, by GitHub's confirmed
 // answers, once a pass. A scope left out is one GitHub couldn't confirm,
 // which loses nothing by its declarations this pass.
 func (s *Service) declarations(ctx context.Context, st *state, repo int64, there map[string]record[Image]) map[string]declared {
 	scopes := map[string]bool{}
 	for _, r := range there {
-		if r.v.Kind == KindSaved && lasting(r.v.Scope) {
+		if r.v.Kind == KindCache && lasting(r.v.Scope) {
 			scopes[r.v.Scope] = true
 		}
 	}
@@ -773,7 +854,7 @@ func (s *Service) declarations(ctx context.Context, st *state, repo int64, there
 	}
 	rp, err := s.repository(ctx, st, repo)
 	if err != nil {
-		s.log().Warn("reading a consumer with saved disks; deleting nothing by its declarations this pass", "repository_id", repo, "err", err.Error())
+		s.log().Warn("reading a consumer with caches; deleting nothing by its declarations this pass", "repository_id", repo, "err", err.Error())
 		return nil
 	}
 	confirm := func(err error) error { return s.confirmed(ctx, st, repo, err) }
@@ -816,7 +897,7 @@ func readDeclarations(ctx context.Context, gh github.API, log *slog.Logger, repo
 	var errs []error
 	for _, sc := range scopes {
 		if sc == "main" {
-			out[sc] = declared{families: families(f)}
+			out[sc] = declared{caches: caches(f)}
 			continue
 		}
 		branch, ok := byScope[sc]
@@ -839,7 +920,7 @@ func readDeclarations(ctx context.Context, gh github.API, log *slog.Logger, repo
 			errs = append(errs, fmt.Errorf("%s's branch's %s: %w", sc, consumer.RunnersFile, err))
 			continue
 		}
-		out[sc] = declared{families: families(bf)}
+		out[sc] = declared{caches: caches(bf)}
 	}
 	return out, errors.Join(errs...)
 }
@@ -861,11 +942,11 @@ func readRunnersFile(ctx context.Context, gh github.API, repo github.Repository,
 	return consumer.Parse(data)
 }
 
-// families are the families a file declares.
-func families(f consumer.File) map[string]bool {
+// caches are the caches a file declares.
+func caches(f consumer.File) map[string]bool {
 	out := map[string]bool{}
-	for family := range f.Disks {
-		out[family] = true
+	for cache := range f.Caches {
+		out[cache] = true
 	}
 	return out
 }
@@ -902,7 +983,7 @@ func (s *Service) tidyScopes(ctx context.Context, st *state, repo int64, unknown
 	have := map[string]bool{}
 	for _, r := range st.records {
 		v := r.v
-		if v.RepositoryID == repo && v.Kind == KindSaved {
+		if v.RepositoryID == repo && v.Kind == KindCache {
 			have[v.Scope] = true
 		}
 	}
@@ -945,6 +1026,27 @@ func (s *Service) tidy(ctx context.Context, st *state) {
 	for key, r := range st.records {
 		v := r.v
 		recorded[v.Image] = true
+		if v.Kind == KindCache {
+			// A ready version whose objects are gone, which only happens if
+			// someone else deleted them, restores nothing: its record goes.
+			// One being saved has none yet, and settle decides it.
+			if v.State != ImageReady || st.intact(v) {
+				continue
+			}
+			if gone, err := s.objectsGone(ctx, v); err != nil || !gone {
+				continue
+			}
+			// A repository GitHub doesn't show as the organization's loses
+			// nothing, not even a record that restores nothing.
+			if !s.stillShown(ctx, st, v.RepositoryID) {
+				continue
+			}
+			if err := s.Objects.Delete(ctx, key, r.gen); err == nil {
+				delete(st.records, key)
+				s.log().Warn("record of a cache version whose objects are gone removed", "version", v.Image)
+			}
+			continue
+		}
 		// An image whose making was abandoned, its machine gone, never
 		// becomes ready: it goes, image and record, and stops counting
 		// against its scope's limit.
@@ -994,6 +1096,63 @@ func (s *Service) tidy(ctx context.Context, st *state) {
 		if err := s.Objects.Delete(ctx, key, r.gen); err == nil {
 			delete(st.records, key)
 			s.log().Info("record of an image that's gone removed", "image", v.Image, "state", v.State)
+		}
+	}
+	// A version's objects that no record describes go like any version:
+	// under the disks' lease, never while a choice names the version, once
+	// GitHub, read again under the lease, shows their repository as the
+	// organization's, and recorded as marked before they're deleted. A
+	// version's record is written before anything of it is uploaded, and the
+	// bucket was listed before the records were read, so no version being
+	// saved is among them; one whose record is written since is left alone.
+	if st.versionsRead {
+		orphaned := map[int64][]string{}
+		for _, version := range slices.Sorted(maps.Keys(st.versions)) {
+			if recorded[version] {
+				continue
+			}
+			repo, _, _ := versionOf(st.versions[version][0].Name)
+			orphaned[repo] = append(orphaned[repo], version)
+		}
+		for _, repo := range slices.Sorted(maps.Keys(orphaned)) {
+			if _, err := s.repository(ctx, st, repo); err != nil {
+				continue
+			}
+			var marked []Image
+			err := s.step(ctx, repo, func(ctx context.Context) error {
+				named, err := s.named(ctx, repo, nil)
+				if err != nil {
+					return err
+				}
+				if !s.stillShown(ctx, st, repo) {
+					return nil
+				}
+				for _, version := range orphaned[repo] {
+					if named[version] {
+						s.log().Warn("a cache version with no record is named by a choice; it's kept", "version", version)
+						continue
+					}
+					rec := Image{Image: version, RepositoryID: repo, Kind: KindCache, State: ImageMarked, MarkedAt: s.now()}
+					got, _, err := createOnce(ctx, s.Objects, versionKey(repo, version), rec)
+					if err != nil {
+						return err
+					}
+					if got.State == ImageMarked {
+						marked = append(marked, got)
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				s.log().Warn("marking orphaned cache versions", "repository_id", repo, "err", err.Error())
+			}
+			for _, v := range marked {
+				if err := s.deleteMarked(ctx, v); err != nil {
+					s.log().Warn("deleting a cache version's orphaned objects", "version", v.Image, "err", err.Error())
+					continue
+				}
+				s.log().Info("orphaned cache objects deleted", "version", v.Image, "objects", len(st.versions[v.Image]))
+			}
 		}
 	}
 	// An image of the service's names that no record describes goes like
@@ -1049,7 +1208,7 @@ func (s *Service) tidy(ctx context.Context, st *state) {
 					s.log().Warn("an image with no record is named by a choice or claim; it's kept", "image", name)
 					continue
 				}
-				kind := KindSaved
+				kind := kindSaved
 				if resumeName.MatchString(name) {
 					kind = KindResume
 				}
@@ -1077,7 +1236,7 @@ func (s *Service) tidy(ctx context.Context, st *state) {
 	}
 	present := map[string]bool{}
 	for _, r := range st.records {
-		present[imageKey(r.v.RepositoryID, r.v.Image)] = true
+		present[recordKey(r.v)] = true
 	}
 	// A claim goes once its image is gone from both the bucket and
 	// Compute Engine: one that keeps an orphaned image stays with it.

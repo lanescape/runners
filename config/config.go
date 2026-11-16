@@ -35,8 +35,12 @@ type Organization struct {
 
 // Shapes are the machines jobs may ask for.
 type Shapes struct {
-	Zones               []string          `yaml:"zones"`
-	BootDiskGB          int               `yaml:"boot_disk_gb"`
+	Zones      []string `yaml:"zones"`
+	BootDiskGB int      `yaml:"boot_disk_gb"`
+	// WorkDiskGB is a work disk's size, unless its job asks for another.
+	WorkDiskGB int `yaml:"work_disk_gb"`
+	// DiskIOPS and DiskThroughputMiBps are every boot disk's performance,
+	// and a work disk's, unless its job asks for other.
 	DiskIOPS            int               `yaml:"disk_iops"`
 	DiskThroughputMiBps int               `yaml:"disk_throughput_mibps"`
 	Shapes              map[string]*Shape `yaml:"shapes"`
@@ -70,7 +74,6 @@ type Shape struct {
 	Arch         string   `yaml:"-"`
 	MachineTypes []string `yaml:"machine_types"`
 	MemoryGB     int      `yaml:"memory_gb"`
-	WorkDiskGB   int      `yaml:"work_disk_gb"`
 }
 
 // Runner is the GitHub runner release the base images install.
@@ -212,8 +215,8 @@ func (c *Config) Validate() error {
 		}
 		seenZone[z] = true
 	}
-	if s.BootDiskGB <= 0 || s.DiskIOPS <= 0 || s.DiskThroughputMiBps <= 0 {
-		bad("shapes.yaml: boot_disk_gb, disk_iops and disk_throughput_mibps must be positive")
+	if s.BootDiskGB <= 0 || s.WorkDiskGB <= 0 || s.DiskIOPS <= 0 || s.DiskThroughputMiBps <= 0 {
+		bad("shapes.yaml: boot_disk_gb, work_disk_gb, disk_iops and disk_throughput_mibps must be positive")
 	}
 	if len(s.Shapes) == 0 {
 		bad("shapes.yaml: no shapes")
@@ -251,8 +254,8 @@ func (c *Config) Validate() error {
 				bad("shapes.yaml: %s: %s is %s, not %s", name, mt, arch, sh.Arch)
 			}
 		}
-		if sh.MemoryGB <= 0 || sh.WorkDiskGB <= 0 {
-			bad("shapes.yaml: %s: memory_gb and work_disk_gb must be positive", name)
+		if sh.MemoryGB <= 0 {
+			bad("shapes.yaml: %s: memory_gb must be positive", name)
 		}
 	}
 

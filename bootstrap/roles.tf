@@ -105,8 +105,9 @@ resource "google_project_iam_member" "service_machines" {
 resource "google_project_iam_custom_role" "compute_reader" {
   role_id     = "lanescapeRunnersComputeReader"
   title       = "Lanescape Runners compute reader"
-  description = "Lists instances, disks and images, and reads zones, machine types and operations: what can't be limited by name."
+  description = "Lists instances, disks and images, and reads zones, machine types, disk types and operations: what can't be limited by name."
   permissions = [
+    "compute.diskTypes.get",
     "compute.disks.list",
     "compute.globalOperations.get",
     "compute.globalOperations.list",

@@ -222,3 +222,27 @@ func TestAllRegionsQuota(t *testing.T) {
 		t.Fatalf("within the quota, in another region: %+v", op.Error.Errors[0])
 	}
 }
+
+// Hyperdisk Balanced's limits, at and either side of each boundary.
+func TestHyperdiskBalancedLimits(t *testing.T) {
+	for _, tc := range []struct {
+		size, iops, throughput int64
+		ok                     bool
+	}{
+		{4, 2000, 140, true}, {4, 2001, 140, false}, {4, 1999, 140, false},
+		{5, 2500, 140, true}, {6, 3000, 140, true}, {6, 2999, 140, false},
+		{50, 3000, 400, true}, {50, 25000, 0, true}, {50, 25001, 0, false},
+		{500, 160000, 2400, true}, {500, 160001, 2400, false},
+		{500, 3001, 750, true}, {500, 3001, 751, false},
+		{500, 40000, 156, true}, {500, 40000, 155, false},
+		{500, 10000, 2400, true}, {500, 10000, 2501, false},
+		{3, 0, 0, false}, {65536, 0, 0, true}, {65537, 0, 0, false},
+		{50, 0, 825, true}, {50, 0, 826, false},
+		{4, 0, 500, true}, {4, 0, 600, false}, {500, 0, 1000, true}, {500, 0, 1501, false},
+	} {
+		why := gceemu.HyperdiskBalancedRefusal(tc.size, tc.iops, tc.throughput)
+		if (why == "") != tc.ok {
+			t.Errorf("%d GB, %d IOPS, %d MiB/s: refusal %q; want allowed %v", tc.size, tc.iops, tc.throughput, why, tc.ok)
+		}
+	}
+}

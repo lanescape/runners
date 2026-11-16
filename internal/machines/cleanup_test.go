@@ -80,23 +80,6 @@ func TestAReportEndsTheMachine(t *testing.T) {
 	}
 }
 
-func TestAServiceThatSavesNothing(t *testing.T) {
-	e := setup(t)
-	e.repo.Commit("main", map[string]string{".github/runners.json": declares})
-	m, _ := e.admitted(sel2)
-	m.diskReady("build")
-	if code, body := m.save(); code != http.StatusOK || body["saves"] != true {
-		t.Fatalf("save request: %d %v", code, body)
-	}
-	m.release(true)
-	m.finished()
-	m.report()
-	e.pass()
-	if e.exists(m.in.Name) || !e.logged("this service saves no disks") {
-		t.Fatal("a save the service can't make should be logged, and the machine deleted")
-	}
-}
-
 func TestNoReport(t *testing.T) {
 	e := setup(t)
 	m, _ := e.admitted(sel2)
@@ -183,8 +166,6 @@ type preemptions struct {
 	mu       sync.Mutex
 	calls    map[string]bool
 	ageLimit map[string]bool
-	// family is the family of each machine's work disk, as recorded.
-	family map[string]string
 	// at, if it's set, is called as each machine is recorded.
 	at func(m machines.Machine)
 	// lost are the jobs recorded lost on retired machines, by machine;
@@ -224,10 +205,6 @@ func (p *preemptions) Stopped(_ context.Context, m machines.Machine, _ machines.
 		p.ageLimit = map[string]bool{}
 	}
 	p.ageLimit[m.Name] = ageLimit
-	if p.family == nil {
-		p.family = map[string]string{}
-	}
-	p.family[m.Name] = m.Selector.Family
 	return nil
 }
 
@@ -407,13 +384,13 @@ func TestTheAgeLimitReadsTheRecordsAgain(t *testing.T) {
 		m, _ := e.admitted(sel2)
 		e.clock.Advance(machines.MaxAge)
 		var code int
-		meanwhile(e, func() { code, _ = m.disk("build") })
+		meanwhile(e, func() { code, _ = m.disk() })
 		e.pass()
 		if code != http.StatusOK && code != http.StatusServiceUnavailable {
 			t.Fatalf("work disk request: %d", code)
 		}
-		if !p.ageLimit[m.in.Name] || p.family[m.in.Name] != "build" {
-			t.Fatalf("recorded %v with families %v; want the work disk asked for as the pass read the queue", p.ageLimit, p.family)
+		if !p.ageLimit[m.in.Name] {
+			t.Fatalf("recorded %v; want the job recorded at its age limit while its disk was asked for", p.ageLimit)
 		}
 	})
 }
@@ -477,7 +454,7 @@ func TestOrphanedDisks(t *testing.T) {
 	e := setup(t)
 	e.repo.Commit("main", map[string]string{".github/runners.json": declares})
 	m, _ := e.admitted(sel2)
-	m.diskReady("build")
+	m.diskReady()
 	idle := e.mainRun()
 	e.queue(idle, sel2)
 	e.pass()

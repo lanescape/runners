@@ -1,30 +1,34 @@
-// Package disks saves and restores work disks, and makes resume images of
-// the work disks of jobs lost to a preemption or to the age limit
+// Package disks keeps consumers' caches, and makes resume images of the
+// work disks of jobs lost to a preemption or to the age limit
 // (specs/0003-disks.md, specs/0002-machines.md, Preemption). It serves the
 // machines' part of the service through the seams machines.Service offers:
-// choosing what a job's work disk starts from, saving a finished job's disk,
-// and recording a machine whose job was lost; and it adds its own part of
-// each pass, which reruns runs that lost a job, and deletes what its rules
-// say goes: saved disks are the consumer's to manage, kept while their
-// family is declared, and never deleted for want of use or for their age
-// (specs/0003-disks.md, Deletion).
+// choosing what a job's work disk starts from, a job's requests to restore,
+// save and commit a cache, and recording a machine whose job was lost; and
+// it adds its own part of each pass, which settles finished jobs' cache
+// versions, reruns runs that lost a job, and deletes what its rules say
+// goes: caches are the consumer's to manage, kept while they're declared,
+// and never deleted for want of use or for their age (specs/0003-disks.md,
+// Deletion).
 //
-// What images exist is in Compute Engine, by their names and labels; what
-// they hold and who chose them is in the bucket:
+// What resume images exist is in Compute Engine, by their names and labels,
+// and what versions of caches exist in the caches' bucket, under
+// <repository>/<version>/; what they hold and who chose them is in the
+// service's bucket:
 //
-//	images/<repository>/<image>.json            a saved disk or resume image, recorded before it's made
-//	choices/<repository>/<run>/<selector hash>.json  a run's restore choice for a selector
+//	caches/<repository>/<version>.json          a cache's version, recorded before anything of it is uploaded
+//	images/<repository>/<image>.json            a resume image, recorded before it's made
+//	savings/<repository>/<job>/<cache>.json     the one version a job saves of a cache
+//	choices/<repository>/<run>/<hash>.json      a run's restore choice for a cache on an architecture
 //	closures/<repository>/<scope>.json          when a pull request was last seen closed
 //	claims/<repository>/<image>.json            the job a resume image is claimed for
 //	preemptions/<repository>/<run>/<instance ID>.json  a machine whose job was lost: a stopped Spot machine, preempted or perhaps, or one stopped at its age limit
 //	events/<instance ID>.json                   Compute Engine's event that it preempted an instance
 //	reruns/<repository>/<run>.json              the attempts of a run the service has rerun
-//	machines/<machine>/save.json                a finished job's save, once decided
 //	leases/disks/<repository>                   the short lease for choosing and marking
 //
-// A saved disk serves the scope it was saved in and no other: main's are
-// made only from jobs of runs bound main, a pull request's only from its own
-// runs, and a pull request's are read only by its own later runs.
+// A cache serves the scope it was saved in and no other: main's are saved
+// only by jobs of runs bound main, a pull request's only by its own runs,
+// and a pull request's are read only by its own later runs.
 package disks
 
 import (
@@ -75,10 +79,15 @@ const (
 	eventsKept = 2 * ResumeKept
 )
 
-// The kinds of image the service makes besides its base images.
+// The kinds of record the disks keep, besides base images: a version of a
+// cache, objects in the caches' bucket that a job saved, and a resume
+// image, which the service makes of a lost job's work disk.
 const (
-	KindSaved  = "saved"
+	KindCache  = "cache"
 	KindResume = "resume"
+	// kindSaved is a saved disk's image, from before caches replaced saved
+	// disks, or an orphaned image named as one: it goes, as an image.
+	kindSaved = "saved"
 )
 
 // Labels on the service's images. Values that may be longer or freer than a
@@ -96,10 +105,14 @@ const (
 	LabelJobName    = "lsr-job-name"
 )
 
-// The states an image is recorded in.
+// The states an image or a cache's version is recorded in: being made, or
+// for a version, its objects being uploaded; for a version, committed, its
+// objects recorded, until GitHub's conclusion for its job decides it; ready
+// to restore from; marked for deletion.
 const (
-	ImageMaking = "making"
-	ImageReady  = "ready"
+	ImageMaking    = "making"
+	ImageCommitted = "committed"
+	ImageReady     = "ready"
 	// ImageMarked is an image marked for deletion: it's never chosen, and
 	// it's deleted next.
 	ImageMarked = "marked"
@@ -126,6 +139,15 @@ const (
 	NotPreempted = "no"
 )
 
+// Tokens mints OAuth access tokens downscoped to one prefix of the caches'
+// bucket: one that may only read the objects there, and one that may only
+// create them, not overwrite or delete any. They're credentials, never
+// logged.
+type Tokens interface {
+	Read(ctx context.Context, prefix string) (token string, expires time.Time, err error)
+	Create(ctx context.Context, prefix string) (token string, expires time.Time, err error)
+}
+
 var (
 	savedName  = regexp.MustCompile(`^lsr-([1-9][0-9]*)-([0-9a-f]{20})-([1-9][0-9]*)-([a-z0-9]{8})$`)
 	resumeName = regexp.MustCompile(`^lsr-([1-9][0-9]*)-resume-([1-9][0-9]*)$`)
@@ -140,8 +162,15 @@ type Service struct {
 	GitHub  github.API
 	Compute compute.API
 	Objects store.Objects
-	Clock   clockwork.Clock
-	Logger  *slog.Logger
+	// Caches is the caches' bucket, named CacheBucket, which holds every
+	// version's objects (specs/0003-disks.md, Caches), and Tokens mints
+	// the credentials a job reads and writes them with. Unset, there are
+	// no caches.
+	Caches      store.Objects
+	CacheBucket string
+	Tokens      Tokens
+	Clock       clockwork.Clock
+	Logger      *slog.Logger
 	// StepDeadline is how long a step under the disks' lease, waiting for
 	// it included, may take; it defaults to 30 seconds, well inside the
 	// lease's validity.
@@ -160,17 +189,17 @@ func (s *Service) now() time.Time { return s.Clock.Now().UTC() }
 // day is a time's date, as labels carry it.
 func day(t time.Time) string { return t.UTC().Format("2006-01-02") }
 
-// Series is the hash that names a saved disk's versions: of its scope, its
-// architecture, its family and its key, so that a family's disks of one
-// architecture never stand in for another's.
-func Series(scope, arch, family, key string) string {
-	return selector.Hash(scope + "\x00" + arch + "\x00" + family + "\x00" + key)
+// Series is the hash that names a cache's versions: of its scope, its
+// architecture, its name and its key, so that a cache saved on one
+// architecture never stands in for another's.
+func Series(scope, arch, cache, key string) string {
+	return selector.Hash(scope + "\x00" + arch + "\x00" + cache + "\x00" + key)
 }
 
-// SavedName names a new version of a saved disk: lsr-<repository
+// VersionName names a new version of a cache: lsr-<repository
 // ID>-<series>-<save time, in Unix seconds>-<the random part of the
 // machine's name>, since two jobs can save the same series in one second.
-func SavedName(repositoryID int64, series string, at time.Time, machine string) string {
+func VersionName(repositoryID int64, series string, at time.Time, machine string) string {
 	return fmt.Sprintf("lsr-%d-%s-%d-%s", repositoryID, series, at.Unix(), machine[strings.LastIndex(machine, "-")+1:])
 }
 
@@ -180,12 +209,19 @@ func ResumeName(repositoryID int64, instanceID uint64) string {
 	return fmt.Sprintf("lsr-%d-resume-%d", repositoryID, instanceID)
 }
 
-// ours reports whether an image is one of the service's saved disks or
-// resume images, and its consumer's.
+// VersionPrefix is where a cache's version's objects are in the caches'
+// bucket: <repository ID>/<version>/.
+func VersionPrefix(repositoryID int64, version string) string {
+	return strconv.FormatInt(repositoryID, 10) + "/" + version + "/"
+}
+
+// ours reports whether an image is one of the service's resume images, and
+// its consumer's. Images named as cache versions, which saved disks were,
+// are the service's too, and go as orphans.
 func ours(im compute.Image) (int64, bool) {
-	m := savedName.FindStringSubmatch(im.Name)
+	m := resumeName.FindStringSubmatch(im.Name)
 	if m == nil {
-		m = resumeName.FindStringSubmatch(im.Name)
+		m = savedName.FindStringSubmatch(im.Name)
 	}
 	if m == nil || im.Labels[LabelRepository] != m[1] {
 		return 0, false
@@ -194,18 +230,25 @@ func ours(im compute.Image) (int64, bool) {
 	return repo, err == nil
 }
 
-// Image is a saved disk or a resume image, as the bucket records it,
-// before it's made.
+// Image is a cache's version or a resume image, as the bucket records it,
+// before it's made. Image is the version's or the image's name.
 type Image struct {
 	Image        string `json:"image"`
 	RepositoryID int64  `json:"repository_id"`
 	Kind         string `json:"kind"`
 	State        string `json:"state"`
-	// A saved disk's scope, family and key; every image's architecture.
-	Scope  string `json:"scope,omitempty"`
-	Arch   string `json:"arch"`
-	Family string `json:"family,omitempty"`
-	Key    string `json:"key,omitempty"`
+	// A version's scope, cache and key; every record's architecture; and a
+	// resume image's family, always machines.LegacyFamily.
+	Scope        string `json:"scope,omitempty"`
+	Arch         string `json:"arch"`
+	Cache        string `json:"cache,omitempty"`
+	Key          string `json:"key,omitempty"`
+	LegacyFamily string `json:"family,omitempty"`
+	// A version's objects, as Cloud Storage held them when it was
+	// committed, and their total size.
+	Objects     []machines.CacheObject `json:"objects,omitempty"`
+	Bytes       int64                  `json:"bytes,omitempty"`
+	CommittedAt time.Time              `json:"committed_at,omitzero"`
 	// What it was made from.
 	Machine    string `json:"machine"`
 	Zone       string `json:"zone"`
@@ -221,30 +264,30 @@ type Image struct {
 	// request ID of the next try.
 	Attempt int       `json:"attempt,omitempty"`
 	SavedAt time.Time `json:"saved_at"`
-	// BoundAt is when a saved disk's run was bound: one of a pull
-	// request's bound before the pull request was last closed is never
-	// chosen again.
+	// BoundAt is when a version's run was bound: one of a pull request's
+	// bound before the pull request was last closed is never chosen
+	// again.
 	BoundAt time.Time `json:"bound_at,omitzero"`
 	// TouchedAt is when a job last chose or claimed it: writing it changes
 	// the record's generation, so marking it, which writes the same
 	// record with the generation it read, can't succeed past a choice.
 	TouchedAt time.Time `json:"touched_at,omitzero"`
 	MarkedAt  time.Time `json:"marked_at,omitzero"`
-	// GoneAt is when a pass first found the machine it's made from gone
-	// while it was still being made.
+	// GoneAt is when a pass first found the machine a resume image is made
+	// from gone while it was still being made.
 	GoneAt time.Time `json:"gone_at,omitzero"`
 }
 
-// Choice is a run's restore choice for a selector: the exact image version
-// every job of the run with that selector starts from, or none, and which
-// step of the restore order it came from.
+// Choice is a run's restore choice for a cache on an architecture: the
+// exact version every job of the run that restores it gets, or none, and
+// which step of the restore order it came from.
 type Choice struct {
 	RepositoryID int64  `json:"repository_id"`
 	RunID        int64  `json:"run_id"`
 	Selector     string `json:"selector"`
 	Scope        string `json:"scope"`
 	Arch         string `json:"arch"`
-	Family       string `json:"family"`
+	Cache        string `json:"cache"`
 	Step         string `json:"step"`
 	Image        string `json:"image,omitempty"`
 	// Attempt is the run attempt it was picked in. It holds for the
@@ -254,7 +297,7 @@ type Choice struct {
 	At      time.Time `json:"at"`
 }
 
-// Closure is a pull request the service has seen closed: its disks saved by
+// Closure is a pull request the service has seen closed: its caches saved by
 // runs bound up to the last time it was seen closed are never chosen again,
 // even once it's reopened, and go as soon as no unfinished run's choice
 // names them. SeenAt moves on with every pass that still sees it closed, so
@@ -267,10 +310,10 @@ type Closure struct {
 	SeenAt       time.Time `json:"seen_at"`
 }
 
-// retired reports whether a saved disk of a pull request's was saved by a
-// run bound before its pull request was last seen closed.
+// retired reports whether a version of a pull request's cache was saved by
+// a run bound before its pull request was last seen closed.
 func retired(v Image, c *Closure) bool {
-	return c != nil && v.Kind == KindSaved && v.Scope == c.Scope && !v.BoundAt.After(c.SeenAt)
+	return c != nil && v.Kind == KindCache && v.Scope == c.Scope && !v.BoundAt.After(c.SeenAt)
 }
 
 // Claim is the one job a resume image is for.
@@ -298,11 +341,11 @@ type Preemption struct {
 	RunID        int64  `json:"run_id"`
 	RunAttempt   int    `json:"run_attempt"`
 	Selector     string `json:"selector"`
-	// Arch and Family are its work disk's, if its job asked for one: a
-	// resume image resumes only a job of the same name that asks for the
-	// same family on the same architecture.
-	Arch   string `json:"arch"`
-	Family string `json:"family,omitempty"`
+	// Arch is its machine's: a resume image resumes only a job of the same
+	// name on the same architecture.
+	Arch string `json:"arch"`
+	// LegacyFamily is always machines.LegacyFamily.
+	LegacyFamily string `json:"family,omitempty"`
 	// Preempted is yes, or unknown while there's no evidence, or no for a
 	// standard machine.
 	Preempted string `json:"preempted"`
@@ -345,24 +388,39 @@ type Rerun struct {
 	At           time.Time `json:"at"`
 }
 
-// Save is a finished job's save, once decided: the image it's made as, or
-// why it's skipped.
-type Save struct {
-	Machine string    `json:"machine"`
-	Image   string    `json:"image,omitempty"`
-	SizeGB  int64     `json:"size_gb"`
-	Skipped string    `json:"skipped,omitempty"`
-	Done    bool      `json:"done,omitempty"`
+// Saving is the one version a job saves of a cache: created only if absent,
+// so that every request of the job for the cache names the same version.
+type Saving struct {
+	Version string    `json:"version"`
+	JobID   int64     `json:"job_id"`
+	Cache   string    `json:"cache"`
 	At      time.Time `json:"at"`
 }
 
 func imageKey(repo int64, image string) string { return fmt.Sprintf("images/%d/%s.json", repo, image) }
-func choicePrefix(repo, run int64) string      { return fmt.Sprintf("choices/%d/%d/", repo, run) }
 
-// choiceKey is a run's restore choice for a family on an architecture: one
-// per run, family and architecture (specs/0003-disks.md).
-func choiceKey(repo, run int64, sel selector.Selector) string {
-	return choicePrefix(repo, run) + selector.Hash(sel.Family+"\x00"+sel.Arch) + ".json"
+// versionKey is a cache version's record: under caches/, apart from images'
+// records, so that a revision of the service from before caches, which
+// still runs passes while a deploy moves traffic over and reads every record
+// under images/ as an image's, never reads one, finds no image of its name,
+// and drops it.
+func versionKey(repo int64, version string) string {
+	return fmt.Sprintf("caches/%d/%s.json", repo, version)
+}
+
+// recordKey is where a record of either kind is.
+func recordKey(rec Image) string {
+	if rec.Kind == KindCache {
+		return versionKey(rec.RepositoryID, rec.Image)
+	}
+	return imageKey(rec.RepositoryID, rec.Image)
+}
+func choicePrefix(repo, run int64) string { return fmt.Sprintf("choices/%d/%d/", repo, run) }
+
+// choiceKey is a run's restore choice for a cache on an architecture: one
+// per run, cache and architecture (specs/0003-disks.md).
+func choiceKey(repo, run int64, cache, arch string) string {
+	return choicePrefix(repo, run) + selector.Hash(cache+"\x00"+arch) + ".json"
 }
 func closureKey(repo int64, scope string) string {
 	return fmt.Sprintf("closures/%d/%s.json", repo, scope)
@@ -374,8 +432,10 @@ func preemptionKey(repo, run int64, id uint64) string {
 }
 func eventKey(id uint64) string       { return "events/" + strconv.FormatUint(id, 10) + ".json" }
 func rerunKey(repo, run int64) string { return fmt.Sprintf("reruns/%d/%d.json", repo, run) }
-func saveKey(machine string) string   { return "machines/" + machine + "/save.json" }
-func leaseKey(repo int64) string      { return fmt.Sprintf("leases/disks/%d", repo) }
+func savingKey(repo, job int64, cache string) string {
+	return fmt.Sprintf("savings/%d/%d/%s.json", repo, job, cache)
+}
+func leaseKey(repo int64) string { return fmt.Sprintf("leases/disks/%d", repo) }
 
 func getJSON[T any](ctx context.Context, o store.Objects, key string) (T, int64, bool, error) {
 	var v T
@@ -500,12 +560,12 @@ func (s *Service) step(ctx context.Context, repo int64, f func(ctx context.Conte
 	return err
 }
 
-// touch rewrites an image's record, as a choice or claim of it does, so
-// that any marking of it that read the record before fails its
-// precondition. It fails if the image has been marked.
-func (s *Service) touch(ctx context.Context, repo int64, image string) error {
+// touch rewrites an image's or version's record, at key, as a choice or
+// claim of it does, so that any marking of it that read the record before
+// fails its precondition. It fails if it has been marked.
+func (s *Service) touch(ctx context.Context, key, image string) error {
 	for range 3 {
-		rec, gen, ok, err := getJSON[Image](ctx, s.Objects, imageKey(repo, image))
+		rec, gen, ok, err := getJSON[Image](ctx, s.Objects, key)
 		if err != nil {
 			return err
 		}
@@ -513,7 +573,7 @@ func (s *Service) touch(ctx context.Context, repo int64, image string) error {
 			return fmt.Errorf("image %s is no longer ready", image)
 		}
 		rec.TouchedAt = s.now()
-		if _, err := replaceJSON(ctx, s.Objects, imageKey(repo, image), rec, gen); err == nil {
+		if _, err := replaceJSON(ctx, s.Objects, key, rec, gen); err == nil {
 			return nil
 		} else if !errors.Is(err, store.ErrPrecondition) {
 			return err
@@ -530,15 +590,12 @@ func labels(rec Image) map[string]string {
 		LabelArch:       rec.Arch,
 		LabelSaved:      day(rec.SavedAt),
 	}
-	switch rec.Kind {
-	case KindSaved:
-		l[LabelScope] = selector.Hash(rec.Scope)
-		l[LabelFamily] = selector.Hash(rec.Family)
-		l[LabelKey] = selector.Hash(rec.Key)
-	case KindResume:
+	if rec.Kind == KindResume {
 		l[LabelRun] = strconv.FormatInt(rec.RunID, 10)
-		l[LabelFamily] = selector.Hash(rec.Family)
 		l[LabelJobName] = selector.Hash(rec.JobName)
+		if rec.LegacyFamily != "" {
+			l[LabelFamily] = selector.Hash(rec.LegacyFamily)
+		}
 	}
 	return l
 }
@@ -550,7 +607,9 @@ func matches(im compute.Image, rec Image) bool {
 		return false
 	}
 	want := labels(rec)
-	for _, k := range []string{LabelRepository, LabelKind, LabelArch, LabelScope, LabelFamily, LabelKey, LabelRun, LabelJobName} {
+	// A resume image made before work disks lost their families has a
+	// family label too, which nothing reads any more.
+	for _, k := range []string{LabelRepository, LabelKind, LabelArch, LabelRun, LabelJobName} {
 		if im.Labels[k] != want[k] {
 			return false
 		}
@@ -558,34 +617,48 @@ func matches(im compute.Image, rec Image) bool {
 	return true
 }
 
-// make makes a recorded image from its machine's work disk, then records
-// it ready. A confirmed failure is tried again under a new request ID.
+// make moves the making of a recorded image from its machine's work disk
+// on, and records it ready once Compute Engine shows it so. It never waits
+// for Compute Engine to make it, which can take minutes, and the pass's
+// lease would hold up every queued job meanwhile: one asked for, or still
+// being made, is machines.ErrPending, and a later pass finds it ready. A
+// confirmed failure is tried again under a new request ID.
 func (s *Service) make(ctx context.Context, key string, rec Image, gen int64) (Image, int64, error) {
 	if rec.State != ImageMaking {
 		return rec, gen, nil
 	}
-	err := s.Compute.CreateImage(ctx, compute.ImageSpec{Name: rec.Image, SourceZone: rec.Zone, SourceDisk: machines.WorkDisk(rec.Machine),
-		Labels: labels(rec)}, compute.RequestID("image", rec.Image, strconv.Itoa(rec.Attempt)))
-	if err == nil || errors.Is(err, compute.ErrExists) {
-		// Made, or there from an earlier request of ours, since only the
-		// service makes images of these names; but it's made only once
-		// Compute Engine shows it ready. One still being made is waited
-		// for; a failed one is deleted, and made again by the next try.
-		im, ierr := s.Compute.Image(ctx, rec.Image)
-		switch {
-		case ierr != nil:
-			err = ierr
-		case im.Status == "READY" && matches(im, rec):
-			err = nil
-		case im.Status == "PENDING":
-			return rec, gen, fmt.Errorf("image %s is still being made", rec.Image)
-		default:
-			s.log().Warn("an image that failed, or isn't the one recorded, is deleted to be made again", "image", rec.Image, "status", im.Status)
-			if derr := s.Compute.DeleteImage(ctx, rec.Image, freshID("delete image", rec.Image)); derr != nil && !errors.Is(derr, compute.ErrNotFound) {
-				return rec, gen, derr
+	im, err := s.Compute.Image(ctx, rec.Image)
+	if errors.Is(err, compute.ErrNotFound) {
+		var done bool
+		done, err = s.Compute.StartImage(ctx, compute.ImageSpec{Name: rec.Image, SourceZone: rec.Zone, SourceDisk: machines.WorkDisk(rec.Machine),
+			Labels: labels(rec)}, compute.RequestID("image", rec.Image, strconv.Itoa(rec.Attempt)))
+		if err == nil || errors.Is(err, compute.ErrExists) {
+			// Asked for, or there from an earlier request of ours, since
+			// only the service makes images of these names: it's looked
+			// at once, in case it's made already.
+			im, err = s.Compute.Image(ctx, rec.Image)
+			switch {
+			case errors.Is(err, compute.ErrNotFound) && done:
+				// Made, by a request whose answer came back as done, and
+				// deleted since: another request makes it again.
+				err = fmt.Errorf("image %s was made and is gone", rec.Image)
+			case errors.Is(err, compute.ErrNotFound):
+				return rec, gen, fmt.Errorf("image %s asked for: %w", rec.Image, machines.ErrPending)
 			}
-			err = fmt.Errorf("image %s was %s", rec.Image, im.Status)
 		}
+	}
+	switch {
+	case err != nil:
+	case im.Status == "READY" && matches(im, rec):
+	case im.Status == "PENDING":
+		return rec, gen, fmt.Errorf("image %s is still being made: %w", rec.Image, machines.ErrPending)
+	default:
+		// A failed one is deleted, and made again by the next try.
+		s.log().Warn("an image that failed, or isn't the one recorded, is deleted to be made again", "image", rec.Image, "status", im.Status)
+		if derr := s.Compute.DeleteImage(ctx, rec.Image, freshID("delete image", rec.Image)); derr != nil && !errors.Is(derr, compute.ErrNotFound) {
+			return rec, gen, derr
+		}
+		err = fmt.Errorf("image %s was %s", rec.Image, im.Status)
 	}
 	if err != nil {
 		if !compute.IsUnavailable(err) {

@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"net/http"
 	"net/http/httptest"
 	"regexp"
 	"slices"
@@ -32,6 +33,7 @@ import (
 	"time"
 
 	"github.com/jonboulle/clockwork"
+	gce "google.golang.org/api/compute/v1"
 	"google.golang.org/api/option"
 
 	"github.com/lanescape/runners/emulators/fault"
@@ -61,11 +63,16 @@ type Emulator struct {
 	public    map[string]*image    // other projects' public images, by project/name
 	ops       map[string]*operation
 	requests  map[string]*operation // by requestId
-	stockouts map[capacityKey]bool
-	refusing  map[capacityKey]bool
-	diskShort map[string]bool
-	failNext  map[string]string
-	quotas    map[string]int64 // by region/metric
+	// firstAnswers are the operations as first answered, by requestId,
+	// which a repeated request gets while staleReplays is set.
+	firstAnswers map[string]*gce.Operation
+	staleReplays bool
+	stockouts    map[capacityKey]bool
+	refusing     map[capacityKey]bool
+	diskShort    map[string]bool
+	maxDisksSize map[string]int64
+	failNext     map[string]string
+	quotas       map[string]int64 // by region/metric
 	// globalQuotas are quotas of the whole project, by metric, such as
 	// CPUS_ALL_REGIONS.
 	globalQuotas map[string]int64
@@ -171,6 +178,9 @@ type image struct {
 	sourceDisk string
 	sizeGB     int64
 	labelFP    int64
+	// making is the operation making a held image, which runs until the
+	// image is let be ready, as Compute Engine's runs until it's made.
+	making *operation
 }
 
 // Option configures an Emulator.
@@ -195,8 +205,8 @@ func New(opts ...Option) *Emulator {
 		clock:     clockwork.NewRealClock(),
 		zones:     []string{"northamerica-northeast1-a", "northamerica-northeast1-b"},
 		instances: map[string]*instance{}, disks: map[string]*disk{}, images: map[string]*image{}, public: map[string]*image{},
-		ops: map[string]*operation{}, requests: map[string]*operation{},
-		stockouts: map[capacityKey]bool{}, refusing: map[capacityKey]bool{}, diskShort: map[string]bool{}, failNext: map[string]string{}, quotas: map[string]int64{}, globalQuotas: map[string]int64{}, booted: map[uint64]bool{},
+		ops: map[string]*operation{}, requests: map[string]*operation{}, firstAnswers: map[string]*gce.Operation{},
+		stockouts: map[capacityKey]bool{}, refusing: map[capacityKey]bool{}, diskShort: map[string]bool{}, maxDisksSize: map[string]int64{}, failNext: map[string]string{}, quotas: map[string]int64{}, globalQuotas: map[string]int64{}, booted: map[uint64]bool{},
 	}
 	for _, o := range opts {
 		o(e)
@@ -281,9 +291,9 @@ func (e *Emulator) AddLabelledImage(name, family, arch string, labels map[string
 		created: e.clock.Now(), sizeGB: 10}
 }
 
-// HoldImages makes images made from now on stay PENDING, as one Compute
-// Engine is slow to finish does, or lets them be READY again, those held
-// included.
+// HoldImages makes images made from now on stay PENDING, their operations
+// running, as one Compute Engine is slow to finish does, or lets them be
+// READY again, those held included, their operations done.
 func (e *Emulator) HoldImages(hold bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -293,8 +303,35 @@ func (e *Emulator) HoldImages(hold bool) {
 			if im.status == "PENDING" {
 				im.status = "READY"
 			}
+			if im.making != nil {
+				im.making.doneAt, im.making = time.Time{}, nil
+			}
 		}
 	}
+}
+
+// FailHeldImages ends the operations making held images with an error,
+// leaving no image, as Compute Engine can fail to make one after it has
+// taken the request.
+func (e *Emulator) FailHeldImages(code string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for name, im := range e.images {
+		if im.making != nil {
+			im.making.fail(http.StatusInternalServerError, code, "The operation failed.")
+			im.making.doneAt = time.Time{}
+			delete(e.images, name)
+		}
+	}
+}
+
+// StaleReplays makes a request repeated with a requestId already seen get
+// that request's operation as it was first answered, rather than as it now
+// stands, which Compute Engine doesn't promise either.
+func (e *Emulator) StaleReplays(stale bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.staleReplays = stale
 }
 
 // AddPublicImage adds a ready image to another project, public, as

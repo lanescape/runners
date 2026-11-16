@@ -17,10 +17,12 @@ import (
 // action is a client that speaks the interface for actions
 // (specs/0005-interface.md) as the actions in lanescape/actions do, and
 // nothing more: it writes a job's selector, which names a shape alone; it
-// writes the steps that ask for the job's work disk and its save, which
-// run in the job, signed with the machine's identity token from its
-// metadata server, and wait for /work to be the mounted disk. These tests are the service's promise to the actions; one
-// that has to change breaks /v1/.
+// writes the steps that ask for the job's work disk, and wait for /work to
+// be the mounted disk, and that restore and save its caches, uploading and
+// downloading their objects with the token the service gives; they run in
+// the job, signed with the machine's identity token from its metadata
+// server. These tests are the service's promise to the actions; one that
+// has to change breaks /v1/.
 type action struct {
 	t *testing.T
 	// service stands in for endpoints.Service, which is also the audience
@@ -49,7 +51,10 @@ func (a action) selector(shape string, spot bool) string {
 // standard input, never in an argument another process could see. It
 // prints the answer's status, leaves its body in the file $answer, and
 // prints both in the job's log, as "<path> <status> <body>", where a test
-// reads them.
+// reads them, with any token the body holds for the caches' bucket left
+// out, as the actions never log it. lsr_storage calls the caches' bucket,
+// whose JSON API $LSR_TEST_STORAGE stands in for, with a token from an
+// answer, again in a header read from standard input.
 const stepRequest = `set -e
 answer=$(mktemp)
 trap 'rm -f "$answer"' EXIT
@@ -60,9 +65,16 @@ lsr_request() {
 		"$md/computeMetadata/v1/instance/service-accounts/default/identity") || return 1
 	code=$(printf 'header = "Authorization: Bearer %s"\n' "$token" |
 		curl -sS --config - -o "$answer" -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data "$2" "$service$1") || code=000
-	echo "lanescape-runners test action: $1 $code $(tr -d '\n' <"$answer")" >&2
+	echo "lanescape-runners test action: $1 $code $(jq -c 'if type == "object" and has("token") then .token = "-" else . end' "$answer" 2>/dev/null ||
+		tr -d '\n' <"$answer")" >&2
 	echo "$code"
 }
+lsr_storage() {
+	local token=$1
+	shift
+	printf 'header = "Authorization: Bearer %s"\n' "$token" | curl -fsS --config - "$@"
+}
+lsr_uri() { jq -rn --arg s "$1" '$s | @uri'; }
 `
 
 // steps joins a job's steps into the script the runner runs: each must
@@ -71,27 +83,61 @@ func (a action) steps(parts ...string) string {
 	return stepRequest + strings.Join(parts, "\n") + "\n"
 }
 
-// diskStep asks for the job's work disk of a family, as the disk action
-// does: POST /v1/disks until the answer is ready, then waits until /work,
-// which $LSR_TEST_WORK stands in for, is the mounted disk. A refusal fails
-// the step.
-func (a action) diskStep(family string) string {
-	return fmt.Sprintf(`while :; do
-	code=$(lsr_request /v1/disks '{"family": "%s"}') || code=000
+// diskStep asks for the job's work disk, as the disk action does: POST
+// /v1/disks until the answer is ready, then waits until /work, which
+// $LSR_TEST_WORK stands in for, is the mounted disk. A refusal fails the
+// step.
+func (a action) diskStep() string {
+	return `while :; do
+	code=$(lsr_request /v1/disks '{}') || code=000
 	case $code in
 	200) [ "$(jq -r .state "$answer")" = ready ] && break ;;
 	403) exit 1 ;;
 	esac
 	sleep 0.2
 done
-until [ -e "$LSR_TEST_WORK/.disk" ]; do sleep 0.1; done`, family)
+until [ -e "$LSR_TEST_WORK/.disk" ]; do sleep 0.1; done`
 }
 
-// saveStep asks for the job's work disk to be saved when the job finishes,
-// as the save-disk action does. A refusal fails the step.
-func (a action) saveStep() string {
-	return `code=$(lsr_request /v1/disks/save '{"save": true}') || code=000
-[ "$code" = 200 ]`
+// restoreStep restores a cache, as the cache action does: POST
+// /v1/caches/restore, then, unless it restored nothing, each of the
+// version's objects at its generation, read with the answer's token into
+// $LSR_TEST_WORK/caches/<cache>/, checking its size. A refusal fails the
+// step.
+func (a action) restoreStep(cache string) string {
+	return fmt.Sprintf(`code=$(lsr_request /v1/caches/restore '{"cache": "%[1]s"}') || code=000
+[ "$code" = 200 ]
+if [ "$(jq -r .restored "$answer")" != none ]; then
+	bucket=$(jq -r .bucket "$answer")
+	token=$(jq -r .token "$answer")
+	mkdir -p "$LSR_TEST_WORK/caches/%[1]s"
+	jq -r '.objects[] | "\(.name) \(.generation) \(.size)"' "$answer" | while read -r name gen size; do
+		out="$LSR_TEST_WORK/caches/%[1]s/${name##*/}"
+		lsr_storage "$token" -o "$out" "$LSR_TEST_STORAGE/storage/v1/b/$bucket/o/$(lsr_uri "$name")?alt=media&generation=$gen"
+		[ "$(wc -c <"$out" | tr -d ' ')" = "$size" ]
+	done
+fi`, cache)
+}
+
+// saveStep saves a cache, as the save-cache action does: POST
+// /v1/caches/save, then, in a scope that saves, an object under the
+// version's prefix, uploaded with the answer's token, and POST
+// /v1/caches/commit. A refusal fails the step.
+func (a action) saveStep(cache string) string {
+	return fmt.Sprintf(`code=$(lsr_request /v1/caches/save '{"cache": "%[1]s"}') || code=000
+[ "$code" = 200 ]
+if [ "$(jq -r .saves "$answer")" = true ]; then
+	bucket=$(jq -r .bucket "$answer")
+	prefix=$(jq -r .prefix "$answer")
+	token=$(jq -r .token "$answer")
+	data=$(mktemp)
+	printf '%%s of run %%s, attempt %%s\n' %[1]s "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >"$data"
+	lsr_storage "$token" -o /dev/null -X POST -H 'Content-Type: application/octet-stream' --data-binary @"$data" \
+			"$LSR_TEST_STORAGE/upload/storage/v1/b/$bucket/o?uploadType=media&name=$(lsr_uri "${prefix}shard-000.tar.zst")"
+	rm -f "$data"
+	code=$(lsr_request /v1/caches/commit '{"cache": "%[1]s"}') || code=000
+	[ "$code" = 200 ]
+fi`, cache)
 }
 
 // noDiskYetStep fails unless /work is still without a disk, as it is
@@ -132,8 +178,8 @@ func (a action) stepAnswers(log string) []stepAnswer {
 	return out
 }
 
-// The steps of the restore order a work disk can come from, and resume.
-var restoredSteps = []string{"resume", "pull_request_exact", "pull_request_newest", "main_exact", "main_newest", "branch_exact",
+// The steps of the restore order a cache can come from.
+var restoredSteps = []string{"pull_request_exact", "pull_request_newest", "main_exact", "main_newest", "branch_exact",
 	"branch_newest", "none"}
 
 func (a action) checkStepAnswer(sa stepAnswer) {
@@ -152,14 +198,30 @@ func (a action) checkStepAnswer(sa stepAnswer) {
 	case sa.Path == "/v1/disks":
 		state, _ := sa.Body["state"].(string)
 		restored, _ := sa.Body["restored"].(string)
-		if (state != "making" && state != "ready") || !slices.Contains(restoredSteps, restored) || len(sa.Body) != 2 {
+		if (state != "making" && state != "ready") || (restored != "none" && restored != "resume") || len(sa.Body) != 2 {
 			a.t.Fatalf("/v1/disks answered %v, which the interface doesn't have", sa.Body)
 		}
-	case sa.Path == "/v1/disks/save":
+	case sa.Path == "/v1/caches/restore":
+		restored, _ := sa.Body["restored"].(string)
+		objects, _ := sa.Body["objects"].([]any)
+		switch {
+		case restored == "none" && len(sa.Body) == 1:
+		case slices.Contains(restoredSteps, restored) && restored != "none" && len(objects) > 0 && sa.Body["bucket"] != "" &&
+			sa.Body["token"] != nil && sa.Body["expires"] != nil && len(sa.Body) == 5:
+		default:
+			a.t.Fatalf("/v1/caches/restore answered %v, which the interface doesn't have", sa.Body)
+		}
+	case sa.Path == "/v1/caches/save":
 		saves, ok := sa.Body["saves"].(bool)
 		reason, _ := sa.Body["reason"].(string)
-		if !ok || (saves && reason != "") || (!saves && reason == "") {
-			a.t.Fatalf("/v1/disks/save answered %v, which the interface doesn't have", sa.Body)
+		prefix, _ := sa.Body["prefix"].(string)
+		if !ok || (saves && (reason != "" || prefix == "" || sa.Body["token"] == nil || len(sa.Body) != 5)) ||
+			(!saves && (reason == "" || len(sa.Body) != 2)) {
+			a.t.Fatalf("/v1/caches/save answered %v, which the interface doesn't have", sa.Body)
+		}
+	case sa.Path == "/v1/caches/commit":
+		if n, _ := sa.Body["objects"].(float64); n < 1 || sa.Body["bytes"] == nil || len(sa.Body) != 2 {
+			a.t.Fatalf("/v1/caches/commit answered %v, which the interface doesn't have", sa.Body)
 		}
 	}
 }

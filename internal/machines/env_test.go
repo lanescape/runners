@@ -146,7 +146,9 @@ func setup(t *testing.T) *env {
 	mux.Handle("POST /v1/jobs/started", svc.JobStarted())
 	mux.Handle("POST /v1/jobs/finished", svc.JobFinished())
 	mux.Handle("POST "+machines.DisksPath, svc.DiskRequest())
-	mux.Handle("POST "+machines.SavePath, svc.SaveRequest())
+	mux.Handle("POST "+machines.CacheRestorePath, svc.CacheRestoreRequest())
+	mux.Handle("POST "+machines.CacheSavePath, svc.CacheSaveRequest())
+	mux.Handle("POST "+machines.CacheCommitPath, svc.CacheCommitRequest())
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	e := &env{t: t, clock: clock, gh: gh, gce: gce, gcs: gcs, org: org, contributor: contributor, maintainer: gh.User(42, "maintainer"),
@@ -379,20 +381,26 @@ func (m *machine) report() int {
 	return code
 }
 
-// disk asks once for the job's work disk of a family, as the disk action
-// does.
-func (m *machine) disk(family string) (int, map[string]any) {
+// disk asks once for the job's work disk, as the disk action does.
+func (m *machine) disk() (int, map[string]any) {
 	m.e.t.Helper()
-	return m.e.post(machines.DisksPath, m.e.token(m.in), map[string]string{"family": family})
+	return m.e.post(machines.DisksPath, m.e.token(m.in), map[string]string{})
 }
 
-// diskReady asks for the job's work disk of a family until it's ready, as
-// the disk action does, and returns where it came from.
-func (m *machine) diskReady(family string) string {
+// diskAs asks for the job's work disk with these settings, as the disk
+// action does with its inputs.
+func (m *machine) diskAs(settings map[string]any) (int, map[string]any) {
+	m.e.t.Helper()
+	return m.e.post(machines.DisksPath, m.e.token(m.in), settings)
+}
+
+// diskReady asks for the job's work disk until it's ready, as the disk
+// action does, and returns where it came from.
+func (m *machine) diskReady() string {
 	m.e.t.Helper()
 	var restored string
 	m.e.eventually("the work disk is ready", func() bool {
-		code, body := m.disk(family)
+		code, body := m.disk()
 		if code != http.StatusOK && code != http.StatusServiceUnavailable {
 			m.e.t.Fatalf("work disk request: %d %v", code, body)
 		}
@@ -402,16 +410,16 @@ func (m *machine) diskReady(family string) string {
 	return restored
 }
 
-// save asks for the job's work disk to be saved, as the save-disk action
-// does.
-func (m *machine) save() (int, map[string]any) {
+// cache sends a cache request, restore, save or commit, as the cache
+// actions do.
+func (m *machine) cache(path, cache string) (int, map[string]any) {
 	m.e.t.Helper()
-	return m.e.post(machines.SavePath, m.e.token(m.in), map[string]bool{"save": true})
+	return m.e.post(path, m.e.token(m.in), map[string]string{"cache": cache})
 }
 
-// declares is a .github/runners.json that declares the family build, with
-// no files.
-const declares = `{"disks": {"build": {}}}`
+// declares is a .github/runners.json that declares the cache build, with no
+// files.
+const declares = `{"caches": {"build": {}}}`
 
 func (e *env) eventually(what string, cond func() bool) {
 	e.t.Helper()

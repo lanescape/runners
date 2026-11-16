@@ -63,7 +63,7 @@ func (r reconcile) Pass(p *pass.Pass) error { return r(p) }
 // closing's delivery, which GitHub doesn't send again, and is reopened
 // before any pass sees it closed. The webhook recorded the closing before
 // it tried to publish, so the reopened pull request starts again from
-// main's disk, and what it saved before goes (specs/0003-disks.md,
+// main's version, and what it saved before goes (specs/0003-disks.md,
 // Deletion).
 func TestAClosingIsRecordedAtTheWebhookThoughItsDeliveryFails(t *testing.T) {
 	e := setup(t)
@@ -92,11 +92,11 @@ func TestAClosingIsRecordedAtTheWebhookThoughItsDeliveryFails(t *testing.T) {
 
 	e.gh.ReopenPull(p)
 	e.clock.Advance(time.Minute)
-	if src := e.start(e.pullRun(p), ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, pr)}}).source(); src != m {
+	if src := e.start(e.pullRun(p), ghemu.JobSpec{Name: "build", Labels: []string{sel(key1, pr)}}).restored(); src != m {
 		t.Fatalf("a pull request reopened after a lost delivery restored %q, want main's %s", src, m)
 	}
 	if e.has(img) {
-		t.Fatal("a disk saved before its pull request's closing outlived it")
+		t.Fatal("a version saved before its pull request's closing outlived it")
 	}
 }
 

@@ -27,6 +27,7 @@ func good() map[string]string {
 		"RUNNERS_AUDIENCE":            endpoints.Service,
 		"RUNNERS_PROJECT":             "lanescape-dev",
 		"RUNNERS_BUCKET":              "lanescape-runners",
+		"RUNNERS_CACHES_BUCKET":       "lanescape-runners-caches",
 		"RUNNERS_WEBHOOK_TOPIC":       "projects/lanescape-dev/topics/lanescape-runners-webhooks",
 		"RUNNERS_GITHUB_APP_ID":       "12345",
 		"RUNNERS_GITHUB_APP_KEY_FILE": "/secrets/app-key",
@@ -59,20 +60,21 @@ func TestNoDeployID(t *testing.T) {
 
 func TestBadSettings(t *testing.T) {
 	for name, tc := range map[string]struct{ key, value, want string }{
-		"no audience":     {"RUNNERS_AUDIENCE", "", "RUNNERS_AUDIENCE is required"},
-		"http audience":   {"RUNNERS_AUDIENCE", "http://lanescape-runners-168731703350.northamerica-northeast1.run.app", "endpoints.Service"},
-		"other audience":  {"RUNNERS_AUDIENCE", "https://runners.example.test", "endpoints.Service"},
-		"no bucket":       {"RUNNERS_BUCKET", "", "RUNNERS_BUCKET is required"},
-		"no topic":        {"RUNNERS_WEBHOOK_TOPIC", "", "RUNNERS_WEBHOOK_TOPIC is required"},
-		"no project":      {"RUNNERS_PROJECT", "", "RUNNERS_PROJECT is required"},
-		"app by name":     {"RUNNERS_GITHUB_APP_ID", "lanescape-runners", "numeric ID"},
-		"no accounts":     {"RUNNERS_RECONCILE_ACCOUNTS", " , ", "RUNNERS_RECONCILE_ACCOUNTS is required"},
-		"a person":        {"RUNNERS_RECONCILE_ACCOUNTS", "someone@example.com", "isn't a service account"},
-		"no webhook file": {"RUNNERS_WEBHOOK_SECRET_FILE", "", "RUNNERS_WEBHOOK_SECRET_FILE is required"},
-		"no app key file": {"RUNNERS_GITHUB_APP_KEY_FILE", "", "RUNNERS_GITHUB_APP_KEY_FILE is required"},
-		"negative app ID": {"RUNNERS_GITHUB_APP_ID", "-1", "numeric ID"},
-		"missing app ID":  {"RUNNERS_GITHUB_APP_ID", "", "numeric ID"},
-		"bad deploy ID":   {"RUNNERS_DEPLOY_ID", "19283746", "RUNNERS_DEPLOY_ID"},
+		"no audience":      {"RUNNERS_AUDIENCE", "", "RUNNERS_AUDIENCE is required"},
+		"http audience":    {"RUNNERS_AUDIENCE", "http://lanescape-runners-168731703350.northamerica-northeast1.run.app", "endpoints.Service"},
+		"other audience":   {"RUNNERS_AUDIENCE", "https://runners.example.test", "endpoints.Service"},
+		"no bucket":        {"RUNNERS_BUCKET", "", "RUNNERS_BUCKET is required"},
+		"no caches bucket": {"RUNNERS_CACHES_BUCKET", "", "RUNNERS_CACHES_BUCKET is required"},
+		"no topic":         {"RUNNERS_WEBHOOK_TOPIC", "", "RUNNERS_WEBHOOK_TOPIC is required"},
+		"no project":       {"RUNNERS_PROJECT", "", "RUNNERS_PROJECT is required"},
+		"app by name":      {"RUNNERS_GITHUB_APP_ID", "lanescape-runners", "numeric ID"},
+		"no accounts":      {"RUNNERS_RECONCILE_ACCOUNTS", " , ", "RUNNERS_RECONCILE_ACCOUNTS is required"},
+		"a person":         {"RUNNERS_RECONCILE_ACCOUNTS", "someone@example.com", "isn't a service account"},
+		"no webhook file":  {"RUNNERS_WEBHOOK_SECRET_FILE", "", "RUNNERS_WEBHOOK_SECRET_FILE is required"},
+		"no app key file":  {"RUNNERS_GITHUB_APP_KEY_FILE", "", "RUNNERS_GITHUB_APP_KEY_FILE is required"},
+		"negative app ID":  {"RUNNERS_GITHUB_APP_ID", "-1", "numeric ID"},
+		"missing app ID":   {"RUNNERS_GITHUB_APP_ID", "", "numeric ID"},
+		"bad deploy ID":    {"RUNNERS_DEPLOY_ID", "19283746", "RUNNERS_DEPLOY_ID"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			m := good()

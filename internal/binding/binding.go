@@ -62,8 +62,8 @@ type Binding struct {
 	RepositoryID int64       `json:"repository_id"`
 	RunID        int64       `json:"run_id"`
 	Event        string      `json:"event"`
-	// Commit is the run's commit, whose files decide its saved disks'
-	// keys: a push's head commit, a pull request run's head commit, and a
+	// Commit is the run's commit, whose files decide its caches' keys: a
+	// push's head commit, a pull request run's head commit, and a
 	// contribution's head commit, the event's.
 	Commit string `json:"commit"`
 	// HeadRepositoryID is the repository the run's commit came from, by

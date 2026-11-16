@@ -120,6 +120,7 @@ func New(t testing.TB, clock clockwork.Clock) *World {
 	gcs := gcsemu.New()
 	t.Cleanup(gcs.Close)
 	gcs.CreateBucket(State)
+	gcs.CreateBucket(service.CachesBucket)
 	ps := google.NewPubSub()
 	t.Cleanup(ps.Close)
 	ps.CreateTopic(topic)
@@ -178,17 +179,23 @@ func New(t testing.TB, clock clockwork.Clock) *World {
 		}
 	})
 	binder := &binding.Binder{GitHub: ghc, Objects: objects, OrganizationID: orgID, Clock: clock, Logger: log}
-	dks := &disks.Service{Config: cfg, Project: project, GitHub: ghc, Compute: gcec, Objects: objects, Clock: clock, Logger: log,
-		StepDeadline: 5 * time.Second}
+	caches, err := store.NewGCS(ctx, service.CachesBucket, gcs.ClientOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { caches.Close() })
+	dks := &disks.Service{Config: cfg, Project: project, GitHub: ghc, Compute: gcec, Objects: objects, Caches: caches,
+		CacheBucket: service.CachesBucket, Tokens: Tokens{Clock: clock}, Clock: clock, Logger: log, StepDeadline: 5 * time.Second}
 	svc := &machines.Service{Config: cfg, Project: gce.Project, ServiceURL: audience, MachineAccount: account, GitHub: ghc, Compute: gcec,
 		Objects: objects, Binder: binder, Machines: verifier, Clock: clock, Logger: log, AssignmentWait: 5 * time.Second,
-		AssignmentRetry: 50 * time.Millisecond, FailStopDelay: 100 * time.Millisecond, Disks: dks, Saves: dks, Preemptions: dks}
+		AssignmentRetry: 50 * time.Millisecond, FailStopDelay: 100 * time.Millisecond, Disks: dks, Caches: dks, Preemptions: dks}
 	passes := &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log}
 	body := pass.All(svc.Pass, dks.Pass)
 	handler, err = server.New(server.Config{
 		Logger: log, OrganizationID: orgID, WebhookSecret: []byte(secret), Publisher: pub, ReconcileCallers: callers,
 		Passes: passes, Reconciler: reconciler(body), Events: dks, Closings: dks, JobStarted: svc.JobStarted(), JobFinished: svc.JobFinished(),
-		Disks: svc.DiskRequest(), Save: svc.SaveRequest(),
+		Disks: svc.DiskRequest(), CacheRestore: svc.CacheRestoreRequest(), CacheSave: svc.CacheSaveRequest(),
+		CacheCommit: svc.CacheCommitRequest(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -207,6 +214,24 @@ func New(t testing.TB, clock clockwork.Clock) *World {
 	})
 	return w
 }
+
+// Tokens are what the test service hands out for its caches' bucket: the
+// emulator's token, which its storage emulator doesn't check, as a real
+// token would be downscoped to the prefix it names.
+type Tokens struct{ Clock clockwork.Clock }
+
+// Read implements disks.Tokens.
+func (t Tokens) Read(_ context.Context, prefix string) (string, time.Time, error) {
+	return service.Token, t.Clock.Now().Add(time.Hour).UTC(), nil
+}
+
+// Create implements disks.Tokens.
+func (t Tokens) Create(_ context.Context, prefix string) (string, time.Time, error) {
+	return service.Token, t.Clock.Now().Add(time.Hour).UTC(), nil
+}
+
+// CacheStorage implements service.World.
+func (w *World) CacheStorage() *gcsemu.Emulator { return w.Storage }
 
 type reconciler pass.Body
 
@@ -598,6 +623,16 @@ func (w *World) HoldDisks(on bool) {
 			return strings.HasSuffix(r.URL.Path, "/attachDisk")
 		}, Respond: fault.Status(http.StatusServiceUnavailable, nil, `{"error": {"code": 503, "message": "Service Unavailable"}}`)})
 	}
+}
+
+// WorkDiskSettings implements service.World, from Compute Engine's disk.
+func (w *World) WorkDiskSettings(j service.Job) (service.DiskSettings, bool) {
+	for _, d := range w.Compute.Disks() {
+		if d.Name == machines.WorkDisk(j.Machine) {
+			return service.DiskSettings{SizeGB: d.SizeGB, IOPS: d.IOPS, ThroughputMiBps: d.Throughput}, true
+		}
+	}
+	return service.DiskSettings{}, false
 }
 
 // deliver sends GitHub's signed delivery to the service's webhook, and

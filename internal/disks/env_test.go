@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -44,63 +46,70 @@ const (
 	key2     = "fedcba9876543210fedc"
 	key3     = "00112233445566778899"
 	zero     = "00000000000000000000"
+	// cachesBucket is the caches' bucket, in the storage emulator beside
+	// the state bucket.
+	cachesBucket = "caches"
 )
 
-// declares is a .github/runners.json that declares every family the tests'
-// jobs ask for, which keeps their disks in main's scope and, on a
-// long-lived branch, in its scope.
-const declares = `{"disks": {"build": {}, "tools": {}, "other": {}}}`
+// declares is a .github/runners.json that declares every cache the tests'
+// jobs restore and save, which keeps their versions in main's scope and, on
+// a long-lived branch, in its scope.
+const declares = `{"caches": {"build": {}, "tools": {}, "other": {}}}`
 
-// sel is the 2-vCPU amd64 shape with a work disk of family build, whose key
-// for the run is key, in the run's scope: a test's shorthand, which start
-// and take make into the job's selector, the shape alone, recording the key
-// as the run's, and the family as what the job's disk action asks for.
+// sel is the 2-vCPU amd64 shape whose job restores and saves the cache
+// build, whose key for the run is key, in the run's scope: a test's
+// shorthand, which start and take make into the job's selector, the shape
+// alone, recording the key as the run's, and the cache as what the job's
+// actions name.
 func sel(key, scope string) string {
-	return "lanescape-2vcpu-linux-amd64-disk-build-" + key + "-" + scope
+	return "lanescape-2vcpu-linux-amd64-cache-build-" + key + "-" + scope
 }
 
-var oldLabel = regexp.MustCompile(`^(lanescape-[0-9]+vcpu-linux-[a-z0-9]+(?:-spot)?)(?:-disk-([a-z][a-z0-9-]*?)-([0-9a-f]{20}))?-(main|read|pr[0-9]+|branch-[a-z0-9]+)$`)
+// testLabel is a test's shorthand for a job: its shape, then, for a job that
+// asks for a work disk and restores and saves a cache, -cache-<cache>-<the
+// cache's key for the run>, then its run's scope.
+var testLabel = regexp.MustCompile(`^(lanescape-[0-9]+vcpu-linux-[a-z0-9]+(?:-spot)?)(?:-cache-([a-z][a-z0-9-]*?)-([0-9a-f]{20}))?-(main|read|pr[0-9]+|branch-[a-z0-9]+)$`)
 
 // newLabel is a test's label as the job's selector: its shape alone.
 func newLabel(label string) string {
-	if m := oldLabel.FindStringSubmatch(label); m != nil {
+	if m := testLabel.FindStringSubmatch(label); m != nil {
 		return m[1]
 	}
 	return label
 }
 
-// familyOf is the family a test's label has its job's disk action ask for,
+// cacheOfLabels is the cache a test's label has its job restore and save,
 // or "".
-func familyOf(labels []string) string {
+func cacheOfLabels(labels []string) string {
 	for _, l := range labels {
-		if m := oldLabel.FindStringSubmatch(l); m != nil && m[2] != "" {
+		if m := testLabel.FindStringSubmatch(l); m != nil && m[2] != "" {
 			return m[2]
 		}
 	}
 	return ""
 }
 
-// keys records the keys a test's labels give their families as the run's,
-// as the service would have made them from the run's commit.
+// keys records the keys a test's labels give their caches as the run's, as
+// the service would have made them from the run's commit.
 func (e *env) keys(run *ghemu.Run, labels []string) {
 	e.t.Helper()
-	name := "runs/5001/" + strconv.FormatInt(run.ID, 10) + "/files.json"
+	name := "runs/5001/" + strconv.FormatInt(run.ID, 10) + "/caches.json"
 	var rf machines.RunFiles
 	if data, _, ok := e.gcs.Object("state", name); ok {
 		_ = json.Unmarshal(data, &rf)
 	} else {
-		rf = machines.RunFiles{RepositoryID: repoID, RunID: run.ID, Commit: run.HeadSHA, Families: map[string]machines.FamilyKey{}}
+		rf = machines.RunFiles{RepositoryID: repoID, RunID: run.ID, Commit: run.HeadSHA, Caches: map[string]machines.CacheKey{}}
 	}
 	changed := false
 	for _, l := range labels {
-		m := oldLabel.FindStringSubmatch(l)
+		m := testLabel.FindStringSubmatch(l)
 		if m == nil || m[2] == "" {
 			continue
 		}
-		if had, ok := rf.Families[m[2]]; ok && had.Key != m[3] {
-			e.t.Fatalf("run %d's family %s has the key %s already, not %s: one key per family and run", run.ID, m[2], had.Key, m[3])
+		if had, ok := rf.Caches[m[2]]; ok && had.Key != m[3] {
+			e.t.Fatalf("run %d's cache %s has the key %s already, not %s: one key per cache and run", run.ID, m[2], had.Key, m[3])
 		}
-		rf.Families[m[2]] = machines.FamilyKey{Key: m[3]}
+		rf.Caches[m[2]] = machines.CacheKey{Key: m[3]}
 		changed = true
 	}
 	if changed {
@@ -126,6 +135,29 @@ func (l *lockedBuffer) String() string {
 	return l.b.String()
 }
 
+// tokens are the tests' disks.Tokens: each names what it may do and the
+// prefix it's for, as a real one is downscoped to it, and none is given
+// while fail is set.
+type tokens struct {
+	clock clockwork.Clock
+	fail  atomic.Bool
+}
+
+func (t *tokens) mint(what, prefix string) (string, time.Time, error) {
+	if t.fail.Load() {
+		return "", time.Time{}, errors.New("the token exchange failed")
+	}
+	return what + " " + prefix, t.clock.Now().Add(time.Hour).UTC(), nil
+}
+
+func (t *tokens) Read(_ context.Context, prefix string) (string, time.Time, error) {
+	return t.mint("read", prefix)
+}
+
+func (t *tokens) Create(_ context.Context, prefix string) (string, time.Time, error) {
+	return t.mint("create", prefix)
+}
+
 type env struct {
 	t       *testing.T
 	clock   *clockwork.FakeClock
@@ -138,6 +170,8 @@ type env struct {
 	svc     *machines.Service
 	disks   *disks.Service
 	objects store.Objects
+	caches  store.Objects
+	tokens  *tokens
 	binder  *binding.Binder
 	ghc     *github.Client
 	runner  *pass.Runner
@@ -148,9 +182,9 @@ type env struct {
 	stops     []context.CancelFunc
 	byMachine map[string]context.CancelFunc
 	used      map[string]bool
-	// families are what each job's disk action asks for, by its run and
-	// name, so that a rerun's job asks as its first attempt's did.
-	families map[string]string
+	// cacheNames are the cache each job's actions name, by its run and
+	// name, so that a rerun's job names what its first attempt's did.
+	cacheNames map[string]string
 }
 
 func setup(t *testing.T) *env {
@@ -168,6 +202,7 @@ func setup(t *testing.T) *env {
 	gcs := gcsemu.New()
 	t.Cleanup(gcs.Close)
 	gcs.CreateBucket("state")
+	gcs.CreateBucket(cachesBucket)
 
 	org := gh.Org(orgID, "lanescape")
 	gh.SetForkApproval(org, ghemu.ApproveAllExternalContributors)
@@ -193,6 +228,11 @@ func setup(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { objects.Close() })
+	caches, err := store.NewGCS(ctx, cachesBucket, gcs.ClientOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { caches.Close() })
 	account := machines.MachineAccountOf(gce.Project)
 	verifier, err := auth.NewMachines(auth.Options{Issuer: auth.Issuer{URL: gce.Identity.URL, JWKSURL: gce.Identity.JWKSURL},
 		Audience: audience, Now: clock.Now}, gce.Project, account)
@@ -206,21 +246,25 @@ func setup(t *testing.T) *env {
 			t.Log(logs.String())
 		}
 	})
+	toks := &tokens{clock: clock}
 	binder := &binding.Binder{GitHub: ghc, Objects: objects, OrganizationID: orgID, Clock: clock, Logger: log}
-	dks := &disks.Service{Config: cfg, Project: gce.Project, GitHub: ghc, Compute: gcec, Objects: objects, Clock: clock, Logger: log,
-		StepDeadline: time.Second}
+	dks := &disks.Service{Config: cfg, Project: gce.Project, GitHub: ghc, Compute: gcec, Objects: objects, Caches: caches,
+		CacheBucket: cachesBucket, Tokens: toks, Clock: clock, Logger: log, StepDeadline: time.Second}
 	svc := &machines.Service{Config: cfg, Project: gce.Project, ServiceURL: audience, MachineAccount: account,
 		GitHub: ghc, Compute: gcec, Objects: objects, Binder: binder, Machines: verifier, Clock: clock, Logger: log,
-		AssignmentWait: 3 * time.Second, AssignmentRetry: 50 * time.Millisecond, FailStopDelay: 100 * time.Millisecond, Disks: dks, Saves: dks, Preemptions: dks}
+		AssignmentWait: 3 * time.Second, AssignmentRetry: 50 * time.Millisecond, FailStopDelay: 100 * time.Millisecond, Disks: dks, Caches: dks, Preemptions: dks}
 	mux := http.NewServeMux()
 	mux.Handle("POST /v1/jobs/started", svc.JobStarted())
 	mux.Handle("POST /v1/jobs/finished", svc.JobFinished())
-	mux.Handle("POST /v1/disks", svc.DiskRequest())
-	mux.Handle("POST /v1/disks/save", svc.SaveRequest())
+	mux.Handle("POST "+machines.DisksPath, svc.DiskRequest())
+	mux.Handle("POST "+machines.CacheRestorePath, svc.CacheRestoreRequest())
+	mux.Handle("POST "+machines.CacheSavePath, svc.CacheSaveRequest())
+	mux.Handle("POST "+machines.CacheCommitPath, svc.CacheCommitRequest())
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	e := &env{t: t, clock: clock, gh: gh, gce: gce, gcs: gcs, org: org, repo: repo, cfg: cfg, svc: svc, disks: dks, objects: objects,
-		binder: binder, ghc: ghc, url: srv.URL, logs: logs, byMachine: map[string]context.CancelFunc{}, used: map[string]bool{}, families: map[string]string{},
+		caches: caches, tokens: toks, binder: binder, ghc: ghc, url: srv.URL, logs: logs, byMachine: map[string]context.CancelFunc{},
+		used: map[string]bool{}, cacheNames: map[string]string{},
 		runner: &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log}}
 	gce.OnStop(func(m gceemu.Machine) {
 		e.mu.Lock()
@@ -316,6 +360,10 @@ type job struct {
 	done chan error
 	// checked says the job-started check has allowed it.
 	checked bool
+	// restore is the answer to the job's restore of its cache, and saved
+	// the version it saved, if it did.
+	restore machines.CacheRestore
+	saved   string
 }
 
 // start queues a job and plays it to its admission, which it expects to
@@ -327,22 +375,23 @@ func (e *env) start(run *ghemu.Run, spec ghemu.JobSpec) *job {
 }
 
 // queueJob queues a job, its labels made selectors of its run, with their
-// families' keys recorded as the run's.
+// caches' keys recorded as the run's.
 func (e *env) queueJob(run *ghemu.Run, spec ghemu.JobSpec) *ghemu.WorkflowJob {
 	e.t.Helper()
 	e.keys(run, spec.Labels)
-	family := familyOf(spec.Labels)
+	cache := cacheOfLabels(spec.Labels)
 	labels := make([]string, len(spec.Labels))
 	for i, l := range spec.Labels {
 		labels[i] = newLabel(l)
 	}
 	spec.Labels = labels
-	e.families[fmt.Sprint(run.ID, "/", spec.Name)] = family
+	e.cacheNames[fmt.Sprint(run.ID, "/", spec.Name)] = cache
 	return e.gh.Queue(run, spec)
 }
 
 // admit gives a queued job a machine and plays it to its admission, then,
-// if its label asks for a work disk, to its disk action's request.
+// if its label names a cache, asks for its work disk, as the disk action
+// does, and restores the cache, as the cache action does.
 func (e *env) admit(run *ghemu.Run, j *ghemu.WorkflowJob) *job {
 	e.t.Helper()
 	jb := e.take(run, j)
@@ -350,8 +399,9 @@ func (e *env) admit(run *ghemu.Run, j *ghemu.WorkflowJob) *job {
 		e.t.Fatalf("job-started check: %d", code)
 	}
 	jb.checked = true
-	if f := e.familyOf(j.ID); f != "" {
-		jb.disk(f)
+	if e.cacheOf(j.ID) != "" {
+		jb.disk()
+		jb.restoreCache()
 	}
 	return jb
 }
@@ -375,10 +425,15 @@ func (jb *job) call(path string, body, out any) int {
 	return resp.StatusCode
 }
 
-// askDisk is the job's check, if it hasn't had one, and then one request
-// for its work disk, of its label's family, played until the disk is ready
-// if it's answered 200. It returns the request's status.
-func (jb *job) askDisk() int {
+// cacheBody is a cache request's body, naming the job's cache.
+func (jb *job) cacheBody() map[string]string {
+	return map[string]string{"cache": jb.e.cacheOf(jb.j.ID)}
+}
+
+// askRestore is the job's check, if it hasn't had one, and then one request
+// to restore its label's cache. It returns the request's status, and keeps
+// the answer if it's 200.
+func (jb *job) askRestore() int {
 	jb.e.t.Helper()
 	if !jb.checked {
 		if code := jb.started(); code != http.StatusOK {
@@ -386,22 +441,79 @@ func (jb *job) askDisk() int {
 		}
 		jb.checked = true
 	}
-	family := jb.e.familyOf(jb.j.ID)
-	code := jb.call("/v1/disks", map[string]string{"family": family}, nil)
+	var ans machines.CacheRestore
+	code := jb.call(machines.CacheRestorePath, jb.cacheBody(), &ans)
 	if code == http.StatusOK {
-		jb.disk(family)
+		jb.restore = ans
+		jb.checkRestore()
 	}
 	return code
 }
 
+// restoreCache restores the job's cache, as its cache action does, asking
+// again while the service says to.
+func (jb *job) restoreCache() {
+	jb.e.t.Helper()
+	jb.e.eventually("the cache is restored", func() bool {
+		code := jb.askRestore()
+		if code != http.StatusOK && code != http.StatusServiceUnavailable {
+			jb.e.t.Fatalf("cache restore: %d", code)
+		}
+		return code == http.StatusOK
+	})
+}
+
+// checkRestore checks a restore's answer: none, or a version's objects in
+// the caches' bucket, all of one version, with a token that reads only that
+// version's.
+func (jb *job) checkRestore() {
+	jb.e.t.Helper()
+	r := jb.restore
+	if r.Restored == disks.StepNone {
+		if len(r.Objects) != 0 || r.Token != "" || r.Bucket != "" {
+			jb.e.t.Fatalf("a restore of nothing = %+v", r)
+		}
+		return
+	}
+	if len(r.Objects) == 0 || r.Bucket != cachesBucket || r.Expires == nil {
+		jb.e.t.Fatalf("restore = %+v", r)
+	}
+	prefix := disks.VersionPrefix(repoID, versionOfObject(r.Objects[0].Name))
+	if r.Token != "read "+prefix {
+		jb.e.t.Fatalf("a restore's token is %q, want one that reads %s alone", r.Token, prefix)
+	}
+	for _, o := range r.Objects {
+		if !strings.HasPrefix(o.Name, prefix) {
+			jb.e.t.Fatalf("a restore's objects are of more than one version: %+v", r.Objects)
+		}
+	}
+}
+
+// versionOfObject is the version a caches' bucket object belongs to.
+func versionOfObject(name string) string {
+	parts := strings.SplitN(name, "/", 3)
+	if len(parts) < 3 {
+		return ""
+	}
+	return parts[1]
+}
+
+// restored is the version the job's restore chose, or "".
+func (jb *job) restored() string {
+	if len(jb.restore.Objects) == 0 {
+		return ""
+	}
+	return versionOfObject(jb.restore.Objects[0].Name)
+}
+
 // disk asks for the job's work disk, as its disk action does, until it's
 // ready, and returns where it came from.
-func (jb *job) disk(family string) string {
+func (jb *job) disk() string {
 	jb.e.t.Helper()
 	var ans machines.DiskAnswer
 	jb.e.eventually("the work disk is ready", func() bool {
 		ans = machines.DiskAnswer{}
-		code := jb.call("/v1/disks", map[string]string{"family": family}, &ans)
+		code := jb.call(machines.DisksPath, map[string]string{}, &ans)
 		if code != http.StatusOK && code != http.StatusServiceUnavailable {
 			jb.e.t.Fatalf("work disk request: %d", code)
 		}
@@ -460,17 +572,87 @@ func (jb *job) started() int {
 	return resp.StatusCode
 }
 
-// finish asks to save the job's work disk, if save, as its save-disk action
-// does, lets the job's steps run, waits for its runner to exit, and sends
-// the supervisor's report, then powers the machine off, as the supervisor
+// askSave is one request to save the job's cache, and its answer.
+func (jb *job) askSave() (int, machines.CacheSave) {
+	jb.e.t.Helper()
+	var ans machines.CacheSave
+	return jb.call(machines.CacheSavePath, jb.cacheBody(), &ans), ans
+}
+
+// commit is one request to commit the job's cache, and its answer.
+func (jb *job) commit() (int, machines.CacheCommit) {
+	jb.e.t.Helper()
+	var ans machines.CacheCommit
+	return jb.call(machines.CacheCommitPath, jb.cacheBody(), &ans), ans
+}
+
+// upload writes a version's objects under the prefix a save named, as the
+// save-cache action does with its token: a tar shard or two, whose contents
+// name the job.
+func (jb *job) upload(prefix string) []string {
+	jb.e.t.Helper()
+	var names []string
+	for i := range 2 {
+		name := fmt.Sprintf("%s%d.tar.zst", prefix, i)
+		jb.e.gcs.Put(cachesBucket, name, []byte(fmt.Sprintf("job %d's shard %d of its cache", jb.j.ID, i)))
+		names = append(names, name)
+	}
+	return names
+}
+
+// saveCache saves the job's cache, as its save-cache action does: it asks
+// to save, uploads its objects under the version's prefix, and commits
+// them. It returns the version, or "" if the run's scope saves nothing.
+func (jb *job) saveCache() string {
+	jb.e.t.Helper()
+	code, ans := jb.askSave()
+	if code != http.StatusOK {
+		jb.e.t.Fatalf("save request: %d", code)
+	}
+	if !ans.Saves {
+		if ans.Reason == "" || ans.Token != "" || ans.Prefix != "" {
+			jb.e.t.Fatalf("a save refused = %+v", ans)
+		}
+		return ""
+	}
+	version := versionOfObject(ans.Prefix + "x")
+	if ans.Bucket != cachesBucket || ans.Prefix != disks.VersionPrefix(repoID, version) || ans.Token != "create "+ans.Prefix ||
+		ans.Expires == nil {
+		jb.e.t.Fatalf("save = %+v; want the caches' bucket, a version's prefix and a token that creates objects there alone", ans)
+	}
+	jb.upload(ans.Prefix)
+	if code, got := jb.commit(); code != http.StatusOK || got.Objects != 2 {
+		jb.e.t.Fatalf("commit: %d, %+v", code, got)
+	}
+	jb.saved = version
+	return version
+}
+
+// finish saves the job's cache, if save, as its save-cache action does,
+// lets the job's steps run, waits for its runner to exit, and sends the
+// supervisor's report, then powers the machine off, as the supervisor
 // does, and runs a pass.
 func (jb *job) finish(save bool) {
 	jb.e.t.Helper()
-	if save && jb.e.familyOf(jb.j.ID) != "" {
-		if code := jb.call("/v1/disks/save", map[string]bool{"save": true}, nil); code != http.StatusOK {
-			jb.e.t.Fatalf("save request: %d", code)
-		}
+	jb.report(save)
+	jb.e.gce.Shutdown(jb.in.Zone, jb.in.Name)
+	jb.e.pass()
+}
+
+// report is finish up to the supervisor's report: the machine is still
+// running.
+func (jb *job) report(save bool) {
+	jb.e.t.Helper()
+	if save && jb.e.cacheOf(jb.j.ID) != "" {
+		jb.saveCache()
 	}
+	jb.runSteps()
+	jb.sendReport()
+}
+
+// runSteps lets the job's steps run, and waits for its runner to exit.
+func (jb *job) runSteps() {
+	jb.e.t.Helper()
 	_ = os.WriteFile(jb.gate, []byte("ok"), 0o644)
 	select {
 	case err := <-jb.done:
@@ -480,6 +662,11 @@ func (jb *job) finish(save bool) {
 	case <-time.After(10 * time.Second):
 		jb.e.t.Fatal("the runner never finished")
 	}
+}
+
+// sendReport sends the supervisor's report.
+func (jb *job) sendReport() {
+	jb.e.t.Helper()
 	tok := jb.e.gce.Identity.Mint(jb.e.gce.IdentityClaims(jb.in.Zone, jb.in.Name, audience, true))
 	b, _ := json.Marshal(machines.FinishedRequest{})
 	req, _ := http.NewRequest(http.MethodPost, jb.e.url+"/v1/jobs/finished", bytes.NewReader(b))
@@ -492,8 +679,6 @@ func (jb *job) finish(save bool) {
 	if resp.StatusCode != http.StatusNoContent {
 		jb.e.t.Fatalf("report: %d", resp.StatusCode)
 	}
-	jb.e.gce.Shutdown(jb.in.Zone, jb.in.Name)
-	jb.e.pass()
 }
 
 // source is the image the job's work disk was made from, or "".
@@ -527,7 +712,8 @@ func (e *env) eventually(what string, cond func() bool) {
 	e.t.Fatalf("timed out waiting until %s", what)
 }
 
-// images are the service's saved disks and resume images, by name.
+// images are the service's images, resume images and any made as saved
+// disks were, by name.
 func (e *env) images() map[string]gceemu.ImageState {
 	out := map[string]gceemu.ImageState{}
 	for _, im := range e.gce.Images() {
@@ -538,19 +724,30 @@ func (e *env) images() map[string]gceemu.ImageState {
 	return out
 }
 
-// saved is the one image made since before, which the test expects.
-func (e *env) saved(before map[string]gceemu.ImageState) gceemu.ImageState {
-	e.t.Helper()
-	var made []gceemu.ImageState
-	for n, im := range e.images() {
-		if _, ok := before[n]; !ok {
-			made = append(made, im)
-		}
+// versions are the versions that have objects in the caches' bucket, with
+// their objects' names.
+func (e *env) versions() map[string][]string {
+	out := map[string][]string{}
+	for _, n := range e.gcs.Names(cachesBucket) {
+		v := versionOfObject(n)
+		out[v] = append(out[v], n)
 	}
-	if len(made) != 1 {
-		e.t.Fatalf("%d images made, want 1: %v", len(made), made)
+	return out
+}
+
+// has reports whether a version's objects are in the caches' bucket.
+func (e *env) has(version string) bool { _, ok := e.versions()[version]; return ok }
+
+// hasImage reports whether Compute Engine has an image.
+func (e *env) hasImage(name string) bool { _, ok := e.images()[name]; return ok }
+
+// recorded reports whether a version or image has a record.
+func (e *env) recorded(name string) bool {
+	_, ok := e.record("caches/5001/" + name + ".json")
+	if !ok {
+		_, ok = e.record("images/5001/" + name + ".json")
 	}
-	return made[0]
+	return ok
 }
 
 func (e *env) record(name string) (map[string]any, bool) {
@@ -565,18 +762,24 @@ func (e *env) record(name string) (map[string]any, bool) {
 
 func (e *env) logged(s string) bool { return strings.Contains(e.logs.String(), s) }
 
-// choiceHash names a run's restore choice for a test's label's family and
+// choiceHash names a run's restore choice for a test's label's cache and
 // architecture.
 func choiceHash(label string) string {
-	m := oldLabel.FindStringSubmatch(label)
+	m := testLabel.FindStringSubmatch(label)
 	if m == nil {
 		return ""
 	}
-	return selector.Hash(m[2] + "\x00" + m[1][strings.LastIndex(m[1], "-")+1:])
+	shape := strings.TrimSuffix(m[1], "-spot")
+	return selector.Hash(m[2] + "\x00" + shape[strings.LastIndex(shape, "-")+1:])
 }
 
-// familyOf is the family a job's disk action asks for, by its run and name.
-func (e *env) familyOf(jobID int64) string {
+// choice is the record of a run's restore choice for a test's label.
+func (e *env) choice(run *ghemu.Run, label string) string {
+	return "choices/5001/" + strconv.FormatInt(run.ID, 10) + "/" + choiceHash(label) + ".json"
+}
+
+// cacheOf is the cache a job's actions name, by its run and name.
+func (e *env) cacheOf(jobID int64) string {
 	j := e.gh.Job(jobID)
-	return e.families[fmt.Sprint(j.Run.ID, "/", j.Name)]
+	return e.cacheNames[fmt.Sprint(j.Run.ID, "/", j.Name)]
 }

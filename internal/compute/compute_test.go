@@ -323,7 +323,7 @@ func TestImages(t *testing.T) {
 		t.Fatal(err)
 	}
 	is := compute.ImageSpec{Name: "lsr-5001-0123456789abcdef0123-1", SourceZone: zoneA, SourceDisk: ds.Name, Labels: map[string]string{"lsr-repository": "5001"}}
-	if err := c.CreateImage(ctx, is, compute.RequestID("im")); err == nil || compute.IsUnavailable(err) {
+	if _, err := c.StartImage(ctx, is, compute.RequestID("im")); err == nil || compute.IsUnavailable(err) {
 		t.Fatalf("an image of a running machine's disk: %v, want a confirmed refusal", err)
 	}
 	if err := c.StopInstance(ctx, zoneA, "lsr-5001-aaaaaaaa", compute.RequestID("stop")); err != nil {
@@ -332,7 +332,7 @@ func TestImages(t *testing.T) {
 	// Its first answer is lost after the work is done; the retry with the
 	// same ID gets the same operation.
 	emu.LoseResponse(http.MethodPost, "/global/images", 1)
-	if err := c.CreateImage(ctx, is, compute.RequestID("im2")); err != nil {
+	if _, err := c.StartImage(ctx, is, compute.RequestID("im2")); err != nil {
 		t.Fatal(err)
 	}
 	im, err := c.Image(ctx, is.Name)
@@ -348,9 +348,73 @@ func TestImages(t *testing.T) {
 	if got, _ := c.Image(ctx, is.Name); got.Labels["lsr-note"] != "2026-11-08" {
 		t.Fatalf("labels = %v", got.Labels)
 	}
+	// An image Compute Engine is slow to make: asking for it returns at
+	// once, and so does asking again with the same ID, while its operation
+	// runs; it's ready once Compute Engine has made it.
+	emu.HoldImages(true)
+	slow := compute.ImageSpec{Name: "lsr-5001-0123456789abcdef0123-3", SourceZone: zoneA, SourceDisk: ds.Name}
+	for range 2 {
+		start := time.Now()
+		if _, err := c.StartImage(ctx, slow, compute.RequestID("im4")); err != nil || time.Since(start) > 10*time.Second {
+			t.Fatalf("asking for an image still being made: %v after %v", err, time.Since(start))
+		}
+		if got, err := c.Image(ctx, slow.Name); err != nil || got.Status != "PENDING" {
+			t.Fatalf("an image still being made = %+v, %v", got, err)
+		}
+	}
+	emu.HoldImages(false)
+	if got, err := c.Image(ctx, slow.Name); err != nil || got.Status != "READY" {
+		t.Fatalf("an image made = %+v, %v", got, err)
+	}
+	// Compute Engine can fail to make an image after it has taken the
+	// request, leaving none. Asked again with the same ID, it needn't say
+	// so in its answer, but the operation as it now stands does.
+	emu.StaleReplays(true)
+	emu.HoldImages(true)
+	lost := compute.ImageSpec{Name: "lsr-5001-0123456789abcdef0123-4", SourceZone: zoneA, SourceDisk: ds.Name}
+	if _, err := c.StartImage(ctx, lost, compute.RequestID("im5")); err != nil {
+		t.Fatal(err)
+	}
+	emu.FailHeldImages("INTERNAL_ERROR")
+	emu.HoldImages(false)
+	if _, err := c.Image(ctx, lost.Name); !errors.Is(err, compute.ErrNotFound) {
+		t.Fatalf("a failed image: %v, want none", err)
+	}
+	var later *compute.Failed
+	if _, err := c.StartImage(ctx, lost, compute.RequestID("im5")); !errors.As(err, &later) {
+		t.Fatalf("asking again for an image whose making failed: %v, want Failed", err)
+	}
+	// Nor once Compute Engine has forgotten the operation: asking again
+	// with the same ID is an error, and another ID makes the image.
+	emu.ForgetOperations()
+	if _, err := c.StartImage(ctx, lost, compute.RequestID("im5")); err == nil || compute.IsUnavailable(err) {
+		t.Fatalf("asking again for an image whose operation is forgotten: %v, want a confirmed error", err)
+	}
+	if _, err := c.StartImage(ctx, lost, compute.RequestID("im6")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := c.Image(ctx, lost.Name); err != nil || got.Status != "READY" {
+		t.Fatalf("an image asked for again = %+v, %v", got, err)
+	}
+	// A slow image that's made, and deleted by someone else, is a request
+	// done, however its operation was first answered, so that the caller
+	// asks again with another ID.
+	held := compute.ImageSpec{Name: "lsr-5001-0123456789abcdef0123-5", SourceZone: zoneA, SourceDisk: ds.Name}
+	emu.HoldImages(true)
+	if done, err := c.StartImage(ctx, held, compute.RequestID("im7")); err != nil || done {
+		t.Fatalf("asking for a slow image: done %v, %v", done, err)
+	}
+	emu.HoldImages(false)
+	if err := c.DeleteImage(ctx, held.Name, compute.RequestID("del7")); err != nil {
+		t.Fatal(err)
+	}
+	if done, err := c.StartImage(ctx, held, compute.RequestID("im7")); err != nil || !done {
+		t.Fatalf("asking again for an image made and deleted: done %v, %v; want done", done, err)
+	}
+	emu.StaleReplays(false)
 	emu.FailNextOperation("images.insert", "INTERNAL_ERROR")
 	var f *compute.Failed
-	if err := c.CreateImage(ctx, compute.ImageSpec{Name: "lsr-5001-0123456789abcdef0123-2", SourceZone: zoneA, SourceDisk: ds.Name},
+	if _, err := c.StartImage(ctx, compute.ImageSpec{Name: "lsr-5001-0123456789abcdef0123-2", SourceZone: zoneA, SourceDisk: ds.Name},
 		compute.RequestID("im3")); !errors.As(err, &f) {
 		t.Fatalf("a failed operation: %v, want Failed", err)
 	}

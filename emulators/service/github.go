@@ -350,16 +350,37 @@ func (e *Emulator) CompleteJob(j Job, conclusion string) {
 	e.mu.Lock()
 	js := e.jobs[j.ID]
 	e.mu.Unlock()
-	if js != nil {
-		e.gh.CompleteJob(js.wj, conclusion)
+	if js == nil {
+		return
+	}
+	e.gh.CompleteJob(js.wj, conclusion)
+	// The service decides a finished job's caches from GitHub's
+	// conclusion, whether its machine's supervisor reported or not.
+	ours := e.ours(j.Run.Repository.ID)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if ours {
+		e.settle(j.ID, conclusion == "success")
 	}
 }
 
-// FinishJob implements World: GitHub records the job's conclusion, and the
-// emulator, as the service does on its machine's report, saves its work
-// disk if it was attached, the job asked to save it, its conclusion is
-// success, its run's scope saves and its repository is still the
-// organization's (specs/0003-disks.md).
+// ours reports whether GitHub shows a repository as the organization's.
+func (e *Emulator) ours(repo int64) bool {
+	ours := false
+	e.gh.Read(func(s *ghemu.State) {
+		if rp := s.Repo(repo); rp != nil {
+			ours = rp.Owner.ID == e.org
+		}
+	})
+	return ours
+}
+
+// FinishJob implements World: GitHub records the job's conclusion, its
+// machine's supervisor reports, and the emulator, as a pass of the service
+// does once GitHub shows the job finished, makes ready the cache versions
+// the job committed if its conclusion is success and its repository is
+// still the organization's, and drops any other (specs/0003-disks.md,
+// Caches).
 func (e *Emulator) FinishJob(j Job, conclusion string) {
 	e.mu.Lock()
 	js := e.jobs[j.ID]
@@ -381,7 +402,7 @@ func (e *Emulator) FinishJob(j Job, conclusion string) {
 		return
 	}
 	m.finished = true
-	if conclusion == "success" && ours {
-		e.saveDisk(m)
+	if ours {
+		e.settle(m.job, conclusion == "success")
 	}
 }
