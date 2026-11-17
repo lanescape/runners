@@ -524,8 +524,8 @@ func TestCRC32C(t *testing.T) {
 		t.Fatalf("ParseCRC32C = %x, %v", v, err)
 	}
 	for _, bad := range []string{"", "AAAA", "AAAAAAA=", "not base64"} {
-		if _, err := ParseCRC32C(bad); err == nil {
-			t.Errorf("%q parsed", bad)
+		if _, err := ParseCRC32C(bad); err == nil || (bad != "" && strings.Contains(err.Error(), bad)) {
+			t.Errorf("%q: %v", bad, err)
 		}
 	}
 }
@@ -570,5 +570,120 @@ func TestADescriptionThatIsntOne(t *testing.T) {
 		if err == nil || strings.Contains(err.Error(), "secret") {
 			t.Errorf("%s: %v", field, err)
 		}
+	}
+}
+
+// An object is named in a log or an error only by a base name save-cache
+// gives, never by the service's part of its name.
+func TestLabel(t *testing.T) {
+	for name, want := range map[string]string{
+		"1234/v1/shard-000.tar.zst": "shard-000.tar.zst",
+		"p/dirs.tar.zst":            "dirs.tar.zst",
+		"dirs.tar.zst":              "dirs.tar.zst",
+		"https://storage.googleapis.com/b/o?X-Goog-Signature=secret": "an object",
+		"p/ya29.secret-token":   "an object",
+		"p/private-password":    "an object",
+		"p/shard-1.tar.zst":     "an object",
+		"p/shard-000.tar.zst.x": "an object",
+		"p/":                    "an object",
+		"":                      "an object",
+	} {
+		if got := Label(name); got != want {
+			t.Errorf("Label(%q) = %q, want %q", name, got, want)
+		}
+	}
+}
+
+// The service's part of an object's name, which may hold anything, is
+// never repeated in an error or a retry's log, whatever fails.
+func TestAnObjectsNameIsNeverRepeated(t *testing.T) {
+	const name = "ya29.secret-token/shard-000.tar.zst"
+	var said []string
+	check := func(t *testing.T, w *world, err error) {
+		t.Helper()
+		said = append(said, fmt.Sprint(err))
+		if err == nil {
+			t.Fatal("no error")
+		}
+		for _, s := range said {
+			if strings.Contains(strings.ToLower(s), "secret") {
+				t.Fatalf("repeated: %s", s)
+			}
+		}
+		if !strings.Contains(strings.Join(said, "\n"), "shard-000.tar.zst") {
+			t.Fatalf("not named: %v", said)
+		}
+	}
+	world := func(t *testing.T) *world {
+		w := setup(t)
+		said = nil
+		w.c.Logf = func(format string, args ...any) { said = append(said, fmt.Sprintf(format, args...)) }
+		return w
+	}
+	tok := func() *tokens { return &tokens{list: []string{"t"}} }
+	busy := gcsemu.JSONError(http.StatusServiceUnavailable, "backendError", "busy")
+
+	t.Run("an upload that can't start", func(t *testing.T) {
+		w := world(t)
+		w.emu.Faults().Add(fault.Rule{Method: http.MethodPost, Respond: busy})
+		_, err := w.c.Upload(context.Background(), tok(), "b-1", name, bytes.NewReader(random(10)))
+		check(t, w, err)
+	})
+	t.Run("an upload that can't finish", func(t *testing.T) {
+		w := world(t)
+		w.emu.Faults().Add(fault.Rule{Method: http.MethodPut, Respond: busy})
+		_, err := w.c.Upload(context.Background(), tok(), "b-1", name, bytes.NewReader(random(10)))
+		check(t, w, err)
+	})
+	t.Run("a download that keeps failing", func(t *testing.T) {
+		w := world(t)
+		o := object(w, name, random(1000))
+		w.emu.Faults().Add(fault.Rule{PathPrefix: "/storage/", Respond: busy})
+		_, err := io.ReadAll(w.c.Open(context.Background(), tok(), "b-1", o))
+		check(t, w, err)
+	})
+	t.Run("a download that breaks off, then is too long", func(t *testing.T) {
+		w := world(t)
+		o := object(w, name, random(100_000))
+		w.emu.Faults().Add(fault.Rule{PathPrefix: "/storage/", Times: 1, After: true, Respond: fault.Drop})
+		o.Size--
+		_, err := io.ReadAll(w.c.Open(context.Background(), tok(), "b-1", o))
+		check(t, w, err)
+	})
+	t.Run("a download that keeps breaking off", func(t *testing.T) {
+		w := world(t)
+		o := object(w, name, random(1000))
+		// Each answer promises the whole object, sends some, and closes.
+		w.emu.Faults().Add(fault.Rule{Method: http.MethodGet, Respond: func(rw http.ResponseWriter, _ *http.Request) {
+			rw.Header().Set("Content-Length", "1000")
+			rw.WriteHeader(http.StatusOK)
+			rw.Write(make([]byte, 10))
+			if conn, _, err := http.NewResponseController(rw).Hijack(); err == nil {
+				conn.Close()
+			}
+		}})
+		_, err := io.ReadAll(w.c.Open(context.Background(), tok(), "b-1", o))
+		check(t, w, err)
+		if !strings.Contains(err.Error(), "broke off") || !strings.Contains(strings.Join(said, "\n"), "resuming") {
+			t.Fatalf("said %v", said)
+		}
+	})
+	for change, f := range map[string]func(*Object){
+		"a larger size": func(o *Object) { o.Size++ },
+		"a CRC32C":      func(o *Object) { o.CRC32C ^= 1 },
+	} {
+		t.Run("a download with "+change, func(t *testing.T) {
+			w := world(t)
+			o := object(w, name, random(1000))
+			f(&o)
+			_, err := io.ReadAll(w.c.Open(context.Background(), tok(), "b-1", o))
+			check(t, w, err)
+		})
+		t.Run("a check with "+change, func(t *testing.T) {
+			w := world(t)
+			o := object(w, name, random(1000))
+			f(&o)
+			check(t, w, w.c.Check(context.Background(), tok(), "b-1", o))
+		})
 	}
 }

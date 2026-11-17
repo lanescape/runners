@@ -278,14 +278,17 @@ func TestFailures(t *testing.T) {
 		// refused before.
 		untouched bool
 	}{
-		"a CRC32C mismatch": {func(_ *world, v *version) { v.Objects[0].CRC32C = "AAAAAA==" }, "can't be restored: checking 1234/v1/shard-000.tar.zst", true},
+		"a CRC32C mismatch": {func(_ *world, v *version) { v.Objects[0].CRC32C = "AAAAAA==" }, "can't be restored: checking shard-000.tar.zst", true},
 		"a CRC32C mismatch in the directories' archive": {func(_ *world, v *version) { v.Objects[len(v.Objects)-1].CRC32C = "AAAAAA==" },
-			"can't be restored: checking 1234/v1/dirs.tar.zst", true},
+			"can't be restored: checking dirs.tar.zst", true},
 		"a size mismatch":                   {func(_ *world, v *version) { v.Objects[1].Size++ }, "can't be restored", true},
 		"a generation that's gone":          {func(_ *world, v *version) { v.Objects[0].Generation++ }, "isn't there at its generation", true},
 		"an object that's gone":             {func(w *world, v *version) { w.emu.Put(v.Bucket, v.Objects[2].Name, []byte("replaced")) }, "isn't there at its generation", true},
 		"an object save-cache doesn't make": {func(_ *world, v *version) { v.Objects[0].Name = "1234/v1/other" }, "save-cache doesn't make", true},
-		"no directories' archive":           {func(_ *world, v *version) { v.Objects = v.Objects[:len(v.Objects)-1] }, "no directories' archive", true},
+		"an object's name that isn't repeated": {func(_ *world, v *version) {
+			v.Objects[0].Name = "https://storage.googleapis.com/b/o?X-Goog-Signature=secret"
+		}, "has an object save-cache doesn't make", true},
+		"no directories' archive": {func(_ *world, v *version) { v.Objects = v.Objects[:len(v.Objects)-1] }, "no directories' archive", true},
 		"a refusal": {func(w *world, _ *version) {
 			w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/caches/restore", Respond: fault.Refuse("the run's commit doesn't declare the cache build")})
 		}, "refused to restore the cache build: the run's commit doesn't declare", true},
@@ -295,6 +298,13 @@ func TestFailures(t *testing.T) {
 			v.Objects[0] = obj{Name: v.Objects[0].Name, Size: int64(len(bad)),
 				CRC32C: gcs.FormatCRC32C(crc32.Checksum(bad, crc32.MakeTable(crc32.Castagnoli))), Generation: gen}
 		}, "isn't a plain path", false},
+		"an escaping entry under the service's own part of a name": {func(w *world, v *version) {
+			bad := escaping()
+			name := "ya29.secret-token/shard-000.tar.zst"
+			gen := w.emu.Put(v.Bucket, name, bad)
+			v.Objects[0] = obj{Name: name, Size: int64(len(bad)),
+				CRC32C: gcs.FormatCRC32C(crc32.Checksum(bad, crc32.MakeTable(crc32.Castagnoli))), Generation: gen}
+		}, "restoring shard-000.tar.zst", false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			w := newWorld(t)
@@ -304,7 +314,7 @@ func TestFailures(t *testing.T) {
 			dst := filepath.Join(t.TempDir(), "tree")
 			rt, env, _, svc, st := w.step(t, w.gh.PushRun(w.repo, "main"), dst)
 			err := run(context.Background(), rt, on(true), svc, st)
-			if err == nil || !strings.Contains(err.Error(), c.says) {
+			if err == nil || !strings.Contains(err.Error(), c.says) || strings.Contains(strings.ToLower(err.Error()), "secret") {
 				t.Fatalf("err = %v", err)
 			}
 			if entries, _ := os.ReadDir(dst); c.untouched && len(entries) != 0 {

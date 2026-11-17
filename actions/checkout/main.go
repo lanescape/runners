@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 
 	"github.com/lanescape/runners/actions/internal/actions"
@@ -88,6 +89,10 @@ func verify(ctx context.Context, rt *actions.Runtime) error {
 		return fmt.Errorf("reading the checkout's commit: %w", err)
 	}
 	if head != expect {
+		// What Git printed is shown only if it's a commit's name.
+		if !commitName.MatchString(head) {
+			return fmt.Errorf("the checkout isn't the contribution's commit, %s", expect)
+		}
 		return fmt.Errorf("the checkout is %s, not the contribution's commit, %s", head, expect)
 	}
 	// actions/checkout persists credentials as an http extraheader, in
@@ -97,15 +102,37 @@ func verify(ctx context.Context, rt *actions.Runtime) error {
 		return fmt.Errorf("reading the checkout's git config: %w", err)
 	}
 	for name := range strings.SplitSeq(cfg, "\n") {
-		n := strings.ToLower(name)
-		if strings.HasSuffix(n, ".extraheader") || strings.HasPrefix(n, "includeif.") || strings.HasPrefix(n, "credential.") {
-			return fmt.Errorf("the checkout's git config keeps %s, which may hold credentials", name)
+		if kind := credentialKind(name); kind != "" {
+			return fmt.Errorf("the checkout's git config keeps %s, which may hold credentials", kind)
 		}
 	}
 	rt.Logf("The checkout is %s, with no credentials persisted.", head)
 	return nil
 }
 
+// commitName is a commit's full name, SHA-1 or SHA-256.
+var commitName = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
+
+// credentialKind is the kind of git config entry name is, if it's one that
+// may hold credentials, and otherwise "". Only the kind is ever shown, never
+// the name: a name can hold a credential itself, as in
+// credential.https://user:password@example.com.helper.
+func credentialKind(name string) string {
+	n := strings.ToLower(name)
+	switch {
+	case strings.HasSuffix(n, ".extraheader"):
+		return "an extraheader entry"
+	case strings.HasPrefix(n, "includeif."):
+		return "an includeIf entry"
+	case strings.HasPrefix(n, "credential."):
+		return "a credential entry"
+	}
+	return ""
+}
+
+// git runs git in dir and gives what it printed. A failure is told by git's
+// exit status alone, never by what git printed on stderr, which can repeat
+// the repository's config, credentials included.
 func git(ctx context.Context, dir string, args ...string) (string, error) {
 	// The workspace may belong to another user, such as root, if an earlier
 	// step ran as root with sudo.
@@ -114,9 +141,9 @@ func git(ctx context.Context, dir string, args ...string) (string, error) {
 	if err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
-			return "", fmt.Errorf("git %s: %s", args[0], strings.TrimSpace(string(ee.Stderr)))
+			return "", fmt.Errorf("git %s exited with status %d", args[0], ee.ExitCode())
 		}
-		return "", err
+		return "", fmt.Errorf("git %s couldn't run", args[0])
 	}
 	return strings.TrimSpace(string(out)), nil
 }

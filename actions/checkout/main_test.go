@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -144,11 +146,58 @@ func TestVerify(t *testing.T) {
 		{"http.https://github.com/.extraheader", "AUTHORIZATION: basic x"},
 		{"includeIf.gitdir:/x.path", "/tmp/credentials"},
 		{"credential.helper", "store"},
+		// The entry's name holds a password: only its kind is told.
+		{"credential.https://user:secret@example.com.helper", "store"},
+		{"http.https://user:secret@example.com/.extraHeader", "x"},
 	} {
 		gitIn(t, ws, "config", "--local", kv[0], kv[1])
-		if err := verify(ctx, runtime(env)); err == nil || !strings.Contains(err.Error(), "may hold credentials") {
+		if err := verify(ctx, runtime(env)); err == nil || !strings.Contains(err.Error(), "may hold credentials") || strings.Contains(err.Error(), "secret") {
 			t.Errorf("%s: %v", kv[0], err)
 		}
 		gitIn(t, ws, "config", "--local", "--unset", kv[0])
+	}
+}
+
+// A git failure is told by its exit status, never by what git printed,
+// which can repeat what it was given or the repository's config,
+// credentials included.
+func TestAGitFailureIsntRepeated(t *testing.T) {
+	ws := t.TempDir()
+	gitIn(t, ws, "init", "-q")
+	// git's complaint quotes the revision it was given.
+	if out, _ := exec.Command("git", "-C", ws, "show", "secret").CombinedOutput(); !bytes.Contains(out, []byte("secret")) {
+		t.Fatalf("git didn't quote what it was given: %s", out)
+	}
+	_, err := git(context.Background(), ws, "show", "secret")
+	if err == nil || strings.Contains(err.Error(), "secret") || !strings.Contains(err.Error(), "git show exited with status 128") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestCredentialKind(t *testing.T) {
+	for name, want := range map[string]string{
+		"http.https://github.com/.extraheader":          "an extraheader entry",
+		"includeIf.gitdir:/x.path":                      "an includeIf entry",
+		"credential.https://user:pw@example.com.helper": "a credential entry",
+		"core.bare":         "",
+		"remote.origin.url": "",
+	} {
+		if got := credentialKind(name); got != want {
+			t.Errorf("credentialKind(%q) = %q, want %q", name, got, want)
+		}
+	}
+}
+
+// What git prints for HEAD is shown only if it's a commit's name.
+func TestWhatGitPrintsForHEADIsShownOnlyIfACommit(t *testing.T) {
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\necho ya29.secret-token\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	env := map[string]string{"GITHUB_WORKSPACE": t.TempDir(), "INPUT_EXPECT": strings.Repeat("a", 40)}
+	err := verify(context.Background(), runtime(env))
+	if err == nil || strings.Contains(err.Error(), "secret") || !strings.Contains(err.Error(), "isn't the contribution's commit") {
+		t.Fatalf("err = %v", err)
 	}
 }

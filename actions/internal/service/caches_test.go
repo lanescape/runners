@@ -177,3 +177,26 @@ func TestCacheRefusalsAndRetries(t *testing.T) {
 		t.Fatalf("restore = %+v, %v, after waits %v", v, err, *e.waits)
 	}
 }
+
+// A field the client rejects is never repeated in the error, since the
+// service may have put anything in it, the cache's token included.
+func TestARejectedFieldIsNeverRepeated(t *testing.T) {
+	const secret = "ya29.SECRET-token"
+	for path, body := range map[string]string{
+		"/v1/caches/restore": `{"restored": "` + secret + `", "token": "` + secret + `"}`,
+		"/v1/disks":          `{"state": "` + secret + `", "restored": "none"}`,
+		"/v1/disks#restored": `{"state": "ready", "restored": "` + secret + `"}`,
+	} {
+		e := setup(t)
+		answer(e, strings.Split(path, "#")[0], body)
+		var err error
+		if strings.HasPrefix(path, "/v1/disks") {
+			_, err = e.c.Disk(context.Background(), DiskAsk{})
+		} else {
+			_, err = e.c.RestoreCache(context.Background(), "build")
+		}
+		if err == nil || strings.Contains(err.Error(), "SECRET") {
+			t.Errorf("%s: err = %v", path, err)
+		}
+	}
+}
