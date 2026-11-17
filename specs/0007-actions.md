@@ -1,0 +1,143 @@
+# Actions
+
+The `lanescape` organization's repositories use the runner service through four actions in `actions/`, `lanescape/runners/actions/<name>@v1`: `disk` and `checkout`, and `cache` and `save-cache`, which restore and save a directory as a cache. They call the service through the interface it publishes and keeps compatible, specs/0005-interface.md, "The interface for actions", which is all they may rely on, though they live beside it. Each works inside the organization and degrades gracefully outside it, so the same workflow runs in a fork, at GitHub's expense, as far as it can without the service.
+
+## Where an action is
+
+Each action decides the same way, and says which in the job's summary:
+
+- **Inside the organization:** `github.repository_owner_id` is the organization's immutable ID, `endpoints.Organization` in the service's interface, never compared by name, and either the run isn't from a fork's pull request, by the event's head repository, or it's a `pull_request_target` run, whose jobs the service accepts only once a maintainer approves them.
+- **Outside:** anything else, including a fork's own pushes, another organization, and a fork's pull request into one of the organization's repositories, which runs in the base repository but never on the service's machines.
+
+A run is a fork's pull request's when its event's payload has a pull request, as `pull_request`, `pull_request_review` and `pull_request_target` events do, whose head repository, by ID, isn't the run's repository, or is gone. The owner's ID is `GITHUB_REPOSITORY_OWNER_ID`, or the payload's repository's owner's if that isn't set.
+
+Inside the organization, an action that calls the service also tells whether it's on one of the service's machines, as the service's interface says: by the metadata server's `instance/attributes/lsr-service`, which answers on the service's machines and nowhere else; the same server gives the machine's identity tokens (`disk`, below). It asks with a timeout of a few seconds, so that on any other runner it decides at once.
+
+The decision is a courtesy, not a guard. The service checks everything for itself, from GitHub's records and signed tokens.
+
+## Runners
+
+No action makes runner labels or binds a run. A workflow names the service's machines in `runs-on` itself, as specs/0005-interface.md (Selectors) gives them: a shape, and optionally Spot, and nothing else. The service works out the rest: the run's scope, at its first job's check, from what GitHub told that job's runner, and its caches' keys, from the files at that commit. A job asks for its work disk, which starts empty, in its steps, with `disk`, and keeps what's slow to make again as caches, with `cache` and `save-cache`; the consumer declares its caches in `.github/runners.json`, which the service reads; no action reads or checks it.
+
+No action sets a machine up either. A job runs directly on the service's machine, booted from the service's Debian 13 base image, as the runner's user, with passwordless sudo, and installs what it needs in its own steps, from its own commit, such as with a script of the consumer's run after `checkout` (specs/0002-machines.md, Setting up a machine). The base image has no Docker, so a job on the service's machines names no `container:` or `services:`; one that wants containers installs Docker in a step.
+
+```yaml
+jobs:
+  build:
+    runs-on: lanescape-80vcpu-linux-amd64-spot
+    steps:
+      - uses: lanescape/runners/actions/disk@v1
+        with:
+          size-gb: 500
+      - uses: lanescape/runners/actions/checkout@v1
+      - run: sudo ./ci/init.sh
+      - uses: lanescape/runners/actions/cache@v1
+        with:
+          name: build
+          path: /work/build
+```
+
+A job's `runs-on` is exactly its selector, with no other label. In a fork no runner carries those labels, so a workflow that also runs in forks skips those jobs there, or picks another label, by expressions: `github.repository_owner_id` isn't the organization's ID in a fork's own runs, and in a fork's `pull_request` run into the consumer, which runs in the consumer's repository but never on the service's machines, `github.event.pull_request.head.repo.id` isn't `github.repository_id`. An approved contribution's `pull_request_target` run has a fork's head too, but does run on the service's machines, so a workflow tests `github.event_name` as well and never sends a contribution's jobs elsewhere. A job the service can't serve is stopped by the service before its first step, with the reason in its log, and its run is cancelled; what a job's `disk`, `cache` or `save-cache` step can't have fails that step, with the service's reason.
+
+## Contributions
+
+An approved contribution's `pull_request_target` run is bound by the service once a maintainer approves it, at the check of its contribution job: the one job that names the environment `contribution`, whose required reviewers are the consumer's maintainers, which every other job of the run on the service's machines needs, and which runs only the default branch's code, checking nothing out. It needs no action of ours, only a step:
+
+```yaml
+jobs:
+  contribution:
+    runs-on: lanescape-2vcpu-linux-amd64
+    environment: contribution
+    permissions: {}
+    steps:
+      - run: echo "Approved"
+  build:
+    needs: contribution
+    runs-on: lanescape-80vcpu-linux-amd64-spot
+    permissions: {}
+    steps:
+      - uses: lanescape/runners/actions/disk@v1
+      - uses: lanescape/runners/actions/checkout@v1
+        with:
+          contribution: true
+```
+
+Jobs that run the contribution's code never name the environment, check out with `checkout`'s `contribution: true`, and have `permissions: {}`. Only a job that must sign in to the consumer's own cloud resources may have `id-token: write`, and then the contributor's code can mint tokens of the base repository for any audience, naming the default branch's workflow and ref, while the job runs (specs/0001-architecture.md, Forks and contributions). So every party that trusts the consumer's tokens, its own cloud identity provider included, must tell a token whose `event_name` is `pull_request_target` apart, and give it only what the consumer means a contribution to have, or refuse it; a workflow that can't rely on that gives the job no `id-token` at all. The runner service itself takes no GitHub token.
+
+A job that runs the contribution's code sets its machine up from the contribution's head commit, as any job sets its machine up from its own commit. A job of the run that runs only the default branch's code, such as a trusted final job, never runs the contribution's setup, which is the contributor's code.
+
+## `disk`
+
+Asks the service for the job's work disk, and waits until it's mounted at `/work`:
+
+```yaml
+      - uses: lanescape/runners/actions/disk@v1
+        with:
+          size-gb: 500
+          iops: 10000
+          throughput-mibps: 2400
+```
+
+Its inputs `size-gb`, `iops` and `throughput-mibps` are the disk's size and its provisioned performance, which a job chooses for itself, whatever its shape. Each is a positive whole number in decimal digits, with no sign or leading zero, at most 9223372036854775807, and with any space around it ignored, or empty, the default, for the service's own default, which specs/0005-interface.md gives; one that's neither fails the action before it asks for anything. It's normally a job's first step, since `/work` is an empty directory, owned by root, that the runner's user can't write until then. Inside the organization, on the service's machine, the action asks by `POST /v1/disks`, with the body `{"size_gb": 500, "iops": 10000, "throughput_mibps": 2400}`, leaving out the fields whose inputs are empty, so `{}` with none, signed with the machine's identity token for the service's audience, from the machine's metadata server, got afresh for each request; it needs no GitHub token. It asks again every 5 seconds while the answer is `making`. It retries a `503` with backoff, and fails only once its retries are spent: eight attempts in all, waiting 2 seconds, then twice as long each time up to a minute, or longer if `Retry-After` asks, up to a minute. It retries the same way when the service can't be reached, or a server in front of it answers 429 or a 5xx; any other answer outside the interface fails it at once. The disk starts empty, or, for the rerun of a job lost to a preemption or the age limit, from that job's resume image: the service decides, and the action writes where it came from, the answer's `restored`, `none` or `resume`, in the job's summary; anything else fails it. Once the answer is `ready`, it waits until `/work`, as its own process sees it, is a mounted disk rather than the empty directory under it, by `/proc/self/mountinfo`, for up to 2 minutes, and then succeeds; if `/work` isn't mounted by then, it fails, saying so. The job's log and summary say what it asked for. A refusal, such as from a job the service doesn't admit, or for a disk Compute Engine won't make, such as one with more IOPS than its size allows, fails it with the service's reason. A job has one work disk: running the action again is answered about the same disk, if it asks for the same, and is refused if it asks for other settings.
+
+Outside the organization, or on a machine that isn't the service's, it does nothing and says so, and `/work` is whatever the runner has there.
+
+## `checkout`
+
+Checks out the repository for a job. With no inputs, it checks out the run's own commit, as `actions/checkout` does. With `contribution: true`, in a `pull_request_target` run, it checks out exactly `github.event.pull_request.head.sha`, the commit the approved run was made for, from the head repository, with no credentials persisted, and refuses in any other event. Outside the organization, `contribution: true` does the same in a fork's own `pull_request_target` runs, which use nothing of the service's.
+
+It checks out with `actions/checkout`, pinned by its commit, in the job's workspace, so on the service's machines too the checkout is on the boot disk, never `/work`, and does the same on any runner. The action's program decides what to check out, and passes `actions/checkout` its own defaults for the run's own commit, credentials persisted as there; for a contribution, the head repository and commit, `persist-credentials: false`, and `allow-unsafe-pr-checkout: true`, which `actions/checkout` asks for before it checks out a fork's commit in a `pull_request_target` run. Afterwards the program confirms that the checkout's `HEAD` is that commit, and that its git config keeps no `extraheader`, `includeIf` or `credential` entry, and fails otherwise. `contribution` is `true` or `false`; a contribution whose head repository is gone is refused.
+
+## `cache`
+
+Restores a cache, a directory that `save-cache` saved in an earlier run, under a directory:
+
+```yaml
+      - uses: lanescape/runners/actions/cache@v1
+        with:
+          name: chromium-out
+          path: /work/chromium
+```
+
+Its input `name` is the cache's name, as `.github/runners.json` declares it at the run's commit: 1 to 32 lowercase letters, digits and hyphens, starting with a letter and not ending with a hyphen. `path` is the directory to restore it under, made if it isn't there. Inside the organization, on the service's machine, the action asks which version of the cache the run restores by `POST /v1/caches/restore`, with `{"cache": "<name>"}`, signed and retried as `disk`'s requests are. The service chooses the version once per run, cache and architecture, by its restore order, and answers where it came from, `restored`, a step of that order or `none`, and, unless it's `none`, the version's bucket, its objects, each with its full name, size, CRC32C and generation, and an access token, until `expires`, that can read those objects and nothing else. The action masks the token in the job's log as soon as it has it, and never logs it.
+
+It first checks that every object of the version is there at its generation, with its size and CRC32C, as Cloud Storage describes it, so that a version that can't be restored isn't restored in part. Then it downloads every object at once with Cloud Storage's JSON API, each at its generation, checking it against its size and CRC32C as it streams, decompresses it, and extracts it under `path`: every archive of files at once, then the directories' archive. A download that breaks off resumes where it stopped. A request that fails with 408, 429 or a 5xx, or gets no answer, is retried: eight attempts in all, waiting a second, then twice as long each time up to half a minute. A token Cloud Storage refuses is replaced once, at once, as is one within a minute of expiring, by asking the service again, which must answer with the same version. An object whose size or CRC32C isn't the answer's fails the action, as does an object `save-cache` doesn't make, or a version with no directories' archive.
+
+Each entry keeps its mode, with the setuid, setgid and sticky bits, its modification time to the nanosecond, its numeric owner when the action runs as root, and a symlink its target. A file or symlink takes the place of what's there, so restoring onto a tree overwrites its files: a file or symlink in the way is replaced, never written through, and a directory in the way is removed with everything in it, read-only or not. Directories are made as their files need them, and a directory already there that its owner can't write or search is made so for the while, so a tree restored before with read-only directories can be restored onto; the directories' archive, last, makes each directory that isn't there yet, then gives each, deepest first, its owner, mode and modification time, so that nothing changes a directory after its time is set. Archives are untrusted: every file, symlink and directory is reached from `path` one component at a time, through descriptors that never follow a symlink, so nothing outside `path` is written or changed, whatever the tree becomes while it's restored. An entry whose name isn't a plain relative path, being absolute or having an empty, `.` or `..` component, or with a symlink where a directory it's in should be, whoever made it, fails the action, as does anything but regular files and symlinks in an archive of files, or anything but directories in the directories' archive. A version whose bytes differ from what was recorded only as they stream fails partway, and leaves what it extracted.
+
+Its output `restored` is the answer's `restored`; the action writes it in the job's summary with how much it restored. A refusal, such as a cache the run's commit doesn't declare, fails it with the service's reason. Outside the organization, or on a machine that isn't the service's, it does nothing and says so, and `restored` is `none`.
+
+## `save-cache`
+
+Saves a directory as a version of a cache, for later runs to restore with `cache`:
+
+```yaml
+      - uses: lanescape/runners/actions/save-cache@v1
+        with:
+          name: chromium-out
+          path: /work/chromium
+          exclude: |
+            src/out/tmp
+```
+
+Its inputs `name` and `path` are as `cache`'s, and `path` must be a directory. `exclude` lists paths relative to `path`, one to a line, to leave out with everything under them; each is relative, with no empty, `.` or `..` component, but a leading `./`. Inside the organization, on the service's machine, the action asks to save the cache by `POST /v1/caches/save`, with `{"cache": "<name>"}`, signed and retried as `disk`'s requests are. If the run's scope saves nothing, the answer's `saves` is false, with the service's reason, which the action writes in the job's summary, and it succeeds, reading nothing. Otherwise the answer gives the version's bucket and prefix, and an access token, until `expires`, that can create objects under that prefix and do nothing else, neither replace nor delete one. Asking again gives the same version, while it's uncommitted, with a new token. The action masks the token as soon as it has it.
+
+It walks `path` without following symlinks, reading 64 directories at once: it takes each entry's kind from its directory's listing and each directory's metadata from the open directory, and lstats only what isn't a directory. It reads everything through a handle on `path` that can't reach outside it, Go's `os.Root`, opening each directory and file from the one it's in, never following a symlink in its own place and never waiting on a named pipe, so nothing the tree becomes while it's saved takes the save outside `path` or reads a file in another's place. It keeps directories, regular files and symlinks, and leaves out sockets, devices and named pipes, saying how many; hard links are kept as separate copies. It splits the files and symlinks into up to 64 shards, balanced by the reads they take, one for each and one more for each 64 KiB of a file, since a save is bound by the disk's operations, and orders each shard by path. The directories go in an archive of their own, in tree order, each directory before everything under it, so a sibling such as `a-b` follows all of `a/`. Each shard, and the directories, is a tar archive in PAX format, with each entry's mode, numeric owner, modification time to the nanosecond and a symlink's target, and no access or change times, compressed with zstd at level 3, and streamed into a resumable upload with Cloud Storage's JSON API, with the token, as `<prefix>shard-NNN.tar.zst`, by shard, and `<prefix>dirs.tar.zst`, all at once, each created only if no object has its name. A file's header is what the open file says as it's read; a file that's gone, has become something else, or can't be read whole fails the action. An upload sends 8 MiB at a time, reading the next while one is sent, with nothing but the session's own address as its credential after the start; a request that fails is retried from what Cloud Storage says it has, as `cache`'s requests are, and the token is replaced as `cache`'s is, the service answering with the same version. Once an upload is done, Cloud Storage's size and CRC32C of the object must be what was sent.
+
+Once every object is uploaded, the action commits the version by `POST /v1/caches/commit`, with `{"cache": "<name>"}`: the service records the version's objects and answers how many, `objects`, and their size, `bytes`. Any answer but what the action uploaded fails it, so that the job fails and the version isn't kept. The service keeps the version if the job succeeds, in place of the scope's older versions of that cache for the architecture. A refusal fails the action with the service's reason. Outside the organization, or on a machine that isn't the service's, it does nothing and says so.
+
+## How actions run
+
+Each action is a composite action that builds its Go program from the action's own source with `go build`, run in the repository root of the action's own downloaded copy, `$GITHUB_ACTION_PATH/../..`, into `$RUNNER_TEMP`, and runs the binary. What runs is exactly the code at the commit the action was referenced at, with no separate release to keep in step, and the job sees the program's own exit status, which `go run` wouldn't give. The service's base image has Go on the machine; where that isn't the version `go.mod` names, and on any other runner without it, the action sets that version up with `actions/setup-go`, as below. The actions run on the machine itself, as a job's other steps do: jobs on the service's machines have no job container. `checkout` also needs Git 2.18 or newer wherever it runs: without it, `actions/checkout` downloads an archive rather than a repository, and the program couldn't confirm `HEAD` or the git config, so it checks for Git first and fails, saying so, before it calls `actions/checkout`. Which applies is told by the Go on the machine: the action uses it if `go env GOVERSION` is exactly `go.mod`'s `toolchain` version, and otherwise sets that exact version up, named as `go-version` so that no `GOTOOLCHAIN` the job has can make `actions/setup-go` pick another, with its cache off, since a consumer's workspace has no `go.sum` of ours. The build fails if Go still isn't that version. `actions/setup-go` puts its Go first on the job's `PATH` for the steps after, so a job that sets up a Go of its own does so after these actions. Builds use Go's build cache, so later steps of a job build in moments. A build runs with `GOENV=off`, `GOWORK=off`, `GOTOOLCHAIN=local`, `GO111MODULE=on` and `CGO_ENABLED=0`, and with `GOOS`, `GOARCH`, `GOAMD64`, `GOARM64`, `GOFLAGS`, `GOEXPERIMENT`, `GOROOT`, `GODEBUG` and `GOFIPS140` cleared, so a job's own Go settings, in its environment or saved with `go env -w`, can't change what's built, into a new directory under `$RUNNER_TEMP`; `actions/setup-go`, which runs Go itself, and the check for Go run with the same settings, and `actions/setup-go`, which prints `go env`, also without the job's module and cache settings, such as a `GOPROXY` that holds a credential, and without `GO_DOWNLOAD_BASE_URL`, so it downloads Go from Go's own site rather than print a mirror's URL; it downloads the modules the program needs, which are only the actions' own few, not the service's, through the `GOPROXY` in the job's environment, if any, and otherwise Go's own. A composite action gets no `INPUT_` variables, so each `action.yml` passes its inputs to its program as `INPUT_<NAME>` in the step's environment, and never writes an expression into a script. The programs are pure Go, with CGO off, and CI builds them for every platform runners use: Linux on amd64 and arm64, macOS on arm64, and Windows on amd64. `cache` and `save-cache` archive and extract only on Unix, as the service's machines are; on Windows they build, and are never on the service's machines, so they do nothing.
+
+## Versions
+
+Consumers reference `@v1`, a tag that moves (specs/0004-deployment.md, Releasing the actions), and moves only once the service at its commit is deployed, so an action never asks for more than the deployed service serves. The actions were in `lanescape/actions` until they moved here; that repository's own `v1` stays where it was when they moved, for consumers that haven't moved to these, and it's archived once none references it. No `v1` has been released yet as a stable release, so until then the actions may still change, as `runners` has given way to `disk`, and the `image` action, once specified, has been dropped with the service's consumer images. From then on `v1` stays compatible: its actions keep their inputs, outputs and behaviour. A change that would break them comes as `v2`, while `v1` keeps working, until no consumer references it.
+
+## Code and tests
+
+Each action's `action.yml` and program are in `actions/<name>/`, part of this repository's Go module, and what they share is in `actions/internal/`: the job's runtime (inputs, outputs, summary, masking), the run's event, where an action is, including whether it's on one of the service's machines, the machine's identity tokens, and the client for the service's interface, with its retries; and, for the caches, the walk, shards and archives, in `actions/internal/archive`, and the Cloud Storage client, in `actions/internal/gcs`. An action yet to come adds its calls to the service's client and its program in `actions/<name>/`, and reuses the rest. Of this module, the programs import only `endpoints/`, the interface's constants, and `actions/`, with or without the end-to-end tests' tag, and a test holds them to it: they rely on the interface alone, as an action maintained anywhere else would, never on the service's own code. Outside this module they use `github.com/klauspost/compress` for zstd, `golang.org/x/sys` for a symlink's times and `golang.org/x/sync` for running uploads and downloads at once.
+
+Every behaviour in this spec has a test. No test runs or calls the real runner service. They run against this repository's own emulators: the emulator of the service's interface for actions, `emulators/service`, the emulator of Cloud Storage, `emulators/storage`, which holds the service emulator's caches, and the GitHub emulator, as specs/0005-interface.md (Testing against the emulator) asks of consumers. The conformance suite, `conformance/`, runs the same cases against that emulator and against the real service, and both must pass every one, so what the actions do against the emulator is what they do against the service, as far as the interface goes. End-to-end tests run each action as GitHub would, inside the organization and outside it: an approved contribution's `disk` job after its contribution job has bound the run, a fork's own run and a fork's pull request into an organization repository, and a request from a machine that isn't the service's; a work disk made at once and after `making`, mounted at `/work` and never mounted, and asked for twice; a cache saved in main and restored exactly by a later run in main, a pull request restoring main's and saving its own, a save in a scope that saves nothing, a failed job's version never restored, a cache the commit doesn't declare, a second save of a cache by a job, and an object replaced since its commit; Cloud Storage busy; and the service answering that GitHub couldn't confirm the run, until it can and until the retries are spent. The actions' tests run natively on Linux amd64, Linux arm64 and macOS arm64, since paths, shells, signals and file locking differ between them, and CI builds every program for every platform it targets (specs/0004-deployment.md, CI and CD).
+
+The end-to-end tests, in `actions/e2e/`, build each program as the actions do, with one difference: the build tag `e2e`, which no `action.yml` uses, makes a program call the service emulator, named in `LANESCAPE_TEST_SERVICE`, in place of `endpoints.Service`, and wait milliseconds where the actions wait seconds or minutes: between retries, between asking again for a disk being made, and for `/work` to be mounted; and use the Cloud Storage emulator named in `LANESCAPE_TEST_STORAGE`. They run each program with a job's environment, event payload, output and summary files, a metadata server, with or without the service's attribute, as GitHub and Compute Engine would, and a stand-in for `/proc/self/mountinfo`, showing `/work` mounted or not, and check that no token handed to a job appears in its log unmasked. There is one GitHub: each test makes the repository, its files, its branches, pull requests from it and from a fork, and runs, jobs, environments and approvals in the GitHub emulator, which serves them to the programs, and the service emulator reads that same state through `service.WithGitHub` (specs/0005-interface.md, One GitHub for both). Each test starts its jobs on the service emulator's machines, which binds their runs as the service's check would, and the emulator mints the machine's identity token, served to the program as the metadata server would; how each work disk goes, and what GitHub can't confirm, are set through `World` and `emulators/fault`, answered as the service answers. Every request reaches the service emulator as the program sent it. Unit tests run each program's logic in-process against the GitHub emulator. `cache`'s and `save-cache`'s run against the Cloud Storage emulator, with `emulators/fault` giving the service emulator's answers to `/v1/caches/` where a case needs one it doesn't give on its own, such as a token about to expire or another version on asking again. The archives' own tests save and restore a tree of every kind of entry a cache keeps, with modes and times to the nanosecond, and refuse every way an archive could reach outside its directory. Other tests run the actions' own steps that find Go and build a program under a job's hostile Go settings, `checkout` where Git is missing or too old, and `cd.yml`'s step that moves the tag against a stand-in for `gh`, for each case it creates, moves, leaves or refuses to move the tag. `go test -short` skips the end-to-end ones.

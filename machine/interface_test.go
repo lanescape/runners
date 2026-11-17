@@ -15,7 +15,7 @@ import (
 )
 
 // action is a client that speaks the interface for actions
-// (specs/0005-interface.md) as the actions in lanescape/actions do, and
+// (specs/0005-interface.md) as the actions in actions/ do, and
 // nothing more: it writes a job's selector, which names a shape alone; it
 // writes the steps that ask for the job's work disk, and wait for /work to
 // be the mounted disk, and that restore and save its caches, uploading and

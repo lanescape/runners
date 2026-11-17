@@ -1,0 +1,109 @@
+name: Lanescape cache
+description: >
+  Restores a cache that save-cache saved, under a directory: the version
+  the runner service chooses for the run, if there's one. Outside the
+  lanescape organization, or on a runner that isn't the service's, it does
+  nothing.
+inputs:
+  name:
+    description: The cache's name, as .github/runners.json declares it at the run's commit.
+    required: true
+  path:
+    description: The directory to restore the cache under, such as /work/chromium; made if it isn't there.
+    required: true
+outputs:
+  restored:
+    description: >
+      Where the restored version came from, a step of the runner service's
+      restore order, such as main_exact, or none if nothing was restored.
+    value: ${{ steps.restore.outputs.restored }}
+runs:
+  using: composite
+  steps:
+    # The steps up to Build are the same in every action in this
+    # repository; a test keeps them so.
+    - name: Find Go
+      id: go
+      shell: bash
+      run: |
+        want="$(sed -n 's/^toolchain //p' "$GITHUB_ACTION_PATH/../../go.mod")"
+        if [ -z "$want" ]; then echo "::error::go.mod has no toolchain line"; exit 1; fi
+        have="$(env -u GOOS -u GOARCH -u GOFLAGS -u GOEXPERIMENT -u GOROOT -u GODEBUG -u GOFIPS140 \
+          GOENV=off GOWORK=off GOTOOLCHAIN=local GO111MODULE=on go env GOVERSION 2>/dev/null || true)"
+        echo "version=${want#go}" >> "$GITHUB_OUTPUT"
+        if [ "$have" = "$want" ]; then
+          echo "found=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "found=false" >> "$GITHUB_OUTPUT"
+        fi
+    - name: Set up Go
+      if: steps.go.outputs.found != 'true'
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      # actions/setup-go runs go itself, which mustn't see the job's Go
+      # settings either, and prints go env, which mustn't show where the
+      # job gets its modules, since that may hold a credential. It
+      # downloads Go itself, not modules. Empty is Go's default.
+      env:
+        GOENV: 'off'
+        GOWORK: 'off'
+        GOTOOLCHAIN: local
+        GOFLAGS: ''
+        GOOS: ''
+        GOARCH: ''
+        GOAMD64: ''
+        GOARM64: ''
+        GOEXPERIMENT: ''
+        GOROOT: ''
+        GODEBUG: ''
+        GOFIPS140: ''
+        GO111MODULE: ''
+        GOPROXY: ''
+        GONOPROXY: ''
+        GOPRIVATE: ''
+        GOSUMDB: ''
+        GONOSUMDB: ''
+        GOINSECURE: ''
+        GOAUTH: ''
+        GOVCS: ''
+        GOCACHEPROG: ''
+        # And it downloads Go from Go's own site, never from a mirror the
+        # job names, whose URL it would print.
+        GO_DOWNLOAD_BASE_URL: ''
+      with:
+        # Exactly go.mod's toolchain, whatever GOTOOLCHAIN the job has.
+        go-version: ${{ steps.go.outputs.version }}
+        cache: false
+    - name: Build
+      id: build
+      shell: bash
+      env:
+        PROGRAM: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        name="$(basename "$PROGRAM")"
+        dir="$(mktemp -d "$RUNNER_TEMP/lanescape-actions.XXXXXX")"
+        bin="$dir/$name"
+        if [ "$RUNNER_OS" = Windows ]; then bin="$bin.exe"; fi
+        cd "$PROGRAM/../.."
+        # Nothing of the job's Go settings, in its environment or saved
+        # with go env -w, changes the build, but where modules come from.
+        build() {
+          env -u GOOS -u GOARCH -u GOFLAGS -u GOEXPERIMENT -u GOARM64 -u GOAMD64 -u GOROOT -u GODEBUG -u GOFIPS140 \
+            GOENV=off GOWORK=off GOTOOLCHAIN=local GO111MODULE=on CGO_ENABLED=0 "$@"
+        }
+        want="$(sed -n 's/^toolchain //p' go.mod)"
+        have="$(build go env GOVERSION)"
+        if [ "$have" != "$want" ]; then
+          echo "::error::Go is $have, not $want, which go.mod names"
+          exit 1
+        fi
+        build go build -trimpath -o "$bin" "./actions/$name"
+        echo "bin=$bin" >> "$GITHUB_OUTPUT"
+    - name: Restore the cache
+      id: restore
+      shell: bash
+      env:
+        PROGRAM: ${{ steps.build.outputs.bin }}
+        INPUT_NAME: ${{ inputs.name }}
+        INPUT_PATH: ${{ inputs.path }}
+      run: '"$PROGRAM"'

@@ -61,6 +61,36 @@ CD deploys nothing until the repository's Actions variables below are all set (s
 
 3. Let CD deploy `infra/` for the first time: rerun the latest CD run on main, whose deploy was skipped, or push to main. That apply makes the App's secrets with no value, so it fails where the service would start. Add the secrets' values as `infra/README.md` says, then rerun the failed run's deploy, which starts the service.
 
+## The actions' release
+
+CD moves the actions' `v1` tag after each deploy that succeeds (specs/0004-deployment.md, Releasing the actions). That needs three things on GitHub, which no Terraform here makes. A maintainer sets them up before the first push to main that moves `v1`; otherwise that run's release job fails, though its deploy still succeeds.
+
+1. **The App, installed here.** The "Lanescape Actions" GitHub App is private to the organization, with Repository permissions Contents: read and write and nothing else, and no webhook. Its settings are at <https://github.com/organizations/lanescape/settings/apps/lanescape-actions>. To install it on this repository, open the organization's Settings, GitHub Apps, Lanescape Actions, Configure, and add `lanescape/runners` under Repository access.
+2. **The `release` environment.** In this repository's Settings, Environments, make an environment `release`. Under Deployment branches and tags, choose Selected branches and tags and add the branch `main`, and nothing else. Give it:
+   - the variable `RELEASE_APP_ID`: the App ID at the top of the App's settings page. It isn't a secret.
+   - the secret `RELEASE_APP_PRIVATE_KEY`: a private key made for this repository alone. On the App's settings page, under Private keys, choose Generate a private key, which downloads a `.pem` file that GitHub never shows again. Store the whole file, `BEGIN` and `END` lines included, and then delete the download:
+
+     ```sh
+     gh secret set RELEASE_APP_PRIVATE_KEY --env release -R lanescape/runners < <downloaded>.pem
+     rm <downloaded>.pem
+     ```
+
+     If the key leaks or is lost, generate a new one the same way, store it, and delete the old one on the App's settings page.
+3. **The tag ruleset.** It restricts creating, updating and deleting `v*` tags, and only the App may bypass it, always. In this repository's Settings, Rules, Rulesets, choose New ruleset, New tag ruleset, or make it with GitHub's API, where `<app id>` is `RELEASE_APP_ID`:
+
+   ```sh
+   gh api -X POST repos/lanescape/runners/rulesets --input - <<'JSON'
+   {
+     "name": "Release tags",
+     "target": "tag",
+     "enforcement": "active",
+     "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
+     "rules": [{"type": "creation"}, {"type": "update"}, {"type": "deletion"}],
+     "bypass_actors": [{"actor_id": <app id>, "actor_type": "Integration", "bypass_mode": "always"}]
+   }
+   JSON
+   ```
+
 ## What IAM can't limit
 
 IAM Conditions limit grants by name only for some resource types. The grants here that can't be limited, and so reach other teams' resources in the shared project, are:
