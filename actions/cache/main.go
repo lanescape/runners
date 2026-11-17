@@ -109,7 +109,7 @@ func run(ctx context.Context, rt *actions.Runtime, m machine, svc *service.Clien
 		case base == dirsName && dirs == nil:
 			dirs = &v.Objects[i]
 		default:
-			return fmt.Errorf("the version of the cache %s has an object, %s, that save-cache doesn't make", name, o.Name)
+			return fmt.Errorf("the version of the cache %s has an object save-cache doesn't make", name)
 		}
 	}
 	if dirs == nil {
@@ -187,7 +187,7 @@ func extract(ctx context.Context, st *gcs.Client, tokens gcs.Tokens, bucket stri
 	rc := st.Open(ctx, tokens, bucket, o)
 	defer rc.Close()
 	if err := into(rc); err != nil {
-		return fmt.Errorf("restoring %s: %w", o.Name, err)
+		return fmt.Errorf("restoring %s: %w", gcs.Label(o.Name), err)
 	}
 	if _, err := io.Copy(io.Discard, rc); err != nil {
 		return err

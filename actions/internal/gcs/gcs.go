@@ -85,7 +85,7 @@ var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 func ParseCRC32C(s string) (uint32, error) {
 	b, err := base64.StdEncoding.DecodeString(s)
 	if err != nil || len(b) != 4 {
-		return 0, fmt.Errorf("%q isn't a CRC32C as Cloud Storage writes it", s)
+		return 0, errors.New("a CRC32C isn't one as Cloud Storage writes it")
 	}
 	return binary.BigEndian.Uint32(b), nil
 }
@@ -101,6 +101,22 @@ var bucketName = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]$`)
 
 // ValidBucket is whether name is a bucket's name.
 func ValidBucket(name string) bool { return bucketName.MatchString(name) }
+
+// labelName is an object's base name that may be shown: one of the names
+// save-cache gives a version's objects, and nothing else.
+var labelName = regexp.MustCompile(`^(shard-[0-9]{3}\.tar\.zst|dirs\.tar\.zst)$`)
+
+// Label is how a log or an error names the object name: by its base name
+// alone, if that is one save-cache gives a version's objects, and otherwise
+// as "an object". The rest of the name is the runner service's,
+// opaque to the actions, so it's never shown: whatever it holds, such as
+// a credential sent by mistake, stays out of the job's log.
+func Label(name string) string {
+	if base := name[strings.LastIndexByte(name, '/')+1:]; labelName.MatchString(base) {
+		return base
+	}
+	return "an object"
+}
 
 // ValidObject is whether name is an object's name Cloud Storage takes.
 func ValidObject(name string) bool {
@@ -316,7 +332,7 @@ func (c *Client) attempts(ctx context.Context, tokens Tokens, what string, try f
 // never replacing one, with a resumable upload of ChunkSize at a time,
 // and checks Cloud Storage's size and CRC32C of it against what was sent.
 func (c *Client) Upload(ctx context.Context, tokens Tokens, bucket, name string, r io.Reader) (Object, error) {
-	what := "uploading " + name
+	what := "uploading " + Label(name)
 	size := c.ChunkSize
 	if size <= 0 {
 		size = DefaultChunkSize
@@ -481,7 +497,7 @@ func (c *Client) start(ctx context.Context, tokens Tokens, bucket, name string) 
 	u := c.base() + "/upload/storage/v1/b/" + url.PathEscape(bucket) + "/o?" + q.Encode()
 	body, _ := json.Marshal(map[string]string{"name": name, "contentType": "application/zstd"})
 	var session *url.URL
-	err = c.attempts(ctx, tokens, "starting the upload of "+name, func(tok string) error {
+	err = c.attempts(ctx, tokens, "starting the upload of "+Label(name), func(tok string) error {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
 		if err != nil {
 			return err
@@ -665,7 +681,7 @@ func (d *download) Close() error {
 func (d *download) open() error {
 	q := url.Values{"alt": {"media"}, "generation": {strconv.FormatInt(d.o.Generation, 10)}}
 	u := d.c.base() + "/storage/v1/b/" + url.PathEscape(d.bucket) + "/o/" + url.PathEscape(d.o.Name) + "?" + q.Encode()
-	return d.c.attempts(d.ctx, d.tokens, "downloading "+d.o.Name, func(tok string) error {
+	return d.c.attempts(d.ctx, d.tokens, "downloading "+Label(d.o.Name), func(tok string) error {
 		req, err := http.NewRequestWithContext(d.ctx, http.MethodGet, u, nil)
 		if err != nil {
 			return err
@@ -709,15 +725,15 @@ func (d *download) Read(p []byte) (int, error) {
 		d.off += int64(n)
 		d.crc.Write(p[:n])
 		if d.off > d.o.Size {
-			d.end = fmt.Errorf("downloading %s: it's longer than its %d bytes", d.o.Name, d.o.Size)
+			d.end = fmt.Errorf("downloading %s: it's longer than its %d bytes", Label(d.o.Name), d.o.Size)
 			return 0, d.end
 		}
 		if errors.Is(err, io.EOF) {
 			d.end = io.EOF
 			if d.off != d.o.Size {
-				d.end = fmt.Errorf("downloading %s: it's %d bytes, not %d", d.o.Name, d.off, d.o.Size)
+				d.end = fmt.Errorf("downloading %s: it's %d bytes, not %d", Label(d.o.Name), d.off, d.o.Size)
 			} else if got := d.crc.Sum32(); got != d.o.CRC32C {
-				d.end = fmt.Errorf("downloading %s: its CRC32C is %s, not %s", d.o.Name, FormatCRC32C(got), FormatCRC32C(d.o.CRC32C))
+				d.end = fmt.Errorf("downloading %s: its CRC32C is %s, not %s", Label(d.o.Name), FormatCRC32C(got), FormatCRC32C(d.o.CRC32C))
 			}
 			return n, d.end
 		}
@@ -728,11 +744,11 @@ func (d *download) Read(p []byte) (int, error) {
 			d.broke++
 			pol := d.c.policy()
 			if d.broke >= pol.Attempts {
-				d.end = fmt.Errorf("downloading %s: it broke off %d times", d.o.Name, d.broke)
+				d.end = fmt.Errorf("downloading %s: it broke off %d times", Label(d.o.Name), d.broke)
 				return n, d.end
 			}
 			if d.c.Logf != nil {
-				d.c.Logf("Downloading %s broke off at byte %d; resuming.", d.o.Name, d.off)
+				d.c.Logf("Downloading %s broke off at byte %d; resuming.", Label(d.o.Name), d.off)
 			}
 			if err := pol.Pause(d.ctx, pol.Wait(d.broke, 0)); err != nil {
 				return n, err
@@ -802,7 +818,7 @@ func (r *Refreshing) Expired(tok string) {
 func (c *Client) Check(ctx context.Context, tokens Tokens, bucket string, o Object) error {
 	q := url.Values{"generation": {strconv.FormatInt(o.Generation, 10)}}
 	u := c.base() + "/storage/v1/b/" + url.PathEscape(bucket) + "/o/" + url.PathEscape(o.Name) + "?" + q.Encode()
-	return c.attempts(ctx, tokens, "checking "+o.Name, func(tok string) error {
+	return c.attempts(ctx, tokens, "checking "+Label(o.Name), func(tok string) error {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if err != nil {
 			return err

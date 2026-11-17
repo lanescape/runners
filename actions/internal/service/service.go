@@ -291,10 +291,10 @@ func (c *Client) Disk(ctx context.Context, ask DiskAsk) (Disk, error) {
 		return Disk{}, err
 	}
 	if out.State != Making && out.State != Ready {
-		return Disk{}, fmt.Errorf("the runner service answered with a work disk's state its interface doesn't have: %q", out.State)
+		return Disk{}, errors.New("the runner service answered with a work disk's state its interface doesn't have")
 	}
 	if _, ok := Steps[out.Restored]; !ok {
-		return Disk{}, fmt.Errorf("the runner service answered that the work disk came from %q, which its interface doesn't have", out.Restored)
+		return Disk{}, errors.New("the runner service answered that the work disk came from somewhere its interface doesn't have")
 	}
 	return out, nil
 }
@@ -429,7 +429,7 @@ func (c *Client) RestoreCache(ctx context.Context, name string) (CacheRestore, e
 	}
 	bad := errors.New("the runner service answered a cache's restore with a body its interface doesn't have")
 	if _, ok := CacheSteps[out.Restored]; !ok {
-		return CacheRestore{}, fmt.Errorf("the runner service answered that the cache came from %q, which its interface doesn't have", out.Restored)
+		return CacheRestore{}, errors.New("the runner service answered that the cache came from somewhere its interface doesn't have")
 	}
 	if out.Restored == "none" {
 		return CacheRestore{Restored: "none"}, nil
