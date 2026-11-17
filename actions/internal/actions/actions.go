@@ -13,10 +13,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strings"
 	"sync"
 )
+
+// Nothing writes to the standard logger but net/http, which writes there
+// what a server sent unasked on a connection kept for another request,
+// and that could be anything, a credential included. So it goes nowhere:
+// a program says what it does with Logf alone.
+func init() { log.SetOutput(io.Discard) }
 
 // Runtime is a step's view of the runner. Tests fill it in; Default reads
 // the process's own environment.

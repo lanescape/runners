@@ -2,6 +2,8 @@ package actions
 
 import (
 	"bytes"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,5 +60,13 @@ func TestSetOutputNeedsTheFile(t *testing.T) {
 	rt := &Runtime{Getenv: func(string) string { return "" }, Stdout: &bytes.Buffer{}}
 	if err := rt.SetOutput("a", "b"); err == nil {
 		t.Fatal("no error without GITHUB_OUTPUT")
+	}
+}
+
+// The standard logger, where net/http writes what a server sent unasked,
+// goes nowhere.
+func TestTheStandardLoggerIsDiscarded(t *testing.T) {
+	if log.Writer() != io.Discard {
+		t.Fatal("the standard logger writes somewhere")
 	}
 }

@@ -9,6 +9,7 @@ package gcs
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -16,12 +17,14 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -125,12 +128,16 @@ func (c *Client) policy() backoff.Policy {
 // as long as it takes, but an answer that doesn't start in two minutes is
 // given up on. Every stream has a connection of its own, over HTTP/1.1,
 // and may keep it: the dozens a cache streams at once would share one
-// over HTTP/2.
+// over HTTP/2. So it offers only HTTP/1.1 when it connects, as well as
+// speaking only HTTP/1.1: cloning http.DefaultTransport copies its TLS
+// configuration, which offers HTTP/2 too, and Cloud Storage takes that
+// offer and then refuses the HTTP/1.1 the transport speaks.
 var transport = func() *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	var p http.Protocols
 	p.SetHTTP1(true)
 	t.Protocols = &p
+	t.TLSClientConfig = &tls.Config{NextProtos: []string{"http/1.1"}}
 	t.ResponseHeaderTimeout = 2 * time.Minute
 	t.MaxIdleConnsPerHost = 256
 	return t
@@ -153,15 +160,15 @@ func (c *Client) http() *http.Client {
 
 // statusError is an answer that wasn't what was asked for.
 type statusError struct {
-	code    int
-	message string
+	code   int
+	reason string
 }
 
 func (e *statusError) Error() string {
-	if e.message == "" {
+	if e.reason == "" {
 		return fmt.Sprintf("Cloud Storage answered %d", e.code)
 	}
-	return fmt.Sprintf("Cloud Storage answered %d: %s", e.code, e.message)
+	return fmt.Sprintf("Cloud Storage answered %d (%s)", e.code, e.reason)
 }
 
 // retryable is whether an error may go away if the request is made again.
@@ -177,32 +184,90 @@ func retryable(err error) bool {
 // errStalled is an upload that kept nothing of what was sent.
 var errStalled = errors.New("Cloud Storage kept nothing of what was sent")
 
-// netError is a request that got no answer.
-type netError struct{ op string }
+// netError is a request that got no answer, or an answer cut short.
+type netError struct {
+	op string
+	// why is what went wrong, in netErr's own words.
+	why string
+}
 
-func (e *netError) Error() string { return "Cloud Storage couldn't be reached to " + e.op }
+func (e *netError) Error() string {
+	msg := "Cloud Storage couldn't be reached to " + e.op
+	if e.why != "" {
+		msg += ": " + e.why
+	}
+	return msg
+}
 
-// answerError reads an error answer's message, on one line, with tok
-// nowhere in it.
-func answerError(resp *http.Response, tok string) error {
+// netErr is the netError for err, saying what went wrong in words of its
+// own, never a lower layer's: those can repeat what was sent or answered,
+// such as a token, or an upload's session address, which is a credential
+// of its own. Only err's kind decides what it says.
+func netErr(op string, err error) *netError {
+	return &netError{op: op, why: why(err)}
+}
+
+func why(err error) string {
+	var dns *net.DNSError
+	var cert *tls.CertificateVerificationError
+	var alert tls.AlertError
+	var record tls.RecordHeaderError
+	var syntax *json.SyntaxError
+	var typ *json.UnmarshalTypeError
+	var op *net.OpError
+	var ne net.Error
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, context.Canceled):
+		return "it was cancelled"
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &ne) && ne.Timeout():
+		return "it timed out"
+	case errors.As(err, &dns):
+		return "its address couldn't be looked up"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "the connection was refused"
+	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE):
+		return "the connection was reset"
+	case errors.As(err, &cert):
+		return "its certificate couldn't be verified"
+	case errors.As(err, &alert), errors.As(err, &record):
+		return "the TLS handshake failed"
+	case errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, io.EOF):
+		return "the connection closed before the answer was whole"
+	case errors.As(err, &syntax), errors.As(err, &typ):
+		return "the answer wasn't what Cloud Storage sends"
+	case strings.Contains(err.Error(), "malformed HTTP"), strings.Contains(err.Error(), "malformed MIME"):
+		// Only whether it says so is used, never what it says.
+		return "the answer wasn't HTTP/1.1"
+	case errors.As(err, &op):
+		return "the connection failed"
+	}
+	return "for a reason not named here"
+}
+
+// aReason is the reason Cloud Storage gives an error, such as forbidden or
+// rateLimitExceeded: a word, and nothing a request could have put in it.
+var aReason = regexp.MustCompile(`^[A-Za-z]{1,64}$`)
+
+// answerError is an error answer, by its status and, if it's a word, the
+// reason Cloud Storage gives. Nothing else of the answer is repeated: its
+// message can quote the request, its token or an upload's session address
+// included.
+func answerError(resp *http.Response) error {
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
 	var body struct {
 		Error struct {
-			Message string `json:"message"`
+			Errors []struct {
+				Reason string `json:"reason"`
+			} `json:"errors"`
 		} `json:"error"`
 	}
-	msg := ""
-	if json.Unmarshal(data, &body) == nil {
-		msg = body.Error.Message
+	reason := ""
+	if json.Unmarshal(data, &body) == nil && len(body.Error.Errors) > 0 && aReason.MatchString(body.Error.Errors[0].Reason) {
+		reason = body.Error.Errors[0].Reason
 	}
-	if tok != "" {
-		msg = strings.ReplaceAll(msg, tok, "***")
-	}
-	msg = strings.Join(strings.FieldsFunc(msg, func(r rune) bool { return unicode.IsControl(r) || unicode.IsSpace(r) }), " ")
-	if len(msg) > 300 {
-		msg = msg[:300] + "..."
-	}
-	return &statusError{code: resp.StatusCode, message: msg}
+	return &statusError{code: resp.StatusCode, reason: reason}
 }
 
 // attempts runs try until it succeeds, fails for good, or the retries are
@@ -426,14 +491,14 @@ func (c *Client) start(ctx context.Context, tokens Tokens, bucket, name string) 
 		req.Header.Set("X-Upload-Content-Type", "application/zstd")
 		resp, err := c.http().Do(req)
 		if err != nil {
-			return &netError{op: "start an upload"}
+			return netErr("start an upload", err)
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode == http.StatusPreconditionFailed {
 			return errors.New("the object is there already: this cache's version was saved before")
 		}
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-			return answerError(resp, tok)
+			return answerError(resp)
 		}
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		loc, err := url.Parse(resp.Header.Get("Location"))
@@ -524,7 +589,7 @@ func (c *Client) send(ctx context.Context, session *url.URL, offset int64, data 
 	req.Header.Set("Content-Range", rng)
 	resp, err := c.http().Do(req)
 	if err != nil {
-		return nil, 0, &netError{op: "upload"}
+		return nil, 0, netErr("upload", err)
 	}
 	defer resp.Body.Close()
 	switch resp.StatusCode {
@@ -533,7 +598,7 @@ func (c *Client) send(ctx context.Context, session *url.URL, offset int64, data 
 		if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&r); err != nil {
 			// An answer cut short may be a connection lost: what Cloud
 			// Storage has is asked again.
-			return nil, 0, &netError{op: "read the end of an upload"}
+			return nil, 0, netErr("read the end of an upload", err)
 		}
 		size, _ := strconv.ParseInt(r.Size, 10, 64)
 		return &r, size, nil
@@ -544,7 +609,7 @@ func (c *Client) send(ctx context.Context, session *url.URL, offset int64, data 
 	case http.StatusNotFound, http.StatusGone:
 		return nil, 0, errors.New("the upload's session is gone")
 	default:
-		return nil, 0, answerError(resp, "")
+		return nil, 0, answerError(resp)
 	}
 }
 
@@ -557,7 +622,8 @@ func persisted(h string) (int64, error) {
 	v, ok := strings.CutPrefix(h, "bytes=0-")
 	n, err := strconv.ParseInt(v, 10, 64)
 	if !ok || err != nil || n < 0 {
-		return 0, fmt.Errorf("Cloud Storage's Range %q isn't one it gives", h)
+		// Not repeated: it could be anything, an address included.
+		return 0, errors.New("Cloud Storage's Range isn't one it gives")
 	}
 	return n + 1, nil
 }
@@ -610,7 +676,7 @@ func (d *download) open() error {
 		}
 		resp, err := d.c.http().Do(req)
 		if err != nil {
-			return &netError{op: "download"}
+			return netErr("download", err)
 		}
 		want := http.StatusOK
 		if d.off > 0 {
@@ -621,7 +687,7 @@ func (d *download) open() error {
 			if resp.StatusCode == http.StatusNotFound {
 				return errors.New("the object isn't there at its generation")
 			}
-			return answerError(resp, tok)
+			return answerError(resp)
 		}
 		d.body = resp.Body
 		return nil
@@ -744,18 +810,18 @@ func (c *Client) Check(ctx context.Context, tokens Tokens, bucket string, o Obje
 		req.Header.Set("Authorization", "Bearer "+tok)
 		resp, err := c.http().Do(req)
 		if err != nil {
-			return &netError{op: "check an object"}
+			return netErr("check an object", err)
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode == http.StatusNotFound {
 			return errors.New("the object isn't there at its generation")
 		}
 		if resp.StatusCode != http.StatusOK {
-			return answerError(resp, tok)
+			return answerError(resp)
 		}
 		var r resource
 		if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&r); err != nil {
-			return &netError{op: "read an object's description"}
+			return netErr("read an object's description", err)
 		}
 		got, err := r.object()
 		if err != nil {
