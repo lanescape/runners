@@ -7,15 +7,22 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -241,18 +248,153 @@ func TestRefreshing(t *testing.T) {
 	}
 }
 
+// An error answer is repeated by its status and its reason, if that's a
+// word, and nothing else: its message can quote the request, the token
+// or an upload's session address included.
 func TestTheTokenIsNeverInAnError(t *testing.T) {
 	w := setup(t)
 	o := object(w, "p/shard-000.tar.zst", []byte("data"))
 	const secret = "ya29.secret-token"
 	w.emu.Faults().Add(fault.Rule{Respond: gcsemu.JSONError(http.StatusForbidden, "forbidden", "the token "+secret+" may not")})
 	_, err := io.ReadAll(w.c.Open(context.Background(), &tokens{list: []string{secret}}, "b-1", o))
-	if err == nil || strings.Contains(err.Error(), secret) || !strings.Contains(err.Error(), "the token *** may not") {
+	if err == nil || !strings.HasSuffix(err.Error(), "Cloud Storage answered 403 (forbidden)") {
 		t.Fatalf("download: %v", err)
 	}
 	_, err = w.c.Upload(context.Background(), &tokens{list: []string{secret}}, "b-1", "p/x", strings.NewReader("x"))
 	if err == nil || strings.Contains(err.Error(), secret) {
 		t.Fatalf("upload: %v", err)
+	}
+
+	// Nor is a reason that isn't a word, nor what an upload's answers
+	// say, which have no token to take out, in an error or the log.
+	w = setup(t)
+	var logged []string
+	w.c.Logf = func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }
+	w.emu.Faults().Add(fault.Rule{Method: http.MethodPut, Respond: func(rw http.ResponseWriter, r *http.Request) {
+		gcsemu.JSONError(http.StatusServiceUnavailable, r.URL.String(), "busy at "+r.URL.String()+" with "+secret)(rw, r)
+	}})
+	_, err = w.c.Upload(context.Background(), &tokens{list: []string{secret}}, "b-1", "p/x", strings.NewReader("x"))
+	logged = append(logged, fmt.Sprint(err))
+	for _, line := range logged {
+		if strings.Contains(line, secret) || strings.Contains(line, "upload_id") || strings.Contains(line, "busy") {
+			t.Fatalf("%q", line)
+		}
+	}
+	if err == nil || !strings.HasSuffix(err.Error(), "Cloud Storage answered 503") {
+		t.Fatalf("upload: %v", err)
+	}
+}
+
+// A Range Cloud Storage doesn't give isn't repeated: it could be anything.
+func TestARangeThatIsntOne(t *testing.T) {
+	w := setup(t)
+	w.emu.Faults().Add(fault.Rule{Method: http.MethodPut, Respond: func(rw http.ResponseWriter, r *http.Request) {
+		fault.Status(http.StatusPermanentRedirect, http.Header{"Range": {"bytes=0-" + r.URL.String()}}, "")(rw, r)
+	}})
+	_, err := w.c.Upload(context.Background(), &tokens{list: []string{"t"}}, "b-1", "p/x", strings.NewReader("x"))
+	if err == nil || strings.Contains(err.Error(), "upload_id") || !strings.Contains(err.Error(), "Cloud Storage's Range isn't one it gives") {
+		t.Fatalf("upload: %v", err)
+	}
+}
+
+// The default transport offers HTTP/1.1 alone when it connects, so a
+// server that would take HTTP/2, as Cloud Storage does, answers in
+// HTTP/1.1, which is all the transport speaks.
+func TestTheTransportOffersOnlyHTTP1(t *testing.T) {
+	var negotiated, asked string
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		negotiated, asked = r.TLS.NegotiatedProtocol, r.Proto
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	tr := transport.Clone()
+	t.Cleanup(tr.CloseIdleConnections)
+	tr.TLSClientConfig.RootCAs = x509.NewCertPool()
+	tr.TLSClientConfig.RootCAs.AddCert(srv.Certificate())
+	resp, err := (&http.Client{Transport: tr}).Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if negotiated == "h2" || asked != "HTTP/1.1" || resp.Proto != "HTTP/1.1" {
+		t.Fatalf("agreed on %q, asked in %s, answered in %s", negotiated, asked, resp.Proto)
+	}
+}
+
+// A request that gets no answer says why, but never where: an upload's
+// session address is a credential of its own.
+func TestANetworkErrorSaysWhyButNotWhere(t *testing.T) {
+	w := setup(t)
+	w.emu.Faults().Add(fault.Rule{Method: http.MethodPut, Respond: fault.Drop})
+	_, err := w.c.Upload(context.Background(), &tokens{list: []string{"t"}}, "b-1", "p/x", strings.NewReader("x"))
+	if err == nil || !strings.HasSuffix(err.Error(), "Cloud Storage couldn't be reached to upload: the connection closed before the answer was whole") {
+		t.Fatalf("upload: %v", err)
+	}
+}
+
+// raw answers with exactly what's given, which isn't always HTTP.
+func raw(answer string) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		conn, buf, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			panic(err)
+		}
+		defer conn.Close()
+		buf.WriteString(answer)
+		buf.Flush()
+	}
+}
+
+// What an answer repeats of a request never reaches an error: not the
+// token, nor the session's address.
+func TestAnAnswerRepeatingARequestIsntRepeated(t *testing.T) {
+	const secret = "ya29.secret-token"
+	w := setup(t)
+	w.emu.Faults().Add(fault.Rule{Method: http.MethodPost, Respond: raw("HTTP/1.1 200 OK\r\nAuthorization Bearer " + secret + "\r\n\r\n")})
+	_, err := w.c.Upload(context.Background(), &tokens{list: []string{secret}}, "b-1", "p/x", strings.NewReader("x"))
+	if err == nil || strings.Contains(err.Error(), secret) || !strings.HasSuffix(err.Error(), "to start an upload: the answer wasn't HTTP/1.1") {
+		t.Fatalf("start: %v", err)
+	}
+
+	w = setup(t)
+	w.emu.Faults().Add(fault.Rule{Method: http.MethodPut, Respond: func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("Content-Type", "application/json")
+		rw.WriteHeader(http.StatusOK)
+		io.WriteString(rw, `{"name": `+r.URL.String())
+	}})
+	_, err = w.c.Upload(context.Background(), &tokens{list: []string{secret}}, "b-1", "p/x", strings.NewReader("x"))
+	if err == nil || strings.Contains(err.Error(), "upload_id") || strings.Contains(err.Error(), "/upload/") {
+		t.Fatalf("upload: %v", err)
+	}
+}
+
+func TestNetErr(t *testing.T) {
+	const secret = "SECRET"
+	session := "https://storage.googleapis.com/upload/storage/v1/b/b/o?uploadType=resumable&upload_id=" + secret
+	var syntax error = json.Unmarshal([]byte(`{"name": /upload?upload_id=`+secret), new(any))
+	for _, c := range []struct {
+		err  error
+		want string
+	}{
+		{&url.Error{Op: "Put", URL: session, Err: io.EOF}, "the connection closed before the answer was whole"},
+		{io.ErrUnexpectedEOF, "the connection closed before the answer was whole"},
+		{&url.Error{Op: "Put", URL: session, Err: &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}},
+			"the connection was refused"},
+		{&url.Error{Op: "Put", URL: session, Err: &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", syscall.ECONNRESET)}},
+			"the connection was reset"},
+		{&url.Error{Op: "Put", URL: session, Err: context.DeadlineExceeded}, "it timed out"},
+		{context.Canceled, "it was cancelled"},
+		{&url.Error{Op: "Put", URL: session, Err: &net.DNSError{Name: secret, Err: "no such host"}}, "its address couldn't be looked up"},
+		{&url.Error{Op: "Put", URL: session, Err: &tls.CertificateVerificationError{Err: errors.New(secret)}}, "its certificate couldn't be verified"},
+		{&url.Error{Op: "Put", URL: session, Err: errors.New(`malformed HTTP response "Bearer ` + secret + `"`)}, "the answer wasn't HTTP/1.1"},
+		{syntax, "the answer wasn't what Cloud Storage sends"},
+		{&url.Error{Op: "Put", URL: session, Err: errors.New("proxy " + session + " refused")}, "for a reason not named here"},
+	} {
+		got := netErr("upload", c.err).Error()
+		if got != "Cloud Storage couldn't be reached to upload: "+c.want || strings.Contains(got, secret) {
+			t.Errorf("netErr(%v) = %q, want %q", c.err, got, c.want)
+		}
 	}
 }
 
@@ -340,7 +482,7 @@ func TestUploadStart(t *testing.T) {
 		"no session": {fault.Status(http.StatusOK, nil, ""), "without a session at its own address"},
 		"an object there": {gcsemu.JSONError(http.StatusPreconditionFailed, "conditionNotMet", "At least one of the pre-conditions you specified did not hold."),
 			"saved before"},
-		"a refusal": {gcsemu.JSONError(http.StatusForbidden, "forbidden", "may not create"), "answered 403: may not create"},
+		"a refusal": {gcsemu.JSONError(http.StatusForbidden, "forbidden", "may not create"), "answered 403 (forbidden)"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			w := setup(t)
