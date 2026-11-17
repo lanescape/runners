@@ -132,7 +132,7 @@ Each action is a composite action that builds its Go program from the action's o
 
 ## Versions
 
-Consumers reference `@v1`, a tag that moves (specs/0004-deployment.md, Releasing the actions), and moves only once the service at its commit is deployed, so an action never asks for more than the deployed service serves. The actions were in `lanescape/actions` until they moved here; that repository's own `v1` stays where it was when they moved, for consumers that haven't moved to these, and it's archived once none references it. No `v1` has been released yet as a stable release, so until then the actions may still change, as `runners` has given way to `disk`, and the `image` action, once specified, has been dropped with the service's consumer images. From then on `v1` stays compatible: its actions keep their inputs, outputs and behaviour. A change that would break them comes as `v2`, while `v1` keeps working, until no consumer references it.
+Consumers reference `@v1`, a tag that moves (specs/0004-deployment.md, Releasing the actions), and moves only once the service at its commit is deployed, so an action never asks for more than the deployed service serves. No `v1` has been released yet as a stable release, so until then the actions may still change, as `runners` has given way to `disk`, and the `image` action, once specified, has been dropped with the service's consumer images. From then on `v1` stays compatible: its actions keep their inputs, outputs and behaviour. A change that would break them comes as `v2`, while `v1` keeps working, until no consumer references it.
 
 ## Code and tests
 
