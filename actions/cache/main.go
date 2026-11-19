@@ -2,7 +2,8 @@
 // cache): it asks the runner service which version of a cache the run
 // restores, downloads its objects from Cloud Storage, checking each, and
 // extracts them under a directory, the files' archives at once and the
-// directories' archive last.
+// directories' archive last. With check-only, it only asks where a restore
+// would come from, and restores nothing.
 package main
 
 import (
@@ -53,13 +54,18 @@ func run(ctx context.Context, rt *actions.Runtime, m machine, svc *service.Clien
 		return fmt.Errorf("input name is %q, which isn't a cache's name: 1 to 32 lowercase letters, digits and hyphens, "+
 			"starting with a letter and not ending with a hyphen", name)
 	}
-	dir := rt.Input("path")
-	if dir == "" {
-		return errors.New("input path is empty: it's the directory to restore the cache under")
-	}
-	dir, err := filepath.Abs(dir)
+	checkOnly, err := rt.BoolInput("check-only", false)
 	if err != nil {
 		return err
+	}
+	dir := rt.Input("path")
+	if !checkOnly {
+		if dir == "" {
+			return errors.New("input path is empty: it's the directory to restore the cache under")
+		}
+		if dir, err = filepath.Abs(dir); err != nil {
+			return err
+		}
 	}
 	r, err := event.Load(rt.Getenv)
 	if err != nil {
@@ -83,6 +89,9 @@ func run(ctx context.Context, rt *actions.Runtime, m machine, svc *service.Clien
 			"and nothing was restored.\n\n")
 	}
 	svc.Logf, st.Logf = rt.Logf, rt.Logf
+	if checkOnly {
+		return check(ctx, rt, svc, name, title+place.Summary())
+	}
 	v, err := svc.RestoreCache(ctx, name)
 	if err != nil {
 		var refused *service.Refused
@@ -179,6 +188,26 @@ func run(ctx context.Context, rt *actions.Runtime, m machine, svc *service.Clien
 	return rt.Summary(fmt.Sprintf("%s%s\n\nRestored `%s` from %s (`%s`): %d files and symlinks, %d bytes, and %d directories, "+
 		"from %d objects of %d bytes, in %s.\n\n", title, place.Summary(), dir, service.CacheSteps[v.Restored], v.Restored,
 		entries, size, ndirs, len(v.Objects), bytes, took))
+}
+
+// check asks where a restore of the cache name would come from, and says so,
+// restoring nothing: the service records no choice, so the run's first
+// restore still chooses.
+func check(ctx context.Context, rt *actions.Runtime, svc *service.Client, name, title string) error {
+	found, err := svc.CheckCache(ctx, name)
+	if err != nil {
+		var refused *service.Refused
+		if errors.As(err, &refused) {
+			return fmt.Errorf("the runner service refused to check the cache %s: %s", name, refused.Reason)
+		}
+		return fmt.Errorf("asking to check the cache %s: %w", name, err)
+	}
+	rt.Logf("A restore of the cache %s would come from %s (%s). Only checked: nothing is restored.", name, service.CacheSteps[found], found)
+	if err := rt.SetOutput("restored", found); err != nil {
+		return err
+	}
+	return rt.Summary(fmt.Sprintf("%s\n\nOnly checked, so nothing was restored: a restore would come from %s (`%s`).\n\n",
+		title, service.CacheSteps[found], found))
 }
 
 // extract downloads o and extracts it with into, then reads the rest of

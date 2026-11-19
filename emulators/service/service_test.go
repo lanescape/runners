@@ -2,11 +2,13 @@ package service_test
 
 import (
 	"errors"
-	"github.com/jonboulle/clockwork"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/jonboulle/clockwork"
 
 	"github.com/lanescape/runners/conformance"
 	"github.com/lanescape/runners/emulators/fault"
@@ -278,6 +280,85 @@ func TestALateSaveFromBeforeAClosureReplacesNothing(t *testing.T) {
 	}
 	if saved := e.Caches(repo); len(saved) != 1 || saved[0].Job != fresh.ID {
 		t.Fatalf("after a late save from before the closure, the caches: %+v; want the reopened pull request's own", saved)
+	}
+}
+
+// While a pull request is closed, a check answers what a restore then would,
+// which retires what the pull request's runs saved before; and a check never
+// records the closure, so a pull request reopened after only checks still
+// finds its own version, as one reopened before any restore does.
+func TestACheckSeesAClosureAsARestoreWould(t *testing.T) {
+	for name, clock := range map[string]clockwork.Clock{"at the zero time": clockwork.NewFakeClockAt(time.Time{}),
+		"the real time": clockwork.NewRealClock()} {
+		t.Run(name, func(t *testing.T) {
+			gh := ghemu.New()
+			t.Cleanup(gh.Close)
+			e := service.New(service.WithGitHub(gh), service.WithClock(clock))
+			t.Cleanup(e.Close)
+			c := &conformance.Client{T: t, URL: e.URL()}
+			repo := e.Repository("app")
+			e.Commit(repo, "main", conformance.Files)
+			pr := e.PullRequest(repo, "main", "fix")
+			j, err := e.StartJob(e.PullRequestRun(pr), conformance.Small)
+			if err != nil {
+				t.Fatal(err)
+			}
+			restored(t, e, c, j, "build")
+			saveCache(t, e, c, j, "build")
+			e.FinishJob(j, "success")
+			p := e.GitHubPull(pr)
+			gh.ClosePull(p)
+			run := e.PullRequestRun(pr)
+			checker, err := e.StartJob(run, conformance.Small)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if a, found := c.Check(e.Token(checker), "build"); a.Status != http.StatusOK || found != service.StepNone {
+				t.Fatalf("a check while closed: %d %s; want none, as a restore would", a.Status, found)
+			}
+			gh.ReopenPull(p)
+			next, err := e.StartJob(e.PullRequestRun(pr), conformance.Small)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := restored(t, e, c, next, "build"); got != service.StepPullRequestExact {
+				t.Fatalf("reopened after only a check, restored %s; want its own version, the closure unrecorded", got)
+			}
+			e.FinishJob(checker, "success")
+			e.FinishJob(next, "success")
+		})
+	}
+	// A restore while closed records the closure, the first one included at
+	// the zero time, so the reopened pull request starts again from its base.
+	gh := ghemu.New()
+	t.Cleanup(gh.Close)
+	e := service.New(service.WithGitHub(gh), service.WithClock(clockwork.NewFakeClockAt(time.Time{})))
+	t.Cleanup(e.Close)
+	c := &conformance.Client{T: t, URL: e.URL()}
+	repo := e.Repository("app")
+	e.Commit(repo, "main", conformance.Files)
+	pr := e.PullRequest(repo, "main", "fix")
+	j, err := e.StartJob(e.PullRequestRun(pr), conformance.Small)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored(t, e, c, j, "build")
+	saveCache(t, e, c, j, "build")
+	e.FinishJob(j, "success")
+	p := e.GitHubPull(pr)
+	gh.ClosePull(p)
+	probe, err := e.StartJob(e.Push(repo, "main"), conformance.Small)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored(t, e, c, probe, "build")
+	gh.ReopenPull(p)
+	next, err := e.StartJob(e.PullRequestRun(pr), conformance.Small)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := restored(t, e, c, next, "build"); got != service.StepNone {
+		t.Fatalf("reopened after a restore while closed, at the zero time, restored %s; want none", got)
 	}
 }
 

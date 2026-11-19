@@ -59,6 +59,7 @@ func Cases() []Case {
 		one("disk and cache requests from a run's own machine only", diskRequests),
 		one("caches kept to their repository", ownRepository),
 		one("a cache in the run's own scope from each step of the restore order", restoreOrder),
+		one("a check says where a restore would come from, and chooses nothing", checks),
 		one("a new key's save replaces the old key's version once no unfinished run chose it", newKey),
 		one("one work disk per job, and one save of each cache", oneWorkDisk),
 		one("a work disk of the size and performance its job asks for", diskSettings),
@@ -186,6 +187,17 @@ func (w *world) restored(j service.Job, cache, want string) {
 		if !ok || gen != o.Generation || int64(len(data)) != o.Size {
 			w.t.Fatalf("job %d's restore of %s names %+v, which isn't there as named", j.ID, cache, o)
 		}
+	}
+}
+
+// checked checks a job's cache, as the cache action does with check-only, and
+// wants the answer.
+func (w *world) checked(j service.Job, cache, want string) {
+	w.t.Helper()
+	a, found := w.c.Check(w.Token(j), cache)
+	w.status("job "+strconv.FormatInt(j.ID, 10)+"'s check of "+cache, a, http.StatusOK)
+	if found != want {
+		w.t.Fatalf("job %d (run %d, %s) checked %s and found %s; want %s", j.ID, j.Run.ID, j.Run.Event, cache, found, want)
 	}
 }
 
@@ -482,6 +494,42 @@ func restoreOrder(t T, w *world) {
 
 	// A read run reads main's.
 	w.restored(w.start(w.Event(repo, "workflow_dispatch", "main"), Small), "build", service.StepMainExact)
+}
+
+func checks(t T, w *world) {
+	repo := w.consumer("app")
+	// Nothing saved: a check finds nothing, and chooses nothing, so the
+	// run's jobs restore what one of them saves once that job has succeeded.
+	// The checking job runs on, so that the run is unfinished throughout.
+	run := w.Push(repo, "main")
+	checker := w.start(run, Small)
+	w.checked(checker, "build", service.StepNone)
+	j := w.start(run, Small)
+	w.save(j, "build", true)
+	w.FinishJob(j, "success")
+	w.checked(w.start(run, Small), "build", service.StepMainExact)
+	later := w.start(run, Small)
+	w.restored(later, "build", service.StepMainExact)
+	// Once the run has chosen, a check says what it chose.
+	w.checked(later, "build", service.StepMainExact)
+	w.restored(w.start(run, Arm), "build", service.StepNone)
+	w.checked(w.start(run, Arm), "build", service.StepNone)
+	// A pull request that moves the key finds main's newest, and its own
+	// for the key once it has saved it.
+	pa := w.PullRequest(repo, "main", "a")
+	pa = w.PushPullRequest(pa, map[string]string{"deps.txt": "2\n"})
+	ra := w.PullRequestRun(pa)
+	j = w.start(ra, Small)
+	w.checked(j, "build", service.StepMainNewest)
+	w.save(j, "build", true)
+	w.FinishJob(j, "success")
+	w.checked(w.start(ra, Small), "build", service.StepPullRequestExact)
+	// A check refuses what a restore refuses.
+	for _, name := range []string{"other", "Build"} {
+		a, _ := w.c.Check(w.Token(later), name)
+		w.status("a check of the cache "+strconv.Quote(name), a, http.StatusForbidden)
+	}
+	w.FinishJob(checker, "success")
 }
 
 func newKey(t T, w *world) {

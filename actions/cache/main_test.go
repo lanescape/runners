@@ -404,6 +404,45 @@ func TestTheServiceUnavailable(t *testing.T) {
 	}
 }
 
+// With check-only, the action asks only where a restore would come from,
+// and says so; it restores nothing, needs no path, and makes nothing.
+func TestCheckOnly(t *testing.T) {
+	for _, found := range []string{"main_exact", "none"} {
+		t.Run(found, func(t *testing.T) {
+			w := newWorld(t)
+			var checks atomic.Int32
+			w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/caches/check", Match: func(*http.Request) bool { checks.Add(1); return false }})
+			if found != "none" {
+				w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/caches/check", Respond: fault.Status(http.StatusOK, nil, `{"found": "`+found+`"}`)})
+			}
+			run0 := w.gh.PushRun(w.repo, "main")
+			rt, _, log, c, st := w.step(t, run0, "")
+			env := w.gh.Env(testgithub.Job{Run: run0, Inputs: map[string]string{"name": "build", "check-only": "true"}})
+			rt.Getenv = func(k string) string { return env[k] }
+			if err := run(context.Background(), rt, on(true), c, st); err != nil {
+				t.Fatal(err)
+			}
+			if o := testgithub.Outputs(t, env); o["restored"] != found {
+				t.Errorf("outputs %v; want restored %s", o, found)
+			}
+			if s := testgithub.Summary(t, env); !strings.Contains(s, "Only checked, so nothing was restored") || !strings.Contains(s, "(`"+found+"`)") {
+				t.Errorf("summary = %s", s)
+			}
+			if checks.Load() != 1 || w.asked.Load() != 0 || strings.Contains(log.String(), "::add-mask::") {
+				t.Errorf("checked %d times, asked to restore %d times; log:\n%s", checks.Load(), w.asked.Load(), log)
+			}
+		})
+	}
+	// Only true or false.
+	w := newWorld(t)
+	rt, _, _, c, st := w.step(t, w.gh.PushRun(w.repo, "main"), "")
+	env := w.gh.Env(testgithub.Job{Run: w.gh.PushRun(w.repo, "main"), Inputs: map[string]string{"name": "build", "check-only": "yes"}})
+	rt.Getenv = func(k string) string { return env[k] }
+	if err := run(context.Background(), rt, on(true), c, st); err == nil || !strings.Contains(err.Error(), "check-only") {
+		t.Errorf("check-only: yes: %v", err)
+	}
+}
+
 func TestInputs(t *testing.T) {
 	w := newWorld(t)
 	for _, in := range []map[string]string{{"name": "Build", "path": "/tmp/x"}, {"name": "build-", "path": "/tmp/x"}, {"name": "build"}} {

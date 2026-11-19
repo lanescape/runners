@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"maps"
 	"net/http"
+	"slices"
 	"strconv"
 
 	"github.com/lanescape/runners/emulators/service"
@@ -159,6 +161,25 @@ type CacheObject struct {
 	Size       int64
 	CRC32C     string
 	Generation int64
+}
+
+// Check asks where a restore of a cache would come from, as the cache
+// action does with check-only, and checks the answer: a step of the restore
+// order, or none, and nothing else.
+func (c *Client) Check(token, cache string) (Answer, string) {
+	c.T.Helper()
+	a := c.do(http.MethodPost, "/v1/caches/check", token, cacheBody(cache))
+	if a.Status != http.StatusOK {
+		return a, ""
+	}
+	// Said by its fields' names alone, never their values, so that no token a
+	// check wrongly gave is printed.
+	found, _ := a.Body["found"].(string)
+	if !Steps[found] || len(a.Body) != 1 {
+		names := slices.Sorted(maps.Keys(a.Body))
+		c.T.Fatalf("a check's answer isn't one the interface gives, {\"found\": <step>}: it has %q, and found is a step: %v", names, Steps[found])
+	}
+	return a, found
 }
 
 // Restore asks to restore a cache, as the cache action does, and checks the

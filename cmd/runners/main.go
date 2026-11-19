@@ -256,6 +256,7 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 		JobFinished:      svc.JobFinished(),
 		Disks:            svc.DiskRequest(),
 		CacheRestore:     svc.CacheRestoreRequest(),
+		CacheCheck:       svc.CacheCheckRequest(),
 		CacheSave:        svc.CacheSaveRequest(),
 		CacheCommit:      svc.CacheCommitRequest(),
 	})

@@ -9,13 +9,24 @@ inputs:
     description: The cache's name, as .github/runners.json declares it at the run's commit.
     required: true
   path:
-    description: The directory to restore the cache under, such as /work/chromium; made if it isn't there.
-    required: true
+    description: >
+      The directory to restore the cache under, such as /work/chromium;
+      made if it isn't there. Unused with check-only.
+    required: false
+    default: ''
+  check-only:
+    description: >
+      true to only ask where a restore would come from, as restored says,
+      restoring nothing. The service records no choice for it, so the run's
+      first restore still chooses, and may find a version saved since.
+    required: false
+    default: 'false'
 outputs:
   restored:
     description: >
       Where the restored version came from, a step of the runner service's
       restore order, such as main_exact, or none if nothing was restored.
+      With check-only, where a restore would come from now.
     value: ${{ steps.restore.outputs.restored }}
 runs:
   using: composite
@@ -106,4 +117,5 @@ runs:
         PROGRAM: ${{ steps.build.outputs.bin }}
         INPUT_NAME: ${{ inputs.name }}
         INPUT_PATH: ${{ inputs.path }}
+        INPUT_CHECK_ONLY: ${{ inputs.check-only }}
       run: '"$PROGRAM"'

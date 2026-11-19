@@ -177,7 +177,7 @@ func TestIdentity(t *testing.T) {
 			if code, _ := e.post(machines.DisksPath, tc.token, map[string]string{}); code != tc.code {
 				t.Fatalf("work disk: %d, want %d", code, tc.code)
 			}
-			for _, path := range []string{machines.CacheRestorePath, machines.CacheSavePath, machines.CacheCommitPath} {
+			for _, path := range []string{machines.CacheRestorePath, machines.CacheCheckPath, machines.CacheSavePath, machines.CacheCommitPath} {
 				if code, _ := e.post(path, tc.token, map[string]string{"cache": "build"}); code != tc.code {
 					t.Fatalf("%s: %d, want %d", path, code, tc.code)
 				}

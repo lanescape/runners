@@ -159,6 +159,7 @@ var ErrPending = errors.New("not done yet; a later pass goes on")
 // errFiles-like refusal is RefusedError, and any other error is retried.
 type Caches interface {
 	Restore(ctx context.Context, m Machine, a Admission, cache, key string) (CacheRestore, error)
+	Check(ctx context.Context, m Machine, a Admission, cache, key string) (CacheCheck, error)
 	Save(ctx context.Context, m Machine, a Admission, cache, key string) (CacheSave, error)
 	Commit(ctx context.Context, m Machine, a Admission, cache string) (CacheCommit, error)
 }
@@ -218,6 +219,12 @@ type CacheRestore struct {
 	Objects  []CacheObject `json:"objects,omitempty"`
 	Token    string        `json:"token,omitempty"`
 	Expires  *time.Time    `json:"expires,omitempty"`
+}
+
+// CacheCheck is the answer to POST /v1/caches/check: the step of the
+// restore order a restore of the cache would come from now, or none.
+type CacheCheck struct {
+	Found string `json:"found"`
 }
 
 // CacheSave is the answer to POST /v1/caches/save: whether the run's scope

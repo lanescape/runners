@@ -26,6 +26,7 @@ const (
 	JobFinishedPath  = "/v1/jobs/finished"
 	DisksPath        = "/v1/disks"
 	CacheRestorePath = "/v1/caches/restore"
+	CacheCheckPath   = "/v1/caches/check"
 	CacheSavePath    = "/v1/caches/save"
 	CacheCommitPath  = "/v1/caches/commit"
 )
@@ -122,6 +123,7 @@ type Config struct {
 	// unset, they aren't served.
 	Disks        http.Handler
 	CacheRestore http.Handler
+	CacheCheck   http.Handler
 	CacheSave    http.Handler
 	CacheCommit  http.Handler
 }
@@ -161,6 +163,9 @@ func New(c Config) (http.Handler, error) {
 		mux.Handle("POST "+CacheRestorePath, c.CacheRestore)
 		mux.Handle("POST "+CacheSavePath, c.CacheSave)
 		mux.Handle("POST "+CacheCommitPath, c.CacheCommit)
+	}
+	if c.CacheCheck != nil {
+		mux.Handle("POST "+CacheCheckPath, c.CacheCheck)
 	}
 	return mux, nil
 }

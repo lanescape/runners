@@ -302,7 +302,8 @@ func (e *Emulator) restoreCache(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	c := e.choose(rq, cache, key)
+	e.catchUp(rq.repo.ID)
+	c := e.choose(rq, cache, key, true, nil)
 	if c.version == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"restored": c.step})
 		return
@@ -312,31 +313,65 @@ func (e *Emulator) restoreCache(w http.ResponseWriter, r *http.Request) {
 		Expires: &expires})
 }
 
-// choose is a run's restore choice for a cache and its job's architecture,
-// picked the first time one of the run's jobs asks in its attempt.
-func (e *Emulator) choose(rq request, cache, key string) *choice {
-	m := rq.m
+// checkCache is POST /v1/caches/check: where a restore of the cache would
+// come from now, with no choice recorded and no token given.
+func (e *Emulator) checkCache(w http.ResponseWriter, r *http.Request) {
+	rq, cache, key, ok := e.cacheRequest(w, r, true)
+	if !ok {
+		return
+	}
+	// Versions of jobs that have finished are settled, as the service settles
+	// them once a job finishes; but the pull requests seen closed are only
+	// looked at, as a restore now would see them, and never recorded, so that a
+	// check moves no closure on.
 	e.resettle(rq.repo.ID)
-	// Each pull request seen closed is recorded as closed until now, as the
-	// service records the last time it saw one closed.
-	var closed []int
+	writeJSON(w, http.StatusOK, machines.CacheCheck{Found: e.choose(rq, cache, key, false, e.closedNow(rq.repo.ID)).step})
+}
+
+// catchUp does what the service's passes and webhook would have done by the
+// time a restore arrives, which the emulator, with neither, does when one
+// does: it settles the versions of jobs that have finished, and records each
+// pull request it sees closed as closed until now, as the service records
+// the last time it saw one closed.
+func (e *Emulator) catchUp(repo int64) {
+	e.resettle(repo)
+	closed := e.closedNow(repo)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for k, at := range closed {
+		if was, ok := e.dsk.closures[k]; !ok || at.After(was) {
+			e.dsk.closures[k] = at
+		}
+	}
+}
+
+// closedNow is each pull request of repo that GitHub shows closed, by its
+// closure's key, as closed until now.
+func (e *Emulator) closedNow(repo int64) map[string]time.Time {
+	out := map[string]time.Time{}
 	e.gh.Read(func(s *ghemu.State) {
-		for _, p := range s.Pulls(s.Repo(rq.repo.ID)) {
+		// Read with GitHub's state, so nothing GitHub shows closed has
+		// changed since.
+		now := e.clock.Now()
+		for _, p := range s.Pulls(s.Repo(repo)) {
 			if p.State == "closed" {
-				closed = append(closed, p.Number)
+				out[fmt.Sprintf("%d/pr%d", repo, p.Number)] = now
 			}
 		}
 	})
+	return out
+}
+
+// choose is a run's restore choice for a cache and its job's architecture,
+// picked the first time one of the run's jobs asks in its attempt. Without
+// record, it's a check: the run's choice if it has one, or what a restore
+// would pick now, recorded nowhere, with seen the closures a restore now
+// would have recorded first.
+func (e *Emulator) choose(rq request, cache, key string, record bool, seen map[string]time.Time) *choice {
+	m := rq.m
 	unfinished := e.unfinished(rq.repo.ID)
-	now := e.clock.Now()
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	for _, n := range closed {
-		k := fmt.Sprintf("%d/pr%d", rq.repo.ID, n)
-		if now.After(e.dsk.closures[k]) {
-			e.dsk.closures[k] = now
-		}
-	}
 	ck := fmt.Sprintf("%s/%s", runKey(rq.repo.ID, m.run, cache), m.selector.Arch)
 	c := e.dsk.choices[ck]
 	// Every rerun the emulator sees is a maintainer's, which picks again,
@@ -347,7 +382,7 @@ func (e *Emulator) choose(rq request, cache, key string) *choice {
 		var pool []*cacheVersion
 		for _, v := range e.dsk.versions {
 			if v.repo == rq.repo.ID && v.state == versionReady && v.Cache == cache && v.Architecture == m.selector.Arch &&
-				(!v.replaced || held[v]) && !e.retired(v) {
+				(!v.replaced || held[v]) && !e.retired(v) && !e.retiredSeen(v, seen) {
 				pool = append(pool, v)
 			}
 		}
@@ -377,7 +412,9 @@ func (e *Emulator) choose(rq request, cache, key string) *choice {
 				}
 			}
 		}
-		e.dsk.choices[ck] = c
+		if record {
+			e.dsk.choices[ck] = c
+		}
 	}
 	return c
 }
@@ -673,6 +710,13 @@ func (e *Emulator) held(unfinished map[int64]int) map[*cacheVersion]bool {
 // reopened. The emulator looks at a restore request, so it misses a pull
 // request closed and reopened in between, which the service would learn of
 // from GitHub's delivery. The caller holds e.mu.
+// retiredSeen is whether v would be retired by one of the closures in seen,
+// which a check looks at without recording.
+func (e *Emulator) retiredSeen(v *cacheVersion, seen map[string]time.Time) bool {
+	at, ok := seen[fmt.Sprintf("%d/%s", v.repo, v.Scope)]
+	return ok && !v.boundAt.After(at)
+}
+
 func (e *Emulator) retired(v *cacheVersion) bool {
 	at, ok := e.dsk.closures[fmt.Sprintf("%d/%s", v.repo, v.Scope)]
 	return ok && !v.boundAt.After(at)

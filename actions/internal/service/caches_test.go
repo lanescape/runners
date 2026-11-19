@@ -87,6 +87,16 @@ func TestRestoreCache(t *testing.T) {
 	}
 }
 
+func TestCheckCache(t *testing.T) {
+	for _, step := range []string{"main_exact", "pull_request_newest", "none"} {
+		e := setup(t)
+		answer(e, "/v1/caches/check", `{"found": "`+step+`"}`)
+		if found, err := e.c.CheckCache(context.Background(), "build"); err != nil || found != step {
+			t.Fatalf("check = %q, %v; want %s", found, err, step)
+		}
+	}
+}
+
 // Against the emulator itself: a save in main, its commit, and a later
 // run's restore of it, once the saving job has succeeded.
 func TestCachesAgainstTheEmulator(t *testing.T) {
@@ -117,6 +127,13 @@ func TestCachesAgainstTheEmulator(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := At(e.svc.URL(), metadata.Server{URL: e.svc.Metadata(j)})
+	// A check finds it, and chooses nothing.
+	if found, err := c.CheckCache(ctx, "build"); err != nil || found != "main_exact" {
+		t.Fatalf("check = %q, %v", found, err)
+	}
+	if _, err := c.CheckCache(ctx, "undeclared"); !errors.As(err, &r) || !strings.Contains(r.Reason, "doesn't declare") {
+		t.Fatalf("a check of an undeclared cache: %v", err)
+	}
 	v, err := c.RestoreCache(ctx, "build")
 	want := []gcs.Object{{Name: s.Prefix + "dirs.tar.zst", Size: 11, CRC32C: 0xc99465aa, Generation: gen}}
 	if err != nil || v.Restored != "main_exact" || v.Bucket != service.CachesBucket || !slices.Equal(v.Objects, want) {
@@ -133,6 +150,7 @@ func TestCacheAnswersOutsideTheInterface(t *testing.T) {
 			`{"saves": true, "bucket": "b-1", "prefix": "p/", "token": "", "expires": "2026-11-15T12:00:00Z"}`,
 			`{"saves": true, "bucket": "b-1", "prefix": "p/", "token": "t", "expires": "tomorrow"}`},
 		"/v1/caches/commit": {`{}`, `{"objects": 1}`, `{"objects": -1, "bytes": 0}`},
+		"/v1/caches/check":  {`{}`, `{"found": "resume"}`, `{"found": ""}`, `{"restored": "main_exact"}`},
 		"/v1/caches/restore": {`{}`, `{"restored": "resume"}`, `{"restored": "main_exact"}`,
 			`{"restored": "main_exact", "bucket": "b-1", "token": "t", "expires": "2026-11-15T12:00:00Z", "objects": []}`,
 			`{"restored": "main_exact", "bucket": "b-1", "token": "t", "expires": "2026-11-15T12:00:00Z", "objects": [` + obj + `,` + obj + `]}`,
@@ -151,6 +169,8 @@ func TestCacheAnswersOutsideTheInterface(t *testing.T) {
 				_, err = e.c.SaveCache(context.Background(), "build")
 			case "/v1/caches/commit":
 				_, err = e.c.CommitCache(context.Background(), "build")
+			case "/v1/caches/check":
+				_, err = e.c.CheckCache(context.Background(), "build")
 			default:
 				_, err = e.c.RestoreCache(context.Background(), "build")
 			}
