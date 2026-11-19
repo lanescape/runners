@@ -107,6 +107,8 @@ Each entry keeps its mode, with the setuid, setgid and sticky bits, its modifica
 
 Its output `restored` is the answer's `restored`; the action writes it in the job's summary with how much it restored. A refusal, such as a cache the run's commit doesn't declare, fails it with the service's reason. Outside the organization, or on a machine that isn't the service's, it does nothing and says so, and `restored` is `none`.
 
+With `check-only: true`, the action restores nothing: it asks only where a restore would come from, by `POST /v1/caches/check`, with `{"cache": "<name>"}`, signed and retried as the restore is, and sets `restored` to the answer's `found`, a step of the restore order or `none`, which it writes in the job's summary. The service records no choice for it, so the run's first restore still chooses, and may find a version saved since; a job can so learn whether the cache for its key is saved before it makes it, without fixing its run to an older version. `path` is unused then, and may be left out; otherwise it's required. `check-only` is `true` or `false`, and `false` if left out. A refusal fails it as it fails a restore, and outside the organization, or on a machine that isn't the service's, it does nothing, and `restored` is `none`.
+
 ## `save-cache`
 
 Saves a directory as a version of a cache, for later runs to restore with `cache`:

@@ -244,7 +244,7 @@ func newWorld(t *testing.T) *world {
 		Passes:           passes,
 		Reconciler:       reconciler(body), Events: dks,
 		JobStarted: svc.JobStarted(), JobFinished: svc.JobFinished(),
-		Disks: svc.DiskRequest(), CacheRestore: svc.CacheRestoreRequest(), CacheSave: svc.CacheSaveRequest(),
+		Disks: svc.DiskRequest(), CacheRestore: svc.CacheRestoreRequest(), CacheCheck: svc.CacheCheckRequest(), CacheSave: svc.CacheSaveRequest(),
 		CacheCommit: svc.CacheCommitRequest(),
 	})
 	if err != nil {

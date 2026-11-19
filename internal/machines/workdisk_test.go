@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -150,6 +151,10 @@ func (c *caches) Restore(_ context.Context, m machines.Machine, _ machines.Admis
 	return c.restore, c.note("restore", m, cache, key)
 }
 
+func (c *caches) Check(_ context.Context, m machines.Machine, _ machines.Admission, cache, key string) (machines.CacheCheck, error) {
+	return machines.CacheCheck{Found: c.restore.Restored}, c.note("check", m, cache, key)
+}
+
 func (c *caches) Save(_ context.Context, m machines.Machine, _ machines.Admission, cache, key string) (machines.CacheSave, error) {
 	return machines.CacheSave{Saves: true, Bucket: "b", Prefix: "1/v/", Token: "t"}, c.note("save", m, cache, key)
 }
@@ -171,7 +176,13 @@ func TestCacheRequests(t *testing.T) {
 	e.svc.Caches = cs
 	e.repo.Commit("main", map[string]string{".github/runners.json": `{"caches": {"build": {"from": ["deps.txt"]}}}`, "deps.txt": "1\n"})
 	m := e.admit(e.mainRun(), sel2)
-	code, body := m.cache(machines.CacheRestorePath, "build")
+	// A check answers where a restore would come from, and nothing else: no
+	// bucket, objects or token.
+	code, body := m.cache(machines.CacheCheckPath, "build")
+	if code != http.StatusOK || len(body) != 1 || body["found"] != "main_exact" {
+		t.Fatalf("check: %d %v; want only found: main_exact", code, body)
+	}
+	code, body = m.cache(machines.CacheRestorePath, "build")
 	if code != http.StatusOK || body["restored"] != "main_exact" || body["bucket"] != "b" || body["token"] != "t" {
 		t.Fatalf("restore: %d %v", code, body)
 	}
@@ -187,9 +198,9 @@ func TestCacheRequests(t *testing.T) {
 	// cache's key at the run's commit, which the service makes, never the
 	// job.
 	asked, scopes := cs.all()
-	key := asked[0][len("restore build "):]
-	if len(asked) != 3 || len(key) != 20 || asked[0] != "restore build "+key || asked[1] != "save build "+key || asked[2] != "commit build " ||
-		scopes[0] != "main" || scopes[1] != "main" || scopes[2] != "main" {
+	key := asked[0][len("check build "):]
+	if len(asked) != 4 || len(key) != 20 || asked[0] != "check build "+key || asked[1] != "restore build "+key ||
+		asked[2] != "save build "+key || asked[3] != "commit build " || slices.ContainsFunc(scopes, func(s string) bool { return s != "main" }) {
 		t.Fatalf("asked %v in %v", asked, scopes)
 	}
 	// A refusal is answered 403 with its reason, and anything else is to be
@@ -238,7 +249,7 @@ func TestACacheRequestIsRefused(t *testing.T) {
 			e.svc.Caches = cs
 			e.repo.Commit("main", map[string]string{".github/runners.json": tc.file})
 			m := e.admit(e.mainRun(), sel2)
-			for _, path := range []string{machines.CacheRestorePath, machines.CacheSavePath} {
+			for _, path := range []string{machines.CacheRestorePath, machines.CacheCheckPath, machines.CacheSavePath} {
 				code, body := m.cache(path, tc.cache)
 				refusedFor(t, path, code, body, tc.reason)
 			}
@@ -264,6 +275,7 @@ func (m *machine) requests() map[string]func() (int, map[string]any) {
 	return map[string]func() (int, map[string]any){
 		"work disk": m.disk,
 		"restore":   func() (int, map[string]any) { return m.cache(machines.CacheRestorePath, "build") },
+		"check":     func() (int, map[string]any) { return m.cache(machines.CacheCheckPath, "build") },
 		"save":      func() (int, map[string]any) { return m.cache(machines.CacheSavePath, "build") },
 		"commit":    func() (int, map[string]any) { return m.cache(machines.CacheCommitPath, "build") },
 	}
@@ -345,7 +357,7 @@ func TestAJobsRequestsWaitForGitHubToConfirmItRuns(t *testing.T) {
 	e.svc.Caches = cs
 	e.repo.Commit("main", map[string]string{".github/runners.json": declares})
 	m := e.admit(e.mainRun(), sel2)
-	e.gh.Faults().Add(fault.Rule{Method: http.MethodGet, Times: 4, Respond: fault.Status(http.StatusBadGateway, nil, `{"message": "Bad Gateway"}`),
+	e.gh.Faults().Add(fault.Rule{Method: http.MethodGet, Times: len(m.requests()), Respond: fault.Status(http.StatusBadGateway, nil, `{"message": "Bad Gateway"}`),
 		Match: func(r *http.Request) bool { return strings.Contains(r.URL.Path, "/actions/jobs/") }})
 	for what, ask := range m.requests() {
 		if code, body := ask(); code != http.StatusServiceUnavailable || body["retryable"] != true {
@@ -356,7 +368,7 @@ func TestAJobsRequestsWaitForGitHubToConfirmItRuns(t *testing.T) {
 	// confirms nothing either.
 	j, run, _ := e.gh.JobOnRunner(m.in.Name)
 	queued := fmt.Sprintf(`{"id": %d, "run_id": %d, "status": "queued"}`, j.ID, run.ID)
-	e.gh.Faults().Add(fault.Rule{Method: http.MethodGet, Times: 4, Respond: fault.Status(http.StatusOK, http.Header{"Content-Type": {"application/json"}}, queued),
+	e.gh.Faults().Add(fault.Rule{Method: http.MethodGet, Times: len(m.requests()), Respond: fault.Status(http.StatusOK, http.Header{"Content-Type": {"application/json"}}, queued),
 		Match: func(r *http.Request) bool { return strings.Contains(r.URL.Path, "/actions/jobs/") }})
 	for what, ask := range m.requests() {
 		if code, body := ask(); code != http.StatusServiceUnavailable || body["retryable"] != true {

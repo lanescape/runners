@@ -11,12 +11,16 @@ import (
 // The caches' endpoints (specs/0005-interface.md, Caches).
 const (
 	CacheRestorePath = "/v1/caches/restore"
+	CacheCheckPath   = "/v1/caches/check"
 	CacheSavePath    = "/v1/caches/save"
 	CacheCommitPath  = "/v1/caches/commit"
 )
 
 // CacheRestoreRequest is POST /v1/caches/restore.
 func (s *Service) CacheRestoreRequest() http.Handler { return http.HandlerFunc(s.cacheRestore) }
+
+// CacheCheckRequest is POST /v1/caches/check.
+func (s *Service) CacheCheckRequest() http.Handler { return http.HandlerFunc(s.cacheCheck) }
 
 // CacheSaveRequest is POST /v1/caches/save.
 func (s *Service) CacheSaveRequest() http.Handler { return http.HandlerFunc(s.cacheSave) }
@@ -88,6 +92,17 @@ func (s *Service) cacheRestore(w http.ResponseWriter, r *http.Request) {
 	}
 	got, err := s.Caches.Restore(ctx, j.Admission.Resolve(j.Machine), j.Admission, cache, key)
 	s.cacheAnswer(w, j, "chosen", cache, got, err)
+}
+
+func (s *Service) cacheCheck(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), diskTimeout)
+	defer cancel()
+	j, cache, key, ok := s.cacheRequest(ctx, w, r, true)
+	if !ok {
+		return
+	}
+	got, err := s.Caches.Check(ctx, j.Admission.Resolve(j.Machine), j.Admission, cache, key)
+	s.cacheAnswer(w, j, "checked", cache, got, err)
 }
 
 func (s *Service) cacheSave(w http.ResponseWriter, r *http.Request) {

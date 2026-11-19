@@ -1,6 +1,7 @@
 package disks_test
 
 import (
+	"net/http"
 	"strconv"
 	"strings"
 	"testing"
@@ -183,6 +184,68 @@ func TestTheRestoreOrder(t *testing.T) {
 	e.start(none, ghemu.JobSpec{Name: "e", Labels: []string{label}})
 	if rec, _ := e.record(e.choice(none, label)); rec["step"] != disks.StepNone || rec["image"] != nil {
 		t.Fatalf("a choice of nothing = %v", rec)
+	}
+}
+
+// A check answers where a restore would come from now, and records no
+// choice, so the run's first restore still chooses, and may choose what was
+// saved since; once the run has chosen, a check answers its choice.
+func TestACheckChoosesNothing(t *testing.T) {
+	e := setup(t)
+	old := e.saveMain(key1)
+	run := e.mainRun()
+	label := sel(key1, "main")
+	c := e.take(run, e.queueJob(run, ghemu.JobSpec{Name: "check", Labels: []string{label}}))
+	if code := c.started(); code != http.StatusOK {
+		t.Fatalf("job-started check: %d", code)
+	}
+	c.checked = true
+	if code, ans := c.askCheck(); code != http.StatusOK || ans.Found != disks.StepMainExact {
+		t.Fatalf("a check: %d %+v; want main's for the key", code, ans)
+	}
+	if _, ok := e.record(e.choice(run, label)); ok {
+		t.Fatal("a check recorded a choice")
+	}
+	// Nothing is chosen yet, so a version saved since is what the run's
+	// first restore chooses.
+	e.clock.Advance(time.Minute)
+	newer := e.saveMain(key1)
+	if b := e.start(run, ghemu.JobSpec{Name: "b", Labels: []string{label}}); b.restored() != newer || newer == old {
+		t.Fatalf("the run's first restore after a check restored %s, want the newer %s", b.restored(), newer)
+	}
+	// A check of what the run has chosen answers it, and rewrites nothing of
+	// it, as a restore's reading of the choice does.
+	_, before, _ := e.gcs.Object("state", "caches/5001/"+newer+".json")
+	if code, ans := c.askCheck(); code != http.StatusOK || ans.Found != disks.StepMainExact {
+		t.Fatalf("a check after the run chose: %d %+v", code, ans)
+	}
+	if _, after, _ := e.gcs.Object("state", "caches/5001/"+newer+".json"); after != before {
+		t.Fatalf("a check rewrote the chosen version's record: generation %d, then %d", before, after)
+	}
+	// A cache the run has chosen nothing of, then saved: a check answers the
+	// run's choice, nothing, not what was saved since.
+	tool := tools(key1, "main")
+	if v := e.start(run, ghemu.JobSpec{Name: "c", Labels: []string{tool}}).restored(); v != "" {
+		t.Fatalf("tools restored %s; want nothing", v)
+	}
+	e.save(e.mainRun(), tool)
+	d := e.take(run, e.queueJob(run, ghemu.JobSpec{Name: "d", Labels: []string{tool}}))
+	if code := d.started(); code != http.StatusOK {
+		t.Fatalf("job-started check: %d", code)
+	}
+	d.checked = true
+	if code, ans := d.askCheck(); code != http.StatusOK || ans.Found != disks.StepNone {
+		t.Fatalf("a check after the run chose nothing: %d %+v; want none", code, ans)
+	}
+	// And a new run's check finds what was saved.
+	n := e.mainRun()
+	f := e.take(n, e.queueJob(n, ghemu.JobSpec{Name: "f", Labels: []string{tool}}))
+	if code := f.started(); code != http.StatusOK {
+		t.Fatalf("job-started check: %d", code)
+	}
+	f.checked = true
+	if code, ans := f.askCheck(); code != http.StatusOK || ans.Found != disks.StepMainExact {
+		t.Fatalf("a new run's check: %d %+v; want main's for the key", code, ans)
 	}
 }
 

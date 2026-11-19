@@ -201,6 +201,7 @@ func New(opts ...Option) *Emulator {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/disks", e.disk)
 	mux.HandleFunc("POST /v1/caches/restore", e.restoreCache)
+	mux.HandleFunc("POST /v1/caches/check", e.checkCache)
 	mux.HandleFunc("POST /v1/caches/save", e.saveCache)
 	mux.HandleFunc("POST /v1/caches/commit", e.commitCache)
 	mux.HandleFunc("GET /_metadata/{machine}/computeMetadata/v1/instance/service-accounts/default/identity", e.identity)

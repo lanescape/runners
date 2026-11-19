@@ -407,6 +407,25 @@ type CacheRestore struct {
 	Expires time.Time
 }
 
+// CheckCache asks where a restore of the cache name would come from now,
+// one of CacheSteps, without restoring it (POST /v1/caches/check): the
+// run's choice, if one of its jobs has restored the cache, or else what the
+// restore order picks now. The service records no choice and gives no token,
+// so the run's first restore still chooses.
+func (c *Client) CheckCache(ctx context.Context, name string) (string, error) {
+	body, _ := json.Marshal(map[string]string{"cache": name})
+	var out struct {
+		Found string `json:"found"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/v1/caches/check", body, &out); err != nil {
+		return "", err
+	}
+	if _, ok := CacheSteps[out.Found]; !ok {
+		return "", errors.New("the runner service answered that a restore would come from somewhere its interface doesn't have")
+	}
+	return out.Found, nil
+}
+
 // RestoreCache asks for the version of the cache name to restore (POST
 // /v1/caches/restore). The service chooses it once per run, so asking
 // again gives the same version, with a new token.

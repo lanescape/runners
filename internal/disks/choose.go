@@ -146,8 +146,11 @@ func (s *Service) resume(ctx context.Context, m machines.Machine, a machines.Adm
 // architecture. A recorded choice is read, and its version touched, under
 // the lease too, so a pass that drops the choice or marks the version does
 // so wholly before or after. It returns nil for none, and the step of the
-// restore order the choice came from.
-func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Admission, cache, cacheKey string) (*Image, string, error) {
+// restore order the choice came from. Without record, it's a check: what a
+// restore would choose now, the recorded choice if it stands or else what
+// the restore order picks, with nothing written or touched, so the run's
+// first restore still chooses.
+func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Admission, cache, cacheKey string, record bool) (*Image, string, error) {
 	repo, sel := m.RepositoryID, m.Selector
 	key := choiceKey(repo, a.RunID, cache, sel.Arch)
 	// valid is a recorded choice's version, if it still has one to give.
@@ -190,7 +193,7 @@ func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Ad
 				return err
 			}
 			if good {
-				if im != nil {
+				if im != nil && record {
 					if err := s.touch(ctx, versionKey(repo, im.Image), im.Image); err != nil {
 						return err
 					}
@@ -224,6 +227,10 @@ func (s *Service) restore(ctx context.Context, m machines.Machine, a machines.Ad
 		step := StepNone
 		if cands := candidates(recs, sel, cache, cacheKey, chain, closure); len(cands) > 0 {
 			pick, step = &cands[0].Image, cands[0].step
+		}
+		if !record {
+			out, outStep = pick, step
+			return nil
 		}
 		choice := Choice{RepositoryID: repo, RunID: a.RunID, Selector: sel.String(), Scope: sel.Scope.String(), Arch: sel.Arch,
 			Cache: cache, Step: step, Attempt: a.RunAttempt, At: s.now()}

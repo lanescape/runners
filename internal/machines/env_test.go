@@ -147,6 +147,7 @@ func setup(t *testing.T) *env {
 	mux.Handle("POST /v1/jobs/finished", svc.JobFinished())
 	mux.Handle("POST "+machines.DisksPath, svc.DiskRequest())
 	mux.Handle("POST "+machines.CacheRestorePath, svc.CacheRestoreRequest())
+	mux.Handle("POST "+machines.CacheCheckPath, svc.CacheCheckRequest())
 	mux.Handle("POST "+machines.CacheSavePath, svc.CacheSaveRequest())
 	mux.Handle("POST "+machines.CacheCommitPath, svc.CacheCommitRequest())
 	srv := httptest.NewServer(mux)

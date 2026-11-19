@@ -258,6 +258,7 @@ func setup(t *testing.T) *env {
 	mux.Handle("POST /v1/jobs/finished", svc.JobFinished())
 	mux.Handle("POST "+machines.DisksPath, svc.DiskRequest())
 	mux.Handle("POST "+machines.CacheRestorePath, svc.CacheRestoreRequest())
+	mux.Handle("POST "+machines.CacheCheckPath, svc.CacheCheckRequest())
 	mux.Handle("POST "+machines.CacheSavePath, svc.CacheSaveRequest())
 	mux.Handle("POST "+machines.CacheCommitPath, svc.CacheCommitRequest())
 	srv := httptest.NewServer(mux)
@@ -570,6 +571,13 @@ func (jb *job) started() int {
 	}
 	resp.Body.Close()
 	return resp.StatusCode
+}
+
+// askCheck is one request to check the job's cache, and its answer.
+func (jb *job) askCheck() (int, machines.CacheCheck) {
+	jb.e.t.Helper()
+	var ans machines.CacheCheck
+	return jb.call(machines.CacheCheckPath, jb.cacheBody(), &ans), ans
 }
 
 // askSave is one request to save the job's cache, and its answer.

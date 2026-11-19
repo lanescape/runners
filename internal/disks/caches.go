@@ -31,7 +31,7 @@ func (s *Service) Restore(ctx context.Context, m machines.Machine, a machines.Ad
 	if s.Caches == nil || s.Tokens == nil {
 		return machines.CacheRestore{}, noCaches
 	}
-	v, step, err := s.restore(ctx, m, a, cache, key)
+	v, step, err := s.restore(ctx, m, a, cache, key, true)
 	if err != nil {
 		return machines.CacheRestore{}, err
 	}
@@ -43,6 +43,23 @@ func (s *Service) Restore(ctx context.Context, m machines.Machine, a machines.Ad
 		return machines.CacheRestore{}, fmt.Errorf("a token to read %s: %w", v.Image, err)
 	}
 	return machines.CacheRestore{Restored: step, Bucket: s.CacheBucket, Objects: v.Objects, Token: token, Expires: &expires}, nil
+}
+
+// Check answers a running job's request to check a cache
+// (specs/0003-disks.md, Caches): the step of the restore order that a
+// restore of it would come from now, the run's recorded choice if it stands,
+// or else what the restore order picks, without recording a choice,
+// touching a version or giving a token, so the run's first restore still
+// chooses. It implements machines.Caches.
+func (s *Service) Check(ctx context.Context, m machines.Machine, a machines.Admission, cache, key string) (machines.CacheCheck, error) {
+	if s.Caches == nil || s.Tokens == nil {
+		return machines.CacheCheck{}, noCaches
+	}
+	_, step, err := s.restore(ctx, m, a, cache, key, false)
+	if err != nil {
+		return machines.CacheCheck{}, err
+	}
+	return machines.CacheCheck{Found: step}, nil
 }
 
 // Save answers a running job's request to save a cache, in a scope that
