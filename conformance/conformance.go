@@ -296,13 +296,19 @@ func selectors(t T, w *world) {
 		w.refused(w.Push(repo, "main"), label)
 	}
 	// Every offered shape, standard or Spot, gets one.
-	for _, sel := range []string{Small, Small + "-spot", Mid, Mid + "-spot", Arm, Arm + "-spot"} {
-		run := w.Push(repo, "main")
-		j := w.start(run, sel)
-		if j.Selector != sel {
-			t.Fatalf("a job naming %s got a machine of %s", sel, j.Selector)
+	cfg, err := config.Default()
+	if err != nil {
+		t.Fatalf("the configuration: %v", err)
+	}
+	for _, shape := range cfg.Shapes.Order {
+		for _, sel := range []string{shape, shape + "-spot"} {
+			run := w.Push(repo, "main")
+			j := w.start(run, sel)
+			if j.Selector != sel {
+				t.Fatalf("a job naming %s got a machine of %s", sel, j.Selector)
+			}
+			w.bound(run, "main")
 		}
-		w.bound(run, "main")
 	}
 }
 

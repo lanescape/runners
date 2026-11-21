@@ -50,8 +50,12 @@ type CapacityError struct {
 	// CPUS_PER_VM_FAMILY, a machine family's vCPUs in a region, or
 	// CPUS_ALL_REGIONS, as Compute Engine's answer names it, or empty if it
 	// names none.
-	Quota   string
-	Message string
+	Quota string
+	// Limit is the quota's whole limit, such as a family's vCPUs in the
+	// region, if Compute Engine's answer gives it (HasLimit).
+	Limit    float64
+	HasLimit bool
+	Message  string
 }
 
 func (c *CapacityError) Error() string {
@@ -308,7 +312,8 @@ func classify(err error) error {
 	case ge.Code == http.StatusConflict && reason == "alreadyExists":
 		return fmt.Errorf("%w: %s", ErrExists, ge.Message)
 	case reason == "quotaExceeded" || reason == "QUOTA_EXCEEDED":
-		return &CapacityError{Quota: quotaNamed(ge.Message), Message: ge.Message}
+		limit, has := quotaLimit(ge.Message)
+		return &CapacityError{Quota: quotaNamed(ge.Message), Limit: limit, HasLimit: has, Message: ge.Message}
 	case stockout(reason):
 		// Compute Engine can refuse a request for want of capacity at
 		// once, as well as in its operation.
@@ -330,6 +335,20 @@ func classify(err error) error {
 // quotaMessage is how Compute Engine names the quota a request exceeded, in
 // its message: "Quota 'CPUS_ALL_REGIONS' exceeded.  Limit: 96.0 globally."
 var quotaMessage = regexp.MustCompile(`Quota '([A-Za-z0-9_-]+)' exceeded`)
+
+// quotaLimitMessage is how Compute Engine gives the exceeded quota's limit, in
+// its message: "Limit: 96.0 globally."
+var quotaLimitMessage = regexp.MustCompile(`Limit: ([0-9]+(?:\.[0-9]+)?)`)
+
+// quotaLimit is the limit a message gives, if it gives one.
+func quotaLimit(message string) (float64, bool) {
+	if m := quotaLimitMessage.FindStringSubmatch(message); m != nil {
+		if limit, err := strconv.ParseFloat(m[1], 64); err == nil {
+			return limit, true
+		}
+	}
+	return 0, false
+}
 
 // quotaNamed is the quota a message names, or empty.
 func quotaNamed(message string) string {
@@ -363,13 +382,24 @@ func opError(op *gce.Operation) error {
 		return &CapacityError{Stockout: true, Message: e.Message}
 	case e.Code == "QUOTA_EXCEEDED":
 		q := quotaNamed(e.Message)
+		limit, has := quotaLimit(e.Message)
 		for _, d := range e.ErrorDetails {
 			if d != nil && d.QuotaInfo != nil && d.QuotaInfo.MetricName != "" {
-				q = strings.ToUpper(d.QuotaInfo.MetricName[strings.LastIndex(d.QuotaInfo.MetricName, "/")+1:])
+				named := strings.ToUpper(d.QuotaInfo.MetricName[strings.LastIndex(d.QuotaInfo.MetricName, "/")+1:])
+				// The details' limit is that of the quota they name; a 0 there may
+				// be one the answer left out, so only the message, naming the same
+				// quota or none, says a limit is 0.
+				switch {
+				case d.QuotaInfo.Limit > 0:
+					limit, has = d.QuotaInfo.Limit, true
+				case q != "" && q != named:
+					limit, has = 0, false
+				}
+				q = named
 				break
 			}
 		}
-		return &CapacityError{Quota: q, Message: e.Message}
+		return &CapacityError{Quota: q, Limit: limit, HasLimit: has, Message: e.Message}
 	case e.Code == "RESOURCE_ALREADY_EXISTS":
 		return fmt.Errorf("%w: %s", ErrExists, e.Message)
 	case e.Code == "RESOURCE_NOT_FOUND":

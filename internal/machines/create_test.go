@@ -76,7 +76,7 @@ func TestAMachineForAQueuedJob(t *testing.T) {
 func TestNoMachine(t *testing.T) {
 	for name, tc := range map[string]func(e *env){
 		"a fork's pull request":      func(e *env) { e.queue(e.forkPull(), sel2) },
-		"an unknown shape":           func(e *env) { e.queue(e.mainRun(), "lanescape-4vcpu-linux-amd64") },
+		"an unknown shape":           func(e *env) { e.queue(e.mainRun(), "lanescape-3vcpu-linux-amd64") },
 		"another label":              func(e *env) { e.queue(e.mainRun(), sel2, "gpu") },
 		"two selectors":              func(e *env) { e.queue(e.mainRun(), sel2, "lanescape-80vcpu-linux-amd64") },
 		"only self-hosted":           func(e *env) { e.queue(e.mainRun(), "self-hosted") },
@@ -373,39 +373,156 @@ func TestARunnerGroupIsKeptToItsRepository(t *testing.T) {
 // job of the same machine family is waiting for.
 func TestASmallerJobWaitsForAnOlderLargerOne(t *testing.T) {
 	e := setup(t)
-	e.gce.SetQuota("northamerica-northeast1", "N4_CPUS", 2)
+	e.gce.SetQuota("northamerica-northeast1", "N4_CPUS", 80)
 	e.gce.SetQuota("northamerica-northeast1", "C4_CPUS", 0)
+	// A machine of the service's takes 2 of N4's 80: an 80-vCPU machine
+	// fits once it ends.
+	e.queue(e.mainRun(), sel2)
+	e.pass()
+	e.wantMachines(1)
 	big := e.queue(e.mainRun(), "lanescape-80vcpu-linux-amd64")
 	time.Sleep(1100 * time.Millisecond)
 	small := e.queue(e.mainRun(), sel2)
 	arm := e.queue(e.mainRun(), "lanescape-16vcpu-linux-arm64")
 	e.pass()
-	ms := e.wantMachines(1)
-	if ms[0].Labels[machines.LabelJob] != strconv.FormatInt(arm.ID, 10) {
-		t.Fatalf("the machine is job %s's; want only the Arm job's", ms[0].Labels[machines.LabelJob])
+	ms := e.wantMachines(2)
+	if !slices.ContainsFunc(ms, func(m gceemu.InstanceState) bool {
+		return m.Labels[machines.LabelJob] == strconv.FormatInt(arm.ID, 10)
+	}) {
+		t.Fatal("the Arm job has no machine")
 	}
 	if e.gh.Job(big.ID).Status != "queued" || e.gh.Job(small.ID).Status != "queued" {
 		t.Fatal("a job held back by quota isn't queued")
 	}
-	e.gce.SetQuota("northamerica-northeast1", "N4_CPUS", 82)
+	e.gce.SetQuota("northamerica-northeast1", "N4_CPUS", 84)
 	e.pass()
-	e.wantMachines(3)
+	e.wantMachines(4)
 }
 
 // Spot machines of every family share one quota: a younger Spot job of
 // another family doesn't take what an older Spot job is waiting for.
 func TestAYoungerSpotJobWaitsForAnOlderOne(t *testing.T) {
 	e := setup(t)
-	e.gce.SetQuota("northamerica-northeast1", "PREEMPTIBLE_CPUS", 16)
+	e.gce.SetQuota("northamerica-northeast1", "PREEMPTIBLE_CPUS", 96)
 	e.gce.SetQuota("northamerica-northeast1", "N4_CPUS", 0)
 	e.gce.SetQuota("northamerica-northeast1", "C4_CPUS", 0)
+	// Two Spot machines of the service's take 32 of the 96: an 80-vCPU one
+	// fits once one ends.
+	e.queue(e.mainRun(), "lanescape-16vcpu-linux-arm64-spot")
+	e.queue(e.mainRun(), "lanescape-16vcpu-linux-arm64-spot")
+	e.pass()
+	e.wantMachines(2)
 	big := e.queue(e.mainRun(), "lanescape-80vcpu-linux-amd64-spot")
 	time.Sleep(1100 * time.Millisecond)
 	arm := e.queue(e.mainRun(), "lanescape-16vcpu-linux-arm64-spot")
 	e.pass()
-	e.wantMachines(0)
+	e.wantMachines(2)
 	if e.gh.Job(big.ID).Status != "queued" || e.gh.Job(arm.ID).Status != "queued" {
 		t.Fatal("a job held back by quota isn't queued")
+	}
+}
+
+// A job that asks for more vCPUs than all of the quota its machines draw on,
+// by the limit Compute Engine's answer gives, can never have a machine: its
+// run is refused, saying why, and it holds no younger job back, however
+// Compute Engine reports the quota (specs/0002-machines.md, One pool).
+func TestAJobBeyondAllOfItsQuotaIsRefusedAndHoldsNothing(t *testing.T) {
+	for _, inOp := range []bool{false, true} {
+		t.Run(map[bool]string{false: "at once", true: "in the operation"}[inOp], func(t *testing.T) {
+			e := setup(t)
+			e.gce.ReportQuotaInOperation(inOp)
+			e.gce.SetQuota("northamerica-northeast1", "C4A_CPUS", 48)
+			run := e.mainRun()
+			e.queue(run, "lanescape-64vcpu-linux-arm64")
+			time.Sleep(1100 * time.Millisecond)
+			younger := e.queue(e.mainRun(), "lanescape-16vcpu-linux-arm64")
+			e.pass()
+			ms := e.wantMachines(1)
+			if ms[0].Labels[machines.LabelJob] != strconv.FormatInt(younger.ID, 10) {
+				t.Fatalf("the machine is job %s's; want the younger job's", ms[0].Labels[machines.LabelJob])
+			}
+			rec, ok := e.record("refusals/5001/" + strconv.FormatInt(run.ID, 10) + "-1.json")
+			if !ok || !strings.Contains(fmt.Sprint(rec["reason"]), "than all of the quota") || rec["cancelled_at"] == nil {
+				t.Fatalf("refusal = %v; want the run cancelled, saying why", rec)
+			}
+			if st, c := e.gh.RunState(run); st != "completed" || c != "cancelled" {
+				t.Fatalf("run: %s %s", st, c)
+			}
+		})
+	}
+}
+
+// Each placement counts with its own machine type: an 80-vCPU shape whose N4
+// machines need more than all of N4's quota, and whose C4 backup, 96 vCPUs,
+// more than all of C4's, can never have a machine, though C4's quota is more
+// than the shape's 80.
+func TestALargerBackupBeyondItsQuotaIsRefused(t *testing.T) {
+	e := setup(t)
+	e.gce.SetQuota("northamerica-northeast1", "N4_CPUS", 72)
+	e.gce.SetQuota("northamerica-northeast1", "C4_CPUS", 88)
+	run := e.mainRun()
+	e.queue(run, "lanescape-80vcpu-linux-amd64")
+	time.Sleep(1100 * time.Millisecond)
+	younger := e.queue(e.mainRun(), "lanescape-16vcpu-linux-amd64")
+	e.pass()
+	ms := e.wantMachines(1)
+	if ms[0].Labels[machines.LabelJob] != strconv.FormatInt(younger.ID, 10) {
+		t.Fatalf("the machine is job %s's; want the younger job's", ms[0].Labels[machines.LabelJob])
+	}
+	if st, c := e.gh.RunState(run); st != "completed" || c != "cancelled" {
+		t.Fatalf("run: %s %s", st, c)
+	}
+}
+
+// A job is refused only if every placement needs more than all of its quota:
+// one whose N4 machines lack the project's vCPUs in every region, which a
+// machine's ending could free, still holds younger jobs of its families back,
+// though its C4 machines need more than all of C4's quota.
+func TestAMixedShortageStillHolds(t *testing.T) {
+	e := setup(t)
+	e.gce.SetGlobalQuota("CPUS_ALL_REGIONS", 96)
+	e.gce.SetQuota("northamerica-northeast1", "C4_CPUS", 0)
+	e.queue(e.mainRun(), "lanescape-80vcpu-linux-amd64")
+	e.pass()
+	e.wantMachines(1)
+	run := e.mainRun()
+	older := e.queue(run, "lanescape-80vcpu-linux-amd64")
+	time.Sleep(1100 * time.Millisecond)
+	younger := e.queue(e.mainRun(), "lanescape-2vcpu-linux-amd64")
+	e.pass()
+	e.wantMachines(1)
+	if e.gh.Job(older.ID).Status != "queued" || e.gh.Job(younger.ID).Status != "queued" {
+		t.Fatal("a job held back by quota isn't queued")
+	}
+	if st, _ := e.gh.RunState(run); st == "completed" {
+		t.Fatal("a job that could fit once a machine ends had its run refused")
+	}
+}
+
+// With none of the service's machines running, a quota every machine draws
+// on holds nothing back, but a family's still does: an older job whose N4
+// machines lack the project's vCPUs in every region, and whose C4 machines
+// need more than all of C4's quota, isn't refused, holds a younger job of its
+// families back, and lets a job of another family go on.
+func TestAMixedShortageHoldsItsFamiliesWithNothingRunning(t *testing.T) {
+	e := setup(t)
+	e.gce.SetGlobalQuota("CPUS_ALL_REGIONS", 64)
+	e.gce.SetQuota("northamerica-northeast1", "C4_CPUS", 0)
+	run := e.mainRun()
+	older := e.queue(run, "lanescape-80vcpu-linux-amd64")
+	time.Sleep(1100 * time.Millisecond)
+	younger := e.queue(e.mainRun(), "lanescape-2vcpu-linux-amd64")
+	arm := e.queue(e.mainRun(), "lanescape-16vcpu-linux-arm64")
+	e.pass()
+	ms := e.wantMachines(1)
+	if ms[0].Labels[machines.LabelJob] != strconv.FormatInt(arm.ID, 10) {
+		t.Fatalf("the machine is job %s's; want the Arm job's", ms[0].Labels[machines.LabelJob])
+	}
+	if e.gh.Job(older.ID).Status != "queued" || e.gh.Job(younger.ID).Status != "queued" {
+		t.Fatal("a job held back by quota isn't queued")
+	}
+	if st, _ := e.gh.RunState(run); st == "completed" {
+		t.Fatal("a job that could fit once the quota frees had its run refused")
 	}
 }
 
@@ -570,7 +687,7 @@ func TestARunIsCancelledForALabelNoRunnerHas(t *testing.T) {
 		"a selector naming a run":          {[]string{sel2 + "-run-1"}, "isn't a selector"},
 		"a selector naming a disk":         {[]string{sel2 + "-disk-build"}, "isn't a selector"},
 		"a label that claims to be one":    {[]string{"Lanescape-runners"}, "isn't a selector"},
-		"a shape the service doesn't have": {[]string{"lanescape-4vcpu-linux-amd64-spot"}, "a shape the service doesn't offer"},
+		"a shape the service doesn't have": {[]string{"lanescape-3vcpu-linux-amd64-spot"}, "a shape the service doesn't offer"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := setup(t)

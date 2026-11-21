@@ -18,12 +18,45 @@ shapes:
   lanescape-2vcpu-linux-amd64:
     machine_types: [n4-highcpu-2, c4-highcpu-2]
     memory_gb: 4
+  lanescape-4vcpu-linux-amd64:
+    machine_types: [n4-highcpu-4, c4-highcpu-4]
+    memory_gb: 8
+  lanescape-8vcpu-linux-amd64:
+    machine_types: [n4-highcpu-8, c4-highcpu-8]
+    memory_gb: 16
   lanescape-16vcpu-linux-amd64:
     machine_types: [n4-highcpu-16, c4-highcpu-16]
     memory_gb: 32
+  lanescape-32vcpu-linux-amd64:
+    machine_types: [n4-highcpu-32, c4-highcpu-32]
+    memory_gb: 64
+  lanescape-48vcpu-linux-amd64:
+    machine_types: [n4-highcpu-48, c4-highcpu-48]
+    memory_gb: 96
+  lanescape-64vcpu-linux-amd64:
+    machine_types: [n4-highcpu-64]
+    memory_gb: 128
   lanescape-80vcpu-linux-amd64:
     machine_types: [n4-highcpu-80, c4-highcpu-96]
     memory_gb: 160
+  lanescape-2vcpu-linux-arm64:
+    machine_types: [c4a-highcpu-2]
+    memory_gb: 4
+  lanescape-4vcpu-linux-arm64:
+    machine_types: [c4a-highcpu-4]
+    memory_gb: 8
+  lanescape-8vcpu-linux-arm64:
+    machine_types: [c4a-highcpu-8]
+    memory_gb: 16
   lanescape-16vcpu-linux-arm64:
     machine_types: [c4a-highcpu-16]
     memory_gb: 32
+  lanescape-32vcpu-linux-arm64:
+    machine_types: [c4a-highcpu-32]
+    memory_gb: 64
+  lanescape-48vcpu-linux-arm64:
+    machine_types: [c4a-highcpu-48]
+    memory_gb: 96
+  lanescape-64vcpu-linux-arm64:
+    machine_types: [c4a-highcpu-64]
+    memory_gb: 128
