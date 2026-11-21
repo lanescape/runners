@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"fmt"
 	"os"
 	"slices"
 	"strings"
@@ -33,6 +34,28 @@ func TestDefaultConfig(t *testing.T) {
 		t.Errorf("arm64 shape = %+v", arm)
 	}
 	// The 16-vCPU amd64 shape promises what the 16-vCPU arm64 shape does.
+	// Every amd64 size N4 offers, N4 first and C4 when N4 is short (C4 has no 64-vCPU type, so its 96), and every
+	// arm64 size from 2 to 48 on C4A, each with 2 GB for each vCPU, as Compute Engine's high-CPU types have.
+	amd64 := map[int][]string{2: {"n4-highcpu-2", "c4-highcpu-2"}, 4: {"n4-highcpu-4", "c4-highcpu-4"},
+		8: {"n4-highcpu-8", "c4-highcpu-8"}, 16: {"n4-highcpu-16", "c4-highcpu-16"}, 32: {"n4-highcpu-32", "c4-highcpu-32"},
+		48: {"n4-highcpu-48", "c4-highcpu-48"}, 64: {"n4-highcpu-64", "c4-highcpu-96"}, 80: {"n4-highcpu-80", "c4-highcpu-96"}}
+	for vcpus, types := range amd64 {
+		shape := c.Shapes.Shapes[fmt.Sprintf("lanescape-%dvcpu-linux-amd64", vcpus)]
+		if shape == nil || !slices.Equal(shape.MachineTypes, types) || shape.VCPUs != vcpus || shape.Arch != "amd64" ||
+			shape.MemoryGB != 2*vcpus {
+			t.Errorf("lanescape-%dvcpu-linux-amd64: %+v", vcpus, shape)
+		}
+	}
+	for _, vcpus := range []int{2, 4, 8, 16, 32, 48} {
+		shape := c.Shapes.Shapes[fmt.Sprintf("lanescape-%dvcpu-linux-arm64", vcpus)]
+		if shape == nil || !slices.Equal(shape.MachineTypes, []string{fmt.Sprintf("c4a-highcpu-%d", vcpus)}) ||
+			shape.VCPUs != vcpus || shape.Arch != "arm64" || shape.MemoryGB != 2*vcpus {
+			t.Errorf("lanescape-%dvcpu-linux-arm64: %+v", vcpus, shape)
+		}
+	}
+	if len(c.Shapes.Shapes) != len(amd64)+6 || c.Shapes.Order[0] != "lanescape-2vcpu-linux-amd64" {
+		t.Errorf("shapes: %d, first %q", len(c.Shapes.Shapes), c.Shapes.Order[0])
+	}
 	mid := c.Shapes.Shapes["lanescape-16vcpu-linux-amd64"]
 	if mid == nil || !slices.Equal(mid.MachineTypes, []string{"n4-highcpu-16", "c4-highcpu-16"}) || mid.VCPUs != 16 || mid.Arch != "amd64" ||
 		arm == nil || mid.MemoryGB != arm.MemoryGB {

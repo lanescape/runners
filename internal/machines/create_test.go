@@ -76,7 +76,7 @@ func TestAMachineForAQueuedJob(t *testing.T) {
 func TestNoMachine(t *testing.T) {
 	for name, tc := range map[string]func(e *env){
 		"a fork's pull request":      func(e *env) { e.queue(e.forkPull(), sel2) },
-		"an unknown shape":           func(e *env) { e.queue(e.mainRun(), "lanescape-4vcpu-linux-amd64") },
+		"an unknown shape":           func(e *env) { e.queue(e.mainRun(), "lanescape-3vcpu-linux-amd64") },
 		"another label":              func(e *env) { e.queue(e.mainRun(), sel2, "gpu") },
 		"two selectors":              func(e *env) { e.queue(e.mainRun(), sel2, "lanescape-80vcpu-linux-amd64") },
 		"only self-hosted":           func(e *env) { e.queue(e.mainRun(), "self-hosted") },
@@ -570,7 +570,7 @@ func TestARunIsCancelledForALabelNoRunnerHas(t *testing.T) {
 		"a selector naming a run":          {[]string{sel2 + "-run-1"}, "isn't a selector"},
 		"a selector naming a disk":         {[]string{sel2 + "-disk-build"}, "isn't a selector"},
 		"a label that claims to be one":    {[]string{"Lanescape-runners"}, "isn't a selector"},
-		"a shape the service doesn't have": {[]string{"lanescape-4vcpu-linux-amd64-spot"}, "a shape the service doesn't offer"},
+		"a shape the service doesn't have": {[]string{"lanescape-3vcpu-linux-amd64-spot"}, "a shape the service doesn't offer"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := setup(t)
