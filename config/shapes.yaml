@@ -34,7 +34,7 @@ shapes:
     machine_types: [n4-highcpu-48, c4-highcpu-48]
     memory_gb: 96
   lanescape-64vcpu-linux-amd64:
-    machine_types: [n4-highcpu-64, c4-highcpu-96]
+    machine_types: [n4-highcpu-64]
     memory_gb: 128
   lanescape-80vcpu-linux-amd64:
     machine_types: [n4-highcpu-80, c4-highcpu-96]
@@ -57,3 +57,6 @@ shapes:
   lanescape-48vcpu-linux-arm64:
     machine_types: [c4a-highcpu-48]
     memory_gb: 96
+  lanescape-64vcpu-linux-arm64:
+    machine_types: [c4a-highcpu-64]
+    memory_gb: 128
