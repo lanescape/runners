@@ -464,7 +464,9 @@ type wanted struct {
 // for a stockout or a family's quota, or, if it's a Spot job, of the Spot
 // quota every family shares; and for a quota that every machine draws on,
 // such as CPUS_ALL_REGIONS, or one Compute Engine didn't name, no younger
-// job at all, while any of the service's machines runs.
+// job at all, while any of the service's machines runs. A job that asks for
+// more vCPUs than all of every quota its placements found short can never
+// have a machine: its run is refused, saying why, and it holds nothing back.
 func (s *Service) give(ctx context.Context, inv *inventory) {
 	if !inv.machinesComplete || !inv.recordsComplete {
 		s.log().Warn("making no machines this pass: the machines or records couldn't all be read")
@@ -522,9 +524,14 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 	} else if len(inv.baseShort) > 0 {
 		s.log().Warn("a base image's builder couldn't be made, and none of the service's machines is running; jobs aren't held back for it")
 	}
+	// Runs refused this pass, none of whose jobs gets a machine.
+	refused := map[int64]bool{}
 	for _, w := range all {
 		if ctx.Err() != nil {
 			return
+		}
+		if refused[w.job.RunID] {
+			continue
 		}
 		// A job whose wait for a base image has ended, by its record,
 		// gets no machine until its record says so, so that its hour
@@ -571,7 +578,16 @@ func (s *Service) give(ctx context.Context, inv *inventory) {
 		s.log().Warn("no machine made; the job stays queued", "repository_id", w.repo.ID, "job_id", w.job.ID, "selector", w.sel.String(),
 			"err", err.Error())
 		if compute.IsCapacity(err) {
-			families, shared := s.shortOf(err)
+			families, shared, beyond := s.shortOf(err)
+			if beyond {
+				// Every placement of its shape asks for more vCPUs than
+				// all of a quota: nothing ending would let it fit, so its
+				// run is refused, saying why, and it holds nothing back.
+				s.refuseRun(ctx, inv, w.repo, w.job, fmt.Sprintf("the job names %s, every machine of which needs more vCPUs "+
+					"than all of the quota it draws on", w.sel))
+				refused[w.job.RunID] = true
+				continue
+			}
 			if families {
 				for _, f := range pools {
 					short[f] = true
@@ -636,8 +652,12 @@ func (s *Service) noteWait(ctx context.Context, inv *inventory, repoID, jobID in
 // other kind, one every machine draws on: CPUS_ALL_REGIONS, the project's
 // vCPUs in every region, or another that every machine has, such as
 // external addresses or disks; and a quota Compute Engine's answer didn't
-// name, which might be any of them, as "unnamed".
-func (s *Service) shortOf(err error) (families bool, shared string) {
+// name, which might be any of them, as "unnamed". beyond says every
+// placement found a family's or Spot's quota whose whole limit, as Compute
+// Engine's answer gives it, is less than the vCPUs of the machine type it
+// tried: no machine's ending would let any of them fit, so the job can never
+// have a machine, and its run is refused instead of held.
+func (s *Service) shortOf(err error) (families bool, shared string, beyond bool) {
 	family := map[string]bool{"CPUS_PER_VM_FAMILY": true, "PREEMPTIBLE_CPUS": true}
 	for _, sh := range s.Config.Shapes.Shapes {
 		for _, t := range sh.MachineTypes {
@@ -649,10 +669,21 @@ func (s *Service) shortOf(err error) (families bool, shared string) {
 	if many, ok := err.(interface{ Unwrap() []error }); ok {
 		errs = many.Unwrap()
 	}
+	over, other := 0, 0
 	for _, e := range errs {
 		var c *compute.CapacityError
+		if !errors.As(e, &c) {
+			other++
+			continue
+		}
+		var p placementShort
+		if errors.As(e, &p) && family[c.Quota] && c.HasLimit && machineTypeVCPUs(p.machineType) > 0 &&
+			float64(machineTypeVCPUs(p.machineType)) > c.Limit {
+			over++
+		} else {
+			other++
+		}
 		switch {
-		case !errors.As(e, &c):
 		case c.Stockout || family[c.Quota]:
 			families = true
 		case shared != "":
@@ -662,7 +693,7 @@ func (s *Service) shortOf(err error) (families bool, shared string) {
 			shared = c.Quota
 		}
 	}
-	return families, shared
+	return families, shared, over > 0 && other == 0
 }
 
 // spotPool names the Spot quota, which every machine family's Spot
@@ -1160,6 +1191,7 @@ func (s *Service) make(ctx context.Context, inv *inventory, w wanted) error {
 		}
 		if compute.IsCapacity(err) {
 			s.log().Info("no capacity for a machine", "machine", name, "zone", pl.Zone, "machine_type", pl.MachineType, "spot", pl.Spot, "err", err.Error())
+			err = placementShort{machineType: pl.MachineType, err: err}
 			last = err
 			short = append(short, err)
 			continue
@@ -1191,6 +1223,26 @@ type shortages struct {
 
 func (s shortages) Error() string   { return s.last.Error() }
 func (s shortages) Unwrap() []error { return s.all }
+
+// placementShort is one placement's want of quota or capacity, with the
+// machine type it tried, whose vCPUs a quota's whole limit may be less than.
+type placementShort struct {
+	machineType string
+	err         error
+}
+
+func (p placementShort) Error() string { return p.err.Error() }
+func (p placementShort) Unwrap() error { return p.err }
+
+// machineTypeVCPUs is a predefined machine type's vCPUs, the number its name
+// ends with, such as 96 for c4-highcpu-96; 0 if its name ends with none.
+func machineTypeVCPUs(machineType string) int {
+	n, err := strconv.Atoi(machineType[strings.LastIndex(machineType, "-")+1:])
+	if err != nil {
+		return 0
+	}
+	return n
+}
 
 // onlyLabel reports whether a runner's labels are exactly its selector.
 func onlyLabel(labels []string, sel string) bool {
