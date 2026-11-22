@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -187,6 +188,31 @@ func TestTheBuildersScript(t *testing.T) {
 		if strings.Contains(script, never) {
 			t.Errorf("the script mentions %q", never)
 		}
+	}
+	// Debian's tools that jobs may rely on (specs/0003-disks.md, Base
+	// images): each is installed from Debian's package, and checked to be
+	// on PATH before the image is said to be built.
+	install := regexp.MustCompile(`(?m)^apt_get -y --no-install-recommends install (.+)$`).FindStringSubmatch(script)
+	onPath := regexp.MustCompile(`(?m)^for tool in (.+); do$`).FindStringSubmatch(script)
+	if install == nil || onPath == nil {
+		t.Fatal("the script has no Debian install line, or no check of what's on PATH")
+	}
+	packages, commands := strings.Fields(install[1]), strings.Fields(onPath[1])
+	for _, tool := range []struct{ pkg, cmd string }{
+		{"git", "git"}, {"curl", "curl"}, {"jq", "jq"}, {"gh", "gh"}, {"unzip", "unzip"}, {"zip", "zip"},
+		{"xz-utils", "xz"}, {"build-essential", "gcc"}, {"build-essential", "g++"}, {"build-essential", "make"},
+		{"python3", "python3"}, {"zstd", "zstd"}, {"pigz", "pigz"}, {"e2fsprogs", "mkfs.ext4"}, {"sudo", "sudo"},
+	} {
+		if !slices.Contains(packages, tool.pkg) {
+			t.Errorf("the script doesn't install Debian's %s", tool.pkg)
+		}
+		if !slices.Contains(commands, tool.cmd) {
+			t.Errorf("the script doesn't check %s is on PATH", tool.cmd)
+		}
+	}
+	// HTTPS, for curl, git and gh, trusts Debian's certificate authorities.
+	if !slices.Contains(packages, "ca-certificates") {
+		t.Error("the script doesn't install Debian's ca-certificates")
 	}
 }
 
