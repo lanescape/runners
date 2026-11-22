@@ -375,3 +375,34 @@ func TestAHeldLeaseSaysWhoHoldsItAndUntilWhen(t *testing.T) {
 		t.Fatalf("an owner that said nothing: %v", err)
 	}
 }
+
+// TestARenewalWhoseRecoveryCantBeReadIsReleasedIfStillOurs: a renewal
+// written with its response lost, then refused on retry, can't show the
+// lease is someone else's if it can't read it back, as when shutdown ends
+// that read; the lease then counts as lost but uncertain, and a release
+// reads it again and gives it up, since it's still ours.
+func TestARenewalWhoseRecoveryCantBeReadIsReleasedIfStillOurs(t *testing.T) {
+	e := setup(t)
+	h, err := e.lease.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The renewal is written and its response lost; the client's retry is
+	// refused, its precondition gone; and reading the lease back fails.
+	e.emu.Faults().Add(fault.Rule{Method: http.MethodPost, Times: 1, After: true,
+		Respond: gcsemu.JSONError(http.StatusServiceUnavailable, "backendError", "Backend Error")})
+	e.emu.Faults().Add(fault.Rule{Method: http.MethodGet,
+		Respond: gcsemu.JSONError(http.StatusForbidden, "forbidden", "no")})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := h.Renew(ctx); !errors.Is(err, lease.ErrLost) {
+		t.Fatalf("renewal = %v, want ErrLost", err)
+	}
+	e.emu.Faults().Reset()
+	if err := h.Release(context.Background()); err != nil {
+		t.Fatalf("release = %v", err)
+	}
+	if _, _, ok := e.emu.Object("state", name); ok {
+		t.Fatal("the lease, still ours, was left held")
+	}
+}

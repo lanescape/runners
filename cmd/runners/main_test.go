@@ -130,11 +130,11 @@ func TestKicker(t *testing.T) {
 	}
 }
 
-// TestStopReleasesThePassBeforeTheServer: when Cloud Run stops the
-// instance, a pass running in a request is ended and releases the lease,
-// and its request answers, before the server stops, well within the grace
-// Cloud Run gives, so another revision's pass needn't wait for the lease to
-// expire.
+// TestStopReleasesThePassBeforeTheServer: stop ends a pass running in a
+// request, with the lease given back, before it stops the server, which
+// would otherwise wait for that request until Cloud Run ended the instance.
+// The handler here stands in for reconcile, whose own answer to a stopped
+// pass internal/server's tests hold.
 func TestStopReleasesThePassBeforeTheServer(t *testing.T) {
 	emu := gcsemu.New()
 	defer emu.Close()

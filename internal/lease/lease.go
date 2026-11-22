@@ -200,6 +200,12 @@ func (h *Held) Renew(ctx context.Context) error {
 			h.took(curGen, cur)
 			return nil
 		}
+		if rerr != nil {
+			// Unread, the lease may still be ours: lost, but uncertain,
+			// so a release reads it again and gives it up if it is.
+			h.lost, h.uncertain = true, true
+			return fmt.Errorf("%w: renewing %s: %w", ErrLost, h.lease.name, rerr)
+		}
 	}
 	if err != nil {
 		h.lost = true

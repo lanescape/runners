@@ -353,8 +353,9 @@ func TestStopEndsAPassAndReleasesItsLease(t *testing.T) {
 }
 
 // TestStopGivesUpOnAPassThatWontEnd: a body that ignores its context keeps
-// the pass, and Stop returns when its own context ends; the lease is then
-// left to expire, as before.
+// the pass, and Stop returns when its own context ends, with the lease still
+// held while the body runs, as it would be left to expire if Cloud Run then
+// ended the instance.
 func TestStopGivesUpOnAPassThatWontEnd(t *testing.T) {
 	e := setup(t)
 	release := make(chan struct{})
@@ -422,5 +423,60 @@ func TestPassesSayWhenTheyStartAndHowTheyEnd(t *testing.T) {
 	}
 	if n := strings.Count(got, `msg="pass started"`); n != 3 {
 		t.Errorf("%d passes started, want 3:\n%s", n, got)
+	}
+}
+
+// TestStopWhileTakingTheLeaseGivesItBack: a lease write in flight when Stop
+// comes isn't cut short, since it may take the lease with no one left who
+// knows; it settles, and the pass gives the lease back without running.
+func TestStopWhileTakingTheLeaseGivesItBack(t *testing.T) {
+	e := setup(t)
+	e.emu.Faults().Add(fault.Rule{Method: http.MethodPost, Times: 1, Delay: 300 * time.Millisecond})
+	result := make(chan error, 1)
+	ran := make(chan struct{}, 1)
+	go func() {
+		result <- e.runner.Run(context.Background(), func(*pass.Pass) error { ran <- struct{}{}; return nil })
+	}()
+	time.Sleep(50 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := e.runner.Stop(ctx); err != nil {
+		t.Fatalf("Stop = %v", err)
+	}
+	if err := <-result; !errors.Is(err, pass.ErrStopping) {
+		t.Fatalf("Run = %v, want ErrStopping", err)
+	}
+	if len(ran) != 0 {
+		t.Fatal("the pass ran its body after Stop")
+	}
+	if _, _, ok := e.emu.Object("state", pass.LeaseName); ok {
+		t.Fatal("the lease taken while stopping was left held")
+	}
+}
+
+// TestAStoppedPassStartsNoFurtherPart: once the service stops a pass, the
+// parts after the one running don't start.
+func TestAStoppedPassStartsNoFurtherPart(t *testing.T) {
+	e := setup(t)
+	started := make(chan struct{})
+	second := false
+	result := make(chan error, 1)
+	go func() {
+		result <- e.runner.Run(context.Background(), pass.All(
+			func(p *pass.Pass) error { close(started); <-p.Context().Done(); return p.Context().Err() },
+			func(*pass.Pass) error { second = true; return nil },
+		))
+	}()
+	<-started
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := e.runner.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; !errors.Is(err, pass.ErrStopping) {
+		t.Fatalf("Run = %v", err)
+	}
+	if second {
+		t.Fatal("the second part ran after the pass was stopped")
 	}
 }

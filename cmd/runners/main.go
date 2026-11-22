@@ -325,7 +325,9 @@ func kicker(ctx context.Context, passes *pass.Runner, body pass.Body, every time
 			case <-pending:
 			}
 			for end := time.Now().Add(pass.Validity + pass.Deadline); ; {
-				err := passes.Run(ctx, body)
+				// Not the signal's context: Stop ends this pass, so that
+				// it ends as stopped and gives the lease back.
+				err := passes.Run(context.Background(), body)
 				if errors.Is(err, pass.ErrStopping) {
 					return
 				}

@@ -555,6 +555,42 @@ func TestReconcileWhileStopping(t *testing.T) {
 	}
 }
 
+// TestAPassInFlightWhenStoppingAnswersRetryably: the pass a reconcile call
+// is running when the instance stops ends, gives the lease back, and the
+// call is answered with the retryable 503 a stopping instance gives.
+func TestAPassInFlightWhenStoppingAnswersRetryably(t *testing.T) {
+	e := setup(t)
+	e.rec.block = make(chan struct{})
+	defer close(e.rec.block)
+	type answer struct {
+		code int
+		body map[string]any
+	}
+	done := make(chan answer, 1)
+	go func() {
+		code, body := e.post(server.ReconcilePath, e.gg.Token(pusher, audience), "{}")
+		done <- answer{code, body}
+	}()
+	for {
+		if _, _, ok := e.gcs.Object("state", pass.LeaseName); ok {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := e.passes.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	a := <-done
+	if a.code != http.StatusServiceUnavailable || a.body["retryable"] != true || a.body["error"] != "this instance is stopping" {
+		t.Fatalf("the call whose pass was stopped: %d %v", a.code, a.body)
+	}
+	if _, _, ok := e.gcs.Object("state", pass.LeaseName); ok {
+		t.Fatal("the stopped pass left the lease")
+	}
+}
+
 func TestThereIsNoBindEndpoint(t *testing.T) {
 	e := setup(t)
 	// Runs are bound at their first job's check: no endpoint takes a
