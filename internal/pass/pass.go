@@ -56,6 +56,9 @@ type Runner struct {
 	// they move the clock on: a renewal seen in storage may still be in
 	// flight, and moving the clock past its deadline would end it.
 	renewed func()
+	// stopMarked, if set, is called once Stop has marked the runner
+	// stopping and ended its passes. Tests use it to know Stop has begun.
+	stopMarked func()
 
 	mu       sync.Mutex
 	stopping context.Context // ended by Stop
@@ -102,6 +105,9 @@ func (r *Runner) Stop(ctx context.Context) error {
 		cancel(ErrStopping)
 	}
 	r.mu.Unlock()
+	if r.stopMarked != nil {
+		r.stopMarked()
+	}
 	done := make(chan struct{})
 	go func() {
 		r.running.Wait()
@@ -270,7 +276,10 @@ func (r *Runner) Run(ctx context.Context, body Body) (err error) {
 	wg.Wait()
 
 	lost := errors.Is(context.Cause(pctx), ErrLeaseLost)
-	stopped := errors.Is(context.Cause(pctx), ErrStopping)
+	// Stopped as the service stops, whatever ended the context first: a
+	// deadline that fired at the same moment as Stop still leaves a lease
+	// the next instance's passes would wait for.
+	stopped := errors.Is(context.Cause(pctx), ErrStopping) || stopping.Err() != nil
 	// Whether the body was cut short is decided when it returns; the
 	// release after it doesn't change that.
 	cut := dctx.Err()

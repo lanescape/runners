@@ -459,16 +459,20 @@ func TestStopWhileTakingTheLeaseGivesItBack(t *testing.T) {
 		result <- e.runner.Run(context.Background(), func(*pass.Pass) error { ran <- struct{}{}; return nil })
 	}()
 	<-held.written
+	marked := make(chan struct{})
+	pass.OnStop(e.runner, func() { close(marked) })
 	stopped := make(chan error, 1)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		stopped <- e.runner.Stop(ctx)
 	}()
+	// Stop has begun, and waits for the pass while the write is unanswered.
+	<-marked
 	select {
 	case err := <-stopped:
 		t.Fatalf("Stop returned %v while the lease write was unanswered", err)
-	case <-time.After(100 * time.Millisecond):
+	default:
 	}
 	close(held.let)
 	if err := <-stopped; err != nil {
@@ -509,5 +513,47 @@ func TestAStoppedPassStartsNoFurtherPart(t *testing.T) {
 	}
 	if second {
 		t.Fatal("the second part ran after the pass was stopped")
+	}
+}
+
+// TestAPassStoppedAtItsDeadlineStillReleases: when the pass's deadline
+// fires as the service stops, the deadline ends its context first, but the
+// pass still gives the lease back, since the service is stopping.
+func TestAPassStoppedAtItsDeadlineStillReleases(t *testing.T) {
+	e := setup(t)
+	renewed := renewals(e)
+	ended, afterStop := make(chan struct{}), make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		result <- e.runner.Run(context.Background(), func(p *pass.Pass) error {
+			<-p.Context().Done()
+			close(ended)
+			// Still ending when Stop comes.
+			<-afterStop
+			return p.Context().Err()
+		})
+	}()
+	if err := e.clock.BlockUntilContext(context.Background(), 2); err != nil {
+		t.Fatal(err)
+	}
+	for want := int64(2); want <= 7; want++ {
+		renewTo(t, e, renewed, want)
+	}
+	e.clock.Advance(pass.RenewEvery)
+	<-ended
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stopped := make(chan error, 1)
+	marked := make(chan struct{})
+	pass.OnStop(e.runner, func() { close(marked) })
+	go func() { stopped <- e.runner.Stop(ctx) }()
+	<-marked
+	close(afterStop)
+	if err := <-stopped; err != nil {
+		t.Fatal(err)
+	}
+	<-result
+	if _, _, ok := e.emu.Object("state", pass.LeaseName); ok {
+		t.Fatal("a pass at its deadline as the service stopped left its lease")
 	}
 }
