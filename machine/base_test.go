@@ -197,6 +197,10 @@ func TestTheBuildersScript(t *testing.T) {
 	if install == nil || onPath == nil {
 		t.Fatal("the script has no Debian install line, or no check of what's on PATH")
 	}
+	// The loop does check each, and fails the build for one that's missing.
+	if !strings.Contains(script, onPath[0]+"\n\tcommand -v \"$tool\" >/dev/null || fail \"$tool isn't on PATH\"\ndone\n") {
+		t.Error("the script doesn't fail the build for a tool that isn't on PATH")
+	}
 	packages, commands := strings.Fields(install[1]), strings.Fields(onPath[1])
 	for _, tool := range []struct{ pkg, cmd string }{
 		{"git", "git"}, {"curl", "curl"}, {"jq", "jq"}, {"gh", "gh"}, {"unzip", "unzip"}, {"zip", "zip"},
