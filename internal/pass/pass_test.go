@@ -426,21 +426,52 @@ func TestPassesSayWhenTheyStartAndHowTheyEnd(t *testing.T) {
 	}
 }
 
-// TestStopWhileTakingTheLeaseGivesItBack: a lease write in flight when Stop
-// comes isn't cut short, since it may take the lease with no one left who
-// knows; it settles, and the pass gives the lease back without running.
+// heldCreate is the bucket, but a lease write's answer is held back after
+// the write is made, until let is closed, or its caller gives up.
+type heldCreate struct {
+	store.Objects
+	written chan struct{}
+	let     chan struct{}
+}
+
+func (h *heldCreate) Create(ctx context.Context, name string, data []byte) (int64, error) {
+	gen, err := h.Objects.Create(ctx, name, data)
+	close(h.written)
+	select {
+	case <-h.let:
+		return gen, err
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// TestStopWhileTakingTheLeaseGivesItBack: a lease write made but not yet
+// answered when Stop comes isn't cut short, since the lease would then be
+// taken with no one left who knows; once it's answered, the pass gives the
+// lease back without running, before Stop returns.
 func TestStopWhileTakingTheLeaseGivesItBack(t *testing.T) {
 	e := setup(t)
-	e.emu.Faults().Add(fault.Rule{Method: http.MethodPost, Times: 1, Delay: 300 * time.Millisecond})
+	held := &heldCreate{Objects: e.store, written: make(chan struct{}), let: make(chan struct{})}
+	e.runner.Lease = lease.New(held, pass.LeaseName, pass.Validity, e.clock)
 	result := make(chan error, 1)
 	ran := make(chan struct{}, 1)
 	go func() {
 		result <- e.runner.Run(context.Background(), func(*pass.Pass) error { ran <- struct{}{}; return nil })
 	}()
-	time.Sleep(50 * time.Millisecond)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := e.runner.Stop(ctx); err != nil {
+	<-held.written
+	stopped := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		stopped <- e.runner.Stop(ctx)
+	}()
+	select {
+	case err := <-stopped:
+		t.Fatalf("Stop returned %v while the lease write was unanswered", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(held.let)
+	if err := <-stopped; err != nil {
 		t.Fatalf("Stop = %v", err)
 	}
 	if err := <-result; !errors.Is(err, pass.ErrStopping) {

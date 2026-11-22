@@ -395,8 +395,13 @@ func TestARenewalWhoseRecoveryCantBeReadIsReleasedIfStillOurs(t *testing.T) {
 		Respond: gcsemu.JSONError(http.StatusForbidden, "forbidden", "no")})
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := h.Renew(ctx); !errors.Is(err, lease.ErrLost) {
-		t.Fatalf("renewal = %v, want ErrLost", err)
+	err = h.Renew(ctx)
+	// Lost, from the failed read back: the renewal itself was written.
+	if !errors.Is(err, lease.ErrLost) || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("renewal = %v, want ErrLost from the read's 403", err)
+	}
+	if _, renewal := holderOf(t, e); renewal != 2 {
+		t.Fatalf("the renewal wasn't written: renewal %d", renewal)
 	}
 	e.emu.Faults().Reset()
 	if err := h.Release(context.Background()); err != nil {
@@ -404,5 +409,46 @@ func TestARenewalWhoseRecoveryCantBeReadIsReleasedIfStillOurs(t *testing.T) {
 	}
 	if _, _, ok := e.emu.Object("state", name); ok {
 		t.Fatal("the lease, still ours, was left held")
+	}
+}
+
+// TestReleaseOutlastsALateRenewal: a renewal cut short may still be written
+// after a release read the lease; while the lease names its holder, the
+// release deletes the newer generation too.
+func TestReleaseOutlastsALateRenewal(t *testing.T) {
+	ctx := context.Background()
+	e := setup(t)
+	h, err := e.lease.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder, _ := holderOf(t, e)
+	// The renewal lands after the holder last wrote: a newer generation
+	// naming the same holder.
+	data, _, _ := e.emu.Object("state", name)
+	var rec map[string]any
+	if err := json.Unmarshal(data, &rec); err != nil {
+		t.Fatal(err)
+	}
+	rec["renewal"] = 2
+	late, _ := json.Marshal(rec)
+	e.emu.Put("state", name, late)
+	if err := h.Release(ctx); err != nil {
+		t.Fatalf("release = %v", err)
+	}
+	if _, _, ok := e.emu.Object("state", name); ok {
+		t.Fatalf("the late renewal of %s was left held", holder)
+	}
+	// Someone else's lease at a newer generation is left alone.
+	h2, err := e.lease.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.emu.Put("state", name, []byte(`{"holder":"someone-else","renewal":1,"expires":"2999-01-01T00:00:00Z"}`))
+	if err := h2.Release(ctx); err != nil {
+		t.Fatalf("release = %v", err)
+	}
+	if other, _ := holderOf(t, e); other != "someone-else" {
+		t.Fatalf("someone else's lease was deleted: %q", other)
 	}
 }

@@ -138,6 +138,9 @@ func (l *Lease) Acquire(ctx context.Context) (*Held, error) {
 			h.took(againGen, again)
 			return h, nil
 		}
+		if rerr == nil && l.clock.Now().Before(again.Expires) {
+			return nil, &HeldError{Owner: again.Owner, Expires: again.Expires}
+		}
 		return nil, ErrHeld
 	}
 	if err != nil {
@@ -241,9 +244,33 @@ func (h *Held) Release(ctx context.Context) error {
 		gen = curGen
 	}
 	h.lost, h.uncertain = true, false
-	err := h.lease.objects.Delete(ctx, h.lease.name, gen)
-	if err == nil || errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrPrecondition) {
-		return nil
+	// A renewal cut short may still have been written after the
+	// generation above was read; while the lease names this holder, its
+	// newer generation is deleted too, a bounded number of times.
+	for range releaseAttempts {
+		err := h.lease.objects.Delete(ctx, h.lease.name, gen)
+		if err == nil || errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+		if !errors.Is(err, store.ErrPrecondition) {
+			return fmt.Errorf("releasing %s: %w", h.lease.name, err)
+		}
+		cur, curGen, rerr := h.lease.read(ctx)
+		if errors.Is(rerr, store.ErrNotFound) {
+			return nil
+		}
+		if rerr != nil {
+			return fmt.Errorf("releasing %s: %w", h.lease.name, rerr)
+		}
+		if cur.Holder != h.holder {
+			// Someone else's now: theirs to keep.
+			return nil
+		}
+		gen = curGen
 	}
-	return fmt.Errorf("releasing %s: %w", h.lease.name, err)
+	return fmt.Errorf("releasing %s: it kept changing", h.lease.name)
 }
+
+// releaseAttempts bounds Release's deletes of a lease that still names its
+// holder at a newer generation.
+const releaseAttempts = 3

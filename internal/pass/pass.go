@@ -61,6 +61,10 @@ type Runner struct {
 	stopping context.Context // ended by Stop
 	stop     context.CancelFunc
 	running  sync.WaitGroup
+	// passes are the running passes' own cancels, which Stop calls under
+	// mu, so a pass registered before Stop is ended by it, and one that
+	// would register after finds the service stopping.
+	passes map[*int]context.CancelCauseFunc
 }
 
 // init makes the context Stop ends, once. The caller holds mu.
@@ -94,6 +98,9 @@ func (r *Runner) Stop(ctx context.Context) error {
 	r.mu.Lock()
 	r.init()
 	r.stop()
+	for _, cancel := range r.passes {
+		cancel(ErrStopping)
+	}
 	r.mu.Unlock()
 	done := make(chan struct{})
 	go func() {
@@ -177,7 +184,16 @@ func (r *Runner) Run(ctx context.Context, body Body) (err error) {
 		}
 		return err
 	}
+	// The pass's own context ends at its deadline, when its caller goes,
+	// when its lease is lost, or when Stop is called: Stop ends it under
+	// the runner's lock, so either it's registered before Stop and ended
+	// by it, or it finds the service stopping and gives the lease back.
+	pctx, stop := context.WithCancelCause(dctx)
+	defer stop(nil)
+	key := new(int)
+	r.mu.Lock()
 	if stopping.Err() != nil {
+		r.mu.Unlock()
 		rctx, cancel := withDeadline(context.WithoutCancel(ctx), r.Clock, r.Clock.Now().Add(releaseLimit))
 		defer cancel()
 		if err := held.Release(rctx); err != nil {
@@ -185,6 +201,16 @@ func (r *Runner) Run(ctx context.Context, body Body) (err error) {
 		}
 		return ErrStopping
 	}
+	if r.passes == nil {
+		r.passes = map[*int]context.CancelCauseFunc{}
+	}
+	r.passes[key] = stop
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		delete(r.passes, key)
+		r.mu.Unlock()
+	}()
 	// Each pass that takes the lease says when it starts and how it ended,
 	// so a pass that never ends, such as one in an instance Cloud Run
 	// stopped, shows as a start with no end.
@@ -202,12 +228,6 @@ func (r *Runner) Run(ctx context.Context, body Body) (err error) {
 		}
 		log.Info("pass ended", "outcome", outcome, "took", r.Clock.Since(began).Round(time.Millisecond).String())
 	}()
-	// The pass's own context ends at its deadline, when its caller goes,
-	// when its lease is lost, or when Stop is called.
-	pctx, stop := context.WithCancelCause(dctx)
-	defer stop(nil)
-	unwatch := context.AfterFunc(stopping, func() { stop(ErrStopping) })
-	defer unwatch()
 
 	done := make(chan struct{})
 	var wg sync.WaitGroup
@@ -258,8 +278,15 @@ func (r *Runner) Run(ctx context.Context, body Body) (err error) {
 	// release is capped by the deadline like every other call. A pass that
 	// reached its deadline, or whose renewal failed, leaves the lease to
 	// expire.
-	if !lost && r.Clock.Now().Before(end) {
-		rctx, cancel := withDeadline(context.WithoutCancel(ctx), r.Clock, minTime(r.Clock.Now().Add(releaseLimit), end))
+	// A pass the service stopped releases even if its deadline came
+	// meanwhile: the lease, valid well past the deadline, is still its own,
+	// and the next instance's passes would otherwise wait for it.
+	if !lost && (r.Clock.Now().Before(end) || stopped) {
+		releaseBy := minTime(r.Clock.Now().Add(releaseLimit), end)
+		if stopped {
+			releaseBy = r.Clock.Now().Add(releaseLimit)
+		}
+		rctx, cancel := withDeadline(context.WithoutCancel(ctx), r.Clock, releaseBy)
 		defer cancel()
 		if err := held.Release(rctx); err != nil {
 			log.Warn("pass lease release failed; it will expire", "err", err)

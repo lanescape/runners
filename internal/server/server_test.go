@@ -62,13 +62,18 @@ type reconciler struct {
 	mu     sync.Mutex
 	passes int
 	block  chan struct{}
+	// entered, if set, gets a value as a pass's body starts.
+	entered chan struct{}
 }
 
 func (r *reconciler) Pass(p *pass.Pass) error {
 	r.mu.Lock()
 	r.passes++
-	block := r.block
+	block, entered := r.block, r.entered
 	r.mu.Unlock()
+	if entered != nil {
+		entered <- struct{}{}
+	}
 	if block != nil {
 		select {
 		case <-block:
@@ -561,6 +566,7 @@ func TestReconcileWhileStopping(t *testing.T) {
 func TestAPassInFlightWhenStoppingAnswersRetryably(t *testing.T) {
 	e := setup(t)
 	e.rec.block = make(chan struct{})
+	e.rec.entered = make(chan struct{}, 1)
 	defer close(e.rec.block)
 	type answer struct {
 		code int
@@ -571,11 +577,11 @@ func TestAPassInFlightWhenStoppingAnswersRetryably(t *testing.T) {
 		code, body := e.post(server.ReconcilePath, e.gg.Token(pusher, audience), "{}")
 		done <- answer{code, body}
 	}()
-	for {
-		if _, _, ok := e.gcs.Object("state", pass.LeaseName); ok {
-			break
-		}
-		time.Sleep(time.Millisecond)
+	// The pass's body is running.
+	select {
+	case <-e.rec.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pass's body didn't start")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
