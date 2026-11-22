@@ -68,7 +68,7 @@ say "installing Debian's packages"
 apt_get() { apt-get -q -o DPkg::Lock::Timeout=600 "$@"; }
 apt_get update
 apt_get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade
-apt_get -y --no-install-recommends install ca-certificates curl e2fsprogs git jq pigz python3 sudo zstd
+apt_get -y --no-install-recommends install build-essential ca-certificates curl e2fsprogs gh git jq pigz python3 sudo unzip xz-utils zip zstd
 
 work=$(mktemp -d /var/tmp/lanescape-runners-build.XXXXXX)
 
@@ -220,7 +220,7 @@ install -d -o root -g root -m 0755 /work
 
 # Check what was made before saying it was built.
 say "checking the image"
-for tool in git curl jq python3 zstd pigz mkfs.ext4 go gofmt sudo; do
+for tool in git curl jq gh unzip zip xz gcc g++ make python3 zstd pigz mkfs.ext4 go gofmt sudo; do
 	command -v "$tool" >/dev/null || fail "$tool isn't on PATH"
 done
 [ "$(go env GOVERSION)" = "go$go_version" ] || fail "go is $(go env GOVERSION), not go$go_version"
