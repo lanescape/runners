@@ -452,3 +452,26 @@ func TestReleaseOutlastsALateRenewal(t *testing.T) {
 		t.Fatalf("someone else's lease was deleted: %q", other)
 	}
 }
+
+// TestAReleaseWhoseDeleteFailedCanBeRetried: a delete whose outcome isn't
+// known leaves the release retryable; the retry reads the lease and deletes
+// it if it still names its holder.
+func TestAReleaseWhoseDeleteFailedCanBeRetried(t *testing.T) {
+	ctx := context.Background()
+	e := setup(t)
+	h, err := e.lease.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.emu.Faults().Add(fault.Rule{Method: http.MethodDelete, Times: 1,
+		Respond: gcsemu.JSONError(http.StatusForbidden, "forbidden", "no")})
+	if err := h.Release(ctx); err == nil {
+		t.Fatal("the failed delete released")
+	}
+	if err := h.Release(ctx); err != nil {
+		t.Fatalf("retry = %v", err)
+	}
+	if _, _, ok := e.emu.Object("state", name); ok {
+		t.Fatal("the lease remains after the retried release")
+	}
+}

@@ -297,7 +297,16 @@ func (r *Runner) Run(ctx context.Context, body Body) (err error) {
 		}
 		rctx, cancel := withDeadline(context.WithoutCancel(ctx), r.Clock, releaseBy)
 		defer cancel()
-		if err := held.Release(rctx); err != nil {
+		err := held.Release(rctx)
+		if err != nil && stopping.Err() != nil {
+			// The service began stopping while the release was under way,
+			// perhaps with little of the pass's time left: once more, in a
+			// window of its own.
+			rctx2, cancel2 := withDeadline(context.WithoutCancel(ctx), r.Clock, r.Clock.Now().Add(releaseLimit))
+			defer cancel2()
+			err = held.Release(rctx2)
+		}
+		if err != nil {
 			log.Warn("pass lease release failed; it will expire", "err", err)
 		}
 	}

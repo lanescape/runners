@@ -253,6 +253,9 @@ func (h *Held) Release(ctx context.Context) error {
 			return nil
 		}
 		if !errors.Is(err, store.ErrPrecondition) {
+			// Whether it was deleted isn't known: a later Release reads
+			// the lease again, and deletes it if it still names us.
+			h.uncertain = true
 			return fmt.Errorf("releasing %s: %w", h.lease.name, err)
 		}
 		cur, curGen, rerr := h.lease.read(ctx)

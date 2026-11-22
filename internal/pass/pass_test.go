@@ -557,3 +557,51 @@ func TestAPassStoppedAtItsDeadlineStillReleases(t *testing.T) {
 		t.Fatal("a pass at its deadline as the service stopped left its lease")
 	}
 }
+
+// heldDelete is the bucket, but the first lease delete waits until let is
+// closed and then fails without deleting, as one cut off by its deadline.
+type heldDelete struct {
+	store.Objects
+	deleting chan struct{}
+	let      chan struct{}
+	once     bool
+}
+
+func (h *heldDelete) Delete(ctx context.Context, name string, generation int64) error {
+	if !h.once {
+		h.once = true
+		close(h.deleting)
+		<-h.let
+		return context.DeadlineExceeded
+	}
+	return h.Objects.Delete(ctx, name, generation)
+}
+
+// TestAReleaseCutShortAsTheServiceStopsIsRetried: a pass's release whose
+// delete fails while the service begins stopping is tried once more, and
+// the lease is given back before Stop returns.
+func TestAReleaseCutShortAsTheServiceStopsIsRetried(t *testing.T) {
+	e := setup(t)
+	held := &heldDelete{Objects: e.store, deleting: make(chan struct{}), let: make(chan struct{})}
+	e.runner.Lease = lease.New(held, pass.LeaseName, pass.Validity, e.clock)
+	result := make(chan error, 1)
+	go func() { result <- e.runner.Run(context.Background(), func(*pass.Pass) error { return nil }) }()
+	<-held.deleting
+	marked := make(chan struct{})
+	pass.OnStop(e.runner, func() { close(marked) })
+	stopped := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		stopped <- e.runner.Stop(ctx)
+	}()
+	<-marked
+	close(held.let)
+	if err := <-stopped; err != nil {
+		t.Fatal(err)
+	}
+	<-result
+	if _, _, ok := e.emu.Object("state", pass.LeaseName); ok {
+		t.Fatal("the release cut short as the service stopped wasn't retried")
+	}
+}
