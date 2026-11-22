@@ -22,6 +22,26 @@ import (
 // ErrHeld means someone else holds the lease and it hasn't expired.
 var ErrHeld = errors.New("lease is held")
 
+// HeldError is ErrHeld, with who holds the lease and until when, when the
+// lease said.
+type HeldError struct {
+	// Owner is what the holder said it is, such as its Cloud Run revision;
+	// empty if it said nothing.
+	Owner   string
+	Expires time.Time
+}
+
+func (e *HeldError) Error() string {
+	owner := e.Owner
+	if owner == "" {
+		owner = "a holder that didn't say who it is"
+	}
+	return fmt.Sprintf("lease is held by %s until %s", owner, e.Expires.UTC().Format(time.RFC3339))
+}
+
+// Is makes a HeldError ErrHeld.
+func (e *HeldError) Is(target error) bool { return target == ErrHeld }
+
 // ErrLost means the lease is no longer this holder's: it was taken over, or
 // its holder can't tell whether it still has it.
 var ErrLost = errors.New("lease lost")
@@ -29,6 +49,7 @@ var ErrLost = errors.New("lease lost")
 // record is what the lease object holds.
 type record struct {
 	Holder  string    `json:"holder"`
+	Owner   string    `json:"owner,omitempty"`
 	Renewal int64     `json:"renewal"`
 	Expires time.Time `json:"expires"`
 }
@@ -39,6 +60,11 @@ type Lease struct {
 	name     string
 	validity time.Duration
 	clock    clockwork.Clock
+
+	// Owner, if set, is written into the lease while it's held, so that
+	// anyone who finds it held can say by whom, such as the service's
+	// Cloud Run revision. It identifies; it decides nothing.
+	Owner string
 }
 
 // New returns the lease kept in object name, valid for validity after each
@@ -101,7 +127,7 @@ func (l *Lease) Acquire(ctx context.Context) (*Held, error) {
 		return h, nil
 	}
 	if l.clock.Now().Before(cur.Expires) {
-		return nil, ErrHeld
+		return nil, &HeldError{Owner: cur.Owner, Expires: cur.Expires}
 	}
 	gen, err = l.objects.Replace(ctx, l.name, data, curGen)
 	if errors.Is(err, store.ErrPrecondition) {
@@ -137,7 +163,7 @@ func (l *Lease) read(ctx context.Context) (record, int64, error) {
 
 // next is the record of the holder's next write.
 func (h *Held) next() record {
-	return record{Holder: h.holder, Renewal: h.renewal + 1, Expires: h.lease.clock.Now().Add(h.lease.validity)}
+	return record{Holder: h.holder, Owner: h.lease.Owner, Renewal: h.renewal + 1, Expires: h.lease.clock.Now().Add(h.lease.validity)}
 }
 
 func (h *Held) took(gen int64, rec record) {

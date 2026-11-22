@@ -1,10 +1,13 @@
 package pass_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -303,5 +306,121 @@ func TestAllRunsEveryPartInOrder(t *testing.T) {
 	err := e.runner.Run(context.Background(), pass.All(part("machines", failed), part("disks", nil)))
 	if !errors.Is(err, failed) || len(ran) != 2 || ran[0] != "machines" || ran[1] != "disks" {
 		t.Fatalf("ran %v, err %v; a failed part doesn't stop the next", ran, err)
+	}
+}
+
+// TestStopEndsAPassAndReleasesItsLease: Stop ends a running pass's context
+// at once, the pass releases the lease, as Cloud Run's SIGTERM needs, so
+// another instance's pass can run at once rather than once the lease
+// expires; and no pass starts after.
+func TestStopEndsAPassAndReleasesItsLease(t *testing.T) {
+	e := setup(t)
+	_, _, result := start(t, e)
+	if _, _, ok := e.emu.Object("state", pass.LeaseName); !ok {
+		t.Fatal("the pass holds no lease")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := e.runner.Stop(ctx); err != nil {
+		t.Fatalf("Stop = %v", err)
+	}
+	if err := <-result; !errors.Is(err, pass.ErrStopping) {
+		t.Fatalf("the stopped pass returned %v, not ErrStopping", err)
+	}
+	if _, _, ok := e.emu.Object("state", pass.LeaseName); ok {
+		t.Fatal("the stopped pass left its lease")
+	}
+	// Another instance's runner takes the lease at once.
+	other := &pass.Runner{Lease: lease.New(e.store, pass.LeaseName, pass.Validity, e.clock), Clock: e.clock}
+	ran := false
+	if err := other.Run(context.Background(), func(*pass.Pass) error { ran = true; return nil }); err != nil || !ran {
+		t.Fatalf("the next pass: ran %v, %v", ran, err)
+	}
+	// And this runner starts none.
+	if err := e.runner.Run(context.Background(), func(*pass.Pass) error {
+		t.Fatal("a pass ran after Stop")
+		return nil
+	}); !errors.Is(err, pass.ErrStopping) {
+		t.Fatalf("Run after Stop = %v", err)
+	}
+	// Stopping again, or with nothing running, returns at once.
+	if err := e.runner.Stop(ctx); err != nil {
+		t.Fatalf("second Stop = %v", err)
+	}
+	if err := (&pass.Runner{}).Stop(ctx); err != nil {
+		t.Fatalf("Stop of an idle runner = %v", err)
+	}
+}
+
+// TestStopGivesUpOnAPassThatWontEnd: a body that ignores its context keeps
+// the pass, and Stop returns when its own context ends; the lease is then
+// left to expire, as before.
+func TestStopGivesUpOnAPassThatWontEnd(t *testing.T) {
+	e := setup(t)
+	release := make(chan struct{})
+	result := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		result <- e.runner.Run(context.Background(), func(*pass.Pass) error {
+			close(started)
+			<-release
+			return nil
+		})
+	}()
+	<-started
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := e.runner.Stop(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Stop = %v, want its deadline", err)
+	}
+	if _, _, ok := e.emu.Object("state", pass.LeaseName); !ok {
+		t.Fatal("the lease went while its pass still ran")
+	}
+	close(release)
+	if err := <-result; !errors.Is(err, pass.ErrStopping) {
+		t.Fatalf("the pass returned %v", err)
+	}
+}
+
+// TestPassesSayWhenTheyStartAndHowTheyEnd: one line as a pass takes the
+// lease, and one as it ends, with its outcome; a pass that finds the lease
+// held logs neither.
+func TestPassesSayWhenTheyStartAndHowTheyEnd(t *testing.T) {
+	e := setup(t)
+	var logs bytes.Buffer
+	e.runner.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	if err := e.runner.Run(context.Background(), func(*pass.Pass) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.runner.Run(context.Background(), func(*pass.Pass) error { return errors.New("boom") }); err == nil {
+		t.Fatal("the failed pass succeeded")
+	}
+	_, _, result := start(t, e)
+	before := logs.Len()
+	if err := e.runner.Run(context.Background(), func(*pass.Pass) error { return nil }); !errors.Is(err, pass.ErrHeld) {
+		t.Fatalf("a second pass = %v", err)
+	}
+	if logs.Len() != before {
+		t.Fatalf("a pass that found the lease held logged: %s", logs.String()[before:])
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := e.runner.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	<-result
+	got := logs.String()
+	for _, want := range []string{
+		`msg="pass started"`,
+		`msg="pass ended" outcome=finished`,
+		`msg="pass ended" outcome=failed`,
+		`msg="pass ended" outcome="stopped: the service is stopping"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("no %s in:\n%s", want, got)
+		}
+	}
+	if n := strings.Count(got, `msg="pass started"`); n != 3 {
+		t.Errorf("%d passes started, want 3:\n%s", n, got)
 	}
 }

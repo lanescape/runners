@@ -31,6 +31,10 @@ const (
 // ErrHeld means another pass is running.
 var ErrHeld = lease.ErrHeld
 
+// ErrStopping means the service is stopping: Stop has been called, so no
+// pass starts, and a running one was ended.
+var ErrStopping = errors.New("the service is stopping")
+
 // ErrLeaseLost is the cause of a pass's context ending when a renewal fails.
 var ErrLeaseLost = errors.New("pass stopped: its lease could not be renewed")
 
@@ -52,6 +56,56 @@ type Runner struct {
 	// they move the clock on: a renewal seen in storage may still be in
 	// flight, and moving the clock past its deadline would end it.
 	renewed func()
+
+	mu       sync.Mutex
+	stopping context.Context // ended by Stop
+	stop     context.CancelFunc
+	running  sync.WaitGroup
+}
+
+// init makes the context Stop ends, once. The caller holds mu.
+func (r *Runner) init() {
+	if r.stopping == nil {
+		r.stopping, r.stop = context.WithCancel(context.Background())
+	}
+}
+
+// begin counts a pass in, and gives the context Stop ends; false once
+// stopping.
+func (r *Runner) begin() (context.Context, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.init()
+	if r.stopping.Err() != nil {
+		return nil, false
+	}
+	r.running.Add(1)
+	return r.stopping, true
+}
+
+// Stop ends every running pass and starts no other: each running pass's
+// context ends at once, and the pass releases the lease as one its caller
+// cut short does, so that the next pass, in another instance or revision,
+// can run at once rather than once the lease expires. It returns once every
+// pass has returned, or with ctx's error if ctx ends first. The service
+// calls it when Cloud Run stops an instance, which gives it 10 seconds
+// before ending it (specs/0001-architecture.md, Passes).
+func (r *Runner) Stop(ctx context.Context) error {
+	r.mu.Lock()
+	r.init()
+	r.stop()
+	r.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		r.running.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Pass is one running pass.
@@ -86,8 +140,22 @@ func minTime(a, b time.Time) time.Time {
 func (p *Pass) Lost() bool { return errors.Is(context.Cause(p.ctx), ErrLeaseLost) }
 
 // Run takes the lease and runs body under it. It returns ErrHeld, without
-// running body, if another pass holds the lease.
-func (r *Runner) Run(ctx context.Context, body Body) error {
+// running body, if another pass holds the lease, and ErrStopping, without
+// taking it, once Stop has been called. A pass Stop ends returns an error
+// that wraps ErrStopping.
+func (r *Runner) Run(ctx context.Context, body Body) (err error) {
+	stopping, ok := r.begin()
+	if !ok {
+		return ErrStopping
+	}
+	defer r.running.Done()
+	// The pass's context ends when its caller's does, or when Stop is
+	// called; the release below still uses the caller's own.
+	sctx, stopped := context.WithCancelCause(ctx)
+	defer stopped(nil)
+	unwatch := context.AfterFunc(stopping, func() { stopped(ErrStopping) })
+	defer unwatch()
+
 	deadline := r.Deadline
 	if deadline == 0 {
 		deadline = Deadline
@@ -102,12 +170,32 @@ func (r *Runner) Run(ctx context.Context, body Body) error {
 	}
 
 	end := r.Clock.Now().Add(deadline)
-	dctx, cancelDeadline := withDeadline(ctx, r.Clock, end)
+	dctx, cancelDeadline := withDeadline(sctx, r.Clock, end)
 	defer cancelDeadline()
 	held, err := r.Lease.Acquire(dctx)
 	if err != nil {
+		if errors.Is(context.Cause(sctx), ErrStopping) {
+			return ErrStopping
+		}
 		return err
 	}
+	// Each pass that takes the lease says when it starts and how it ended,
+	// so a pass that never ends, such as one in an instance Cloud Run
+	// stopped, shows as a start with no end.
+	began := r.Clock.Now()
+	log.Info("pass started", "deadline", end.UTC())
+	defer func() {
+		outcome := "finished"
+		switch {
+		case errors.Is(err, ErrStopping):
+			outcome = "stopped: the service is stopping"
+		case errors.Is(err, ErrLeaseLost):
+			outcome = "stopped: its lease was lost"
+		case err != nil:
+			outcome = "failed"
+		}
+		log.Info("pass ended", "outcome", outcome, "took", r.Clock.Since(began).Round(time.Millisecond).String())
+	}()
 	pctx, stop := context.WithCancelCause(dctx)
 	defer stop(nil)
 
@@ -167,6 +255,9 @@ func (r *Runner) Run(ctx context.Context, body Body) error {
 	}
 	if lost {
 		return errors.Join(context.Cause(pctx), berr)
+	}
+	if cut != nil && errors.Is(context.Cause(sctx), ErrStopping) {
+		return errors.Join(fmt.Errorf("pass stopped: %w", ErrStopping), berr)
 	}
 	if err := cut; err != nil {
 		// The pass was cut short, by its deadline or its caller, whatever

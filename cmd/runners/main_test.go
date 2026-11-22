@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"net"
+	"net/http"
 	"slices"
 	"strings"
 	"testing"
@@ -124,5 +127,69 @@ func TestKicker(t *testing.T) {
 	case <-ran:
 	case <-time.After(10 * time.Second):
 		t.Fatal("no pass ran after the report")
+	}
+}
+
+// TestStopReleasesThePassBeforeTheServer: when Cloud Run stops the
+// instance, a pass running in a request is ended and releases the lease,
+// and its request answers, before the server stops, well within the grace
+// Cloud Run gives, so another revision's pass needn't wait for the lease to
+// expire.
+func TestStopReleasesThePassBeforeTheServer(t *testing.T) {
+	emu := gcsemu.New()
+	defer emu.Close()
+	emu.CreateBucket("state")
+	objects, err := store.NewGCS(context.Background(), "state", emu.ClientOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer objects.Close()
+	clock := clockwork.NewRealClock()
+	passes := &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock}
+
+	running := make(chan struct{})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		err := passes.Run(r.Context(), func(p *pass.Pass) error {
+			close(running)
+			<-p.Context().Done()
+			return p.Context().Err()
+		})
+		if errors.Is(err, pass.ErrStopping) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	answer := make(chan int, 1)
+	go func() {
+		resp, err := http.Post("http://"+ln.Addr().String()+"/v1/reconcile", "application/json", nil)
+		if err != nil {
+			answer <- 0
+			return
+		}
+		resp.Body.Close()
+		answer <- resp.StatusCode
+	}()
+	<-running
+	if _, _, ok := emu.Object("state", pass.LeaseName); !ok {
+		t.Fatal("the pass holds no lease")
+	}
+	began := time.Now()
+	if err := stop(passes, srv, slog.Default()); err != nil {
+		t.Fatalf("stop = %v", err)
+	}
+	if took := time.Since(began); took > 2*time.Second {
+		t.Errorf("stopping took %s", took)
+	}
+	if code := <-answer; code != http.StatusServiceUnavailable {
+		t.Errorf("the pass's request answered %d, not 503", code)
+	}
+	if _, _, ok := emu.Object("state", pass.LeaseName); ok {
+		t.Fatal("the lease was left held")
 	}
 }

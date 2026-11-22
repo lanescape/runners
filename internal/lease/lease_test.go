@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -333,5 +334,44 @@ func TestAcquireFailsWhenStorageIsDown(t *testing.T) {
 	_, err := e.lease.Acquire(ctx)
 	if err == nil || errors.Is(err, lease.ErrHeld) {
 		t.Fatalf("acquire with storage down: %v, want an error other than ErrHeld", err)
+	}
+}
+
+// TestAHeldLeaseSaysWhoHoldsItAndUntilWhen: the lease records its owner,
+// and someone who finds it held learns who holds it and until when, as
+// ErrHeld; an owner that said nothing is named as such.
+func TestAHeldLeaseSaysWhoHoldsItAndUntilWhen(t *testing.T) {
+	ctx := context.Background()
+	e := setup(t)
+	e.lease.Owner = "lanescape-runners-00021-z5t"
+	held, err := e.lease.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = e.lease.Acquire(ctx)
+	var he *lease.HeldError
+	if !errors.Is(err, lease.ErrHeld) || !errors.As(err, &he) {
+		t.Fatalf("Acquire while held = %v", err)
+	}
+	if he.Owner != "lanescape-runners-00021-z5t" || !he.Expires.Equal(held.Expires()) {
+		t.Fatalf("held by %q until %s, want the owner until %s", he.Owner, he.Expires, held.Expires())
+	}
+	// A renewal keeps the owner.
+	e.clock.Advance(time.Minute)
+	if err := held.Renew(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.lease.Acquire(ctx); !errors.As(err, &he) || he.Owner != "lanescape-runners-00021-z5t" || !he.Expires.Equal(held.Expires()) {
+		t.Fatalf("after a renewal: %v", err)
+	}
+	if err := held.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	e.lease.Owner = ""
+	if _, err := e.lease.Acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.lease.Acquire(ctx); !errors.As(err, &he) || he.Owner != "" || !strings.Contains(err.Error(), "didn't say who") {
+		t.Fatalf("an owner that said nothing: %v", err)
 	}
 }

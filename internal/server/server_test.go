@@ -148,6 +148,8 @@ type env struct {
 	url   string
 	logs  *bytes.Buffer
 	logMu *sync.Mutex
+	// passes is the server's pass runner.
+	passes *pass.Runner
 }
 
 type lockedWriter struct {
@@ -195,6 +197,9 @@ func setupPass(t *testing.T, deadline time.Duration) *env {
 	clock := clockwork.NewRealClock()
 	pub := &publisher{}
 	rec := &reconciler{}
+	passLease := lease.New(objects, pass.LeaseName, pass.Validity, clock)
+	passLease.Owner = "lanescape-runners-test"
+	passes := &pass.Runner{Lease: passLease, Clock: clock, Logger: log, Deadline: deadline}
 	ev := &events{}
 	cl := &closings{pub: pub}
 	h, err := server.New(server.Config{
@@ -205,7 +210,7 @@ func setupPass(t *testing.T, deadline time.Duration) *env {
 		WebhookSecret:    secret,
 		Publisher:        pub,
 		ReconcileCallers: callers,
-		Passes:           &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log, Deadline: deadline},
+		Passes:           passes,
 		Reconciler:       rec,
 	})
 	if err != nil {
@@ -213,7 +218,7 @@ func setupPass(t *testing.T, deadline time.Duration) *env {
 	}
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
-	return &env{t: t, ev: ev, cl: cl, gh: gh, gg: gg, gcs: gcs, org: org, repo: repo, inst: inst, pub: pub, rec: rec, url: srv.URL, logs: logs, logMu: logMu}
+	return &env{t: t, ev: ev, cl: cl, gh: gh, gg: gg, gcs: gcs, org: org, repo: repo, inst: inst, pub: pub, rec: rec, url: srv.URL, logs: logs, logMu: logMu, passes: passes}
 }
 
 func (e *env) post(path, token, body string) (int, map[string]any) {
@@ -514,11 +519,40 @@ func TestReconcile(t *testing.T) {
 		if code != http.StatusServiceUnavailable || body["retryable"] != true {
 			t.Fatalf("push while a pass runs: %d %v, want a retryable 503", code, body)
 		}
+		// The log says who holds the lease, and until when.
+		e.logMu.Lock()
+		logged := e.logs.String()
+		e.logMu.Unlock()
+		if !strings.Contains(logged, `msg="a pass is running" holder=lanescape-runners-test expires=`) {
+			t.Fatalf("no holder in the log:\n%s", logged)
+		}
 		close(e.rec.block)
 		if code := <-done; code != http.StatusNoContent {
 			t.Fatalf("first pass: %d", code)
 		}
 	})
+}
+
+// TestReconcileWhileStopping: once the instance is stopping, a push or the
+// scheduler's call runs no pass and is answered with a retryable 503, so
+// Pub/Sub delivers it again, to an instance that isn't stopping.
+func TestReconcileWhileStopping(t *testing.T) {
+	e := setup(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := e.passes.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	code, body := e.post(server.ReconcilePath, e.gg.Token(pusher, audience), "{}")
+	if code != http.StatusServiceUnavailable || body["retryable"] != true || body["error"] != "this instance is stopping" {
+		t.Fatalf("reconcile while stopping: %d %v, want a retryable 503", code, body)
+	}
+	if e.rec.passes != 0 {
+		t.Fatal("a pass ran while stopping")
+	}
+	if _, _, ok := e.gcs.Object("state", pass.LeaseName); ok {
+		t.Fatal("a stopping instance took the lease")
+	}
 }
 
 func TestThereIsNoBindEndpoint(t *testing.T) {
