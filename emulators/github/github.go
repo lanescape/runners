@@ -163,6 +163,10 @@ type Run struct {
 	HeadRef string
 
 	Created time.Time
+	// Unindexed leaves the run out of every filtered runs list, by status
+	// or by creation, though the unfiltered list has it, as GitHub's
+	// search index sometimes does for a while.
+	Unindexed bool
 	// Updated is when its status last changed.
 	Updated   time.Time
 	Jobs      []*WorkflowJob

@@ -255,7 +255,7 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 		ReconcileCallers: callers,
 		Passes:           passes,
 		Reconciler:       reconciler(body),
-		Events:           dks,
+		Events:           machines.Events{Machines: svc, Others: dks},
 		Closings:         dks,
 		JobStarted:       svc.JobStarted(),
 		JobFinished:      svc.JobFinished(),

@@ -863,6 +863,9 @@ func (e *Emulator) listRuns(w http.ResponseWriter, r *http.Request, rp *Repo) {
 		if run.Repo != rp {
 			continue
 		}
+		if run.Unindexed && (status != "" || q.Get("created") != "") {
+			continue
+		}
 		if status != "" && ((runStatuses[status] && run.Status != status) || (!runStatuses[status] && run.Conclusion != status)) {
 			continue
 		}

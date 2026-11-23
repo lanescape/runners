@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -13,10 +14,13 @@ import (
 
 	"github.com/jonboulle/clockwork"
 
+	"github.com/lanescape/runners/config"
 	gcsemu "github.com/lanescape/runners/emulators/storage"
 	"github.com/lanescape/runners/endpoints"
 	"github.com/lanescape/runners/internal/deploy"
+	"github.com/lanescape/runners/internal/disks"
 	"github.com/lanescape/runners/internal/lease"
+	"github.com/lanescape/runners/internal/machines"
 	"github.com/lanescape/runners/internal/pass"
 	"github.com/lanescape/runners/internal/store"
 )
@@ -191,5 +195,42 @@ func TestStopReleasesThePassBeforeTheServer(t *testing.T) {
 	}
 	if _, _, ok := emu.Object("state", pass.LeaseName); ok {
 		t.Fatal("the lease was left held")
+	}
+}
+
+// TestPushedEventsAreRouted: a workflow_job delivery's queued run goes to the
+// machines' hints; any other pushed message goes to the disks' records.
+func TestPushedEventsAreRouted(t *testing.T) {
+	ctx := context.Background()
+	emu := gcsemu.New()
+	defer emu.Close()
+	emu.CreateBucket("state")
+	objects, err := store.NewGCS(ctx, "state", emu.ClientOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer objects.Close()
+	cfg, err := config.Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := clockwork.NewFakeClock()
+	ev := machines.Events{
+		Machines: &machines.Service{Config: cfg, Objects: objects, Clock: clock},
+		Others:   &disks.Service{Config: cfg, Objects: objects, Clock: clock},
+	}
+	queued := fmt.Sprintf(`{"action":"queued","workflow_job":{"id":7,"run_id":42,"labels":["lanescape-2vcpu-linux-amd64"]},"repository":{"id":5001,"owner":{"id":%d}}}`, cfg.Organization.ID)
+	if err := ev.RecordEvent(ctx, map[string]string{"event": "workflow_job"}, []byte(queued)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := emu.Object("state", "queued/5001/42/7.json"); !ok {
+		t.Fatal("the queued job's delivery left no hint")
+	}
+	// The same body as another event isn't a hint.
+	if err := ev.RecordEvent(ctx, map[string]string{"event": "workflow_run"}, []byte(strings.Replace(queued, "42", "43", 1))); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := emu.Object("state", "queued/5001/43/7.json"); ok {
+		t.Fatal("a workflow_run message left a hint")
 	}
 }

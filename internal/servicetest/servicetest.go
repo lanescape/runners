@@ -193,7 +193,7 @@ func New(t testing.TB, clock clockwork.Clock) *World {
 	body := pass.All(svc.Pass, dks.Pass)
 	handler, err = server.New(server.Config{
 		Logger: log, OrganizationID: orgID, WebhookSecret: []byte(secret), Publisher: pub, ReconcileCallers: callers,
-		Passes: passes, Reconciler: reconciler(body), Events: dks, Closings: dks, JobStarted: svc.JobStarted(), JobFinished: svc.JobFinished(),
+		Passes: passes, Reconciler: reconciler(body), Events: machines.Events{Machines: svc, Others: dks}, Closings: dks, JobStarted: svc.JobStarted(), JobFinished: svc.JobFinished(),
 		Disks: svc.DiskRequest(), CacheRestore: svc.CacheRestoreRequest(), CacheCheck: svc.CacheCheckRequest(), CacheSave: svc.CacheSaveRequest(),
 		CacheCommit: svc.CacheCommitRequest(),
 	})
