@@ -94,22 +94,16 @@ runs:
         fi
         build go build -trimpath -o "$bin" "./actions/$name"
         echo "bin=$bin" >> "$GITHUB_OUTPUT"
-    # Without Git 2.18 or newer, actions/checkout downloads an archive
-    # rather than a repository, and the program couldn't confirm HEAD or
-    # the git config (specs/0007-actions.md, How actions run).
+    # Without Git, actions/checkout downloads an archive rather than a
+    # repository, and the program couldn't confirm HEAD or the git config.
+    # Every system the actions support has a Git newer than the 2.18
+    # actions/checkout needs, so only whether there's one is checked
+    # (specs/0007-actions.md, How actions run).
     - name: Check for Git
       shell: bash
       run: |
-        version="$(git --version 2>/dev/null || true)"
-        parts="$(printf '%s\n' "$version" | sed -n 's/^git version \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p')"
-        if [ -z "$parts" ]; then
-          echo "::error::checkout needs Git 2.18 or newer, and there's no Git here"
-          exit 1
-        fi
-        major="${parts% *}"
-        minor="${parts#* }"
-        if [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt 18 ]; }; then
-          echo "::error::checkout needs Git 2.18 or newer, and Git here is $major.$minor"
+        if ! git --version >/dev/null 2>&1; then
+          echo "::error::checkout needs Git, and there's no working git on PATH here"
           exit 1
         fi
     - name: Decide what to check out

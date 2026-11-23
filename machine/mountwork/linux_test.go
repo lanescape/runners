@@ -82,11 +82,10 @@ func (d *loopDisk) mountOnce() string {
 	return cfg.Mountpoint
 }
 
+// tool is one of Debian's tools in /usr/sbin, where merged /usr puts /sbin's too.
 func tool(t *testing.T, name string) string {
-	for _, dir := range []string{"/usr/sbin", "/sbin"} {
-		if p := filepath.Join(dir, name); fileExists(p) {
-			return p
-		}
+	if p := filepath.Join("/usr/sbin", name); fileExists(p) {
+		return p
 	}
 	t.Skipf("no %s", name)
 	return ""

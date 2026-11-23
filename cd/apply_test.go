@@ -68,7 +68,7 @@ esac
 // bash is a Bash of at least 4.4, which the script needs, as Ubuntu's is.
 func bash(t *testing.T) string {
 	t.Helper()
-	for _, p := range []string{"/opt/homebrew/bin/bash", "/usr/local/bin/bash", "/bin/bash", "/usr/bin/bash"} {
+	for _, p := range []string{"/opt/homebrew/bin/bash", "/usr/local/bin/bash", "/bin/bash"} {
 		out, err := exec.Command(p, "-c", `echo "${BASH_VERSINFO[0]} ${BASH_VERSINFO[1]}"`).Output()
 		if err != nil {
 			continue

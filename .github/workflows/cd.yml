@@ -39,7 +39,7 @@ jobs:
   gate:
     name: May deploy
     needs: checks
-    runs-on: ${{ github.repository_owner_id == '303994381' && 'blacksmith-2vcpu-ubuntu-2604' || 'ubuntu-24.04' }}
+    runs-on: ${{ github.repository_owner_id == '303994381' && 'blacksmith-2vcpu-ubuntu-2604' || 'ubuntu-26.04' }}
     outputs:
       deploy: ${{ steps.gate.outputs.deploy }}
     steps:

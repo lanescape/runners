@@ -27,7 +27,7 @@ func answer(e *env, path, body string) {
 }
 
 func TestCacheNames(t *testing.T) {
-	for n, ok := range map[string]bool{"a": true, "chromium-out-linux": true, "go-1": true, strings.Repeat("a", 32): true,
+	for n, ok := range map[string]bool{"a": true, "build-out-linux": true, "go-1": true, strings.Repeat("a", 32): true,
 		"": false, "1a": false, "a-": false, "-a": false, "A": false, "a_b": false, "a/b": false, strings.Repeat("a", 33): false} {
 		if ValidCacheName(n) != ok {
 			t.Errorf("%q: %v", n, !ok)

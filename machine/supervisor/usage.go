@@ -15,10 +15,10 @@ import (
 // Usage is what the machine used while its runner ran (specs/0002-machines.md,
 // What a job used), measured from the kernel's own counters for the whole
 // machine, which serves that one job. It holds numbers alone: no process,
-// command line, path or anything else a job's steps name. What the kernel
-// doesn't offer, or a counter that couldn't be read at the start, is left
-// out, as zero, or as nil for OOMKills and Pressure, whose zero means
-// something.
+// command line, path or anything else a job's steps name. A counter given
+// as its change over the job, CPU time, OOM kills, pressure or disk I/O,
+// that couldn't be read at the start is left out, as zero, or as nil for
+// OOMKills and Pressure, whose zero means something.
 type Usage struct {
 	// From and To are when the runner started and exited, by the
 	// machine's clock.
@@ -47,9 +47,10 @@ type Usage struct {
 	RootPeak int64 `json:"root_peak,omitempty"`
 	WorkSize int64 `json:"work_size,omitempty"`
 	WorkPeak int64 `json:"work_peak,omitempty"`
-	// Pressure is how long some, or all, of the machine's runnable work
-	// was stalled for want of CPU, memory or I/O, from the kernel's
-	// pressure stall information, if it has any.
+	// Pressure is how long some of the machine's runnable work was stalled
+	// for want of CPU, memory or I/O, and how long all of it was for want of
+	// memory or I/O, from the kernel's pressure stall information, which
+	// Debian 13's kernel has on.
 	Pressure *Pressure `json:"pressure,omitempty"`
 	// Samples is how many times memory and filesystems were sampled.
 	Samples int `json:"samples"`
@@ -133,9 +134,7 @@ func (m *meter) sample() {
 	m.u.Samples++
 	if mi, ok := m.meminfo(); ok {
 		m.u.MemTotal = mi["MemTotal"]
-		if avail, ok := mi["MemAvailable"]; ok {
-			m.u.MemPeak = max(m.u.MemPeak, mi["MemTotal"]-avail)
-		}
+		m.u.MemPeak = max(m.u.MemPeak, mi["MemTotal"]-mi["MemAvailable"])
 		m.u.SwapPeak = max(m.u.SwapPeak, mi["SwapTotal"]-mi["SwapFree"])
 	}
 	if size, used, ok := fsUse(m.root); ok {
@@ -230,7 +229,8 @@ func (m *meter) cpuTimes() (cpuTimes, int, bool) {
 	return t, cpus, found
 }
 
-// meminfo reads /proc/meminfo, in bytes.
+// meminfo reads /proc/meminfo, in bytes. It has MemTotal and MemAvailable,
+// as Debian 13's kernel always gives them, or it isn't read at all.
 func (m *meter) meminfo() (map[string]int64, bool) {
 	b, ok := m.read("meminfo")
 	if !ok {
@@ -252,8 +252,9 @@ func (m *meter) meminfo() (map[string]int64, bool) {
 		}
 		out[k] = n
 	}
-	_, ok = out["MemTotal"]
-	return out, ok
+	_, total := out["MemTotal"]
+	_, avail := out["MemAvailable"]
+	return out, total && avail
 }
 
 // vmstat reads one of /proc/vmstat's counters.

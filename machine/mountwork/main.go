@@ -155,10 +155,11 @@ func (s realSystem) Format(device string, uid, gid int) error {
 // as it is, and resize2fs exits 0.
 func (s realSystem) Grow(device string) error { return run(s.resize2fs, device) }
 
-// run runs one of Debian's tools, saying what it said if it fails.
+// run runs one of Debian's tools, saying what it said if it fails. Its PATH
+// needs no /sbin or /bin: Debian 13's /usr is merged, so they're /usr's.
 func run(tool string, args ...string) error {
 	cmd := exec.Command(tool, args...)
-	cmd.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C"}
+	cmd.Env = []string{"PATH=/usr/sbin:/usr/bin", "LANG=C"}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%v: %s", err, bytes.TrimSpace(out))
 	}

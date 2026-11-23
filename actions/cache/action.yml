@@ -10,7 +10,7 @@ inputs:
     required: true
   path:
     description: >
-      The directory to restore the cache under, such as /work/chromium;
+      The directory to restore the cache under, such as /work/build;
       made if it isn't there. Unused with check-only.
     required: false
     default: ''

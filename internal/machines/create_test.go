@@ -83,7 +83,7 @@ func TestNoMachine(t *testing.T) {
 		"a selector naming a run":    func(e *env) { e.queue(e.mainRun(), sel2+"-run-1") },
 		"a selector naming an image": func(e *env) { e.queue(e.gh.PushRun(e.repo, "main"), sel2+"-image-build") },
 		"a selector naming a disk":   func(e *env) { e.queue(e.mainRun(), sel2+"-disk-build") },
-		"GitHub's own runners":       func(e *env) { e.queue(e.mainRun(), "ubuntu-24.04") },
+		"GitHub's own runners":       func(e *env) { e.queue(e.mainRun(), "ubuntu-26.04") },
 		"another architecture":       func(e *env) { e.queue(e.mainRun(), sel2, "arm64") },
 		"a job still in review": func(e *env) {
 			e.gh.Queue(e.mainRun(), ghemu.JobSpec{Labels: []string{sel2}, Environment: "contribution"})

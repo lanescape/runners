@@ -435,7 +435,7 @@ func TestAnEndedJobInARunStillInProgressIsFound(t *testing.T) {
 	run := e.mainRun()
 	j := e.queue(run, sel2)
 	// Another of the run's jobs, on GitHub's own runners, keeps it going.
-	other := e.queue(run, "ubuntu-latest")
+	other := e.queue(run, "ubuntu-26.04")
 	e.gh.RunJob(other)
 	m := e.boot(e.one())
 	m.taken(j)

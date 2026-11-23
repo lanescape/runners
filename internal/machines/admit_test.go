@@ -656,7 +656,7 @@ func TestARefusedAttemptDoesntCancelARerun(t *testing.T) {
 	e.gcs.Put("state", "refusals/5001/"+strconv.FormatInt(fork.ID, 10)+"-1.json", b)
 	e.gh.SetRunStatus(fork, "completed")
 	e.gh.Rerun(fork)
-	j := e.gh.Queue(fork, ghemu.JobSpec{Labels: []string{"ubuntu-24.04"}})
+	j := e.gh.Queue(fork, ghemu.JobSpec{Labels: []string{"ubuntu-26.04"}})
 	e.pass()
 	if st, _ := e.gh.RunState(fork); st == "completed" || e.gh.Job(j.ID).Status != "queued" {
 		t.Fatal("following up an earlier attempt's refusal cancelled the rerun")

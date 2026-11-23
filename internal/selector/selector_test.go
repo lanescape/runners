@@ -90,7 +90,7 @@ func TestOfJob(t *testing.T) {
 			t.Errorf("OfJob(%v) = %v, %v", ok, s, err)
 		}
 	}
-	for _, none := range [][]string{nil, {"self-hosted"}, {"ubuntu-24.04"}, {"self-hosted", "linux"}} {
+	for _, none := range [][]string{nil, {"self-hosted"}, {"ubuntu-26.04"}, {"self-hosted", "linux"}} {
 		if _, err := selector.OfJob(none); !errors.Is(err, selector.ErrNoSelector) {
 			t.Errorf("OfJob(%v) = %v, want no selector", none, err)
 		}
