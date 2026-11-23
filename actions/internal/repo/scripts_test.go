@@ -174,8 +174,9 @@ func TestTheReleasesTagQuery(t *testing.T) {
 	}
 }
 
-// checkout checks for Git 2.18 or newer before it calls actions/checkout,
-// and fails, saying so, without it.
+// checkout checks for Git before it calls actions/checkout, and fails,
+// saying so, without it: with no git at all, or with one that can't run,
+// such as macOS's stand-in before the command line tools are installed.
 func TestCheckoutNeedsGit(t *testing.T) {
 	sh := bash(t)
 	if runtime.GOOS == "windows" {
@@ -188,28 +189,18 @@ func TestCheckoutNeedsGit(t *testing.T) {
 		t.Fatalf("checkout checks for Git at step %d, and calls actions/checkout at %d", git, co)
 	}
 	script := stepScript(t, filepath.Join(actionsDir, "checkout", "action.yml"), "Check for Git")
-	sed, err := exec.LookPath("sed")
-	if err != nil {
-		t.Skip("no sed")
-	}
 	for _, tc := range []struct {
-		name, version string
-		says          string
+		name string
+		git  string // the stand-in's script, if there's one
+		says string
 	}{
-		{name: "no Git", says: "there's no Git here"},
-		{name: "Git 1.9", version: "git version 1.9.5", says: "Git here is 1.9"},
-		{name: "Git 2.17", version: "git version 2.17.1", says: "Git here is 2.17"},
-		{name: "Git 2.18", version: "git version 2.18.0"},
-		{name: "Apple's Git", version: "git version 2.39.5 (Apple Git-154)"},
-		{name: "Git for Windows", version: "git version 2.47.1.windows.2"},
-		{name: "Git 3", version: "git version 3.0.0"},
+		{name: "no Git", says: "there's no working git on PATH here"},
+		{name: "a git that can't run", git: "echo 'xcrun: error: invalid active developer path' >&2\nexit 1\n", says: "there's no working git on PATH here"},
+		{name: "Git", git: "echo 'git version 2.53.0'\n"},
 	} {
 		dir := t.TempDir()
-		if err := os.Symlink(sed, filepath.Join(dir, "sed")); err != nil {
-			t.Fatal(err)
-		}
-		if tc.version != "" {
-			stub := "#!" + sh + "\n[ \"$1\" = --version ] && echo '" + tc.version + "'\n"
+		if tc.git != "" {
+			stub := "#!" + sh + "\n[ \"$1\" = --version ] || exit 2\n" + tc.git
 			if err := os.WriteFile(filepath.Join(dir, "git"), []byte(stub), 0o755); err != nil {
 				t.Fatal(err)
 			}
@@ -223,7 +214,7 @@ func TestCheckoutNeedsGit(t *testing.T) {
 			}
 			continue
 		}
-		if err == nil || !strings.Contains(string(b), "::error::checkout needs Git 2.18 or newer") || !strings.Contains(string(b), tc.says) {
+		if err == nil || !strings.Contains(string(b), "::error::checkout needs Git,") || !strings.Contains(string(b), tc.says) {
 			t.Errorf("%s: err = %v\n%s", tc.name, err, b)
 		}
 	}

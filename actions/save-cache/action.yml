@@ -9,7 +9,7 @@ inputs:
     description: The cache's name, as .github/runners.json declares it at the run's commit.
     required: true
   path:
-    description: The directory to save, such as /work/chromium.
+    description: The directory to save, such as /work/build.
     required: true
   exclude:
     description: >

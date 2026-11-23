@@ -9,10 +9,19 @@ The specs in [`specs/`](specs/) describe what it does:
 - [0001 Architecture](specs/0001-architecture.md): the service, the organization-only guards, endpoints, passes, forks and contributions.
 - [0002 Machines](specs/0002-machines.md): selectors, scopes and long-lived branches, binding a run, failing a job with its reason, a machine's life, the work disk, setting up a machine, preemption, and what's to be confirmed on real GitHub.
 - [0003 Base images, caches and resume images](specs/0003-disks.md): base images, caches' keys, restoring and saving caches, resume images, and deleting them as early as nothing needs them.
-- [0004 Code, tests and deployment](specs/0004-deployment.md): Go, our own emulators, CI and CD on Blacksmith, Terraform through Infrastructure Manager, and the actions' `v1` tag, which moves once its commit is deployed.
+- [0004 Code, tests and deployment](specs/0004-deployment.md): Go, our own emulators, CI and CD on Blacksmith, the systems they support, Terraform through Infrastructure Manager, and the actions' `v1` tag, which moves once its commit is deployed.
 - [0005 The interface for actions](specs/0005-interface.md): selectors, `.github/runners.json`, work disks and caches, and what the actions may rely on, versioned as `/v1/`.
 - [0006 Build tools](specs/0006-tools.md): the organization's private bucket of build tools, its layout, who reads it and how; apart from the service.
 - [0007 Actions](specs/0007-actions.md): the actions in `actions/`, `disk`, `checkout`, `cache` and `save-cache`, how each degrades outside the organization, and how they're built and tested.
+
+## Supported systems
+
+The organization's CI and CD runs on these systems, and on none older (specs/0004-deployment.md, Supported systems):
+
+- **Linux:** Debian 13 (trixie), with its Linux 6.12 LTS kernel, on the service's own machines, whose base images are made from it; and Ubuntu 26.04 on GitHub's and Blacksmith's runners, `ubuntu-26.04`, `ubuntu-26.04-arm`, `blacksmith-<vCPUs>vcpu-ubuntu-2604` and `blacksmith-<vCPUs>vcpu-ubuntu-2604-arm`.
+- **macOS:** macOS 26.2, the version of the macOS SDK the organization's builds use, `MacOSX26.2.sdk` from Xcode 26.3 (Build tools, below), on GitHub's `macos-26` and Blacksmith's `blacksmith-<vCPUs>vcpu-macos-26`.
+
+Nothing here keeps a fallback for an older kernel, distribution or macOS. The actions also build for Windows on amd64, for GitHub's Windows runners, with no minimum version set.
 
 ## Build tools
 
@@ -29,6 +38,6 @@ go test -race ./...         # with the actions' end-to-end tests against the ser
 go test -short -race ./...  # without them
 ```
 
-Tests need nothing but Go, at the version `go.mod` names: they run against this repository's own emulators of GitHub and Google Cloud.
+Tests run against this repository's own emulators of GitHub and Google Cloud, and need no cloud or account. They need Go, at the version `go.mod` names, Git, Bash, curl and jq, and on Linux a C compiler, since `-race` builds with cgo there. The tests of `cd/apply.sh` also need Bash 4.4 or newer, as Ubuntu has, and skip without it: macOS's own `/bin/bash` is 3.2, so on a Mac they look for Homebrew's too.
 
 Licensed under the [MIT License](LICENSE).

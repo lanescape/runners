@@ -134,17 +134,24 @@ func TestTheReportSaysWhatTheMachineUsed(t *testing.T) {
 	}
 }
 
-// A kernel without pressure stall information, or a counter that couldn't
-// be read at the start, gives nothing for it, not a total since boot: here
-// they can be read only at the end, which the job's steps write.
+// A counter that couldn't be read at the start gives nothing, not a total
+// since boot: here they can be read only at the end, which the job's steps
+// write.
 func TestWhatTheKernelDoesntSayIsLeftOut(t *testing.T) {
 	e := setup(t, jit, steps(t))
-	for _, name := range []string{"pressure", "vmstat", "diskstats"} {
+	for _, name := range []string{"pressure/cpu", "pressure/memory", "pressure/io", "vmstat", "diskstats"} {
 		if err := os.RemoveAll(filepath.Join(e.cfg.Proc, name)); err != nil {
 			t.Fatal(err)
 		}
 	}
 	e.supervise()
+	// The job's steps wrote them again, so only the start's readings were
+	// missing.
+	for _, name := range []string{"pressure/cpu", "pressure/memory", "pressure/io", "vmstat", "diskstats"} {
+		if b, err := os.ReadFile(filepath.Join(e.cfg.Proc, name)); err != nil || string(b) != endProc[name] {
+			t.Fatalf("%s at the end: %q, %v", name, b, err)
+		}
+	}
 	u := e.usage(0)
 	if u == nil || u.Pressure != nil || u.OOMKills != nil || u.DiskRead != 0 || u.DiskWritten != 0 || u.CPUBusyMS != 3000 {
 		t.Fatalf("usage = %+v", u)
@@ -152,6 +159,38 @@ func TestWhatTheKernelDoesntSayIsLeftOut(t *testing.T) {
 	for _, field := range []string{"pressure", "oom_kills", "disk_read", "disk_written"} {
 		if strings.Contains(e.svc.reports[0], field) {
 			t.Fatalf("report = %s", e.svc.reports[0])
+		}
+	}
+}
+
+// A sample whose meminfo lacks MemTotal or MemAvailable records neither
+// memory nor swap, never a figure worked out from one that isn't there;
+// the samples before it still count.
+func TestMeminfoNeedsTotalAndAvailable(t *testing.T) {
+	const swap = "SwapTotal:      1000000 kB\nSwapFree:        400000 kB\n"
+	for name, content := range map[string]string{
+		"no MemAvailable": "MemTotal:       8000000 kB\nMemFree:         500000 kB\n" + swap,
+		"no MemTotal":     "MemFree:         500000 kB\nMemAvailable:   2000000 kB\n" + swap,
+	} {
+		dir := t.TempDir()
+		writeProc(t, dir, map[string]string{"meminfo": content})
+		m := newMeter(dir, dir, filepath.Join(dir, "work"), time.Second)
+		if _, ok := m.meminfo(); ok {
+			t.Errorf("%s: meminfo was read", name)
+		}
+		m.sample()
+		if m.u.MemTotal != 0 || m.u.MemPeak != 0 || m.u.SwapPeak != 0 || m.u.Samples != 1 {
+			t.Errorf("%s: usage = %+v", name, m.u)
+		}
+		// A whole sample, with 200,000 kB of swap in use, and then another
+		// without, whose 600,000 kB of swap isn't recorded.
+		writeProc(t, dir, map[string]string{"meminfo": "MemTotal:       8000000 kB\nMemAvailable:   2000000 kB\n" +
+			"SwapTotal:      1000000 kB\nSwapFree:        800000 kB\n"})
+		m.sample()
+		writeProc(t, dir, map[string]string{"meminfo": content})
+		m.sample()
+		if m.u.MemTotal != 8000000*1024 || m.u.MemPeak != 6000000*1024 || m.u.SwapPeak != 200000*1024 || m.u.Samples != 3 {
+			t.Errorf("%s: after a whole sample, usage = %+v", name, m.u)
 		}
 	}
 }

@@ -21,7 +21,7 @@ jobs:
     # The organization's own pull requests, and its pushes to main through
     # cd.yml, run on Blacksmith. A fork's pull request runs on GitHub's
     # runners, since nothing in CI needs anything of ours.
-    runs-on: ${{ github.repository_owner_id == '303994381' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'blacksmith-2vcpu-ubuntu-2604' || 'ubuntu-24.04' }}
+    runs-on: ${{ github.repository_owner_id == '303994381' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'blacksmith-2vcpu-ubuntu-2604' || 'ubuntu-26.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -110,7 +110,7 @@ jobs:
 
   build:
     name: Build every action for every platform
-    runs-on: ${{ github.repository_owner_id == '303994381' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'blacksmith-2vcpu-ubuntu-2604' || 'ubuntu-24.04' }}
+    runs-on: ${{ github.repository_owner_id == '303994381' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'blacksmith-2vcpu-ubuntu-2604' || 'ubuntu-26.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -134,7 +134,7 @@ jobs:
 
   terraform:
     name: Terraform
-    runs-on: ${{ github.repository_owner_id == '303994381' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'blacksmith-2vcpu-ubuntu-2604' || 'ubuntu-24.04' }}
+    runs-on: ${{ github.repository_owner_id == '303994381' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'blacksmith-2vcpu-ubuntu-2604' || 'ubuntu-26.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
