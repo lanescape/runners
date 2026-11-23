@@ -154,6 +154,23 @@ func (s *Service) inventory(p *pass.Pass) *inventory {
 		inv.repos[r.ID] = r
 		inv.queues = append(inv.queues, s.readQueue(qctx, r))
 	}
+	// Then, once every repository's listed runs are read, the hinted runs
+	// the lists left out (queued.go), in a budget of their own, so that
+	// they never hold up the listed ones. Without the hints, a run they
+	// left out can't be told from one that's finished, so cleanup keeps
+	// its jobs' records.
+	hctx, hcancel := p.Within(HintDeadline)
+	defer hcancel()
+	hints, hintsComplete := s.readHintObjects(hctx)
+	for _, q := range inv.queues {
+		if !hintsComplete {
+			q.complete = false
+		}
+		s.readHints(hctx, q, hints[q.repo.ID])
+		slices.SortFunc(q.jobs, func(a, b github.Job) int {
+			return cmp.Or(a.CreatedAt.Compare(b.CreatedAt), cmp.Compare(a.ID, b.ID))
+		})
+	}
 	slices.SortFunc(inv.queues, func(a, b *queue) int { return cmp.Compare(a.repo.ID, b.repo.ID) })
 	return inv
 }
@@ -266,10 +283,19 @@ func (s *Service) readQueue(ctx context.Context, repo github.Repository) *queue 
 		ids = append(ids, id)
 	}
 	slices.Sort(ids)
+	s.readJobs(ctx, q, ids)
+	slices.SortFunc(q.jobs, func(a, b github.Job) int {
+		return cmp.Or(a.CreatedAt.Compare(b.CreatedAt), cmp.Compare(a.ID, b.ID))
+	})
+	return q
+}
+
+// readJobs adds the queued jobs of runs to q.
+func (s *Service) readJobs(ctx context.Context, q *queue, ids []int64) {
 	for _, id := range ids {
-		jobs, err := s.GitHub.RunJobs(ctx, repo, id)
+		jobs, err := s.GitHub.RunJobs(ctx, q.repo, id)
 		if err != nil {
-			s.log().Error("listing jobs", "repository_id", repo.ID, "run_id", id, "err", err.Error())
+			s.log().Error("listing jobs", "repository_id", q.repo.ID, "run_id", id, "err", err.Error())
 			q.complete = false
 			continue
 		}
@@ -280,10 +306,6 @@ func (s *Service) readQueue(ctx context.Context, repo github.Repository) *queue 
 			}
 		}
 	}
-	slices.SortFunc(q.jobs, func(a, b github.Job) int {
-		return cmp.Or(a.CreatedAt.Compare(b.CreatedAt), cmp.Compare(a.ID, b.ID))
-	})
-	return q
 }
 
 func (inv *inventory) refused(m string) bool {

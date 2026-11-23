@@ -19,6 +19,7 @@
 //	disks/<disk>.json                  a work disk, with its family, recorded before it's made
 //	refusals/<repository>/<run>-<attempt>.json  a run attempt refused or cancelled, until GitHub shows it finished
 //	jobs/<repository>/<job>.json       when a queued job's first machine was made
+//	queued/<repository>/<run>/<job>.json  a queued job, from its delivery, for passes to look its run up (queued.go)
 //	logs/<machine>-<created>.txt       a deleted machine's boot log
 package machines
 
