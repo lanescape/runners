@@ -31,6 +31,10 @@ const (
 // ErrHeld means another pass is running.
 var ErrHeld = lease.ErrHeld
 
+// ErrStopping means the service is stopping: Stop has been called, so no
+// pass starts, and a running one was ended.
+var ErrStopping = errors.New("the service is stopping")
+
 // ErrLeaseLost is the cause of a pass's context ending when a renewal fails.
 var ErrLeaseLost = errors.New("pass stopped: its lease could not be renewed")
 
@@ -52,6 +56,69 @@ type Runner struct {
 	// they move the clock on: a renewal seen in storage may still be in
 	// flight, and moving the clock past its deadline would end it.
 	renewed func()
+	// stopMarked, if set, is called once Stop has marked the runner
+	// stopping and ended its passes. Tests use it to know Stop has begun.
+	stopMarked func()
+
+	mu       sync.Mutex
+	stopping context.Context // ended by Stop
+	stop     context.CancelFunc
+	running  sync.WaitGroup
+	// passes are the running passes' own cancels, which Stop calls under
+	// mu, so a pass registered before Stop is ended by it, and one that
+	// would register after finds the service stopping.
+	passes map[*int]context.CancelCauseFunc
+}
+
+// init makes the context Stop ends, once. The caller holds mu.
+func (r *Runner) init() {
+	if r.stopping == nil {
+		r.stopping, r.stop = context.WithCancel(context.Background())
+	}
+}
+
+// begin counts a pass in, and gives the context Stop ends; false once
+// stopping.
+func (r *Runner) begin() (context.Context, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.init()
+	if r.stopping.Err() != nil {
+		return nil, false
+	}
+	r.running.Add(1)
+	return r.stopping, true
+}
+
+// Stop ends every running pass and starts no other: each running pass's
+// context ends at once, and the pass releases the lease as one its caller
+// cut short does, so that the next pass, in another instance or revision,
+// can run at once rather than once the lease expires. It returns once every
+// pass has returned, or with ctx's error if ctx ends first. The service
+// calls it when Cloud Run stops an instance, which gives it 10 seconds
+// before ending it (specs/0001-architecture.md, Passes).
+func (r *Runner) Stop(ctx context.Context) error {
+	r.mu.Lock()
+	r.init()
+	r.stop()
+	for _, cancel := range r.passes {
+		cancel(ErrStopping)
+	}
+	r.mu.Unlock()
+	if r.stopMarked != nil {
+		r.stopMarked()
+	}
+	done := make(chan struct{})
+	go func() {
+		r.running.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Pass is one running pass.
@@ -86,8 +153,16 @@ func minTime(a, b time.Time) time.Time {
 func (p *Pass) Lost() bool { return errors.Is(context.Cause(p.ctx), ErrLeaseLost) }
 
 // Run takes the lease and runs body under it. It returns ErrHeld, without
-// running body, if another pass holds the lease.
-func (r *Runner) Run(ctx context.Context, body Body) error {
+// running body, if another pass holds the lease, and ErrStopping, without
+// taking it, once Stop has been called. A pass Stop ends returns an error
+// that wraps ErrStopping.
+func (r *Runner) Run(ctx context.Context, body Body) (err error) {
+	stopping, ok := r.begin()
+	if !ok {
+		return ErrStopping
+	}
+	defer r.running.Done()
+
 	deadline := r.Deadline
 	if deadline == 0 {
 		deadline = Deadline
@@ -104,12 +179,61 @@ func (r *Runner) Run(ctx context.Context, body Body) error {
 	end := r.Clock.Now().Add(deadline)
 	dctx, cancelDeadline := withDeadline(ctx, r.Clock, end)
 	defer cancelDeadline()
+	// Taking the lease isn't cut short by Stop: a write ended mid-flight
+	// may have taken the lease with no one left who knows it. It settles,
+	// then a pass that finds the service stopping gives the lease back at
+	// once.
 	held, err := r.Lease.Acquire(dctx)
 	if err != nil {
+		if stopping.Err() != nil {
+			return ErrStopping
+		}
 		return err
 	}
+	// The pass's own context ends at its deadline, when its caller goes,
+	// when its lease is lost, or when Stop is called: Stop ends it under
+	// the runner's lock, so either it's registered before Stop and ended
+	// by it, or it finds the service stopping and gives the lease back.
 	pctx, stop := context.WithCancelCause(dctx)
 	defer stop(nil)
+	key := new(int)
+	r.mu.Lock()
+	if stopping.Err() != nil {
+		r.mu.Unlock()
+		rctx, cancel := withDeadline(context.WithoutCancel(ctx), r.Clock, r.Clock.Now().Add(releaseLimit))
+		defer cancel()
+		if err := held.Release(rctx); err != nil {
+			log.Warn("pass lease release failed; it will expire", "err", err)
+		}
+		return ErrStopping
+	}
+	if r.passes == nil {
+		r.passes = map[*int]context.CancelCauseFunc{}
+	}
+	r.passes[key] = stop
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		delete(r.passes, key)
+		r.mu.Unlock()
+	}()
+	// Each pass that takes the lease says when it starts and how it ended,
+	// so a pass that never ends, such as one in an instance Cloud Run
+	// stopped, shows as a start with no end.
+	began := r.Clock.Now()
+	log.Info("pass started", "deadline", end.UTC())
+	defer func() {
+		outcome := "finished"
+		switch {
+		case errors.Is(err, ErrStopping):
+			outcome = "stopped: the service is stopping"
+		case errors.Is(err, ErrLeaseLost):
+			outcome = "stopped: its lease was lost"
+		case err != nil:
+			outcome = "failed"
+		}
+		log.Info("pass ended", "outcome", outcome, "took", r.Clock.Since(began).Round(time.Millisecond).String())
+	}()
 
 	done := make(chan struct{})
 	var wg sync.WaitGroup
@@ -130,9 +254,10 @@ func (r *Runner) Run(ctx context.Context, body Body) error {
 			rctx, cancel := withDeadline(pctx, r.Clock, r.Clock.Now().Add(every))
 			err := held.Renew(rctx)
 			cancel()
-			if err != nil && dctx.Err() != nil {
-				// The pass reached its deadline mid-renewal: it's over,
-				// but its lease wasn't shown lost.
+			if err != nil && pctx.Err() != nil {
+				// The pass ended mid-renewal, at its deadline or as the
+				// service stops: it's over, but its lease wasn't shown
+				// lost, and the release settles it.
 				return
 			}
 			if err != nil {
@@ -151,6 +276,10 @@ func (r *Runner) Run(ctx context.Context, body Body) error {
 	wg.Wait()
 
 	lost := errors.Is(context.Cause(pctx), ErrLeaseLost)
+	// Stopped as the service stops, whatever ended the context first: a
+	// deadline that fired at the same moment as Stop still leaves a lease
+	// the next instance's passes would wait for.
+	stopped := errors.Is(context.Cause(pctx), ErrStopping) || stopping.Err() != nil
 	// Whether the body was cut short is decided when it returns; the
 	// release after it doesn't change that.
 	cut := dctx.Err()
@@ -158,15 +287,34 @@ func (r *Runner) Run(ctx context.Context, body Body) error {
 	// release is capped by the deadline like every other call. A pass that
 	// reached its deadline, or whose renewal failed, leaves the lease to
 	// expire.
-	if !lost && r.Clock.Now().Before(end) {
-		rctx, cancel := withDeadline(context.WithoutCancel(ctx), r.Clock, minTime(r.Clock.Now().Add(releaseLimit), end))
+	// A pass the service stopped releases even if its deadline came
+	// meanwhile: the lease, valid well past the deadline, is still its own,
+	// and the next instance's passes would otherwise wait for it.
+	if !lost && (r.Clock.Now().Before(end) || stopped) {
+		releaseBy := minTime(r.Clock.Now().Add(releaseLimit), end)
+		if stopped {
+			releaseBy = r.Clock.Now().Add(releaseLimit)
+		}
+		rctx, cancel := withDeadline(context.WithoutCancel(ctx), r.Clock, releaseBy)
 		defer cancel()
-		if err := held.Release(rctx); err != nil {
+		err := held.Release(rctx)
+		if err != nil && stopping.Err() != nil {
+			// The service began stopping while the release was under way,
+			// perhaps with little of the pass's time left: once more, in a
+			// window of its own.
+			rctx2, cancel2 := withDeadline(context.WithoutCancel(ctx), r.Clock, r.Clock.Now().Add(releaseLimit))
+			defer cancel2()
+			err = held.Release(rctx2)
+		}
+		if err != nil {
 			log.Warn("pass lease release failed; it will expire", "err", err)
 		}
 	}
 	if lost {
 		return errors.Join(context.Cause(pctx), berr)
+	}
+	if stopped {
+		return errors.Join(fmt.Errorf("pass stopped: %w", ErrStopping), berr)
 	}
 	if err := cut; err != nil {
 		// The pass was cut short, by its deadline or its caller, whatever
@@ -236,7 +384,9 @@ func All(bodies ...Body) Body {
 	return func(p *Pass) error {
 		var errs []error
 		for _, b := range bodies {
-			if p.Lost() {
+			// A pass whose lease was lost, or that the service's stopping
+			// or its deadline ended, starts no further part.
+			if p.Context().Err() != nil {
 				errs = append(errs, context.Cause(p.Context()))
 				break
 			}

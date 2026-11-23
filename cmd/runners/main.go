@@ -13,6 +13,7 @@
 //	RUNNERS_GITHUB_APP_KEY_FILE  the App's private key, mounted from Secret Manager
 //	RUNNERS_WEBHOOK_SECRET_FILE  the App's webhook secret, mounted from Secret Manager
 //	RUNNERS_RECONCILE_ACCOUNTS   the scheduler's and push subscriptions' accounts, comma-separated
+//	K_REVISION                   Cloud Run's name for the revision, recorded in the pass's lease while this one holds it
 //
 // The audience every caller's token must name is endpoints.Service, the
 // address the actions rely on (specs/0005-interface.md); the service refuses
@@ -239,7 +240,11 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 	for _, arch := range config.Arches {
 		log.Info("base image", "arch", arch, "image", bases.ImageName(arch, images.Keys[arch]))
 	}
-	passes := &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log}
+	passLease := lease.New(objects, pass.LeaseName, pass.Validity, clock)
+	// Cloud Run's name for this revision, in the lease while a pass here
+	// holds it.
+	passLease.Owner = getenv("K_REVISION")
+	passes := &pass.Runner{Lease: passLease, Clock: clock, Logger: log}
 	body := pass.All(fence.Pass, svc.Pass, dks.Pass)
 	svc.Kick = kicker(ctx, passes, body, 15*time.Second, log)
 	h, err := server.New(server.Config{
@@ -278,9 +283,30 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger) erro
 		return err
 	case <-ctx.Done():
 	}
-	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	return stop(passes, srv, log)
+}
+
+// stopGrace is how long the service takes to stop, within the 10 seconds
+// Cloud Run gives an instance after SIGTERM before it ends it.
+const stopGrace = 8 * time.Second
+
+// stop ends the instance's passes before its server: a pass runs inside a
+// request, which the server's shutdown would wait for but not end, so Cloud
+// Run would end the instance with the pass still running and the lease
+// still held, and every other revision's passes would wait until it
+// expired. Stopping the passes first ends each one's context, so it releases
+// the lease; the requests they ran in then answer, and the server stops
+// (specs/0001-architecture.md, Passes).
+func stop(passes *pass.Runner, srv *http.Server, log *slog.Logger) error {
+	ctx, cancel := context.WithTimeout(context.Background(), stopGrace)
 	defer cancel()
-	return srv.Shutdown(sctx)
+	log.Info("stopping: ending passes, then the server")
+	if err := passes.Stop(ctx); err != nil {
+		log.Warn("a pass didn't stop in time; its lease will expire", "err", err)
+	} else {
+		log.Info("stopping: no pass is running")
+	}
+	return srv.Shutdown(ctx)
 }
 
 // kicker runs a pass soon after a machine reports, so its cleanup starts at
@@ -299,7 +325,12 @@ func kicker(ctx context.Context, passes *pass.Runner, body pass.Body, every time
 			case <-pending:
 			}
 			for end := time.Now().Add(pass.Validity + pass.Deadline); ; {
-				err := passes.Run(ctx, body)
+				// Not the signal's context: Stop ends this pass, so that
+				// it ends as stopped and gives the lease back.
+				err := passes.Run(context.Background(), body)
+				if errors.Is(err, pass.ErrStopping) {
+					return
+				}
 				if !errors.Is(err, pass.ErrHeld) {
 					if err != nil {
 						log.Warn("pass after a report", "err", err)

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/lanescape/runners/internal/auth"
+	"github.com/lanescape/runners/internal/lease"
 	"github.com/lanescape/runners/internal/pass"
 )
 
@@ -328,7 +329,18 @@ func (s *server) reconcile(w http.ResponseWriter, r *http.Request) {
 	err = s.Passes.Run(r.Context(), s.Reconciler.Pass)
 	switch {
 	case errors.Is(err, pass.ErrHeld):
+		// Who holds the lease, and until when: a lease held long after
+		// any pass could still be running shows at once.
+		var held *lease.HeldError
+		if errors.As(err, &held) {
+			s.log.Info("a pass is running", "holder", held.Owner, "expires", held.Expires.UTC())
+		} else {
+			s.log.Info("a pass is running")
+		}
 		retryLater(w, "a pass is running")
+	case errors.Is(err, pass.ErrStopping):
+		// Another instance takes the retry.
+		retryLater(w, "this instance is stopping")
 	case err != nil:
 		s.log.Error("pass failed", "err", err)
 		retryLater(w, "pass failed")

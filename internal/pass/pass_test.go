@@ -1,10 +1,13 @@
 package pass_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -303,5 +306,302 @@ func TestAllRunsEveryPartInOrder(t *testing.T) {
 	err := e.runner.Run(context.Background(), pass.All(part("machines", failed), part("disks", nil)))
 	if !errors.Is(err, failed) || len(ran) != 2 || ran[0] != "machines" || ran[1] != "disks" {
 		t.Fatalf("ran %v, err %v; a failed part doesn't stop the next", ran, err)
+	}
+}
+
+// TestStopEndsAPassAndReleasesItsLease: Stop ends a running pass's context
+// at once, the pass releases the lease, as Cloud Run's SIGTERM needs, so
+// another instance's pass can run at once rather than once the lease
+// expires; and no pass starts after.
+func TestStopEndsAPassAndReleasesItsLease(t *testing.T) {
+	e := setup(t)
+	_, _, result := start(t, e)
+	if _, _, ok := e.emu.Object("state", pass.LeaseName); !ok {
+		t.Fatal("the pass holds no lease")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := e.runner.Stop(ctx); err != nil {
+		t.Fatalf("Stop = %v", err)
+	}
+	if err := <-result; !errors.Is(err, pass.ErrStopping) {
+		t.Fatalf("the stopped pass returned %v, not ErrStopping", err)
+	}
+	if _, _, ok := e.emu.Object("state", pass.LeaseName); ok {
+		t.Fatal("the stopped pass left its lease")
+	}
+	// Another instance's runner takes the lease at once.
+	other := &pass.Runner{Lease: lease.New(e.store, pass.LeaseName, pass.Validity, e.clock), Clock: e.clock}
+	ran := false
+	if err := other.Run(context.Background(), func(*pass.Pass) error { ran = true; return nil }); err != nil || !ran {
+		t.Fatalf("the next pass: ran %v, %v", ran, err)
+	}
+	// And this runner starts none.
+	if err := e.runner.Run(context.Background(), func(*pass.Pass) error {
+		t.Fatal("a pass ran after Stop")
+		return nil
+	}); !errors.Is(err, pass.ErrStopping) {
+		t.Fatalf("Run after Stop = %v", err)
+	}
+	// Stopping again, or with nothing running, returns at once.
+	if err := e.runner.Stop(ctx); err != nil {
+		t.Fatalf("second Stop = %v", err)
+	}
+	if err := (&pass.Runner{}).Stop(ctx); err != nil {
+		t.Fatalf("Stop of an idle runner = %v", err)
+	}
+}
+
+// TestStopGivesUpOnAPassThatWontEnd: a body that ignores its context keeps
+// the pass, and Stop returns when its own context ends, with the lease still
+// held while the body runs, as it would be left to expire if Cloud Run then
+// ended the instance.
+func TestStopGivesUpOnAPassThatWontEnd(t *testing.T) {
+	e := setup(t)
+	release := make(chan struct{})
+	result := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		result <- e.runner.Run(context.Background(), func(*pass.Pass) error {
+			close(started)
+			<-release
+			return nil
+		})
+	}()
+	<-started
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := e.runner.Stop(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Stop = %v, want its deadline", err)
+	}
+	if _, _, ok := e.emu.Object("state", pass.LeaseName); !ok {
+		t.Fatal("the lease went while its pass still ran")
+	}
+	close(release)
+	if err := <-result; !errors.Is(err, pass.ErrStopping) {
+		t.Fatalf("the pass returned %v", err)
+	}
+}
+
+// TestPassesSayWhenTheyStartAndHowTheyEnd: one line as a pass takes the
+// lease, and one as it ends, with its outcome; a pass that finds the lease
+// held logs neither.
+func TestPassesSayWhenTheyStartAndHowTheyEnd(t *testing.T) {
+	e := setup(t)
+	var logs bytes.Buffer
+	e.runner.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	if err := e.runner.Run(context.Background(), func(*pass.Pass) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.runner.Run(context.Background(), func(*pass.Pass) error { return errors.New("boom") }); err == nil {
+		t.Fatal("the failed pass succeeded")
+	}
+	_, _, result := start(t, e)
+	before := logs.Len()
+	if err := e.runner.Run(context.Background(), func(*pass.Pass) error { return nil }); !errors.Is(err, pass.ErrHeld) {
+		t.Fatalf("a second pass = %v", err)
+	}
+	if logs.Len() != before {
+		t.Fatalf("a pass that found the lease held logged: %s", logs.String()[before:])
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := e.runner.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	<-result
+	got := logs.String()
+	for _, want := range []string{
+		`msg="pass started"`,
+		`msg="pass ended" outcome=finished`,
+		`msg="pass ended" outcome=failed`,
+		`msg="pass ended" outcome="stopped: the service is stopping"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("no %s in:\n%s", want, got)
+		}
+	}
+	if n := strings.Count(got, `msg="pass started"`); n != 3 {
+		t.Errorf("%d passes started, want 3:\n%s", n, got)
+	}
+}
+
+// heldCreate is the bucket, but a lease write's answer is held back after
+// the write is made, until let is closed, or its caller gives up.
+type heldCreate struct {
+	store.Objects
+	written chan struct{}
+	let     chan struct{}
+}
+
+func (h *heldCreate) Create(ctx context.Context, name string, data []byte) (int64, error) {
+	gen, err := h.Objects.Create(ctx, name, data)
+	close(h.written)
+	select {
+	case <-h.let:
+		return gen, err
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// TestStopWhileTakingTheLeaseGivesItBack: a lease write made but not yet
+// answered when Stop comes isn't cut short, since the lease would then be
+// taken with no one left who knows; once it's answered, the pass gives the
+// lease back without running, before Stop returns.
+func TestStopWhileTakingTheLeaseGivesItBack(t *testing.T) {
+	e := setup(t)
+	held := &heldCreate{Objects: e.store, written: make(chan struct{}), let: make(chan struct{})}
+	e.runner.Lease = lease.New(held, pass.LeaseName, pass.Validity, e.clock)
+	result := make(chan error, 1)
+	ran := make(chan struct{}, 1)
+	go func() {
+		result <- e.runner.Run(context.Background(), func(*pass.Pass) error { ran <- struct{}{}; return nil })
+	}()
+	<-held.written
+	marked := make(chan struct{})
+	pass.OnStop(e.runner, func() { close(marked) })
+	stopped := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		stopped <- e.runner.Stop(ctx)
+	}()
+	// Stop has begun, and waits for the pass while the write is unanswered.
+	<-marked
+	select {
+	case err := <-stopped:
+		t.Fatalf("Stop returned %v while the lease write was unanswered", err)
+	default:
+	}
+	close(held.let)
+	if err := <-stopped; err != nil {
+		t.Fatalf("Stop = %v", err)
+	}
+	if err := <-result; !errors.Is(err, pass.ErrStopping) {
+		t.Fatalf("Run = %v, want ErrStopping", err)
+	}
+	if len(ran) != 0 {
+		t.Fatal("the pass ran its body after Stop")
+	}
+	if _, _, ok := e.emu.Object("state", pass.LeaseName); ok {
+		t.Fatal("the lease taken while stopping was left held")
+	}
+}
+
+// TestAStoppedPassStartsNoFurtherPart: once the service stops a pass, the
+// parts after the one running don't start.
+func TestAStoppedPassStartsNoFurtherPart(t *testing.T) {
+	e := setup(t)
+	started := make(chan struct{})
+	second := false
+	result := make(chan error, 1)
+	go func() {
+		result <- e.runner.Run(context.Background(), pass.All(
+			func(p *pass.Pass) error { close(started); <-p.Context().Done(); return p.Context().Err() },
+			func(*pass.Pass) error { second = true; return nil },
+		))
+	}()
+	<-started
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := e.runner.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; !errors.Is(err, pass.ErrStopping) {
+		t.Fatalf("Run = %v", err)
+	}
+	if second {
+		t.Fatal("the second part ran after the pass was stopped")
+	}
+}
+
+// TestAPassStoppedAtItsDeadlineStillReleases: when the pass's deadline
+// fires as the service stops, the deadline ends its context first, but the
+// pass still gives the lease back, since the service is stopping.
+func TestAPassStoppedAtItsDeadlineStillReleases(t *testing.T) {
+	e := setup(t)
+	renewed := renewals(e)
+	ended, afterStop := make(chan struct{}), make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		result <- e.runner.Run(context.Background(), func(p *pass.Pass) error {
+			<-p.Context().Done()
+			close(ended)
+			// Still ending when Stop comes.
+			<-afterStop
+			return p.Context().Err()
+		})
+	}()
+	if err := e.clock.BlockUntilContext(context.Background(), 2); err != nil {
+		t.Fatal(err)
+	}
+	for want := int64(2); want <= 7; want++ {
+		renewTo(t, e, renewed, want)
+	}
+	e.clock.Advance(pass.RenewEvery)
+	<-ended
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stopped := make(chan error, 1)
+	marked := make(chan struct{})
+	pass.OnStop(e.runner, func() { close(marked) })
+	go func() { stopped <- e.runner.Stop(ctx) }()
+	<-marked
+	close(afterStop)
+	if err := <-stopped; err != nil {
+		t.Fatal(err)
+	}
+	<-result
+	if _, _, ok := e.emu.Object("state", pass.LeaseName); ok {
+		t.Fatal("a pass at its deadline as the service stopped left its lease")
+	}
+}
+
+// heldDelete is the bucket, but the first lease delete waits until let is
+// closed and then fails without deleting, as one cut off by its deadline.
+type heldDelete struct {
+	store.Objects
+	deleting chan struct{}
+	let      chan struct{}
+	once     bool
+}
+
+func (h *heldDelete) Delete(ctx context.Context, name string, generation int64) error {
+	if !h.once {
+		h.once = true
+		close(h.deleting)
+		<-h.let
+		return context.DeadlineExceeded
+	}
+	return h.Objects.Delete(ctx, name, generation)
+}
+
+// TestAReleaseCutShortAsTheServiceStopsIsRetried: a pass's release whose
+// delete fails while the service begins stopping is tried once more, and
+// the lease is given back before Stop returns.
+func TestAReleaseCutShortAsTheServiceStopsIsRetried(t *testing.T) {
+	e := setup(t)
+	held := &heldDelete{Objects: e.store, deleting: make(chan struct{}), let: make(chan struct{})}
+	e.runner.Lease = lease.New(held, pass.LeaseName, pass.Validity, e.clock)
+	result := make(chan error, 1)
+	go func() { result <- e.runner.Run(context.Background(), func(*pass.Pass) error { return nil }) }()
+	<-held.deleting
+	marked := make(chan struct{})
+	pass.OnStop(e.runner, func() { close(marked) })
+	stopped := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		stopped <- e.runner.Stop(ctx)
+	}()
+	<-marked
+	close(held.let)
+	if err := <-stopped; err != nil {
+		t.Fatal(err)
+	}
+	<-result
+	if _, _, ok := e.emu.Object("state", pass.LeaseName); ok {
+		t.Fatal("the release cut short as the service stopped wasn't retried")
 	}
 }

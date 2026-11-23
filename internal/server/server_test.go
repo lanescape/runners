@@ -62,13 +62,18 @@ type reconciler struct {
 	mu     sync.Mutex
 	passes int
 	block  chan struct{}
+	// entered, if set, gets a value as a pass's body starts.
+	entered chan struct{}
 }
 
 func (r *reconciler) Pass(p *pass.Pass) error {
 	r.mu.Lock()
 	r.passes++
-	block := r.block
+	block, entered := r.block, r.entered
 	r.mu.Unlock()
+	if entered != nil {
+		entered <- struct{}{}
+	}
 	if block != nil {
 		select {
 		case <-block:
@@ -148,6 +153,8 @@ type env struct {
 	url   string
 	logs  *bytes.Buffer
 	logMu *sync.Mutex
+	// passes is the server's pass runner.
+	passes *pass.Runner
 }
 
 type lockedWriter struct {
@@ -195,6 +202,9 @@ func setupPass(t *testing.T, deadline time.Duration) *env {
 	clock := clockwork.NewRealClock()
 	pub := &publisher{}
 	rec := &reconciler{}
+	passLease := lease.New(objects, pass.LeaseName, pass.Validity, clock)
+	passLease.Owner = "lanescape-runners-test"
+	passes := &pass.Runner{Lease: passLease, Clock: clock, Logger: log, Deadline: deadline}
 	ev := &events{}
 	cl := &closings{pub: pub}
 	h, err := server.New(server.Config{
@@ -205,7 +215,7 @@ func setupPass(t *testing.T, deadline time.Duration) *env {
 		WebhookSecret:    secret,
 		Publisher:        pub,
 		ReconcileCallers: callers,
-		Passes:           &pass.Runner{Lease: lease.New(objects, pass.LeaseName, pass.Validity, clock), Clock: clock, Logger: log, Deadline: deadline},
+		Passes:           passes,
 		Reconciler:       rec,
 	})
 	if err != nil {
@@ -213,7 +223,7 @@ func setupPass(t *testing.T, deadline time.Duration) *env {
 	}
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
-	return &env{t: t, ev: ev, cl: cl, gh: gh, gg: gg, gcs: gcs, org: org, repo: repo, inst: inst, pub: pub, rec: rec, url: srv.URL, logs: logs, logMu: logMu}
+	return &env{t: t, ev: ev, cl: cl, gh: gh, gg: gg, gcs: gcs, org: org, repo: repo, inst: inst, pub: pub, rec: rec, url: srv.URL, logs: logs, logMu: logMu, passes: passes}
 }
 
 func (e *env) post(path, token, body string) (int, map[string]any) {
@@ -514,11 +524,77 @@ func TestReconcile(t *testing.T) {
 		if code != http.StatusServiceUnavailable || body["retryable"] != true {
 			t.Fatalf("push while a pass runs: %d %v, want a retryable 503", code, body)
 		}
+		// The log says who holds the lease, and until when.
+		e.logMu.Lock()
+		logged := e.logs.String()
+		e.logMu.Unlock()
+		if !strings.Contains(logged, `msg="a pass is running" holder=lanescape-runners-test expires=`) {
+			t.Fatalf("no holder in the log:\n%s", logged)
+		}
 		close(e.rec.block)
 		if code := <-done; code != http.StatusNoContent {
 			t.Fatalf("first pass: %d", code)
 		}
 	})
+}
+
+// TestReconcileWhileStopping: once the instance is stopping, a push or the
+// scheduler's call runs no pass and is answered with a retryable 503, so
+// Pub/Sub delivers it again, to an instance that isn't stopping.
+func TestReconcileWhileStopping(t *testing.T) {
+	e := setup(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := e.passes.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	code, body := e.post(server.ReconcilePath, e.gg.Token(pusher, audience), "{}")
+	if code != http.StatusServiceUnavailable || body["retryable"] != true || body["error"] != "this instance is stopping" {
+		t.Fatalf("reconcile while stopping: %d %v, want a retryable 503", code, body)
+	}
+	if e.rec.passes != 0 {
+		t.Fatal("a pass ran while stopping")
+	}
+	if _, _, ok := e.gcs.Object("state", pass.LeaseName); ok {
+		t.Fatal("a stopping instance took the lease")
+	}
+}
+
+// TestAPassInFlightWhenStoppingAnswersRetryably: the pass a reconcile call
+// is running when the instance stops ends, gives the lease back, and the
+// call is answered with the retryable 503 a stopping instance gives.
+func TestAPassInFlightWhenStoppingAnswersRetryably(t *testing.T) {
+	e := setup(t)
+	e.rec.block = make(chan struct{})
+	e.rec.entered = make(chan struct{}, 1)
+	defer close(e.rec.block)
+	type answer struct {
+		code int
+		body map[string]any
+	}
+	done := make(chan answer, 1)
+	go func() {
+		code, body := e.post(server.ReconcilePath, e.gg.Token(pusher, audience), "{}")
+		done <- answer{code, body}
+	}()
+	// The pass's body is running.
+	select {
+	case <-e.rec.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pass's body didn't start")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := e.passes.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	a := <-done
+	if a.code != http.StatusServiceUnavailable || a.body["retryable"] != true || a.body["error"] != "this instance is stopping" {
+		t.Fatalf("the call whose pass was stopped: %d %v", a.code, a.body)
+	}
+	if _, _, ok := e.gcs.Object("state", pass.LeaseName); ok {
+		t.Fatal("the stopped pass left the lease")
+	}
 }
 
 func TestThereIsNoBindEndpoint(t *testing.T) {
